@@ -1,0 +1,39 @@
+[package]
+name = "kurama-adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+http = ["dep:reqwest", "dep:rustls", "dep:url"]
+openai = ["http"]
+anthropic = ["http"]
+openai-compatible = ["http"]
+codex-bridge = ["dep:futures-core", "dep:futures-util", "dep:tokio"]
+claude-bridge = ["dep:futures-core", "dep:futures-util", "dep:tokio"]
+tools = ["dep:diffy", "dep:libc", "dep:reqwest", "dep:shlex", "dep:tokio", "dep:url"]
+fs-store = ["dep:libc", "dep:sha2"]
+native-credentials = ["dep:basic-toml", "dep:libc", "dep:zeroize"]
+
+[dependencies]
+basic-toml = { workspace = true, optional = true }
+diffy = { workspace = true, optional = true }
+futures-core = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+kurama-protocol = { path = "../kurama-protocol" }
+libc = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = { workspace = true, optional = true }
+shlex = { workspace = true, optional = true }
+thiserror.workspace = true
+tokio = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true

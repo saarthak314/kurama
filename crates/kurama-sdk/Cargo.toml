@@ -1,0 +1,11 @@
+[package]
+name = "kurama-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+kurama-adapters = { path = "../kurama-adapters" }
+kurama-core = { path = "../kurama-core" }
+kurama-protocol = { path = "../kurama-protocol" }

@@ -1,0 +1,21 @@
+[package]
+name = "kurama-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kurama"
+path = "src/main.rs"
+
+[dependencies]
+crossterm.workspace = true
+kurama-adapters = { path = "../kurama-adapters", features = ["http", "openai", "anthropic", "openai-compatible", "codex-bridge", "claude-bridge", "tools", "fs-store", "native-credentials"] }
+kurama-core = { path = "../kurama-core" }
+kurama-protocol = { path = "../kurama-protocol" }
+kurama-sdk = { path = "../kurama-sdk" }
+lexopt.workspace = true
+ratatui.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
