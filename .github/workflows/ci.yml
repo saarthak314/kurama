@@ -36,12 +36,12 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Lint
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Test libraries
-        run: cargo test --workspace --lib
+        run: cargo test --locked --workspace --lib
       - name: Test core
-        run: cargo test -p kurama-core --tests
+        run: cargo test --locked -p kurama-core --tests
       - name: Test adapters
-        run: cargo test -p kurama-adapters --all-features --tests
+        run: cargo test --locked -p kurama-adapters --all-features --tests
       - name: Test CLI
-        run: cargo test -p kurama-cli --tests
+        run: cargo test --locked -p kurama-cli --tests

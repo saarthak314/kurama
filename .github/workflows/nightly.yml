@@ -32,11 +32,11 @@ jobs:
           key: cargo-nightly-heavy-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'tools/prompt-budget/Cargo.lock') }}
           restore-keys: cargo-nightly-heavy-${{ runner.os }}-
       - name: Test all features
-        run: cargo test --workspace --all-features
+        run: cargo test --locked --workspace --all-features
       - name: Run exhaustive recovery matrix
-        run: cargo test -p kurama-core --all-features --test recovery -- --include-ignored
+        run: cargo test --locked -p kurama-core --all-features --test recovery -- --include-ignored
       - name: Run fake bridge contracts
-        run: cargo test -p kurama-adapters --all-features --test bridge_contract
+        run: cargo test --locked -p kurama-adapters --all-features --test bridge_contract
       - name: Check prompt budget
         run: scripts/check-prompt-budget.sh target/release/kurama
       - name: Report duplicate dependencies
@@ -70,7 +70,7 @@ jobs:
         run: |
           for term in xterm-256color screen-256color vt100; do
             echo "TERM=$term"
-            TERM="$term" cargo test -p kurama-cli --test tui_structure
+            TERM="$term" cargo test --locked -p kurama-cli --test tui_structure
           done
 
   native-builds:

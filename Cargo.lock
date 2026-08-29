@@ -850,7 +850,6 @@ dependencies = [
 name = "kurama-sdk"
 version = "0.1.0"
 dependencies = [
- "kurama-adapters",
  "kurama-core",
  "kurama-protocol",
 ]

@@ -29,7 +29,7 @@ jobs:
           key: cargo-release-tests-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-release-tests-${{ runner.os }}-
       - name: Test release source
-        run: cargo test --workspace --all-features
+        run: cargo test --locked --workspace --all-features
 
   package:
     needs: tests
