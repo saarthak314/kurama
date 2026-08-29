@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use kurama_core::{
-    agent_manager::{ChildProgress, ChildRunContext, ChildRunner},
+    agent_manager::{ChildApproval, ChildProgress, ChildRunContext, ChildRunner},
     engine::{EngineConfig, EngineOrchestration},
 };
 use kurama_protocol::{
@@ -174,10 +174,11 @@ impl ChildRunner for RuntimeChildRunner {
                 ))
             })?;
             let replay = store.replay_agent(&session.id, &context.agent_id)?;
+            let child_profile = budgeted_profile(&context.launch.profile, &context.launch.budget);
             let (handle, mut events) = kurama_core::engine::Engine::spawn(
                 EngineConfig {
                     session: session.clone(),
-                    profile: context.launch.profile.clone(),
+                    profile: child_profile.clone(),
                     backend: backend.clone(),
                     tools,
                     policy,
@@ -186,8 +187,8 @@ impl ChildRunner for RuntimeChildRunner {
                     orchestrator,
                     ids,
                     context_policy: kurama_core::context::ContextPolicy {
-                        max_input_tokens: context.launch.profile.max_input_tokens,
-                        reserve_output_tokens: context.launch.profile.max_output_tokens,
+                        max_input_tokens: child_profile.max_input_tokens,
+                        reserve_output_tokens: child_profile.max_output_tokens,
                         ..kurama_core::context::ContextPolicy::default()
                     },
                     workspace_root,
@@ -247,6 +248,17 @@ impl ChildRunner for RuntimeChildRunner {
                             }
                             RuntimeEvent::TurnCompleted => {
                                 completed_turns += 1;
+                                let usage = child_usage(
+                                    store.as_ref(),
+                                    &session.id,
+                                    &context.agent_id,
+                                )?;
+                                let _ = context.progress.send(ChildProgress {
+                                    phase: Some("completed turn".into()),
+                                    usage,
+                                    completed_turns,
+                                    ..ChildProgress::default()
+                                }).await;
                                 if pending_messages.is_empty() {
                                     let _ = handle.shutdown().await;
                                     let (changed_files, evidence_refs) = child_artifacts(
@@ -273,10 +285,23 @@ impl ChildRunner for RuntimeChildRunner {
                                 return Err(KuramaError::Model(message));
                             }
                             RuntimeEvent::Shutdown => return Err(KuramaError::Cancelled),
-                            RuntimeEvent::ApprovalRequired { .. } => {
-                                handle
-                                    .resolve_approval(kurama_protocol::policy::ApprovalResponse::Deny)
-                                    .await?;
+                            RuntimeEvent::ApprovalRequired { request } => {
+                                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                                context.approvals.send(ChildApproval {
+                                    agent_id: context.agent_id.clone(),
+                                    request,
+                                    response: response_tx,
+                                }).await.map_err(|_| KuramaError::Cancelled)?;
+                                let response = tokio::select! {
+                                    () = context.cancel.cancelled() => {
+                                        let _ = handle.cancel_turn().await;
+                                        return Err(KuramaError::Cancelled);
+                                    }
+                                    response = response_rx => {
+                                        response.map_err(|_| KuramaError::Cancelled)?
+                                    }
+                                };
+                                handle.resolve_approval(response).await?;
                             }
                             RuntimeEvent::Status { .. }
                             | RuntimeEvent::ToolOutputDelta { .. }
@@ -288,6 +313,36 @@ impl ChildRunner for RuntimeChildRunner {
             }
         })
     }
+}
+
+fn budgeted_profile(
+    profile: &ModelProfile,
+    budget: &kurama_protocol::agent::AgentBudget,
+) -> ModelProfile {
+    ModelProfile {
+        name: profile.name.clone(),
+        model: profile.model.clone(),
+        max_input_tokens: profile.max_input_tokens.min(budget.max_input_tokens),
+        max_output_tokens: profile.max_output_tokens.min(budget.max_output_tokens),
+    }
+}
+
+fn child_usage(
+    store: &dyn SessionStore,
+    session_id: &kurama_protocol::id::SessionId,
+    agent_id: &kurama_protocol::id::AgentId,
+) -> Result<kurama_protocol::model::Usage, KuramaError> {
+    let mut total = kurama_protocol::model::Usage::default();
+    for event in store.replay_agent(session_id, agent_id)? {
+        if let SessionEvent::ModelUsage { usage } = event.event {
+            total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+            total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+            total.cached_input_tokens = total
+                .cached_input_tokens
+                .saturating_add(usage.cached_input_tokens);
+        }
+    }
+    Ok(total)
 }
 
 fn child_prompt(context: &ChildRunContext) -> String {

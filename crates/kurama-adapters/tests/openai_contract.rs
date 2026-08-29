@@ -80,6 +80,7 @@ fn responses_request_uses_strict_tools_and_no_storage() {
     assert_eq!(body["stream"], true);
     assert_eq!(body["store"], false);
     assert_eq!(body["parallel_tool_calls"], true);
+    assert_eq!(body["max_output_tokens"], 4_000);
     assert_eq!(body["previous_response_id"], "resp_previous");
     assert_eq!(body["tools"][0]["name"], "read");
     assert_eq!(body["tools"][0]["strict"], true);

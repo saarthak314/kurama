@@ -56,6 +56,7 @@ impl OpenAiCompatBackend {
             "model": request.profile.model,
             "messages": chat_messages(request),
             "tools": chat_tools(&request.tools, request.delegation.as_ref()),
+            "max_tokens": request.profile.max_output_tokens,
             "stream": true,
             "stream_options": {"include_usage": true}
         });

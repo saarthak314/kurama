@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use kurama_protocol::{
@@ -9,11 +13,12 @@ use kurama_protocol::{
     },
     id::{AgentId, SessionId},
     model::Usage,
+    policy::{ApprovalRequest, ApprovalResponse},
     runtime::{AgentCommand, RuntimeEvent},
     session::{EventEnvelope, SessionEvent},
     traits::{BoxFuture, EventSink, SessionStore},
 };
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::{cancel::CancelToken, orchestrator::scopes_overlap};
 
@@ -34,6 +39,13 @@ pub struct ChildRunContext {
     pub cancel: CancelToken,
     pub messages: mpsc::Receiver<String>,
     pub progress: mpsc::Sender<ChildProgress>,
+    pub approvals: mpsc::Sender<ChildApproval>,
+}
+
+pub struct ChildApproval {
+    pub agent_id: AgentId,
+    pub request: ApprovalRequest,
+    pub response: oneshot::Sender<ApprovalResponse>,
 }
 
 pub trait ChildRunner: Send + Sync {
@@ -61,6 +73,8 @@ pub struct AgentManager {
 #[derive(Default)]
 struct ManagerState {
     agents: BTreeMap<AgentId, ManagedAgent>,
+    active_approval: Option<ChildApproval>,
+    queued_approvals: VecDeque<ChildApproval>,
 }
 
 struct ManagedAgent {
@@ -122,6 +136,7 @@ impl AgentManager {
         self.register(&specs).await?;
 
         let (progress_tx, mut progress_rx) = mpsc::channel(64);
+        let (approval_tx, mut approval_rx) = mpsc::channel(32);
         let mut running = FuturesUnordered::new();
         let mut results = Vec::new();
 
@@ -133,6 +148,7 @@ impl AgentManager {
                 &project_summary,
                 runner.clone(),
                 progress_tx.clone(),
+                approval_tx.clone(),
                 &mut running,
             )
             .await?;
@@ -153,7 +169,15 @@ impl AgentManager {
                         self.apply_progress(&agent_id, progress).await?;
                     }
                 }
+                approval = approval_rx.recv() => {
+                    if let Some(approval) = approval {
+                        self.queue_approval(approval).await?;
+                    }
+                }
                 completed = running.next(), if !running.is_empty() => {
+                    while let Ok((agent_id, progress)) = progress_rx.try_recv() {
+                        self.apply_progress(&agent_id, progress).await?;
+                    }
                     if let Some((agent_id, outcome)) = completed
                         && let Some(result) = self.finish(&agent_id, outcome).await?
                     {
@@ -178,6 +202,23 @@ impl AgentManager {
             AgentCommand::Message { agent_id, text } => self.message(&agent_id, text).await,
             AgentCommand::Cancel { agent_id } => self.cancel(&agent_id).await,
         }
+    }
+
+    pub async fn resolve_approval(&self, response: ApprovalResponse) -> Result<(), KuramaError> {
+        let next_request = {
+            let mut state = self.state.lock().await;
+            let approval = state
+                .active_approval
+                .take()
+                .ok_or_else(|| KuramaError::Protocol("no child approval is pending".into()))?;
+            let _ = approval.response.send(response);
+            promote_approval(&mut state)
+        };
+        if let Some(request) = next_request {
+            self.emit(RuntimeEvent::ApprovalRequired { request })
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn inspect(&self, agent_id: &AgentId) -> Result<AgentInspection, KuramaError> {
@@ -314,6 +355,7 @@ impl AgentManager {
         project_summary: &str,
         runner: Arc<dyn ChildRunner>,
         progress_tx: mpsc::Sender<(AgentId, ChildProgress)>,
+        approval_tx: mpsc::Sender<ChildApproval>,
         running: &mut FuturesUnordered<
             BoxFuture<'static, (AgentId, Result<AgentResult, KuramaError>)>,
         >,
@@ -420,6 +462,7 @@ impl AgentManager {
                 cancel: cancel.clone(),
                 messages,
                 progress: child_progress_tx,
+                approvals: approval_tx.clone(),
             };
             let agent_id = spec.id.clone();
             let timeout = Duration::from_secs(spec.budget.max_seconds);
@@ -464,6 +507,28 @@ impl AgentManager {
         self.emit(RuntimeEvent::AgentUpdated { snapshot }).await
     }
 
+    async fn queue_approval(&self, approval: ChildApproval) -> Result<(), KuramaError> {
+        let request = {
+            let mut state = self.state.lock().await;
+            if !state.agents.contains_key(&approval.agent_id) {
+                return Err(KuramaError::NotFound(approval.agent_id.to_string()));
+            }
+            if state.active_approval.is_some() {
+                state.queued_approvals.push_back(approval);
+                None
+            } else {
+                let request = approval.request.clone();
+                state.active_approval = Some(approval);
+                Some(request)
+            }
+        };
+        if let Some(request) = request {
+            self.emit(RuntimeEvent::ApprovalRequired { request })
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn finish(
         &self,
         agent_id: &AgentId,
@@ -476,81 +541,83 @@ impl AgentManager {
                 .get_mut(agent_id)
                 .ok_or_else(|| KuramaError::NotFound(agent_id.to_string()))?;
             agent.messages = None;
-            match outcome {
-                Ok(result) => {
-                    agent.snapshot.state = AgentState::Completed;
-                    agent.snapshot.changed_files = result.changed_files.clone();
-                    let snapshot = agent.snapshot.clone();
-                    self.append_agent_event(
-                        agent,
-                        SessionEvent::AgentCompleted {
-                            snapshot: snapshot.clone(),
-                            summary: result.summary.clone(),
-                        },
-                    )?;
-                    (snapshot, Some(result))
-                }
-                Err(KuramaError::Cancelled) if agent.cancel.is_cancelled() => {
-                    agent.snapshot.state = AgentState::Cancelled;
-                    let snapshot = agent.snapshot.clone();
-                    self.append_agent_event(
-                        agent,
-                        SessionEvent::AgentCancelled {
-                            snapshot: snapshot.clone(),
-                        },
-                    )?;
-                    (snapshot, None)
-                }
-                Err(error @ KuramaError::Model(_)) if agent.profile_attempts < 2 => {
-                    agent.snapshot.state = AgentState::Queued;
-                    agent.snapshot.phase = Some("retrying".into());
-                    agent.snapshot.last_error = Some(error.to_string());
-                    let snapshot = agent.snapshot.clone();
-                    self.append_agent_event(
-                        agent,
-                        SessionEvent::AgentProgress {
-                            snapshot: snapshot.clone(),
-                        },
-                    )?;
-                    (snapshot, None)
-                }
-                Err(error @ KuramaError::Model(_))
-                    if agent.next_escalation < agent.spec.escalation_profiles.len() =>
-                {
-                    let profile_name = &agent.spec.escalation_profiles[agent.next_escalation];
-                    let profile = self.profiles.get(profile_name).cloned().ok_or_else(|| {
-                        KuramaError::Configuration(format!(
-                            "unknown escalation profile {profile_name}"
-                        ))
-                    })?;
-                    agent.next_escalation += 1;
-                    agent.profile_attempts = 0;
-                    agent.spec.profile = profile;
-                    agent.snapshot.profile = profile_name.clone();
-                    agent.snapshot.state = AgentState::Queued;
-                    agent.snapshot.phase = Some("escalating".into());
-                    agent.snapshot.last_error = Some(error.to_string());
-                    let snapshot = agent.snapshot.clone();
-                    self.append_agent_event(
-                        agent,
-                        SessionEvent::AgentProgress {
-                            snapshot: snapshot.clone(),
-                        },
-                    )?;
-                    (snapshot, None)
-                }
-                Err(error) => {
-                    agent.snapshot.state = AgentState::Failed;
-                    agent.snapshot.last_error = Some(error.to_string());
-                    let snapshot = agent.snapshot.clone();
-                    self.append_agent_event(
-                        agent,
-                        SessionEvent::AgentFailed {
-                            snapshot: snapshot.clone(),
-                            error: error.to_string(),
-                        },
-                    )?;
-                    (snapshot, None)
+            if agent.cancel.is_cancelled() {
+                agent.snapshot.state = AgentState::Cancelled;
+                let snapshot = agent.snapshot.clone();
+                self.append_agent_event(
+                    agent,
+                    SessionEvent::AgentCancelled {
+                        snapshot: snapshot.clone(),
+                    },
+                )?;
+                (snapshot, None)
+            } else {
+                match outcome {
+                    Ok(result) => {
+                        agent.snapshot.state = AgentState::Completed;
+                        agent.snapshot.changed_files = result.changed_files.clone();
+                        let snapshot = agent.snapshot.clone();
+                        self.append_agent_event(
+                            agent,
+                            SessionEvent::AgentCompleted {
+                                snapshot: snapshot.clone(),
+                                summary: result.summary.clone(),
+                            },
+                        )?;
+                        (snapshot, Some(result))
+                    }
+                    Err(error @ KuramaError::Model(_)) if agent.profile_attempts < 2 => {
+                        agent.snapshot.state = AgentState::Queued;
+                        agent.snapshot.phase = Some("retrying".into());
+                        agent.snapshot.last_error = Some(error.to_string());
+                        let snapshot = agent.snapshot.clone();
+                        self.append_agent_event(
+                            agent,
+                            SessionEvent::AgentProgress {
+                                snapshot: snapshot.clone(),
+                            },
+                        )?;
+                        (snapshot, None)
+                    }
+                    Err(error @ KuramaError::Model(_))
+                        if agent.next_escalation < agent.spec.escalation_profiles.len() =>
+                    {
+                        let profile_name = &agent.spec.escalation_profiles[agent.next_escalation];
+                        let profile =
+                            self.profiles.get(profile_name).cloned().ok_or_else(|| {
+                                KuramaError::Configuration(format!(
+                                    "unknown escalation profile {profile_name}"
+                                ))
+                            })?;
+                        agent.next_escalation += 1;
+                        agent.profile_attempts = 0;
+                        agent.spec.profile = profile;
+                        agent.snapshot.profile = profile_name.clone();
+                        agent.snapshot.state = AgentState::Queued;
+                        agent.snapshot.phase = Some("escalating".into());
+                        agent.snapshot.last_error = Some(error.to_string());
+                        let snapshot = agent.snapshot.clone();
+                        self.append_agent_event(
+                            agent,
+                            SessionEvent::AgentProgress {
+                                snapshot: snapshot.clone(),
+                            },
+                        )?;
+                        (snapshot, None)
+                    }
+                    Err(error) => {
+                        agent.snapshot.state = AgentState::Failed;
+                        agent.snapshot.last_error = Some(error.to_string());
+                        let snapshot = agent.snapshot.clone();
+                        self.append_agent_event(
+                            agent,
+                            SessionEvent::AgentFailed {
+                                snapshot: snapshot.clone(),
+                                error: error.to_string(),
+                            },
+                        )?;
+                        (snapshot, None)
+                    }
                 }
             }
         };
@@ -644,6 +711,18 @@ impl AgentManager {
         }
         Ok(())
     }
+}
+
+fn promote_approval(state: &mut ManagerState) -> Option<ApprovalRequest> {
+    while let Some(approval) = state.queued_approvals.pop_front() {
+        if approval.response.is_closed() {
+            continue;
+        }
+        let request = approval.request.clone();
+        state.active_approval = Some(approval);
+        return Some(request);
+    }
+    None
 }
 
 fn agent_dependency_keys(agent: &ManagedAgent) -> [String; 2] {

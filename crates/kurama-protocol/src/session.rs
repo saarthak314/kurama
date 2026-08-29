@@ -1,9 +1,11 @@
+use std::path::PathBuf;
+
 use crate::{
     agent::AgentSnapshot,
     id::{AgentId, CallId, OperationId, SessionId},
     model::{BackendCursor, Usage},
     policy::{ApprovalResponse, ExecutionMode},
-    tool::{Operation, ToolResult},
+    tool::{Operation, ToolInvocation, ToolResult},
 };
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -12,6 +14,12 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub struct BlobRef {
     pub sha256: String,
     pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileCheckpoint {
+    pub path: PathBuf,
+    pub content: Option<BlobRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -89,6 +97,14 @@ pub enum SessionEvent {
         call_id: CallId,
         operation: Operation,
     },
+    ToolInvocationRecorded {
+        operation_id: OperationId,
+        invocation: ToolInvocation,
+    },
+    WritePrepared {
+        operation_id: OperationId,
+        files: Vec<FileCheckpoint>,
+    },
     ToolPrepared {
         operation_id: OperationId,
     },
@@ -97,6 +113,11 @@ pub enum SessionEvent {
     },
     ToolCompleted {
         operation_id: OperationId,
+        result: ToolResult,
+    },
+    WriteApplied {
+        operation_id: OperationId,
+        files: Vec<FileCheckpoint>,
         result: ToolResult,
     },
     ToolUnknown {

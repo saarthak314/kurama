@@ -39,6 +39,7 @@ fn chat_request_supports_optional_parallel_tool_calls() {
     assert_eq!(body["model"], "local-test");
     assert_eq!(body["stream"], true);
     assert_eq!(body["stream_options"]["include_usage"], true);
+    assert_eq!(body["max_tokens"], 4_000);
     assert_eq!(body["parallel_tool_calls"], false);
     assert_eq!(body["tools"][0]["function"]["name"], "read");
 }

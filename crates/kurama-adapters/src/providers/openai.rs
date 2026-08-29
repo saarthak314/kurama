@@ -50,6 +50,7 @@ impl OpenAiBackend {
             "input": responses_input(request),
             "tools": responses_tools(&request.tools, request.delegation.as_ref()),
             "parallel_tool_calls": true,
+            "max_output_tokens": request.profile.max_output_tokens,
             "stream": true,
             "store": false
         });

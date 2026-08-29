@@ -16,7 +16,7 @@ use kurama_protocol::{
         PolicyDecision,
     },
     runtime::{AgentCommand, EngineCommand, RuntimeEvent},
-    session::{EventEnvelope, SessionEvent, SessionMetadata},
+    session::{EventEnvelope, FileCheckpoint, SessionEvent, SessionMetadata},
     tool::{Operation, ToolContext, ToolInvocation, ToolLimits, ToolResult},
     traits::{
         ApprovalPolicy, EventSink, IdGenerator, ModelBackend, Orchestrator, SessionStore, Tool,
@@ -28,7 +28,7 @@ use crate::{
     agent_manager::{AgentManager, ChildRunner},
     cancel::CancelToken,
     context::{ContextManager, ContextPolicy, estimate_text, normalize_compaction_json},
-    recovery::{NoopRecoveryProbe, RecoveryAction, RecoveryPlanner, StreamRecovery},
+    recovery::{RecoveryAction, RecoveryPlanner, SessionRecoveryProbe, StreamRecovery},
 };
 
 pub type RuntimeEvents = mpsc::Receiver<RuntimeEvent>;
@@ -147,30 +147,18 @@ impl Engine {
             replay.push(event);
         }
 
+        let recovery_probe = SessionRecoveryProbe::new(&replay, config.store.as_ref());
         let recovery = RecoveryPlanner::new().plan_for_backend(
             &replay,
-            &NoopRecoveryProbe,
+            &recovery_probe,
             config.backend.backend_name(),
             config.backend.capabilities(),
         )?;
-        for (operation_id, action) in &recovery.operations {
-            if matches!(action, RecoveryAction::Completed { .. }) {
-                continue;
-            }
-            let event = EventEnvelope::new(
-                sequence,
-                now_ms(),
-                config.session.id.clone(),
-                config.agent_id.clone(),
-                SessionEvent::RecoveryDecision {
-                    operation_id: operation_id.clone(),
-                    action: recovery_action_name(action).into(),
-                },
-            );
-            config.store.append(&event)?;
-            sequence += 1;
-            replay.push(event);
-        }
+        let resume_incomplete_turn = !matches!(recovery.stream, StreamRecovery::None);
+        let recovery_continuation = match recovery.stream {
+            StreamRecovery::Continue(cursor) => Some(cursor),
+            StreamRecovery::None | StreamRecovery::RestartFromBoundary => None,
+        };
 
         let (command_tx, command_rx) = mpsc::channel(config.command_capacity);
         let (runtime_tx, runtime_rx) = mpsc::channel(config.event_capacity);
@@ -231,10 +219,10 @@ impl Engine {
             runtime_tx,
             session_approvals: BTreeSet::new(),
             completed_tool_calls,
-            recovery_continuation: match recovery.stream {
-                StreamRecovery::Continue(cursor) => Some(cursor),
-                _ => None,
-            },
+            recovery_continuation,
+            recovery_operations: recovery.operations.into_iter().collect(),
+            interrupted_agents: recovery.interrupted_agents,
+            resume_incomplete_turn,
         };
         tokio::spawn(actor.run());
         Ok((
@@ -272,10 +260,34 @@ struct EngineActor {
     session_approvals: BTreeSet<String>,
     completed_tool_calls: BTreeMap<kurama_protocol::id::CallId, (OperationId, ToolResult)>,
     recovery_continuation: Option<BackendCursor>,
+    recovery_operations: Vec<(OperationId, RecoveryAction)>,
+    interrupted_agents: Vec<kurama_protocol::agent::AgentSnapshot>,
+    resume_incomplete_turn: bool,
 }
 
 impl EngineActor {
     async fn run(mut self) {
+        let recovered = match self.recover_startup().await {
+            Ok(()) => true,
+            Err(error) => {
+                let _ = self
+                    .emit(RuntimeEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                false
+            }
+        };
+        if recovered && self.resume_incomplete_turn {
+            self.resume_incomplete_turn = false;
+            if let Err(error) = self.resume_turn().await {
+                let _ = self
+                    .emit(RuntimeEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+            }
+        }
         while let Some(command) = self.command_rx.recv().await {
             let result = match command {
                 EngineCommand::SubmitTurn {
@@ -312,54 +324,458 @@ impl EngineActor {
         }
     }
 
+    async fn recover_startup(&mut self) -> Result<(), KuramaError> {
+        for snapshot in std::mem::take(&mut self.interrupted_agents) {
+            let error = snapshot
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "interrupted during previous process".into());
+            self.append(SessionEvent::AgentFailed {
+                snapshot: snapshot.clone(),
+                error,
+            })?;
+            self.emit(RuntimeEvent::AgentUpdated { snapshot }).await?;
+        }
+
+        let cancel = CancelToken::new();
+        for (operation_id, action) in std::mem::take(&mut self.recovery_operations) {
+            match action {
+                RecoveryAction::Completed { .. } => {}
+                RecoveryAction::RecordCompleted { result, .. } => {
+                    self.record_recovery_decision(&operation_id, "record_completed")?;
+                    self.complete_tool(operation_id, result).await?;
+                }
+                RecoveryAction::DiscardDenied { tool } => {
+                    self.record_recovery_decision(&operation_id, "discard_denied")?;
+                    let result = error_result(
+                        tool.call_id,
+                        "operation was not resumed after recovery".into(),
+                        tool.invocation.as_ref().map_or_else(
+                            || operation_tool_name(&tool.operation),
+                            |value| value.name.as_str(),
+                        ),
+                    );
+                    self.complete_tool(operation_id, result).await?;
+                }
+                RecoveryAction::RetrySafe { tool, .. } => {
+                    self.record_recovery_decision(&operation_id, "retry_safe")?;
+                    self.execute_recovered_operation(
+                        operation_id,
+                        tool.operation,
+                        tool.invocation,
+                        tool.call_id,
+                        &cancel,
+                    )
+                    .await?;
+                }
+                RecoveryAction::Reevaluate { tool } => {
+                    self.record_recovery_decision(&operation_id, "reevaluate")?;
+                    self.reevaluate_recovered_operation(
+                        operation_id,
+                        tool.operation,
+                        tool.invocation,
+                        tool.call_id,
+                        &cancel,
+                    )
+                    .await?;
+                }
+                RecoveryAction::RestoreApproval { tool, summary } => {
+                    self.record_recovery_decision(&operation_id, "restore_approval")?;
+                    self.restore_recovered_approval(
+                        operation_id,
+                        tool.operation,
+                        tool.invocation,
+                        tool.call_id,
+                        summary,
+                        &cancel,
+                    )
+                    .await?;
+                }
+                RecoveryAction::RequireDecision {
+                    tool,
+                    reason,
+                    pending,
+                } => {
+                    self.require_recovery_decision(
+                        operation_id,
+                        tool.operation,
+                        tool.invocation,
+                        tool.call_id,
+                        reason,
+                        pending,
+                        &cancel,
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn reevaluate_recovered_operation(
+        &mut self,
+        operation_id: OperationId,
+        operation: Operation,
+        invocation: Option<ToolInvocation>,
+        call_id: kurama_protocol::id::CallId,
+        cancel: &CancelToken,
+    ) -> Result<ToolResult, KuramaError> {
+        let Some(invocation) = invocation else {
+            return self
+                .complete_tool(
+                    operation_id,
+                    error_result(
+                        call_id,
+                        "durable tool invocation is unavailable".into(),
+                        operation_tool_name(&operation),
+                    ),
+                )
+                .await;
+        };
+        let policy_context = PolicyContext {
+            mode: self.mode,
+            workspace_root: self.workspace_root.clone(),
+            write_scope: self.write_scope.clone(),
+            auto: self.auto.clone(),
+        };
+        match self.policy.decide(&policy_context, &operation) {
+            PolicyDecision::Allow => {
+                self.execute_recovered_operation(
+                    operation_id,
+                    operation,
+                    Some(invocation),
+                    call_id,
+                    cancel,
+                )
+                .await
+            }
+            PolicyDecision::Deny { reason } => {
+                let tool_name = invocation.name.clone();
+                self.complete_tool(operation_id, error_result(call_id, reason, &tool_name))
+                    .await
+            }
+            PolicyDecision::Ask { reason } => {
+                let summary = operation_summary(&operation);
+                self.append(SessionEvent::ApprovalRequested {
+                    operation_id: operation_id.clone(),
+                    summary: summary.clone(),
+                })?;
+                self.emit(RuntimeEvent::ApprovalRequired {
+                    request: ApprovalRequest {
+                        operation_id: operation_id.clone(),
+                        operation: operation.clone(),
+                        summary: format!("{summary}: {reason}"),
+                    },
+                })
+                .await?;
+                let response = self.await_approval(cancel).await?;
+                self.append(SessionEvent::ApprovalResolved {
+                    operation_id: operation_id.clone(),
+                    response: response.clone(),
+                })?;
+                self.apply_recovered_approval(
+                    operation_id,
+                    operation,
+                    invocation,
+                    response,
+                    true,
+                    cancel,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn restore_recovered_approval(
+        &mut self,
+        operation_id: OperationId,
+        operation: Operation,
+        invocation: Option<ToolInvocation>,
+        call_id: kurama_protocol::id::CallId,
+        summary: String,
+        cancel: &CancelToken,
+    ) -> Result<ToolResult, KuramaError> {
+        self.emit(RuntimeEvent::ApprovalRequired {
+            request: ApprovalRequest {
+                operation_id: operation_id.clone(),
+                operation: operation.clone(),
+                summary,
+            },
+        })
+        .await?;
+        let response = self.await_approval(cancel).await?;
+        self.append(SessionEvent::ApprovalResolved {
+            operation_id: operation_id.clone(),
+            response: response.clone(),
+        })?;
+        let Some(invocation) = invocation else {
+            return self
+                .complete_tool(
+                    operation_id,
+                    error_result(
+                        call_id,
+                        "durable tool invocation is unavailable".into(),
+                        operation_tool_name(&operation),
+                    ),
+                )
+                .await;
+        };
+        self.apply_recovered_approval(operation_id, operation, invocation, response, true, cancel)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn require_recovery_decision(
+        &mut self,
+        operation_id: OperationId,
+        operation: Operation,
+        invocation: Option<ToolInvocation>,
+        call_id: kurama_protocol::id::CallId,
+        reason: String,
+        pending: bool,
+        cancel: &CancelToken,
+    ) -> Result<ToolResult, KuramaError> {
+        if !pending {
+            self.append(SessionEvent::ApprovalRequested {
+                operation_id: operation_id.clone(),
+                summary: reason.clone(),
+            })?;
+        }
+        self.emit(RuntimeEvent::ApprovalRequired {
+            request: ApprovalRequest {
+                operation_id: operation_id.clone(),
+                operation: operation.clone(),
+                summary: format!("Retry interrupted operation? {reason}"),
+            },
+        })
+        .await?;
+        let response = self.await_approval(cancel).await?;
+        self.append(SessionEvent::ApprovalResolved {
+            operation_id: operation_id.clone(),
+            response: response.clone(),
+        })?;
+        match response {
+            ApprovalResponse::Deny => {
+                self.record_recovery_decision(&operation_id, "skip")?;
+                self.complete_tool(
+                    operation_id,
+                    error_result(
+                        call_id,
+                        "interrupted operation was not retried".into(),
+                        invocation.as_ref().map_or_else(
+                            || operation_tool_name(&operation),
+                            |value| value.name.as_str(),
+                        ),
+                    ),
+                )
+                .await
+            }
+            ApprovalResponse::ApproveOnce | ApprovalResponse::ApproveSession => {
+                self.record_recovery_decision(&operation_id, "retry")?;
+                self.execute_recovered_operation(
+                    operation_id,
+                    operation,
+                    invocation,
+                    call_id,
+                    cancel,
+                )
+                .await
+            }
+            ApprovalResponse::Edit { arguments } => {
+                self.record_recovery_decision(&operation_id, "edit")?;
+                let Some(mut invocation) = invocation else {
+                    return self
+                        .complete_tool(
+                            operation_id,
+                            error_result(
+                                call_id,
+                                "durable tool invocation is unavailable".into(),
+                                operation_tool_name(&operation),
+                            ),
+                        )
+                        .await;
+                };
+                let replaced = error_result(
+                    call_id,
+                    "operation replaced by edited arguments".into(),
+                    &invocation.name,
+                );
+                self.append(SessionEvent::ToolCompleted {
+                    operation_id,
+                    result: replaced,
+                })?;
+                invocation.arguments = arguments;
+                self.execute_tool(invocation, cancel).await
+            }
+        }
+    }
+
+    async fn apply_recovered_approval(
+        &mut self,
+        operation_id: OperationId,
+        operation: Operation,
+        mut invocation: ToolInvocation,
+        response: ApprovalResponse,
+        remember_session: bool,
+        cancel: &CancelToken,
+    ) -> Result<ToolResult, KuramaError> {
+        match response {
+            ApprovalResponse::Deny => {
+                let tool_name = invocation.name.clone();
+                self.complete_tool(
+                    operation_id,
+                    error_result(
+                        invocation.call_id,
+                        "operation denied by user".into(),
+                        &tool_name,
+                    ),
+                )
+                .await
+            }
+            ApprovalResponse::ApproveSession => {
+                if remember_session {
+                    let approval_key = serde_json::to_string(&operation)
+                        .map_err(|error| KuramaError::Protocol(error.to_string()))?;
+                    self.session_approvals.insert(approval_key);
+                }
+                let call_id = invocation.call_id.clone();
+                self.execute_recovered_operation(
+                    operation_id,
+                    operation,
+                    Some(invocation),
+                    call_id,
+                    cancel,
+                )
+                .await
+            }
+            ApprovalResponse::ApproveOnce => {
+                let call_id = invocation.call_id.clone();
+                self.execute_recovered_operation(
+                    operation_id,
+                    operation,
+                    Some(invocation),
+                    call_id,
+                    cancel,
+                )
+                .await
+            }
+            ApprovalResponse::Edit { arguments } => {
+                let result = error_result(
+                    invocation.call_id.clone(),
+                    "operation replaced by edited arguments".into(),
+                    &invocation.name,
+                );
+                self.append(SessionEvent::ToolCompleted {
+                    operation_id,
+                    result,
+                })?;
+                invocation.arguments = arguments;
+                self.execute_tool(invocation, cancel).await
+            }
+        }
+    }
+
+    async fn execute_recovered_operation(
+        &mut self,
+        operation_id: OperationId,
+        operation: Operation,
+        invocation: Option<ToolInvocation>,
+        call_id: kurama_protocol::id::CallId,
+        cancel: &CancelToken,
+    ) -> Result<ToolResult, KuramaError> {
+        let Some(invocation) = invocation else {
+            return self
+                .complete_tool(
+                    operation_id,
+                    error_result(
+                        call_id,
+                        "durable tool invocation is unavailable".into(),
+                        operation_tool_name(&operation),
+                    ),
+                )
+                .await;
+        };
+        let Some(tool) = self.tools.get(&invocation.name).cloned() else {
+            let tool_name = invocation.name.clone();
+            return self
+                .complete_tool(
+                    operation_id,
+                    error_result(
+                        invocation.call_id,
+                        format!("unknown tool {tool_name}"),
+                        &tool_name,
+                    ),
+                )
+                .await;
+        };
+        let tool_context = self.tool_context();
+        match tool.classify(&tool_context, &invocation) {
+            Ok(current) if current == operation => {
+                self.execute_authorized_tool(
+                    tool,
+                    tool_context,
+                    operation_id,
+                    operation,
+                    invocation,
+                    cancel,
+                )
+                .await
+            }
+            Ok(_) => {
+                let tool_name = invocation.name.clone();
+                self.complete_tool(
+                    operation_id,
+                    error_result(
+                        invocation.call_id,
+                        "recovered tool operation no longer matches its durable proposal".into(),
+                        &tool_name,
+                    ),
+                )
+                .await
+            }
+            Err(error) => {
+                let tool_name = invocation.name.clone();
+                self.complete_tool(
+                    operation_id,
+                    error_result(invocation.call_id, error.to_string(), &tool_name),
+                )
+                .await
+            }
+        }
+    }
+
+    fn record_recovery_decision(
+        &mut self,
+        operation_id: &OperationId,
+        action: &str,
+    ) -> Result<(), KuramaError> {
+        self.append(SessionEvent::RecoveryDecision {
+            operation_id: operation_id.clone(),
+            action: action.into(),
+        })?;
+        Ok(())
+    }
+
     async fn run_turn(
         &mut self,
         text: String,
         explicit_delegation: bool,
     ) -> Result<(), KuramaError> {
         self.append(SessionEvent::UserMessage { text })?;
+        self.continue_turn(explicit_delegation).await
+    }
+
+    async fn resume_turn(&mut self) -> Result<(), KuramaError> {
+        self.continue_turn(false).await
+    }
+
+    async fn continue_turn(&mut self, explicit_delegation: bool) -> Result<(), KuramaError> {
         let cancel = CancelToken::new();
         let capability_enabled = explicit_delegation
             || self
                 .orchestrator
                 .explicit_delegation(self.latest_user_text().unwrap_or_default().as_str());
-        let outcome = async {
-            loop {
-                let mut assembled = self.context.assemble(
-                    &self.profile,
-                    self.tool_descriptors.clone(),
-                    capability_enabled && self.agent_id.is_none(),
-                )?;
-                if assembled.request.continuation.is_none() {
-                    assembled.request.continuation = self.recovery_continuation.take();
-                }
-                let round = self.stream_round(assembled.request, &cancel).await?;
-                if !round.text.is_empty() {
-                    self.append(SessionEvent::AssistantMessage { text: round.text })?;
-                }
-                for invocation in round.tool_calls {
-                    self.execute_tool(invocation, &cancel).await?;
-                }
-                for request in round.delegations {
-                    self.execute_delegation(request, capability_enabled, &cancel)
-                        .await?;
-                }
-                if !round.tool_calls_empty || !round.delegations_empty {
-                    continue;
-                }
-                match round.finish_reason.unwrap_or(FinishReason::Stop) {
-                    FinishReason::Stop => return Ok(()),
-                    FinishReason::ToolCalls => continue,
-                    FinishReason::Length => {
-                        return Err(KuramaError::Model(
-                            "model stopped at its output limit".into(),
-                        ));
-                    }
-                    FinishReason::Cancelled => return Err(KuramaError::Cancelled),
-                }
-            }
-        }
-        .await;
+        let outcome = self.drive_turn(capability_enabled, &cancel).await;
 
         match outcome {
             Ok(()) => {
@@ -371,6 +787,47 @@ impl EngineActor {
                     error: error.to_string(),
                 })?;
                 Err(error)
+            }
+        }
+    }
+
+    async fn drive_turn(
+        &mut self,
+        capability_enabled: bool,
+        cancel: &CancelToken,
+    ) -> Result<(), KuramaError> {
+        loop {
+            let mut assembled = self.context.assemble(
+                &self.profile,
+                self.tool_descriptors.clone(),
+                capability_enabled && self.agent_id.is_none(),
+            )?;
+            if assembled.request.continuation.is_none() {
+                assembled.request.continuation = self.recovery_continuation.take();
+            }
+            let round = self.stream_round(assembled.request, cancel).await?;
+            if !round.text.is_empty() {
+                self.append(SessionEvent::AssistantMessage { text: round.text })?;
+            }
+            for invocation in round.tool_calls {
+                self.execute_tool(invocation, cancel).await?;
+            }
+            for request in round.delegations {
+                self.execute_delegation(request, capability_enabled, cancel)
+                    .await?;
+            }
+            if !round.tool_calls_empty || !round.delegations_empty {
+                continue;
+            }
+            match round.finish_reason.unwrap_or(FinishReason::Stop) {
+                FinishReason::Stop => return Ok(()),
+                FinishReason::ToolCalls => continue,
+                FinishReason::Length => {
+                    return Err(KuramaError::Model(
+                        "model stopped at its output limit".into(),
+                    ));
+                }
+                FinishReason::Cancelled => return Err(KuramaError::Cancelled),
             }
         }
     }
@@ -510,6 +967,10 @@ impl EngineActor {
                 call_id: invocation.call_id.clone(),
                 operation: operation.clone(),
             })?;
+            self.append(SessionEvent::ToolInvocationRecorded {
+                operation_id: operation_id.clone(),
+                invocation: invocation.clone(),
+            })?;
 
             let policy_context = PolicyContext {
                 mode: self.mode,
@@ -579,45 +1040,87 @@ impl EngineActor {
                 PolicyDecision::Allow => {}
             }
 
-            self.append(SessionEvent::ToolPrepared {
-                operation_id: operation_id.clone(),
-            })?;
-            self.append(SessionEvent::ToolStarted {
-                operation_id: operation_id.clone(),
-            })?;
-            self.emit(RuntimeEvent::ToolStarted {
-                operation_id: operation_id.clone(),
-                name: invocation.name.clone(),
-            })
-            .await?;
-            let call_id = invocation.call_id.clone();
-            let tool_name = invocation.name.clone();
-            let execution = tool.execute(tool_context, invocation, cancel);
-            tokio::pin!(execution);
-            let mut result = loop {
-                tokio::select! {
-                    result = &mut execution => {
-                        break result.unwrap_or_else(|error| error_result(call_id.clone(), error.to_string(), &tool_name));
-                    }
-                    command = self.command_rx.recv() => self.handle_turn_command(command, cancel).await?,
-                }
-            };
-            attach_tool_name(&mut result, &tool_name);
-            self.append(SessionEvent::ToolCompleted {
-                operation_id: operation_id.clone(),
-                result: result.clone(),
-            })?;
-            self.completed_tool_calls.insert(
-                result.call_id.clone(),
-                (operation_id.clone(), result.clone()),
-            );
-            self.emit(RuntimeEvent::ToolCompleted {
-                operation_id,
-                result: result.clone(),
-            })
-            .await?;
-            return Ok(result);
+            return self
+                .execute_authorized_tool(
+                    tool,
+                    tool_context,
+                    operation_id,
+                    operation,
+                    invocation,
+                    cancel,
+                )
+                .await;
         }
+    }
+
+    async fn execute_authorized_tool(
+        &mut self,
+        tool: Arc<dyn Tool>,
+        tool_context: ToolContext,
+        operation_id: OperationId,
+        operation: Operation,
+        invocation: ToolInvocation,
+        cancel: &CancelToken,
+    ) -> Result<ToolResult, KuramaError> {
+        if let Operation::Write { paths, .. } = &operation {
+            let files = self.checkpoint_files(paths)?;
+            self.append(SessionEvent::WritePrepared {
+                operation_id: operation_id.clone(),
+                files,
+            })?;
+        }
+        self.append(SessionEvent::ToolPrepared {
+            operation_id: operation_id.clone(),
+        })?;
+        self.append(SessionEvent::ToolStarted {
+            operation_id: operation_id.clone(),
+        })?;
+        self.emit(RuntimeEvent::ToolStarted {
+            operation_id: operation_id.clone(),
+            name: invocation.name.clone(),
+        })
+        .await?;
+        let call_id = invocation.call_id.clone();
+        let tool_name = invocation.name.clone();
+        let execution = tool.execute(tool_context, invocation, cancel);
+        tokio::pin!(execution);
+        let mut result = loop {
+            tokio::select! {
+                result = &mut execution => {
+                    break result.unwrap_or_else(|error| error_result(call_id.clone(), error.to_string(), &tool_name));
+                }
+                command = self.command_rx.recv() => self.handle_turn_command(command, cancel).await?,
+            }
+        };
+        attach_tool_name(&mut result, &tool_name);
+        if !result.is_error
+            && let Operation::Write { paths, .. } = &operation
+        {
+            let files = self.checkpoint_files(paths)?;
+            self.append(SessionEvent::WriteApplied {
+                operation_id: operation_id.clone(),
+                files,
+                result: result.clone(),
+            })?;
+        }
+        self.complete_tool(operation_id, result).await
+    }
+
+    fn checkpoint_files(&self, paths: &[PathBuf]) -> Result<Vec<FileCheckpoint>, KuramaError> {
+        paths
+            .iter()
+            .map(|path| {
+                let content = match std::fs::read(path) {
+                    Ok(bytes) => Some(self.store.put_blob(&bytes)?),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                };
+                Ok(FileCheckpoint {
+                    path: path.clone(),
+                    content,
+                })
+            })
+            .collect()
     }
 
     async fn complete_tool(
@@ -672,6 +1175,9 @@ impl EngineActor {
                 command = self.command_rx.recv() => {
                     match command {
                         Some(EngineCommand::Agent(command)) => manager.command(command).await?,
+                        Some(EngineCommand::ResolveApproval(response)) => {
+                            manager.resolve_approval(response).await?
+                        }
                         Some(EngineCommand::CancelTurn) => {
                             cancel.cancel();
                             manager.cancel_all().await;
@@ -946,6 +1452,16 @@ fn operation_summary(operation: &Operation) -> String {
     }
 }
 
+fn operation_tool_name(operation: &Operation) -> &'static str {
+    match operation {
+        Operation::Read { .. } => "read",
+        Operation::Write { .. } => "write",
+        Operation::Bash { .. } => "bash",
+        Operation::WebSearch { .. } => "web-search",
+        Operation::WebOpen { .. } => "web-open",
+    }
+}
+
 fn is_transient(error: &KuramaError) -> bool {
     let KuramaError::Model(message) = error else {
         return false;
@@ -955,18 +1471,6 @@ fn is_transient(error: &KuramaError) -> bool {
         || message.contains("rate limit")
         || message.contains("timeout")
         || message.contains("temporarily unavailable")
-}
-
-fn recovery_action_name(action: &RecoveryAction) -> &'static str {
-    match action {
-        RecoveryAction::Reevaluate { .. } => "reevaluate",
-        RecoveryAction::RestoreApproval { .. } => "restore_approval",
-        RecoveryAction::DiscardDenied => "discard_denied",
-        RecoveryAction::RetrySafe { .. } => "retry_safe",
-        RecoveryAction::RecordCompleted { .. } => "record_completed",
-        RecoveryAction::RequireDecision { .. } => "require_decision",
-        RecoveryAction::Completed { .. } => "completed",
-    }
 }
 
 fn now_ms() -> u64 {
