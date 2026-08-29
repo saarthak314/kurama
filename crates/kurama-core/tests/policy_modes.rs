@@ -1,0 +1,151 @@
+use std::path::PathBuf;
+
+use kurama_core::policy::DefaultPolicy;
+use kurama_protocol::{
+    agent::WriteScope,
+    policy::{AutoBoundaries, ExecutionMode, PolicyContext, PolicyDecision},
+    tool::{CommandClass, Operation},
+    traits::ApprovalPolicy,
+};
+
+fn context(mode: ExecutionMode) -> PolicyContext {
+    let workspace_root = std::env::current_dir().expect("current dir");
+    PolicyContext {
+        mode,
+        workspace_root: workspace_root.clone(),
+        write_scope: WriteScope {
+            roots: vec![workspace_root.clone()],
+            files: Vec::new(),
+        },
+        auto: AutoBoundaries {
+            write_roots: vec![workspace_root],
+            allowed_commands: vec!["cargo".into()],
+            allowed_hosts: vec!["docs.rs".into()],
+        },
+    }
+}
+
+fn read(path: PathBuf) -> Operation {
+    Operation::Read {
+        path,
+        external: false,
+    }
+}
+
+#[test]
+fn supervised_allows_internal_reads_and_prompts_for_writes() {
+    let context = context(ExecutionMode::Supervised);
+    let policy = DefaultPolicy::new(ExecutionMode::Supervised, context.auto.clone());
+    assert_eq!(
+        policy.decide(&context, &read(context.workspace_root.join("Cargo.toml"))),
+        PolicyDecision::Allow
+    );
+    assert!(matches!(
+        policy.decide(
+            &context,
+            &Operation::Write {
+                paths: vec![context.workspace_root.join("new.txt")],
+                destructive: false,
+                external: false,
+            }
+        ),
+        PolicyDecision::Ask { .. }
+    ));
+    assert!(matches!(
+        policy.decide(&context, &read(context.workspace_root.join("../outside"))),
+        PolicyDecision::Ask { .. }
+    ));
+}
+
+#[test]
+fn auto_denies_boundary_expansion() {
+    let context = context(ExecutionMode::Auto);
+    let policy = DefaultPolicy::new(ExecutionMode::Auto, context.auto.clone());
+    assert_eq!(
+        policy.decide(
+            &context,
+            &Operation::Write {
+                paths: vec![context.workspace_root.join("new.txt")],
+                destructive: false,
+                external: false,
+            }
+        ),
+        PolicyDecision::Allow
+    );
+    assert!(matches!(
+        policy.decide(
+            &context,
+            &Operation::WebOpen {
+                url: "https://unlisted.example/docs".into(),
+                private_target: false,
+            }
+        ),
+        PolicyDecision::Deny { .. }
+    ));
+}
+
+#[test]
+fn yolo_allows_every_classified_operation() {
+    let context = context(ExecutionMode::Yolo);
+    let policy = DefaultPolicy::new(ExecutionMode::Yolo, AutoBoundaries::default());
+    let operations = [
+        read(PathBuf::from("/private/outside")),
+        Operation::Bash {
+            command: "rm -rf /".into(),
+            cwd: PathBuf::from("/"),
+            class: CommandClass::Mutating,
+            timeout_ms: 1_000,
+        },
+        Operation::WebOpen {
+            url: "http://127.0.0.1".into(),
+            private_target: true,
+        },
+    ];
+    assert!(
+        operations
+            .iter()
+            .all(|operation| policy.decide(&context, operation) == PolicyDecision::Allow)
+    );
+}
+
+#[test]
+fn supervised_bash_allowlist_rejects_shell_composition() {
+    let context = context(ExecutionMode::Supervised);
+    let policy = DefaultPolicy::new(ExecutionMode::Supervised, context.auto.clone());
+    let bash = |command: &str| Operation::Bash {
+        command: command.into(),
+        cwd: context.workspace_root.clone(),
+        class: CommandClass::ReadOnly,
+        timeout_ms: 1_000,
+    };
+    assert_eq!(
+        policy.decide(&context, &bash("git status --short")),
+        PolicyDecision::Allow
+    );
+    assert!(matches!(
+        policy.decide(&context, &bash("git status; rm -rf .")),
+        PolicyDecision::Ask { .. }
+    ));
+    assert!(matches!(
+        policy.decide(&context, &bash("sed -i '' s/a/b/ file")),
+        PolicyDecision::Ask { .. }
+    ));
+}
+
+#[test]
+fn read_only_child_cannot_write_outside_its_scope() {
+    let mut context = context(ExecutionMode::Auto);
+    context.write_scope = WriteScope::default();
+    let policy = DefaultPolicy::new(ExecutionMode::Auto, context.auto.clone());
+    assert!(matches!(
+        policy.decide(
+            &context,
+            &Operation::Write {
+                paths: vec![context.workspace_root.join("new.txt")],
+                destructive: false,
+                external: false,
+            }
+        ),
+        PolicyDecision::Deny { .. }
+    ));
+}

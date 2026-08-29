@@ -66,6 +66,37 @@ pub struct MemoryStore {
     blobs: Mutex<BTreeMap<String, Vec<u8>>>,
 }
 
+impl MemoryStore {
+    pub fn events(&self, session_id: impl Into<SessionId>) -> Vec<EventEnvelope> {
+        self.events
+            .lock()
+            .expect("memory events lock")
+            .get(&(session_id.into(), None))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn operation_completion_count(
+        &self,
+        session_id: impl Into<SessionId>,
+        operation_id: impl Into<OperationId>,
+    ) -> usize {
+        let operation_id = operation_id.into();
+        self.events(session_id)
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.event,
+                    kurama_protocol::session::SessionEvent::ToolCompleted {
+                        operation_id: completed,
+                        ..
+                    } if completed == &operation_id
+                )
+            })
+            .count()
+    }
+}
+
 impl SessionStore for MemoryStore {
     fn create(&self, metadata: &SessionMetadata) -> Result<(), KuramaError> {
         self.metadata
