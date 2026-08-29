@@ -582,7 +582,7 @@ fn narrow_approval_edit_cursor_follows_wrapped_context() {
 }
 
 #[test]
-fn every_tui_view_preserves_the_terminal_background() {
+fn every_tui_view_uses_a_readable_dark_surface() {
     let main = TuiState::new("work", "model", ".", ExecutionMode::Yolo);
 
     let mut approval = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
@@ -610,8 +610,11 @@ fn every_tui_view_preserves_the_terminal_background() {
     for state in [&main, &approval, &agents, &inspect, &onboarding] {
         let buffer = rendered(state, 100, 30);
         assert!(
-            buffer.content().iter().all(|cell| cell.bg == Color::Reset),
-            "view painted an opaque terminal background: {:?}",
+            buffer
+                .content()
+                .iter()
+                .all(|cell| cell.bg == Color::Rgb(13, 16, 22)),
+            "view left inconsistent background cells: {:?}",
             state.overlay
         );
     }

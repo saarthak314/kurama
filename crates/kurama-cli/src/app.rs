@@ -34,6 +34,7 @@ use kurama_sdk::AgentBuilder;
 use ratatui::{
     Terminal, TerminalOptions, Viewport,
     backend::{Backend, CrosstermBackend},
+    style::Style,
     widgets::{Block, Padding, Paragraph, Widget},
 };
 use tokio::sync::mpsc;
@@ -42,7 +43,7 @@ use crate::{
     args::{Args, ResumeChoice},
     commands::{Command, parse_command},
     tui::{
-        OnboardingState, OnboardingSubmission, Overlay, TerminalGuard, TuiState, render,
+        OnboardingState, OnboardingSubmission, Overlay, SURFACE, TerminalGuard, TuiState, render,
         spawn_input_thread, transcript_lines,
     },
 };
@@ -1069,6 +1070,7 @@ where
     for chunk in lines.chunks(MAX_TRANSCRIPT_INSERT_HEIGHT) {
         terminal
             .insert_before(chunk.len() as u16, |buffer| {
+                buffer.set_style(*buffer.area(), Style::default().bg(SURFACE));
                 Paragraph::new(chunk.to_vec())
                     .block(Block::default().padding(Padding::new(
                         TRANSCRIPT_HORIZONTAL_PADDING as u16,
@@ -1287,7 +1289,9 @@ mod tests {
         id::{CallId, OperationId},
         tool::ToolResult,
     };
-    use ratatui::{TerminalOptions, Viewport, backend::TestBackend, layout::Position};
+    use ratatui::{
+        TerminalOptions, Viewport, backend::TestBackend, layout::Position, style::Color,
+    };
 
     use super::*;
 
@@ -1464,6 +1468,15 @@ mod tests {
             .collect::<String>();
 
         assert!(inserted_row.contains("› committed question"));
+        assert!((0..80).all(|x| {
+            terminal
+                .backend()
+                .buffer()
+                .cell((x, 4))
+                .expect("inserted background")
+                .bg
+                == Color::Rgb(13, 16, 22)
+        }));
         assert!(app.state.live_transcript().is_empty());
     }
 

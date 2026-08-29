@@ -16,6 +16,7 @@ use super::{Overlay, TranscriptKind, TuiState};
 const BORDER: Color = Color::Rgb(48, 53, 64);
 const DIM: Color = Color::Rgb(126, 132, 146);
 const TEXT: Color = Color::Rgb(224, 226, 232);
+pub(crate) const SURFACE: Color = Color::Rgb(13, 16, 22);
 const RED: Color = Color::Rgb(255, 92, 82);
 const AMBER: Color = Color::Rgb(220, 178, 73);
 const GREEN: Color = Color::Rgb(111, 207, 151);
@@ -24,6 +25,7 @@ const APPROVAL_MAX_HEIGHT: usize = 14;
 const APPROVAL_EDITOR_MIN_LINES: usize = 4;
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
+    paint_surface(frame);
     render_main(frame, state);
     match state.overlay {
         Overlay::None | Overlay::Approval | Overlay::ApprovalEdit => {}
@@ -33,6 +35,12 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
             render_agent_inspect(frame, state)
         }
     }
+}
+
+fn paint_surface(frame: &mut Frame<'_>) {
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+    frame.render_widget(Block::default().style(surface_style()), area);
 }
 
 fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
@@ -187,7 +195,7 @@ fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
 }
 
 fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) {
-    frame.render_widget(Clear, frame.area());
+    paint_surface(frame);
     let area = inset(frame.area(), 4, 2);
     if !state.onboarding.is_selecting_connection() {
         let input = state.onboarding.display_input();
@@ -455,7 +463,7 @@ fn bounded_approval_context(
 }
 
 fn render_agents(frame: &mut Frame<'_>, state: &TuiState) {
-    frame.render_widget(Clear, frame.area());
+    paint_surface(frame);
     let area = inset(frame.area(), 3, 2);
     let mut lines = vec![
         Line::from(vec![
@@ -543,7 +551,7 @@ fn render_agents(frame: &mut Frame<'_>, state: &TuiState) {
 }
 
 fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) {
-    frame.render_widget(Clear, frame.area());
+    paint_surface(frame);
     let area = inset(frame.area(), 3, 2);
     let Some(agent) = state.selected_agent() else {
         return;
@@ -1718,6 +1726,10 @@ fn truncate_display(value: &str, width: usize) -> String {
 
 fn text_style() -> Style {
     Style::default().fg(TEXT)
+}
+
+fn surface_style() -> Style {
+    Style::default().bg(SURFACE)
 }
 
 fn code_style() -> Style {
