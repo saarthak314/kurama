@@ -11,6 +11,7 @@ pub struct Args {
     pub yolo: bool,
     pub help: bool,
     pub version: bool,
+    pub internal_print_prompt_bundle: bool,
 }
 
 pub const HELP: &str = "Kurama — minimal coding agent\n\nUsage: kurama [OPTIONS]\n\nOptions:\n  --profile <NAME>  Use a configured profile\n  --resume <ID>     Resume a session\n  --continue        Resume this project's latest session\n  --yolo            Disable approvals and boundaries for this launch\n  -h, --help        Print help\n  -V, --version     Print version\n";
@@ -48,6 +49,7 @@ where
             Long("yolo") => parsed.yolo = true,
             Short('h') | Long("help") => parsed.help = true,
             Short('V') | Long("version") => parsed.version = true,
+            Long("internal-print-prompt-bundle") => parsed.internal_print_prompt_bundle = true,
             value => return Err(format!("unexpected argument: {value:?}")),
         }
     }

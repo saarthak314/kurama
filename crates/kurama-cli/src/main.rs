@@ -21,6 +21,10 @@ async fn main() {
         println!("kurama {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    if args.internal_print_prompt_bundle {
+        println!("{}", app::prompt_bundle());
+        return;
+    }
 
     if let Err(error) = app::run(args).await {
         eprintln!("kurama: {error}");

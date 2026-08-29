@@ -129,23 +129,39 @@ fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
         "agents {} running · {} queued",
         state.running_agents, state.queued_agents
     );
-    let footer = Line::from(vec![
-        Span::styled(format!("  {}", state.project), Style::default().fg(DIM)),
-        Span::raw("    "),
-        Span::styled(
-            format!("{}/{}", state.profile, state.model),
-            Style::default().fg(DIM),
-        ),
-        Span::raw("    "),
-        Span::styled(mode_label(state.mode), mode_style(state.mode)),
-        Span::raw("    "),
-        Span::styled(
-            agents,
-            Style::default().fg(if state.running_agents > 0 { RED } else { DIM }),
-        ),
-        Span::raw("    "),
-        Span::styled(state.status.as_str(), Style::default().fg(DIM)),
-    ]);
+    let footer = if chunks[3].width < 100 {
+        Line::from(vec![
+            Span::styled(
+                format!("  {}/{}", state.profile, state.model),
+                Style::default().fg(DIM),
+            ),
+            Span::raw("  "),
+            Span::styled(mode_label(state.mode), mode_style(state.mode)),
+            Span::raw("  "),
+            Span::styled(
+                agents,
+                Style::default().fg(if state.running_agents > 0 { RED } else { DIM }),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(format!("  {}", state.project), Style::default().fg(DIM)),
+            Span::raw("    "),
+            Span::styled(
+                format!("{}/{}", state.profile, state.model),
+                Style::default().fg(DIM),
+            ),
+            Span::raw("    "),
+            Span::styled(mode_label(state.mode), mode_style(state.mode)),
+            Span::raw("    "),
+            Span::styled(
+                agents,
+                Style::default().fg(if state.running_agents > 0 { RED } else { DIM }),
+            ),
+            Span::raw("    "),
+            Span::styled(state.status.as_str(), Style::default().fg(DIM)),
+        ])
+    };
     frame.render_widget(Paragraph::new(footer), chunks[3]);
 }
 

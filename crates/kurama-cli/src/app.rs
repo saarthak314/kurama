@@ -1,8 +1,15 @@
 use std::{io, path::PathBuf};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use kurama_protocol::{policy::ApprovalResponse, runtime::EngineCommand};
-use ratatui::{Terminal, backend::CrosstermBackend};
+use kurama_protocol::{
+    policy::ApprovalResponse,
+    runtime::{EngineCommand, RuntimeEvent},
+};
+use ratatui::{
+    Terminal,
+    backend::{Backend, CrosstermBackend},
+};
+use tokio::sync::mpsc;
 
 use crate::{
     args::Args,
@@ -63,7 +70,7 @@ impl App {
         Ok(())
     }
 
-    fn handle_event(&mut self, event: Event) -> Result<bool, String> {
+    pub fn handle_event(&mut self, event: Event) -> Result<bool, String> {
         let Event::Key(key) = event else {
             return Ok(false);
         };
@@ -98,6 +105,15 @@ impl App {
                     .unwrap_or(0);
                 self.state.composer.drain(previous..self.state.cursor);
                 self.state.cursor = previous;
+            }
+            KeyCode::Delete if self.state.cursor < self.state.composer.len() => {
+                let next = self.state.cursor
+                    + self.state.composer[self.state.cursor..]
+                        .chars()
+                        .next()
+                        .map(char::len_utf8)
+                        .unwrap_or(0);
+                self.state.composer.drain(self.state.cursor..next);
             }
             KeyCode::Left => {
                 self.state.cursor = self.state.composer[..self.state.cursor]
@@ -186,6 +202,22 @@ impl App {
                 self.state.resolve_approval(ApprovalResponse::Deny)
             }
             (Overlay::Approval, KeyCode::Char('e')) => self.state.begin_approval_edit(),
+            (Overlay::ApprovalEdit, KeyCode::Char(character)) => {
+                if let Some(approval) = &mut self.state.approval {
+                    approval.editor.push(character);
+                    if let Ok(arguments) = serde_json::from_str(&approval.editor) {
+                        approval.arguments = arguments;
+                    }
+                }
+            }
+            (Overlay::ApprovalEdit, KeyCode::Backspace) => {
+                if let Some(approval) = &mut self.state.approval {
+                    approval.editor.pop();
+                    if let Ok(arguments) = serde_json::from_str(&approval.editor) {
+                        approval.arguments = arguments;
+                    }
+                }
+            }
             (Overlay::ApprovalEdit, KeyCode::Enter) => {
                 let _ = self.state.submit_approval_edit();
             }
@@ -201,6 +233,12 @@ impl App {
             (Overlay::Agents, KeyCode::Enter) => self.state.inspect_selected_agent(),
             (Overlay::Agents | Overlay::AgentInspect, KeyCode::Char('m')) => {
                 self.state.begin_agent_message()
+            }
+            (Overlay::AgentMessage, KeyCode::Char(character)) => {
+                self.state.agent_message.push(character);
+            }
+            (Overlay::AgentMessage, KeyCode::Backspace) => {
+                self.state.agent_message.pop();
             }
             (Overlay::AgentMessage, KeyCode::Enter) => self.state.submit_agent_message(),
             (Overlay::Agents | Overlay::AgentInspect, KeyCode::Char('x')) => {
@@ -237,4 +275,57 @@ pub async fn run(args: Args) -> Result<(), String> {
     )?
     .run()
     .await
+}
+
+pub fn prompt_bundle() -> String {
+    let schemas = serde_json::json!([
+        {"name":"read","parameters":{"type":"object","properties":{"paths":{"type":"array"},"start_line":{"type":"integer"},"max_lines":{"type":"integer"}},"required":["paths"],"additionalProperties":false}},
+        {"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"patch":{"type":"string"},"expected_hash":{"type":"string"}},"required":["path"],"additionalProperties":false}},
+        {"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"timeout_ms":{"type":"integer"}},"required":["command","cwd","timeout_ms"],"additionalProperties":false}},
+        {"name":"web-search","parameters":{"oneOf":[{"type":"object","properties":{"operation":{"const":"search"},"query":{"type":"string"},"limit":{"type":"integer"},"contains_workspace_data":{"type":"boolean"}},"required":["operation","query","limit","contains_workspace_data"],"additionalProperties":false},{"type":"object","properties":{"operation":{"const":"open"},"url":{"type":"string"}},"required":["operation","url"],"additionalProperties":false}]}}
+    ]);
+    format!("{}\n{}", kurama_core::prompts::SYSTEM_PROMPT, schemas)
+}
+
+pub async fn run_with<B>(
+    mut app: App,
+    terminal: &mut Terminal<B>,
+    mut input: mpsc::Receiver<Event>,
+    mut runtime_events: mpsc::Receiver<RuntimeEvent>,
+) -> Result<App, String>
+where
+    B: Backend,
+{
+    terminal
+        .draw(|frame| render(frame, &app.state))
+        .map_err(|error| error.to_string())?;
+
+    loop {
+        tokio::select! {
+            event = input.recv() => {
+                let Some(event) = event else {
+                    if runtime_events.is_closed() {
+                        break;
+                    }
+                    continue;
+                };
+                if app.handle_event(event)? {
+                    break;
+                }
+            }
+            event = runtime_events.recv() => {
+                let Some(event) = event else {
+                    if input.is_closed() {
+                        break;
+                    }
+                    continue;
+                };
+                app.state.apply_runtime_event(event);
+            }
+        }
+        terminal
+            .draw(|frame| render(frame, &app.state))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(app)
 }

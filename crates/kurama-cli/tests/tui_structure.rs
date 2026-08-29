@@ -1,4 +1,5 @@
 use kurama_cli::{
+    app::App,
     commands::{Command, parse_command},
     tui::{TuiState, render},
 };
@@ -47,12 +48,19 @@ fn main_screen_is_transcript_first_without_tool_statistics() {
     state.push_assistant("I’ll split this between an implementer and reviewer.");
     state.set_agent_counts(1, 1);
 
-    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-    terminal.draw(|frame| render(frame, &state)).unwrap();
-    let text = buffer_text(terminal.backend().buffer());
-    assert!(text.contains("KURAMA"));
-    assert!(text.contains("SUPERVISED"));
-    assert!(text.contains("agents 1 running · 1 queued"));
-    assert!(!text.contains("tool calls"));
-    assert!(!text.contains("tokens/sec"));
+    for (width, height) in [(80, 24), (100, 30), (160, 50)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("KURAMA"));
+        assert!(text.contains("SUPERVISED"));
+        assert!(text.contains("agents 1 running · 1 queued"));
+        assert!(!text.contains("tool calls"));
+        assert!(!text.contains("tokens/sec"));
+    }
+}
+
+#[test]
+fn standard_cli_registry_contains_exactly_four_tools() {
+    assert_eq!(App::tool_names(), ["bash", "read", "web-search", "write"]);
 }

@@ -12,7 +12,10 @@ pub struct TerminalGuard;
 impl TerminalGuard {
     pub fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, crossterm::cursor::Hide)?;
+        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen, crossterm::cursor::Hide) {
+            let _ = disable_raw_mode();
+            return Err(error);
+        }
         Ok(Self)
     }
 }
