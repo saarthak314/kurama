@@ -1,0 +1,10 @@
+[package]
+name = "kurama-prompt-budget"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+tiktoken-rs = "0.12.0"
+
+[workspace]

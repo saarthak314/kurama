@@ -2,4 +2,6 @@ AGENTS.md
 .superpowers
 docs/superpowers/
 /target/
+/scripts/__pycache__/
+/tools/**/target/
 *.tmp

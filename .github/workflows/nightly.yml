@@ -1,0 +1,156 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  heavy-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust 1.98.0
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.98.0
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            tools/prompt-budget/target
+          key: cargo-nightly-heavy-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'tools/prompt-budget/Cargo.lock') }}
+          restore-keys: cargo-nightly-heavy-${{ runner.os }}-
+      - name: Test all features
+        run: cargo test --workspace --all-features
+      - name: Run exhaustive recovery matrix
+        run: cargo test -p kurama-core --all-features --test recovery -- --include-ignored
+      - name: Run fake bridge contracts
+        run: cargo test -p kurama-adapters --all-features --test bridge_contract
+      - name: Check prompt budget
+        run: scripts/check-prompt-budget.sh target/release/kurama
+      - name: Report duplicate dependencies
+        run: cargo tree -d --workspace --all-features
+      - name: Report crate contribution to binary size
+        run: |
+          command -v cargo-bloat >/dev/null || cargo install cargo-bloat --locked
+          cargo bloat --release --crates
+
+  tui-compatibility:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust 1.98.0
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.98.0
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-nightly-tui-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-nightly-tui-${{ runner.os }}-
+      - name: Test terminal structures
+        run: |
+          for term in xterm-256color screen-256color vt100; do
+            echo "TERM=$term"
+            TERM="$term" cargo test -p kurama-cli --test tui_structure
+          done
+
+  native-builds:
+    name: Native build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust 1.98.0
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal --target ${{ matrix.target }}
+          rustup default 1.98.0
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-nightly-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-nightly-${{ matrix.target }}-
+      - name: Build native release binary
+        run: cargo build --locked --release -p kurama-cli --target ${{ matrix.target }}
+      - name: Check stripped size
+        run: scripts/check-size.sh target/${{ matrix.target }}/release/kurama
+
+  performance:
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust 1.98.0
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.98.0
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-nightly-performance-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-nightly-performance-${{ runner.os }}-${{ runner.arch }}-
+      - name: Build release binary
+        run: cargo build --locked --release -p kurama-cli
+      - name: Measure startup and idle core process
+        run: |
+          set +e
+          python3 scripts/bench-startup.py target/release/kurama | tee startup.json
+          startup_status=${PIPESTATUS[0]}
+          python3 scripts/bench-idle.py target/release/kurama | tee idle.json
+          idle_status=${PIPESTATUS[0]}
+          printf '%s\n' 'Kurama core metrics are in idle.json. Official provider CLI and local-server processes must be measured and reported separately.' > process-boundary.txt
+          if (( startup_status != 0 || idle_status != 0 )); then
+            exit 1
+          fi
+      - name: Upload raw measurements
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kurama-performance-${{ github.run_id }}
+          path: |
+            startup.json
+            idle.json
+            process-boundary.txt
+          if-no-files-found: error

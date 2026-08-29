@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust 1.98.0
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.98.0
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-tests-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-release-tests-${{ runner.os }}-
+      - name: Test release source
+        run: cargo test --workspace --all-features
+
+  package:
+    needs: tests
+    name: Package (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust 1.98.0
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal --target ${{ matrix.target }}
+          rustup default 1.98.0
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-release-${{ matrix.target }}-
+      - name: Build release binary
+        run: cargo build --locked --release -p kurama-cli --target ${{ matrix.target }}
+      - name: Enforce 10 MiB stripped limit
+        run: scripts/check-size.sh target/${{ matrix.target }}/release/kurama
+      - name: Package archive and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          archive="kurama-${version}-${{ matrix.target }}.tar.gz"
+          stage=$(mktemp -d)
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/kurama "$stage/kurama"
+          cp README.md "$stage/README.md"
+          for license in LICENSE LICENSE.*; do
+            if [[ -f "$license" ]]; then
+              cp "$license" "$stage/"
+            fi
+          done
+          tar -czf "dist/$archive" -C "$stage" .
+          (cd dist && shasum -a 256 "$archive" > "$archive.sha256")
+      - name: Upload archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: kurama-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
