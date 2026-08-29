@@ -261,30 +261,45 @@ async fn approval_edit_is_reclassified_before_execution() {
     let (handle, mut events) = Engine::spawn(config, Vec::new()).expect("spawn");
     handle.submit("edit", false).await.expect("submit");
     let mut approvals = 0;
+    let mut stale_rejections = 0;
     loop {
         match events.recv().await.expect("event") {
-            RuntimeEvent::ApprovalRequired { .. } if approvals == 0 => {
+            RuntimeEvent::ApprovalRequired { request } if approvals == 0 => {
                 approvals += 1;
                 handle
-                    .resolve_approval(ApprovalResponse::Edit {
-                        arguments: serde_json::json!({"path":"safe.txt"}),
-                    })
+                    .resolve_approval(
+                        OperationId::from("stale-operation"),
+                        ApprovalResponse::ApproveOnce,
+                    )
+                    .await
+                    .expect("submit stale approval");
+                handle
+                    .resolve_approval(
+                        request.operation_id,
+                        ApprovalResponse::Edit {
+                            arguments: serde_json::json!({"path":"safe.txt"}),
+                        },
+                    )
                     .await
                     .expect("edit");
             }
-            RuntimeEvent::ApprovalRequired { .. } => {
+            RuntimeEvent::ApprovalRequired { request } => {
                 approvals += 1;
                 handle
-                    .resolve_approval(ApprovalResponse::ApproveOnce)
+                    .resolve_approval(request.operation_id, ApprovalResponse::ApproveOnce)
                     .await
                     .expect("approve");
             }
             RuntimeEvent::TurnCompleted => break,
+            RuntimeEvent::Error { message } if message.contains("no longer pending") => {
+                stale_rejections += 1;
+            }
             RuntimeEvent::Error { message } => panic!("engine error: {message}"),
             _ => {}
         }
     }
     assert_eq!(approvals, 2);
+    assert_eq!(stale_rejections, 1);
     assert_eq!(
         executed.lock().expect("executed lock").as_slice(),
         &[serde_json::json!({"path":"safe.txt"})]
@@ -532,7 +547,7 @@ async fn resume_restores_pending_approval_before_write() {
         event => panic!("expected approval, got {event:?}"),
     }
     handle
-        .resolve_approval(ApprovalResponse::ApproveOnce)
+        .resolve_approval(operation_id, ApprovalResponse::ApproveOnce)
         .await
         .expect("approve recovery");
     while !matches!(
@@ -737,14 +752,121 @@ async fn resume_requires_a_decision_before_retrying_unknown_bash() {
     }
     assert_eq!(executions.load(Ordering::Relaxed), 0);
     handle
-        .resolve_approval(ApprovalResponse::Deny)
+        .resolve_approval(operation_id, ApprovalResponse::Deny)
         .await
         .expect("skip retry");
     while !matches!(
         events.recv().await.expect("recovery event"),
         RuntimeEvent::TurnCompleted
     ) {}
+}
+
+#[tokio::test]
+async fn resume_requires_a_new_decision_after_an_authorized_bash_retry_is_interrupted() {
+    let operation_id = OperationId::from("operation");
+    let invocation = ToolInvocation {
+        call_id: "call".into(),
+        name: "bash".into(),
+        arguments: serde_json::json!({"command":"make install"}),
+    };
+    let operation = Operation::Bash {
+        command: "make install".into(),
+        cwd: ".".into(),
+        class: CommandClass::Unknown,
+        timeout_ms: 1_000,
+    };
+    let replay = vec![
+        replay_event(
+            0,
+            SessionEvent::UserMessage {
+                text: "install".into(),
+            },
+        ),
+        replay_event(
+            1,
+            SessionEvent::ToolProposed {
+                operation_id: operation_id.clone(),
+                call_id: invocation.call_id.clone(),
+                operation: operation.clone(),
+            },
+        ),
+        replay_event(
+            2,
+            SessionEvent::ToolInvocationRecorded {
+                operation_id: operation_id.clone(),
+                invocation,
+            },
+        ),
+        replay_event(
+            3,
+            SessionEvent::ToolStarted {
+                operation_id: operation_id.clone(),
+            },
+        ),
+        replay_event(
+            4,
+            SessionEvent::ApprovalRequested {
+                operation_id: operation_id.clone(),
+                summary: "interrupted Bash outcome is unknown".into(),
+            },
+        ),
+        replay_event(
+            5,
+            SessionEvent::ApprovalResolved {
+                operation_id: operation_id.clone(),
+                response: ApprovalResponse::ApproveOnce,
+            },
+        ),
+        replay_event(
+            6,
+            SessionEvent::RecoveryDecision {
+                operation_id: operation_id.clone(),
+                action: "retry_once".into(),
+            },
+        ),
+        replay_event(
+            7,
+            SessionEvent::ToolStarted {
+                operation_id: operation_id.clone(),
+            },
+        ),
+    ];
+    let store = Arc::new(MemoryStore::default());
+    seed_replay(&store, &replay);
+    let tool = BashCountingTool::default();
+    let executions = tool.executions.clone();
+    let (handle, mut events) = Engine::spawn(
+        resume_config(
+            store.clone(),
+            vec![Arc::new(tool)],
+            Arc::new(AllowAllPolicy),
+        ),
+        replay,
+    )
+    .expect("resume engine");
+
+    match events.recv().await.expect("decision event") {
+        RuntimeEvent::ApprovalRequired { request } => {
+            assert_eq!(request.operation_id, operation_id);
+            assert_eq!(request.operation, operation);
+            assert!(request.summary.contains("outcome is unknown"));
+        }
+        event => panic!("expected recovery decision, got {event:?}"),
+    }
     assert_eq!(executions.load(Ordering::Relaxed), 0);
+    handle
+        .resolve_approval(operation_id, ApprovalResponse::ApproveOnce)
+        .await
+        .expect("approve retry");
+    while !matches!(
+        events.recv().await.expect("recovery event"),
+        RuntimeEvent::TurnCompleted
+    ) {}
+    assert_eq!(executions.load(Ordering::Relaxed), 1);
+    assert!(store.events("resume").iter().any(|event| matches!(
+        &event.event,
+        SessionEvent::RecoveryDecision { action, .. } if action == "retry_once"
+    )));
 }
 
 #[tokio::test]

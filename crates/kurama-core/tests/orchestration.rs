@@ -6,7 +6,7 @@ use std::{
 };
 
 use kurama_core::{
-    agent_manager::{AgentManager, ChildProgress, ChildRunContext, ChildRunner},
+    agent_manager::{AgentManager, ChildApproval, ChildProgress, ChildRunContext, ChildRunner},
     orchestrator::SmartOrchestrator,
     testing::{CollectingSink, MemoryStore, SequenceIds},
 };
@@ -17,9 +17,15 @@ use kurama_protocol::{
         WriteScope,
     },
     model::ModelProfile,
+    policy::{ApprovalRequest, ApprovalResponse},
+    runtime::RuntimeEvent,
+    tool::Operation,
     traits::{BoxFuture, Orchestrator},
 };
-use tokio::sync::mpsc;
+use tokio::{
+    sync::{Notify, mpsc, oneshot},
+    time::Duration,
+};
 
 fn agent(role: &str, profile: Option<&str>, depends_on: &[&str]) -> AgentSpec {
     AgentSpec {
@@ -237,6 +243,145 @@ async fn manager_messages_one_child_and_cancels_another() {
             .state,
         AgentState::Cancelled
     );
+}
+
+struct ApprovalRunner {
+    requested: mpsc::UnboundedSender<kurama_protocol::id::AgentId>,
+    release_cancelled: Arc<Notify>,
+}
+
+impl ChildRunner for ApprovalRunner {
+    fn run(
+        &self,
+        context: ChildRunContext,
+    ) -> BoxFuture<'static, Result<AgentResult, KuramaError>> {
+        let requested = self.requested.clone();
+        let release_cancelled = self.release_cancelled.clone();
+        Box::pin(async move {
+            let (response, decision) = oneshot::channel();
+            context
+                .approvals
+                .send(ChildApproval {
+                    agent_id: context.agent_id.clone(),
+                    request: ApprovalRequest {
+                        operation_id: format!("approval-{}", context.agent_id).into(),
+                        operation: Operation::Write {
+                            paths: vec![PathBuf::from("child.txt")],
+                            destructive: false,
+                            external: false,
+                        },
+                        summary: context.agent_id.to_string(),
+                    },
+                    response,
+                })
+                .await
+                .expect("approval request");
+            requested
+                .send(context.agent_id.clone())
+                .expect("approval requested");
+            tokio::select! {
+                biased;
+                () = context.cancel.cancelled() => {
+                    release_cancelled.notified().await;
+                    Err(KuramaError::Cancelled)
+                }
+                response = decision => {
+                    response.map_err(|_| KuramaError::Cancelled)?;
+                    Ok(AgentResult {
+                        agent_id: context.agent_id,
+                        summary: "approved".into(),
+                        changed_files: Vec::new(),
+                        evidence_refs: Vec::new(),
+                    })
+                }
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn terminal_child_approval_is_removed_and_next_live_request_is_promoted() {
+    let plan = SmartOrchestrator::new(Arc::new(SequenceIds::new(20)))
+        .resolve(
+            DelegationRequest {
+                agents: vec![agent("first", None, &[]), agent("second", None, &[])],
+            },
+            &context(),
+        )
+        .expect("resolve");
+    let agent_ids: Vec<_> = plan.ready.iter().map(|spec| spec.id.clone()).collect();
+    let (runtime_tx, mut runtime_rx) = mpsc::channel(16);
+    let manager = Arc::new(
+        AgentManager::new(
+            "approvals".into(),
+            None,
+            2,
+            Arc::new(MemoryStore::default()),
+            Arc::new(CollectingSink::default()),
+        )
+        .with_runtime_sender(runtime_tx),
+    );
+    let (requested_tx, mut requested_rx) = mpsc::unbounded_channel();
+    let release_cancelled = Arc::new(Notify::new());
+    let executing = {
+        let manager = manager.clone();
+        let release_cancelled = release_cancelled.clone();
+        tokio::spawn(async move {
+            manager
+                .execute(
+                    plan,
+                    "project".into(),
+                    Arc::new(ApprovalRunner {
+                        requested: requested_tx,
+                        release_cancelled,
+                    }),
+                )
+                .await
+        })
+    };
+
+    requested_rx.recv().await.expect("first approval request");
+    requested_rx.recv().await.expect("second approval request");
+    let active = next_approval(&mut runtime_rx).await;
+    let active_agent = agent_ids
+        .iter()
+        .find(|agent_id| agent_id.to_string() == active.summary)
+        .expect("active approval agent")
+        .clone();
+    manager
+        .cancel(&active_agent)
+        .await
+        .expect("cancel active child");
+
+    let promoted = next_approval(&mut runtime_rx).await;
+    assert_ne!(promoted.summary, active.summary);
+    let error = manager
+        .resolve_approval(&active.operation_id, ApprovalResponse::ApproveOnce)
+        .await
+        .expect_err("stale approval must not authorize the promoted request");
+    assert!(error.to_string().contains("no longer pending"));
+    manager
+        .resolve_approval(&promoted.operation_id, ApprovalResponse::ApproveOnce)
+        .await
+        .expect("approve promoted request");
+    release_cancelled.notify_one();
+
+    let results = executing.await.expect("join").expect("execute");
+    assert_eq!(results.len(), 1);
+}
+
+async fn next_approval(events: &mut mpsc::Receiver<RuntimeEvent>) -> ApprovalRequest {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let RuntimeEvent::ApprovalRequired { request } =
+                events.recv().await.expect("runtime event")
+            {
+                break request;
+            }
+        }
+    })
+    .await
+    .expect("approval timeout")
 }
 
 struct EscalatingRunner {

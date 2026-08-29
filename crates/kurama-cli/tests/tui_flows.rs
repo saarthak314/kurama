@@ -65,8 +65,10 @@ fn approval_overlay_supports_approve_deny_and_edited_arguments() {
     state.submit_approval_edit().expect("submit edit");
     assert!(matches!(
         state.sent_commands().last(),
-        Some(EngineCommand::ResolveApproval(ApprovalResponse::Edit { arguments }))
-            if arguments["path"] == "safe.txt"
+        Some(EngineCommand::ResolveApproval {
+            operation_id,
+            response: ApprovalResponse::Edit { arguments },
+        }) if operation_id.as_ref() == "o_1" && arguments["path"] == "safe.txt"
     ));
 }
 

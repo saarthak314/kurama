@@ -12,7 +12,10 @@ pub enum EngineCommand {
         text: String,
         explicit_delegation: bool,
     },
-    ResolveApproval(ApprovalResponse),
+    ResolveApproval {
+        operation_id: OperationId,
+        response: ApprovalResponse,
+    },
     CancelTurn,
     Compact,
     SetMode(ExecutionMode),

@@ -276,9 +276,14 @@ impl TuiState {
     }
 
     pub fn resolve_approval(&mut self, response: ApprovalResponse) {
-        self.sent_commands
-            .push(EngineCommand::ResolveApproval(response));
-        self.approval = None;
+        let Some(approval) = self.approval.take() else {
+            self.status = "no approval is pending".into();
+            return;
+        };
+        self.sent_commands.push(EngineCommand::ResolveApproval {
+            operation_id: approval.request.operation_id,
+            response,
+        });
         self.overlay = Overlay::None;
         self.status = "approval submitted".into();
     }

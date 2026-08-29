@@ -51,8 +51,16 @@ impl EngineHandle {
         .await
     }
 
-    pub async fn resolve_approval(&self, response: ApprovalResponse) -> Result<(), KuramaError> {
-        self.send(EngineCommand::ResolveApproval(response)).await
+    pub async fn resolve_approval(
+        &self,
+        operation_id: OperationId,
+        response: ApprovalResponse,
+    ) -> Result<(), KuramaError> {
+        self.send(EngineCommand::ResolveApproval {
+            operation_id,
+            response,
+        })
+        .await
     }
 
     pub async fn cancel_turn(&self) -> Result<(), KuramaError> {
@@ -294,7 +302,7 @@ impl EngineActor {
                     text,
                     explicit_delegation,
                 } => self.run_turn(text, explicit_delegation).await,
-                EngineCommand::ResolveApproval(_) => {
+                EngineCommand::ResolveApproval { .. } => {
                     self.emit(RuntimeEvent::Error {
                         message: "there is no pending approval".into(),
                     })
@@ -468,7 +476,7 @@ impl EngineActor {
                     },
                 })
                 .await?;
-                let response = self.await_approval(cancel).await?;
+                let response = self.await_approval(&operation_id, cancel).await?;
                 self.append(SessionEvent::ApprovalResolved {
                     operation_id: operation_id.clone(),
                     response: response.clone(),
@@ -503,7 +511,7 @@ impl EngineActor {
             },
         })
         .await?;
-        let response = self.await_approval(cancel).await?;
+        let response = self.await_approval(&operation_id, cancel).await?;
         self.append(SessionEvent::ApprovalResolved {
             operation_id: operation_id.clone(),
             response: response.clone(),
@@ -549,7 +557,7 @@ impl EngineActor {
             },
         })
         .await?;
-        let response = self.await_approval(cancel).await?;
+        let response = self.await_approval(&operation_id, cancel).await?;
         self.append(SessionEvent::ApprovalResolved {
             operation_id: operation_id.clone(),
             response: response.clone(),
@@ -571,7 +579,7 @@ impl EngineActor {
                 .await
             }
             ApprovalResponse::ApproveOnce | ApprovalResponse::ApproveSession => {
-                self.record_recovery_decision(&operation_id, "retry")?;
+                self.record_recovery_decision(&operation_id, "retry_once")?;
                 self.execute_recovered_operation(
                     operation_id,
                     operation,
@@ -1004,7 +1012,7 @@ impl EngineActor {
                         },
                     })
                     .await?;
-                    let response = self.await_approval(cancel).await?;
+                    let response = self.await_approval(&operation_id, cancel).await?;
                     self.append(SessionEvent::ApprovalResolved {
                         operation_id: operation_id.clone(),
                         response: response.clone(),
@@ -1175,8 +1183,11 @@ impl EngineActor {
                 command = self.command_rx.recv() => {
                     match command {
                         Some(EngineCommand::Agent(command)) => manager.command(command).await?,
-                        Some(EngineCommand::ResolveApproval(response)) => {
-                            manager.resolve_approval(response).await?
+                        Some(EngineCommand::ResolveApproval {
+                            operation_id,
+                            response,
+                        }) => {
+                            manager.resolve_approval(&operation_id, response).await?
                         }
                         Some(EngineCommand::CancelTurn) => {
                             cancel.cancel();
@@ -1210,11 +1221,21 @@ impl EngineActor {
 
     async fn await_approval(
         &mut self,
+        expected_operation_id: &OperationId,
         cancel: &CancelToken,
     ) -> Result<ApprovalResponse, KuramaError> {
         loop {
             match self.command_rx.recv().await {
-                Some(EngineCommand::ResolveApproval(response)) => return Ok(response),
+                Some(EngineCommand::ResolveApproval {
+                    operation_id,
+                    response,
+                }) if &operation_id == expected_operation_id => return Ok(response),
+                Some(EngineCommand::ResolveApproval { .. }) => {
+                    self.emit(RuntimeEvent::Error {
+                        message: "approval request is no longer pending".into(),
+                    })
+                    .await?;
+                }
                 Some(EngineCommand::CancelTurn) => {
                     cancel.cancel();
                     return Err(KuramaError::Cancelled);
@@ -1248,7 +1269,7 @@ impl EngineActor {
                 Err(KuramaError::Cancelled)
             }
             Some(EngineCommand::Agent(command)) => self.agent_command(command).await,
-            Some(EngineCommand::ResolveApproval(_)) => {
+            Some(EngineCommand::ResolveApproval { .. }) => {
                 self.emit(RuntimeEvent::Error {
                     message: "there is no pending approval".into(),
                 })

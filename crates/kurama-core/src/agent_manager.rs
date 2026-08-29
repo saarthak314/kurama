@@ -11,7 +11,7 @@ use kurama_protocol::{
         AgentResult, AgentSnapshot, AgentState, ChildBrief, ChildLaunch, ResolvedAgentSpec,
         SchedulePlan,
     },
-    id::{AgentId, SessionId},
+    id::{AgentId, OperationId, SessionId},
     model::Usage,
     policy::{ApprovalRequest, ApprovalResponse},
     runtime::{AgentCommand, RuntimeEvent},
@@ -204,13 +204,23 @@ impl AgentManager {
         }
     }
 
-    pub async fn resolve_approval(&self, response: ApprovalResponse) -> Result<(), KuramaError> {
+    pub async fn resolve_approval(
+        &self,
+        operation_id: &OperationId,
+        response: ApprovalResponse,
+    ) -> Result<(), KuramaError> {
         let next_request = {
             let mut state = self.state.lock().await;
             let approval = state
                 .active_approval
                 .take()
                 .ok_or_else(|| KuramaError::Protocol("no child approval is pending".into()))?;
+            if &approval.request.operation_id != operation_id {
+                state.active_approval = Some(approval);
+                return Err(KuramaError::Protocol(
+                    "child approval request is no longer pending".into(),
+                ));
+            }
             let _ = approval.response.send(response);
             promote_approval(&mut state)
         };
@@ -273,28 +283,37 @@ impl AgentManager {
     }
 
     pub async fn cancel(&self, agent_id: &AgentId) -> Result<(), KuramaError> {
-        let mut terminal_snapshot = None;
-        {
+        let (terminal_snapshot, next_request) = {
             let mut state = self.state.lock().await;
-            let agent = state
-                .agents
-                .get_mut(agent_id)
-                .ok_or_else(|| KuramaError::NotFound(agent_id.to_string()))?;
-            agent.cancel.cancel();
-            if agent.snapshot.state == AgentState::Queued {
-                agent.snapshot.state = AgentState::Cancelled;
-                let snapshot = agent.snapshot.clone();
-                self.append_agent_event(
-                    agent,
-                    SessionEvent::AgentCancelled {
-                        snapshot: snapshot.clone(),
-                    },
-                )?;
-                terminal_snapshot = Some(snapshot);
-            }
-        }
+            let terminal_snapshot = {
+                let agent = state
+                    .agents
+                    .get_mut(agent_id)
+                    .ok_or_else(|| KuramaError::NotFound(agent_id.to_string()))?;
+                agent.cancel.cancel();
+                if agent.snapshot.state == AgentState::Queued {
+                    agent.snapshot.state = AgentState::Cancelled;
+                    let snapshot = agent.snapshot.clone();
+                    self.append_agent_event(
+                        agent,
+                        SessionEvent::AgentCancelled {
+                            snapshot: snapshot.clone(),
+                        },
+                    )?;
+                    Some(snapshot)
+                } else {
+                    None
+                }
+            };
+            let next_request = remove_agent_approvals(&mut state, agent_id);
+            (terminal_snapshot, next_request)
+        };
         if let Some(snapshot) = terminal_snapshot {
             self.emit(RuntimeEvent::AgentUpdated { snapshot }).await?;
+        }
+        if let Some(request) = next_request {
+            self.emit(RuntimeEvent::ApprovalRequired { request })
+                .await?;
         }
         Ok(())
     }
@@ -510,16 +529,23 @@ impl AgentManager {
     async fn queue_approval(&self, approval: ChildApproval) -> Result<(), KuramaError> {
         let request = {
             let mut state = self.state.lock().await;
-            if !state.agents.contains_key(&approval.agent_id) {
-                return Err(KuramaError::NotFound(approval.agent_id.to_string()));
+            let agent = state
+                .agents
+                .get(&approval.agent_id)
+                .ok_or_else(|| KuramaError::NotFound(approval.agent_id.to_string()))?;
+            if agent.snapshot.state != AgentState::Running || approval.response.is_closed() {
+                return Ok(());
             }
-            if state.active_approval.is_some() {
-                state.queued_approvals.push_back(approval);
+            state.queued_approvals.push_back(approval);
+            if state
+                .active_approval
+                .as_ref()
+                .is_some_and(|approval| approval_is_live(&state.agents, approval))
+            {
                 None
             } else {
-                let request = approval.request.clone();
-                state.active_approval = Some(approval);
-                Some(request)
+                state.active_approval.take();
+                promote_approval(&mut state)
             }
         };
         if let Some(request) = request {
@@ -534,8 +560,9 @@ impl AgentManager {
         agent_id: &AgentId,
         outcome: Result<AgentResult, KuramaError>,
     ) -> Result<Option<AgentResult>, KuramaError> {
-        let (snapshot, result) = {
+        let (snapshot, result, next_request) = {
             let mut state = self.state.lock().await;
+            let next_request = remove_agent_approvals(&mut state, agent_id);
             let agent = state
                 .agents
                 .get_mut(agent_id)
@@ -550,7 +577,7 @@ impl AgentManager {
                         snapshot: snapshot.clone(),
                     },
                 )?;
-                (snapshot, None)
+                (snapshot, None, next_request)
             } else {
                 match outcome {
                     Ok(result) => {
@@ -564,7 +591,7 @@ impl AgentManager {
                                 summary: result.summary.clone(),
                             },
                         )?;
-                        (snapshot, Some(result))
+                        (snapshot, Some(result), next_request)
                     }
                     Err(error @ KuramaError::Model(_)) if agent.profile_attempts < 2 => {
                         agent.snapshot.state = AgentState::Queued;
@@ -577,7 +604,7 @@ impl AgentManager {
                                 snapshot: snapshot.clone(),
                             },
                         )?;
-                        (snapshot, None)
+                        (snapshot, None, next_request)
                     }
                     Err(error @ KuramaError::Model(_))
                         if agent.next_escalation < agent.spec.escalation_profiles.len() =>
@@ -603,7 +630,7 @@ impl AgentManager {
                                 snapshot: snapshot.clone(),
                             },
                         )?;
-                        (snapshot, None)
+                        (snapshot, None, next_request)
                     }
                     Err(error) => {
                         agent.snapshot.state = AgentState::Failed;
@@ -616,12 +643,16 @@ impl AgentManager {
                                 error: error.to_string(),
                             },
                         )?;
-                        (snapshot, None)
+                        (snapshot, None, next_request)
                     }
                 }
             }
         };
         self.emit(RuntimeEvent::AgentUpdated { snapshot }).await?;
+        if let Some(request) = next_request {
+            self.emit(RuntimeEvent::ApprovalRequired { request })
+                .await?;
+        }
         Ok(result)
     }
 
@@ -715,7 +746,7 @@ impl AgentManager {
 
 fn promote_approval(state: &mut ManagerState) -> Option<ApprovalRequest> {
     while let Some(approval) = state.queued_approvals.pop_front() {
-        if approval.response.is_closed() {
+        if !approval_is_live(&state.agents, &approval) {
             continue;
         }
         let request = approval.request.clone();
@@ -723,6 +754,31 @@ fn promote_approval(state: &mut ManagerState) -> Option<ApprovalRequest> {
         return Some(request);
     }
     None
+}
+
+fn remove_agent_approvals(state: &mut ManagerState, agent_id: &AgentId) -> Option<ApprovalRequest> {
+    let remove_active = state.active_approval.as_ref().is_some_and(|approval| {
+        &approval.agent_id == agent_id || !approval_is_live(&state.agents, approval)
+    });
+    if remove_active {
+        state.active_approval.take();
+    }
+    let agents = &state.agents;
+    state
+        .queued_approvals
+        .retain(|approval| &approval.agent_id != agent_id && approval_is_live(agents, approval));
+    if state.active_approval.is_none() {
+        promote_approval(state)
+    } else {
+        None
+    }
+}
+
+fn approval_is_live(agents: &BTreeMap<AgentId, ManagedAgent>, approval: &ChildApproval) -> bool {
+    !approval.response.is_closed()
+        && agents.get(&approval.agent_id).is_some_and(|agent| {
+            agent.snapshot.state == AgentState::Running && !agent.cancel.is_cancelled()
+        })
 }
 
 fn agent_dependency_keys(agent: &ManagedAgent) -> [String; 2] {

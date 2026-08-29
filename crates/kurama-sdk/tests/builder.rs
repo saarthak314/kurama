@@ -14,13 +14,14 @@ use kurama_core::testing::{
     SequenceIds,
 };
 use kurama_sdk::{
-    AgentBudget, AgentBuilder, AgentRuntime, AgentSpec, AgentState, ApprovalPolicy,
+    AgentBudget, AgentBuilder, AgentCommand, AgentRuntime, AgentSpec, AgentState, ApprovalPolicy,
     ApprovalResponse, BackendCapabilities, BoxFuture, CancelSignal, DelegationRequest,
-    ExecutionMode, FinishReason, KuramaError, ModelBackend, ModelEvent, ModelProfile, ModelRequest,
-    ModelStream, Operation, OrchestrationContext, PolicyContext, PolicyDecision, RuntimeEvent,
-    SessionEvent, SessionMetadata, SessionStore, Tool, ToolContext, ToolDescriptor, ToolInvocation,
-    ToolResult, Usage, WriteScope,
+    EventEnvelope, ExecutionMode, FinishReason, KuramaError, ModelBackend, ModelEvent,
+    ModelProfile, ModelRequest, ModelStream, Operation, OrchestrationContext, PolicyContext,
+    PolicyDecision, RuntimeEvent, SessionEvent, SessionMetadata, SessionStore, Tool, ToolContext,
+    ToolDescriptor, ToolInvocation, ToolResult, Usage, WriteScope,
 };
+use tokio::sync::Notify;
 
 type ScriptEvent = Result<ModelEvent, KuramaError>;
 
@@ -80,26 +81,30 @@ async fn runtime_launches_explicit_depth_one_children() {
 }
 
 #[tokio::test]
-async fn supervised_child_write_routes_parent_approval() {
-    let backend = Arc::new(ScriptedBackend::new(vec![
+async fn second_child_turn_routes_parent_approval() {
+    let mut budget = child_budget(16_000, 2_000);
+    budget.max_turns = 2;
+    let backend = Arc::new(GatedChildBackend::new(
         vec![
-            delegation(child_budget(16_000, 2_000)),
-            completed(FinishReason::ToolCalls),
+            vec![delegation(budget), completed(FinishReason::ToolCalls)],
+            vec![text("parent complete"), completed(FinishReason::Stop)],
         ],
         vec![
-            Ok(ModelEvent::ToolCall {
-                call_id: "child-call".into(),
-                name: "mutate".into(),
-                arguments: Default::default(),
-            }),
-            completed(FinishReason::ToolCalls),
+            vec![text("first turn"), completed(FinishReason::Stop)],
+            vec![
+                Ok(ModelEvent::ToolCall {
+                    call_id: "child-call".into(),
+                    name: "mutate".into(),
+                    arguments: Default::default(),
+                }),
+                completed(FinishReason::ToolCalls),
+            ],
+            vec![text("child complete"), completed(FinishReason::Stop)],
         ],
-        vec![text("child complete"), completed(FinishReason::Stop)],
-        vec![text("parent complete"), completed(FinishReason::Stop)],
-    ]));
+    ));
     let tool = Arc::new(ApprovalTool::default());
     let runtime = orchestrated_runtime(
-        backend,
+        backend.clone(),
         Arc::new(AskPolicy),
         Arc::new(MemoryStore::default()),
         Some(tool.clone()),
@@ -108,6 +113,25 @@ async fn supervised_child_write_routes_parent_approval() {
         .start(session("approval"), Vec::new())
         .expect("start");
     handle.submit("delegate", true).await.expect("submit");
+
+    let child_id = loop {
+        match events.recv().await.expect("event") {
+            RuntimeEvent::AgentUpdated { snapshot } if snapshot.state == AgentState::Running => {
+                break snapshot.id;
+            }
+            RuntimeEvent::Error { message } => panic!("runtime error: {message}"),
+            _ => {}
+        }
+    };
+    backend.wait_for_child_turn().await;
+    handle
+        .agent_command(AgentCommand::Message {
+            agent_id: child_id,
+            text: "perform the write".into(),
+        })
+        .await
+        .expect("queue child message");
+    backend.release_child_turn();
 
     let request = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
@@ -124,27 +148,22 @@ async fn supervised_child_write_routes_parent_approval() {
     assert!(matches!(request.operation, Operation::Write { .. }));
 
     handle
-        .resolve_approval(ApprovalResponse::ApproveOnce)
+        .resolve_approval(request.operation_id, ApprovalResponse::ApproveOnce)
         .await
         .expect("approve");
     wait_for_turn(&mut events).await;
     assert_eq!(tool.executions.load(Ordering::Relaxed), 1);
+    assert_eq!(backend.child_requests().len(), 3);
 }
 
 #[tokio::test]
-async fn child_token_budget_is_enforced() {
+async fn child_finishes_when_no_queued_work_remains() {
     let budget = child_budget(1_000, 7);
     let backend = Arc::new(RecordingBackend::new(vec![
         vec![delegation(budget), completed(FinishReason::ToolCalls)],
         vec![
-            Ok(ModelEvent::Usage {
-                usage: Usage {
-                    input_tokens: 900,
-                    output_tokens: 8,
-                    cached_input_tokens: 0,
-                },
-            }),
-            text("over budget"),
+            usage(1_000, 7),
+            text("exact budget"),
             completed(FinishReason::Stop),
         ],
         vec![text("parent complete"), completed(FinishReason::Stop)],
@@ -168,19 +187,295 @@ async fn child_token_budget_is_enforced() {
         }
     }
 
-    let child_request = backend
+    let child_requests: Vec<_> = backend
         .requests()
         .into_iter()
-        .find(|request| request.agent_id.is_some())
-        .expect("child request");
+        .filter(|request| request.agent_id.is_some())
+        .collect();
+    assert_eq!(child_requests.len(), 1);
+    let child_request = &child_requests[0];
     assert_eq!(child_request.profile.max_input_tokens, 1_000);
     assert_eq!(child_request.profile.max_output_tokens, 7);
     let child_snapshot = child_snapshot.expect("child snapshot");
-    assert_eq!(child_snapshot.state, AgentState::Cancelled);
+    assert_eq!(child_snapshot.state, AgentState::Completed);
+    assert_eq!(child_snapshot.last_error, None);
+}
+
+#[tokio::test]
+async fn child_final_turn_overage_surfaces_budget_exhaustion() {
+    let budget = child_budget(1_000, 7);
+    let backend = Arc::new(RecordingBackend::new(vec![
+        vec![delegation(budget), completed(FinishReason::ToolCalls)],
+        vec![
+            usage(1_001, 7),
+            text("over budget"),
+            completed(FinishReason::Stop),
+        ],
+        vec![text("parent complete"), completed(FinishReason::Stop)],
+    ]));
+    let runtime = orchestrated_runtime(
+        backend.clone(),
+        Arc::new(AllowAllPolicy),
+        Arc::new(MemoryStore::default()),
+        None,
+    );
+    let (handle, mut events) = runtime
+        .start(session("final-overage"), Vec::new())
+        .expect("start");
+    handle.submit("delegate", true).await.expect("submit");
+
+    let child_snapshot = wait_for_child_result(&mut events).await;
+
+    assert_eq!(child_requests(&backend).len(), 1);
+    assert_budget_exhausted(child_snapshot);
+}
+
+#[tokio::test]
+async fn child_replay_clamps_initial_request_to_remaining_budget() {
+    let session_id = "replay-budget";
+    let store = Arc::new(MemoryStore::default());
+    seed_child_replay(
+        store.as_ref(),
+        session_id,
+        [
+            SessionEvent::ModelUsage {
+                usage: Usage {
+                    input_tokens: 400,
+                    output_tokens: 40,
+                    cached_input_tokens: 0,
+                },
+            },
+            SessionEvent::TurnCompleted,
+        ],
+    );
+    let mut budget = child_budget(1_000, 100);
+    budget.max_turns = 2;
+    let backend = Arc::new(RecordingBackend::new(vec![
+        vec![delegation(budget), completed(FinishReason::ToolCalls)],
+        vec![
+            usage(600, 60),
+            text("child complete"),
+            completed(FinishReason::Stop),
+        ],
+        vec![text("parent complete"), completed(FinishReason::Stop)],
+    ]));
+    let runtime = orchestrated_runtime(backend.clone(), Arc::new(AllowAllPolicy), store, None);
+    let (handle, mut events) = runtime
+        .start(session(session_id), Vec::new())
+        .expect("start");
+    handle.submit("delegate", true).await.expect("submit");
+
+    let child_snapshot = wait_for_child_result(&mut events).await;
+
+    let requests = child_requests(&backend);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].profile.max_input_tokens, 600);
+    assert_eq!(requests[0].profile.max_output_tokens, 60);
+    assert_eq!(child_snapshot.state, AgentState::Completed);
+}
+
+#[tokio::test]
+async fn exhausted_child_replay_skips_model_request() {
+    for (session_id, budget, replay) in [
+        (
+            "replay-token-exhausted",
+            child_budget(1_000, 100),
+            vec![SessionEvent::ModelUsage {
+                usage: Usage {
+                    input_tokens: 1_000,
+                    output_tokens: 40,
+                    cached_input_tokens: 0,
+                },
+            }],
+        ),
+        (
+            "replay-turn-exhausted",
+            AgentBudget {
+                max_turns: 1,
+                ..child_budget(1_000, 100)
+            },
+            vec![SessionEvent::TurnCompleted],
+        ),
+    ] {
+        let store = Arc::new(MemoryStore::default());
+        seed_child_replay(store.as_ref(), session_id, replay);
+        let backend = Arc::new(RecordingBackend::new(vec![
+            vec![delegation(budget), completed(FinishReason::ToolCalls)],
+            vec![text("parent complete"), completed(FinishReason::Stop)],
+        ]));
+        let runtime = orchestrated_runtime(backend.clone(), Arc::new(AllowAllPolicy), store, None);
+        let (handle, mut events) = runtime
+            .start(session(session_id), Vec::new())
+            .expect("start");
+        handle.submit("delegate", true).await.expect("submit");
+
+        let child_snapshot = wait_for_child_result(&mut events).await;
+
+        assert!(child_requests(&backend).is_empty());
+        assert_budget_exhausted(child_snapshot);
+    }
+}
+
+#[tokio::test]
+async fn queued_child_message_uses_remaining_token_budget() {
+    let mut budget = child_budget(1_000, 100);
+    budget.max_turns = 2;
+    let (backend, child_snapshot) = run_queued_child(
+        budget,
+        vec![
+            usage(400, 40),
+            text("first turn"),
+            completed(FinishReason::Stop),
+        ],
+    )
+    .await;
+
+    let requests = backend.child_requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].profile.max_input_tokens, 1_000);
+    assert_eq!(requests[0].profile.max_output_tokens, 100);
+    assert_eq!(requests[1].profile.max_input_tokens, 600);
+    assert_eq!(requests[1].profile.max_output_tokens, 60);
+    assert_eq!(child_snapshot.state, AgentState::Completed);
+}
+
+#[tokio::test]
+async fn queued_child_message_surfaces_exhausted_token_budget() {
+    for usage_event in [usage(1_000, 40), usage(400, 101)] {
+        let mut budget = child_budget(1_000, 100);
+        budget.max_turns = 2;
+        let (backend, child_snapshot) = run_queued_child(
+            budget,
+            vec![
+                usage_event,
+                text("first turn"),
+                completed(FinishReason::Stop),
+            ],
+        )
+        .await;
+
+        assert_eq!(backend.child_requests().len(), 1);
+        assert_budget_exhausted(child_snapshot);
+    }
+}
+
+#[tokio::test]
+async fn queued_child_message_surfaces_exhausted_turn_budget() {
+    let mut budget = child_budget(1_000, 100);
+    budget.max_turns = 1;
+    let (backend, child_snapshot) = run_queued_child(
+        budget,
+        vec![text("first turn"), completed(FinishReason::Stop)],
+    )
+    .await;
+
+    assert_eq!(backend.child_requests().len(), 1);
+    assert_budget_exhausted(child_snapshot);
+}
+
+async fn run_queued_child(
+    budget: AgentBudget,
+    first_child_turn: Vec<ScriptEvent>,
+) -> (Arc<GatedChildBackend>, kurama_sdk::AgentSnapshot) {
+    let backend = Arc::new(GatedChildBackend::new(
+        vec![
+            vec![delegation(budget), completed(FinishReason::ToolCalls)],
+            vec![text("parent complete"), completed(FinishReason::Stop)],
+        ],
+        vec![
+            first_child_turn,
+            vec![text("queued work complete"), completed(FinishReason::Stop)],
+        ],
+    ));
+    let runtime = orchestrated_runtime(
+        backend.clone(),
+        Arc::new(AllowAllPolicy),
+        Arc::new(MemoryStore::default()),
+        None,
+    );
+    let (handle, mut events) = runtime
+        .start(session("turn-budget"), Vec::new())
+        .expect("start");
+    handle.submit("delegate", true).await.expect("submit");
+
+    let child_id = loop {
+        match events.recv().await.expect("event") {
+            RuntimeEvent::AgentUpdated { snapshot } if snapshot.state == AgentState::Running => {
+                break snapshot.id;
+            }
+            RuntimeEvent::Error { message } => panic!("runtime error: {message}"),
+            _ => {}
+        }
+    };
+    backend.wait_for_child_turn().await;
+    handle
+        .agent_command(AgentCommand::Message {
+            agent_id: child_id,
+            text: "do another turn".into(),
+        })
+        .await
+        .expect("queue child message");
+    backend.release_child_turn();
+
+    let mut child_snapshot = None;
+    loop {
+        match events.recv().await.expect("event") {
+            RuntimeEvent::AgentUpdated { snapshot } => child_snapshot = Some(snapshot),
+            RuntimeEvent::TurnCompleted => break,
+            RuntimeEvent::Error { message } => panic!("runtime error: {message}"),
+            _ => {}
+        }
+    }
+    (backend, child_snapshot.expect("child snapshot"))
+}
+
+fn assert_budget_exhausted(snapshot: kurama_sdk::AgentSnapshot) {
+    assert_eq!(snapshot.state, AgentState::Cancelled);
     assert_eq!(
-        child_snapshot.last_error.as_deref(),
+        snapshot.last_error.as_deref(),
         Some("child budget exhausted")
     );
+}
+
+async fn wait_for_child_result(
+    events: &mut tokio::sync::mpsc::Receiver<RuntimeEvent>,
+) -> kurama_sdk::AgentSnapshot {
+    let mut child_snapshot = None;
+    loop {
+        match events.recv().await.expect("event") {
+            RuntimeEvent::AgentUpdated { snapshot } => child_snapshot = Some(snapshot),
+            RuntimeEvent::TurnCompleted => break,
+            RuntimeEvent::Error { message } => panic!("runtime error: {message}"),
+            _ => {}
+        }
+    }
+    child_snapshot.expect("child snapshot")
+}
+
+fn child_requests(backend: &RecordingBackend) -> Vec<ModelRequest> {
+    backend
+        .requests()
+        .into_iter()
+        .filter(|request| request.agent_id.is_some())
+        .collect()
+}
+
+fn seed_child_replay(
+    store: &MemoryStore,
+    session_id: &str,
+    events: impl IntoIterator<Item = SessionEvent>,
+) {
+    for (sequence, event) in events.into_iter().enumerate() {
+        store
+            .append(&EventEnvelope::new(
+                sequence as u64,
+                sequence as u64,
+                session_id.into(),
+                Some("a_0".into()),
+                event,
+            ))
+            .expect("seed child replay");
+    }
 }
 
 fn orchestrated_runtime(
@@ -268,6 +563,16 @@ fn completed(finish_reason: FinishReason) -> ScriptEvent {
     })
 }
 
+fn usage(input_tokens: u64, output_tokens: u64) -> ScriptEvent {
+    Ok(ModelEvent::Usage {
+        usage: Usage {
+            input_tokens,
+            output_tokens,
+            cached_input_tokens: 0,
+        },
+    })
+}
+
 async fn wait_for_turn(events: &mut tokio::sync::mpsc::Receiver<RuntimeEvent>) {
     loop {
         match events.recv().await.expect("event") {
@@ -331,6 +636,71 @@ impl Tool for ApprovalTool {
 struct RecordingBackend {
     inner: ScriptedBackend,
     requests: Mutex<Vec<ModelRequest>>,
+}
+
+struct GatedChildBackend {
+    parent: ScriptedBackend,
+    child: ScriptedBackend,
+    child_requests: Mutex<Vec<ModelRequest>>,
+    child_started: Notify,
+    child_release: Notify,
+}
+
+impl GatedChildBackend {
+    fn new(parent: Vec<Vec<ScriptEvent>>, child: Vec<Vec<ScriptEvent>>) -> Self {
+        Self {
+            parent: ScriptedBackend::new(parent),
+            child: ScriptedBackend::new(child),
+            child_requests: Mutex::new(Vec::new()),
+            child_started: Notify::new(),
+            child_release: Notify::new(),
+        }
+    }
+
+    async fn wait_for_child_turn(&self) {
+        self.child_started.notified().await;
+    }
+
+    fn release_child_turn(&self) {
+        self.child_release.notify_one();
+    }
+
+    fn child_requests(&self) -> Vec<ModelRequest> {
+        self.child_requests.lock().expect("requests").clone()
+    }
+}
+
+impl ModelBackend for GatedChildBackend {
+    fn backend_name(&self) -> &'static str {
+        "gated-child"
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::remote_default()
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: ModelRequest,
+        cancel: &'a dyn CancelSignal,
+    ) -> BoxFuture<'a, Result<ModelStream, KuramaError>> {
+        Box::pin(async move {
+            if request.agent_id.is_none() {
+                return self.parent.stream(request, cancel).await;
+            }
+            let request_index = {
+                let mut requests = self.child_requests.lock().expect("requests");
+                let request_index = requests.len();
+                requests.push(request.clone());
+                request_index
+            };
+            if request_index == 0 {
+                self.child_started.notify_one();
+                self.child_release.notified().await;
+            }
+            self.child.stream(request, cancel).await
+        })
+    }
 }
 
 impl RecordingBackend {

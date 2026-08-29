@@ -836,7 +836,10 @@ impl App {
                     text,
                     explicit_delegation,
                 } => engine.submit(text, explicit_delegation).await,
-                EngineCommand::ResolveApproval(response) => engine.resolve_approval(response).await,
+                EngineCommand::ResolveApproval {
+                    operation_id,
+                    response,
+                } => engine.resolve_approval(operation_id, response).await,
                 EngineCommand::CancelTurn => engine.cancel_turn().await,
                 EngineCommand::Compact => engine.compact().await,
                 EngineCommand::SetMode(mode) => engine.set_mode(mode).await,

@@ -383,11 +383,6 @@ impl RecoveryPlanner {
                 || state.approval == Some(ApprovalResponse::Deny)
             {
                 RecoveryAction::DiscardDenied { tool }
-            } else if state.recovery_decision.as_deref() == Some("retry") {
-                RecoveryAction::RetrySafe {
-                    tool,
-                    reason: "retry was approved during recovery".into(),
-                }
             } else if !state.started && state.approval_summary.is_some() && state.approval.is_none()
             {
                 RecoveryAction::RestoreApproval {

@@ -2,6 +2,7 @@ use kurama_core::recovery::{NoopRecoveryProbe, RecoveryAction, RecoveryPlanner, 
 use kurama_protocol::{
     id::{OperationId, SessionId},
     model::{BackendCapabilities, BackendCursor},
+    policy::ApprovalResponse,
     session::{EventEnvelope, SessionEvent},
     tool::{CommandClass, Operation},
 };
@@ -45,6 +46,78 @@ fn recovery_never_blindly_reexecutes_unknown_bash() {
         plan.operations.get(&operation_id),
         Some(RecoveryAction::RequireDecision { .. })
     ));
+}
+
+#[test]
+fn recovery_requires_a_new_decision_after_an_authorized_bash_retry_is_interrupted() {
+    for action in ["retry", "retry_once"] {
+        let operation_id = OperationId::from("operation");
+        let operation = Operation::Bash {
+            command: "make install".into(),
+            cwd: ".".into(),
+            class: CommandClass::Unknown,
+            timeout_ms: 1_000,
+        };
+        let events = vec![
+            event(
+                0,
+                SessionEvent::ToolProposed {
+                    operation_id: operation_id.clone(),
+                    call_id: "call".into(),
+                    operation,
+                },
+            ),
+            event(
+                1,
+                SessionEvent::ToolStarted {
+                    operation_id: operation_id.clone(),
+                },
+            ),
+            event(
+                2,
+                SessionEvent::ApprovalRequested {
+                    operation_id: operation_id.clone(),
+                    summary: "interrupted Bash outcome is unknown".into(),
+                },
+            ),
+            event(
+                3,
+                SessionEvent::ApprovalResolved {
+                    operation_id: operation_id.clone(),
+                    response: ApprovalResponse::ApproveOnce,
+                },
+            ),
+            event(
+                4,
+                SessionEvent::RecoveryDecision {
+                    operation_id: operation_id.clone(),
+                    action: action.into(),
+                },
+            ),
+            event(
+                5,
+                SessionEvent::ToolStarted {
+                    operation_id: operation_id.clone(),
+                },
+            ),
+        ];
+
+        let plan = RecoveryPlanner::new()
+            .plan(
+                &events,
+                &NoopRecoveryProbe,
+                BackendCapabilities::remote_default(),
+            )
+            .expect("plan");
+
+        assert!(
+            matches!(
+                plan.operations.get(&operation_id),
+                Some(RecoveryAction::RequireDecision { .. })
+            ),
+            "{action} must not authorize another retry after a crash"
+        );
+    }
 }
 
 #[test]
