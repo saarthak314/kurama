@@ -13,6 +13,20 @@ pub struct ToolLimits {
     pub max_lines: usize,
 }
 
+impl ToolLimits {
+    pub fn from_model_input_budget(max_input_tokens: u64, reserved_output_tokens: u64) -> Self {
+        let max_bytes = max_input_tokens
+            .saturating_sub(reserved_output_tokens)
+            .saturating_mul(3)
+            .try_into()
+            .unwrap_or(usize::MAX);
+        Self {
+            max_bytes,
+            max_lines: usize::MAX,
+        }
+    }
+}
+
 impl Default for ToolLimits {
     fn default() -> Self {
         Self {

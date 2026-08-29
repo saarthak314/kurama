@@ -9,7 +9,6 @@ use kurama_protocol::{
 use serde::{Deserialize, Deserializer, de::Error as _};
 use serde_json::{Value, json};
 
-const MAX_PROMPT_BYTES: usize = 256 * 1024;
 const MAX_ERROR_BYTES: usize = 16 * 1024;
 
 pub fn control_schema(delegation_enabled: bool) -> Value {
@@ -98,7 +97,7 @@ pub fn bridge_prompt(request: &ModelRequest) -> String {
     let workspace_root =
         serde_json::to_string(&request.workspace_root).unwrap_or_else(|_| "\".\"".into());
     let mut prompt = format!(
-        "{}\n\nYou are a model bridge. Do not use any CLI-provided tools, filesystem access, shell access, web access, plugins, skills, agents, or custom instructions. Return exactly one JSON control object matching the supplied schema. Set fields unused by the selected kind to empty values; encode each tool arguments object as a JSON string.\n\nKurama workspace root: {}\nResolve every relative tool path against that root. For bash calls without a user-specified working directory, set cwd to that exact root; never use the bridge process working directory.\n\nAvailable Kurama tools:\n{}\n\nActive context:\n{}",
+        "{}\n\nYou are a model bridge. Do not use any CLI-provided tools, filesystem access, shell access, web access, plugins, skills, agents, or custom instructions. The disabled CLI tool list applies only to the bridge process; it does not disable Kurama tools. Every listed Kurama tool is available through this control protocol. Return exactly one JSON control object matching the supplied schema. Set fields unused by the selected kind to empty values; encode each tool arguments object as a JSON string. When the latest user request asks to use a listed Kurama tool and the active context does not already contain its result, return kind=tool_calls instead of kind=final. A tool process returning a nonzero exit status or a tool result with is_error=true is not evidence that the tool is missing or unavailable. Infer tool availability or unavailability only from explicit tool-result content or an engine error that states it. Never invent an unavailable-tool failure.\n\nKurama workspace root: {}\nResolve every relative tool path against that root. For bash calls without a user-specified working directory, set cwd to that exact root; never use the bridge process working directory.\n\nAvailable Kurama tools:\n{}\n\nActive context:\n{}",
         request.system,
         workspace_root,
         serde_json::to_string(&tools).unwrap_or_else(|_| "[]".into()),
@@ -109,7 +108,6 @@ pub fn bridge_prompt(request: &ModelRequest) -> String {
     } else {
         prompt.push_str("\n\nKurama assigns child roles and profiles. Delegation dependencies must name the exact objective text of prerequisite agents.");
     }
-    truncate_utf8(&mut prompt, MAX_PROMPT_BYTES);
     prompt
 }
 
@@ -264,16 +262,4 @@ impl ControlAgent {
             depends_on: self.depends_on,
         }
     }
-}
-
-fn truncate_utf8(text: &mut String, max_bytes: usize) {
-    if text.len() <= max_bytes {
-        return;
-    }
-    let mut end = max_bytes;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
-    text.push('…');
 }

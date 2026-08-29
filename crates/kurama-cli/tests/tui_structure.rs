@@ -12,9 +12,9 @@ use kurama_protocol::{
 use ratatui::{
     Terminal,
     backend::{Backend, TestBackend},
-    buffer::Buffer,
+    buffer::{Buffer, Cell},
     layout::Position,
-    style::Color,
+    style::{Color, Modifier},
 };
 
 fn buffer_text(buffer: &Buffer) -> String {
@@ -32,6 +32,18 @@ fn rendered(state: &TuiState, width: u16, height: u16) -> Buffer {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal.draw(|frame| render(frame, state)).unwrap();
     terminal.backend().buffer().clone()
+}
+
+fn cell_at_text<'a>(buffer: &'a Buffer, needle: &str) -> &'a Cell {
+    for y in 0..buffer.area.height {
+        let row = (0..buffer.area.width)
+            .map(|x| buffer.cell((x, y)).expect("cell").symbol())
+            .collect::<String>();
+        if let Some(x) = row.find(needle) {
+            return buffer.cell((x as u16, y)).expect("styled cell");
+        }
+    }
+    panic!("rendered text did not contain {needle:?}");
 }
 
 fn approval_request() -> ApprovalRequest {
@@ -124,7 +136,217 @@ fn transcript_uses_compact_codex_style_hierarchy() {
 }
 
 #[test]
-fn tool_output_is_hard_wrapped_and_bounded_with_head_and_tail() {
+fn assistant_markdown_renders_inline_styles_and_links() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_assistant(concat!(
+        "# Release\n\n",
+        "Use **bold**, *italic*, ~~obsolete~~, `cargo test`, and ",
+        "[docs](https://example.com)."
+    ));
+
+    let buffer = rendered(&state, 100, 24);
+    let text = buffer_text(&buffer);
+
+    assert!(text.contains("Release"));
+    assert!(
+        text.contains("Use bold, italic, obsolete, cargo test, and docs (https://example.com).")
+    );
+    assert!(!text.contains("# Release"));
+    assert!(!text.contains("**bold**"));
+    assert!(!text.contains("*italic*"));
+    assert!(!text.contains("~~obsolete~~"));
+    assert!(!text.contains("`cargo test`"));
+    assert!(!text.contains("[docs](https://example.com)"));
+    assert!(
+        cell_at_text(&buffer, "Release")
+            .modifier
+            .contains(Modifier::BOLD)
+    );
+    assert!(
+        cell_at_text(&buffer, "bold")
+            .modifier
+            .contains(Modifier::BOLD)
+    );
+    assert!(
+        cell_at_text(&buffer, "italic")
+            .modifier
+            .contains(Modifier::ITALIC)
+    );
+    assert!(
+        cell_at_text(&buffer, "obsolete")
+            .modifier
+            .contains(Modifier::CROSSED_OUT)
+    );
+    assert_eq!(
+        cell_at_text(&buffer, "cargo test").fg,
+        Color::Rgb(220, 178, 73)
+    );
+    let link = cell_at_text(&buffer, "docs");
+    assert_eq!(link.fg, Color::Rgb(116, 177, 255));
+    assert!(link.modifier.contains(Modifier::UNDERLINED));
+}
+
+#[test]
+fn assistant_markdown_renders_blocks_lists_code_quotes_rules_and_tables() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_assistant(concat!(
+        "## Plan\n\n",
+        "> Quote with **weight**.\n\n",
+        "- alpha\n",
+        "- beta\n\n",
+        "3. third\n",
+        "4. fourth\n\n",
+        "---\n\n",
+        "```rust\n",
+        "fn main() {\n",
+        "    println!(\"hi\");\n",
+        "}\n",
+        "```\n\n",
+        "| Name | State |\n",
+        "| :--- | ---: |\n",
+        "| parser | ready |"
+    ));
+
+    let buffer = rendered(&state, 120, 40);
+    let text = buffer_text(&buffer);
+
+    assert!(text.contains("Plan"));
+    assert!(text.contains("│ Quote with weight."));
+    assert!(text.contains("• alpha"));
+    assert!(text.contains("• beta"));
+    assert!(text.contains("3. third"));
+    assert!(text.contains("4. fourth"));
+    assert!(text.contains("────────────────"));
+    assert!(text.contains("rust"));
+    assert!(text.contains("│ fn main() {"));
+    assert!(text.contains("│     println!(\"hi\");"));
+    assert!(text.contains("Name   │ State"));
+    assert!(text.contains("parser │ ready"));
+    assert!(!text.contains("## Plan"));
+    assert!(!text.contains("> Quote"));
+    assert!(!text.contains("- alpha"));
+    assert!(!text.contains("```"));
+    assert!(!text.contains("| :--- | ---: |"));
+    assert!(
+        cell_at_text(&buffer, "Plan")
+            .modifier
+            .contains(Modifier::BOLD)
+    );
+    assert!(
+        cell_at_text(&buffer, "weight")
+            .modifier
+            .contains(Modifier::BOLD)
+    );
+    assert!(
+        cell_at_text(&buffer, "Name")
+            .modifier
+            .contains(Modifier::BOLD)
+    );
+}
+
+#[test]
+fn assistant_markdown_preserves_viewport_wrapping_and_style() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_assistant("**abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ**");
+
+    let buffer = rendered(&state, 40, 20);
+    let text = buffer_text(&buffer);
+
+    assert!(text.contains("abcdefghijklmnopqrstuvwxyz0123456789"));
+    assert!(text.contains("ABCDEFGHIJ"));
+    assert!(!text.contains("**"));
+    assert!(
+        cell_at_text(&buffer, "abcdefghijklmnopqrstuvwxyz")
+            .modifier
+            .contains(Modifier::BOLD)
+    );
+    assert!(
+        cell_at_text(&buffer, "ABCDEFGHIJ")
+            .modifier
+            .contains(Modifier::BOLD)
+    );
+}
+
+#[test]
+fn transcript_scroll_reaches_visual_lines_beyond_u16_max() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    let output = (0..65_550)
+        .map(|index| format!("line-{index:05}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    state.push_tool("TOOL / bash", output);
+    state.scroll = usize::from(u16::MAX) + 5;
+
+    let text = buffer_text(&rendered(&state, 40, 12));
+
+    assert!((0..20).any(|index| text.contains(&format!("line-{index:05}"))));
+    assert!(!text.contains("line-65539"));
+}
+
+#[test]
+fn transcript_follows_the_latest_answer_after_long_tool_output() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    let output = (0..100)
+        .map(|index| format!("line-{index:03}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    state.push_tool("TOOL / bash", output);
+    state.push_assistant("**complete answer**");
+
+    let text = buffer_text(&rendered(&state, 40, 12));
+
+    assert!(text.contains("complete answer"));
+    assert!(!text.contains("line-000"));
+}
+
+#[test]
+fn tool_output_wraps_on_unicode_grapheme_clusters() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_tool("TOOL / bash", "A👨‍👩‍👧‍👦B");
+
+    let text = buffer_text(&rendered(&state, 10, 16));
+
+    assert!(text.lines().any(|line| line.contains("👨‍👩‍👧‍👦")));
+}
+
+#[test]
+fn table_cells_preserve_inline_markdown_styles() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_assistant(concat!(
+        "| Field | Value |\n",
+        "| --- | --- |\n",
+        "| **status** | `ready` and [docs](https://example.com) |"
+    ));
+
+    let buffer = rendered(&state, 100, 20);
+
+    assert!(
+        cell_at_text(&buffer, "status")
+            .modifier
+            .contains(Modifier::BOLD)
+    );
+    assert_eq!(cell_at_text(&buffer, "ready").fg, Color::Rgb(220, 178, 73));
+    let link = cell_at_text(&buffer, "docs");
+    assert_eq!(link.fg, Color::Rgb(116, 177, 255));
+    assert!(link.modifier.contains(Modifier::UNDERLINED));
+}
+
+#[test]
+fn narrow_tables_truncate_only_whole_grapheme_clusters() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_assistant(concat!(
+        "| A | B |\n",
+        "| --- | --- |\n",
+        "| x | 👨‍👩‍👧‍👦abcdefghijk |"
+    ));
+
+    let text = buffer_text(&rendered(&state, 14, 20));
+
+    assert!(text.lines().any(|line| line.contains("👨‍👩‍👧‍👦")));
+}
+
+#[test]
+fn tool_output_preserves_every_wrapped_line() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.push_tool(
         "TOOL / bash",
@@ -147,11 +369,14 @@ fn tool_output_is_hard_wrapped_and_bounded_with_head_and_tail() {
     assert!(text.contains("  └ abcdefghijklmnopqrstuvwxyz012345"));
     assert!(text.contains("    6789ABCDEFGHIJ"));
     assert!(text.contains("head-two"));
-    assert!(text.contains("… 6 lines omitted …"));
-    assert!(!text.contains("middle-four"));
-    assert!(!text.contains("middle-eight"));
+    assert!(text.contains("middle-four"));
+    assert!(text.contains("middle-five"));
+    assert!(text.contains("middle-six"));
+    assert!(text.contains("middle-seven"));
+    assert!(text.contains("middle-eight"));
     assert!(text.contains("tail-nine"));
     assert!(text.contains("tail-ten"));
+    assert!(!text.contains("lines omitted"));
 }
 
 #[test]

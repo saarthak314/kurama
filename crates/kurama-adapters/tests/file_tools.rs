@@ -152,15 +152,49 @@ async fn read_supports_binary_byte_ranges_and_bounds_visible_output() {
     );
 
     let mut bounded = BoundedOutput::new(ToolLimits {
-        max_bytes: 12,
+        max_bytes: 64,
         max_lines: 2,
     });
     bounded.push(b"head1\nhead2\nmiddle\ntail1\ntail2\n");
     let bounded = bounded.finish();
     assert!(bounded.truncated);
     assert!(bounded.text.starts_with("head1"));
+    assert!(bounded.text.contains("omitted 19 bytes / 3 lines"));
     assert!(bounded.text.ends_with("tail2\n"));
-    assert!(bounded.text.len() <= 12);
+    assert!(bounded.text.len() <= 64);
+}
+
+#[test]
+fn bounded_output_marks_omissions_without_truncating_the_staged_blob() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let staged_path = temp.path().join("capture.blob");
+    let full_output = b"head1\nhead2\nmiddle\ntail1\ntail2\n";
+    let mut bounded = BoundedOutput::with_staging(
+        ToolLimits {
+            max_bytes: 64,
+            max_lines: 2,
+        },
+        &staged_path,
+    )
+    .expect("staged bounded output");
+
+    bounded.push(full_output);
+    let bounded = bounded.finish();
+
+    assert!(bounded.truncated);
+    assert!(bounded.text.contains("omitted 19 bytes / 3 lines"));
+    assert_eq!(fs::read(&staged_path).expect("staged output"), full_output);
+    assert_eq!(bounded.blob_ref.expect("blob reference").bytes, 31);
+}
+
+#[test]
+fn bounded_output_does_not_preallocate_the_configured_ceiling() {
+    let output = BoundedOutput::new(ToolLimits {
+        max_bytes: usize::MAX,
+        max_lines: usize::MAX,
+    });
+
+    drop(output);
 }
 
 #[tokio::test]

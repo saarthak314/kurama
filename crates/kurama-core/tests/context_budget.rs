@@ -1,9 +1,10 @@
 use kurama_core::context::{ContextManager, ContextPolicy};
 use kurama_protocol::{
-    id::SessionId,
+    id::{CallId, OperationId, SessionId},
     model::{ModelItem, ModelProfile},
     policy::ExecutionMode,
     session::{EventEnvelope, SessionEvent, SessionMetadata},
+    tool::ToolResult,
 };
 use serde_json::json;
 
@@ -47,7 +48,6 @@ fn keeps_recent_turns_and_summary_within_budget() {
         reserve_output_tokens: 200,
         compact_at_percent: 75,
         recent_turns: 3,
-        max_tool_result_tokens: 120,
     });
     manager.replay(events);
     manager.apply_compaction(18, "durable facts".into(), 4);
@@ -62,6 +62,172 @@ fn keeps_recent_turns_and_summary_within_budget() {
             .items
             .iter()
             .any(|item| matches!(item, ModelItem::Summary { .. }))
+    );
+}
+
+#[test]
+fn current_turn_keeps_complete_tool_output_when_it_fits() {
+    let output = (0..300)
+        .map(|line| format!("tracked-file-{line}.rs"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let metadata = SessionMetadata {
+        id: SessionId::from("session"),
+        created_at_ms: 0,
+        project_root: ".".into(),
+        profile: "test".into(),
+        mode: ExecutionMode::Supervised,
+        redaction_best_effort: false,
+    };
+    let mut result = ToolResult::success(CallId::from("call"), output.clone());
+    result.metadata = json!({"tool_name": "bash"});
+    let events = vec![
+        event(0, SessionEvent::SessionStarted { metadata }),
+        event(
+            1,
+            SessionEvent::UserMessage {
+                text: "Summarize the repository.".into(),
+            },
+        ),
+        event(
+            2,
+            SessionEvent::ToolCompleted {
+                operation_id: OperationId::from("operation"),
+                result,
+            },
+        ),
+    ];
+    let mut manager = ContextManager::new(ContextPolicy {
+        max_input_tokens: 16_000,
+        reserve_output_tokens: 1_000,
+        compact_at_percent: 75,
+        recent_turns: 3,
+    });
+    manager.replay(events);
+
+    let assembled = manager
+        .assemble(
+            &ModelProfile::new("test", "frontier", 16_000, 1_000),
+            Vec::new(),
+            false,
+            "/workspace/project",
+        )
+        .expect("assemble context");
+
+    assert!(assembled.request.items.iter().any(|item| {
+        matches!(
+            item,
+            ModelItem::ToolResult { content, .. } if content == &output
+        )
+    }));
+}
+
+#[test]
+fn current_turn_reports_context_overflow_instead_of_dropping_tool_output() {
+    let metadata = SessionMetadata {
+        id: SessionId::from("session"),
+        created_at_ms: 0,
+        project_root: ".".into(),
+        profile: "test".into(),
+        mode: ExecutionMode::Supervised,
+        redaction_best_effort: false,
+    };
+    let mut result = ToolResult::success(CallId::from("call"), "x".repeat(12_000));
+    result.metadata = json!({"tool_name": "bash"});
+    let mut manager = ContextManager::new(ContextPolicy {
+        max_input_tokens: 1_000,
+        reserve_output_tokens: 100,
+        compact_at_percent: 75,
+        recent_turns: 3,
+    });
+    manager.replay(vec![
+        event(0, SessionEvent::SessionStarted { metadata }),
+        event(
+            1,
+            SessionEvent::UserMessage {
+                text: "Inspect everything.".into(),
+            },
+        ),
+        event(
+            2,
+            SessionEvent::ToolCompleted {
+                operation_id: OperationId::from("operation"),
+                result,
+            },
+        ),
+    ]);
+
+    let error = manager
+        .assemble(
+            &ModelProfile::new("test", "frontier", 1_000, 100),
+            Vec::new(),
+            false,
+            "/workspace/project",
+        )
+        .expect_err("oversized current turn must fail explicitly");
+
+    assert!(error.to_string().contains("current turn exceeds"));
+}
+
+#[test]
+fn assembled_items_keep_completed_history_before_the_current_turn() {
+    let metadata = SessionMetadata {
+        id: SessionId::from("session"),
+        created_at_ms: 0,
+        project_root: ".".into(),
+        profile: "test".into(),
+        mode: ExecutionMode::Supervised,
+        redaction_best_effort: false,
+    };
+    let mut result = ToolResult::success(CallId::from("call"), "current output");
+    result.metadata = json!({"tool_name": "bash"});
+    let mut manager = ContextManager::new(ContextPolicy::default());
+    manager.replay(vec![
+        event(0, SessionEvent::SessionStarted { metadata }),
+        event(
+            1,
+            SessionEvent::UserMessage {
+                text: "older question".into(),
+            },
+        ),
+        event(
+            2,
+            SessionEvent::AssistantMessage {
+                text: "older answer".into(),
+            },
+        ),
+        event(3, SessionEvent::TurnCompleted),
+        event(
+            4,
+            SessionEvent::UserMessage {
+                text: "current question".into(),
+            },
+        ),
+        event(
+            5,
+            SessionEvent::ToolCompleted {
+                operation_id: OperationId::from("operation"),
+                result,
+            },
+        ),
+    ]);
+
+    let items = manager
+        .assemble(
+            &ModelProfile::new("test", "frontier", 128_000, 8_000),
+            Vec::new(),
+            false,
+            "/workspace/project",
+        )
+        .expect("assemble context")
+        .request
+        .items;
+
+    assert!(matches!(&items[0], ModelItem::User { text } if text == "older question"));
+    assert!(matches!(&items[1], ModelItem::Assistant { text } if text == "older answer"));
+    assert!(matches!(&items[2], ModelItem::User { text } if text == "current question"));
+    assert!(
+        matches!(&items[3], ModelItem::ToolResult { content, .. } if content == "current output")
     );
 }
 
@@ -207,6 +373,47 @@ fn delegation_schema_describes_a_round_trippable_request() {
         ]
     });
     assert!(schema_is_valid(&schema, &representative));
+}
+
+#[test]
+fn delegation_schema_counts_toward_the_context_budget() {
+    let mut manager = ContextManager::new(ContextPolicy::default());
+    manager.replay(long_session());
+    let profile = ModelProfile::new("test", "frontier", 128_000, 8_000);
+
+    let without_delegation = manager
+        .assemble(&profile, Vec::new(), false, "/workspace/project")
+        .expect("assemble without delegation");
+    let with_delegation = manager
+        .assemble(&profile, Vec::new(), true, "/workspace/project")
+        .expect("assemble with delegation");
+
+    assert!(with_delegation.estimated_tokens > without_delegation.estimated_tokens);
+}
+
+#[test]
+fn context_reserves_space_for_provider_request_envelopes() {
+    let metadata = SessionMetadata {
+        id: SessionId::from("session"),
+        created_at_ms: 0,
+        project_root: ".".into(),
+        profile: "test".into(),
+        mode: ExecutionMode::Supervised,
+        redaction_best_effort: false,
+    };
+    let mut manager = ContextManager::new(ContextPolicy::default());
+    manager.replay(vec![event(0, SessionEvent::SessionStarted { metadata })]);
+
+    let assembled = manager
+        .assemble(
+            &ModelProfile::new("test", "frontier", 128_000, 8_000),
+            Vec::new(),
+            false,
+            "/workspace/project",
+        )
+        .expect("assemble context");
+
+    assert!(assembled.estimated_tokens >= 512);
 }
 
 fn schema_is_valid(schema: &serde_json::Value, value: &serde_json::Value) -> bool {

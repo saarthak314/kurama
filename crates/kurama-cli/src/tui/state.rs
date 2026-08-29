@@ -47,7 +47,7 @@ pub struct TuiState {
     pub transcript: Vec<TranscriptEntry>,
     pub composer: String,
     pub cursor: usize,
-    pub scroll: u16,
+    pub scroll: usize,
     pub status: String,
     pub running_agents: usize,
     pub queued_agents: usize,

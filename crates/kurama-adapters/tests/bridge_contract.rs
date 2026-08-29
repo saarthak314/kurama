@@ -82,6 +82,43 @@ fn bridge_prompt_anchors_relative_tools_to_the_kurama_workspace() {
 }
 
 #[test]
+fn bridge_prompt_does_not_invent_tool_unavailability() {
+    let prompt = bridge_prompt(&request());
+
+    assert!(prompt.contains("listed Kurama tool is available through this control protocol"));
+    assert!(prompt.contains("disabled CLI tool list applies only to the bridge process"));
+    assert!(prompt.contains("return kind=tool_calls instead of kind=final"));
+    assert!(prompt.contains("nonzero exit status"));
+    assert!(prompt.contains("is_error=true"));
+    assert!(prompt.contains("not evidence that the tool is missing or unavailable"));
+    assert!(prompt.contains("only from explicit tool-result content or an engine error"));
+    assert!(prompt.contains("Never invent an unavailable-tool failure"));
+}
+
+#[test]
+fn bridge_prompt_preserves_request_tail_beyond_legacy_limit() {
+    let mut request = request();
+    let tail_marker = "complete-request-tail-marker";
+    request.items = vec![ModelItem::User {
+        text: format!("{}{}", "x".repeat(256 * 1024), tail_marker),
+    }];
+
+    let prompt = bridge_prompt(&request);
+
+    assert!(prompt.len() > 256 * 1024);
+    assert!(prompt.contains(tail_marker));
+}
+
+#[test]
+fn bridge_prompt_wrapper_fits_the_core_envelope_reserve() {
+    let request = request();
+    let serialized_request = serde_json::to_vec(&request).expect("serialize request");
+    let prompt = bridge_prompt(&request);
+
+    assert!(prompt.len() <= serialized_request.len() + 512 * 3);
+}
+
+#[test]
 fn codex_resume_command_preserves_thread_cursor() {
     let cursor = BackendCursor {
         backend: "codex_cli".into(),

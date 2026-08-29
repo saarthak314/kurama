@@ -171,6 +171,16 @@ impl Engine {
         let (command_tx, command_rx) = mpsc::channel(config.command_capacity);
         let (runtime_tx, runtime_rx) = mpsc::channel(config.event_capacity);
         let completed_tool_calls = completed_tool_calls_for_active_turn(&replay);
+        let tool_limits = ToolLimits::from_model_input_budget(
+            config
+                .context_policy
+                .max_input_tokens
+                .min(config.profile.max_input_tokens),
+            config
+                .context_policy
+                .reserve_output_tokens
+                .min(config.profile.max_output_tokens),
+        );
         let mut context = ContextManager::new(config.context_policy);
         context.replay(replay);
         let agent_manager = config.orchestration.as_ref().map(|orchestration| {
@@ -199,6 +209,7 @@ impl Engine {
             ids: config.ids,
             workspace_root: config.workspace_root,
             write_scope: config.write_scope,
+            tool_limits,
             auto: config.auto,
             agent_id: config.agent_id,
             orchestration: config.orchestration,
@@ -243,6 +254,7 @@ struct EngineActor {
     ids: Arc<dyn IdGenerator>,
     workspace_root: PathBuf,
     write_scope: WriteScope,
+    tool_limits: ToolLimits,
     auto: AutoBoundaries,
     agent_id: Option<AgentId>,
     orchestration: Option<EngineOrchestration>,
@@ -1413,7 +1425,7 @@ impl EngineActor {
             cwd: self.workspace_root.clone(),
             workspace_root: self.workspace_root.clone(),
             mode: self.mode,
-            limits: ToolLimits::default(),
+            limits: self.tool_limits,
             write_scope: self.write_scope.clone(),
         }
     }

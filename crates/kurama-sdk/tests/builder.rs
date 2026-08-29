@@ -253,20 +253,20 @@ async fn child_replay_clamps_initial_request_to_remaining_budget() {
         [
             SessionEvent::ModelUsage {
                 usage: Usage {
-                    input_tokens: 400,
-                    output_tokens: 40,
+                    input_tokens: 1_600,
+                    output_tokens: 200,
                     cached_input_tokens: 0,
                 },
             },
             SessionEvent::TurnCompleted,
         ],
     );
-    let mut budget = child_budget(1_000, 100);
+    let mut budget = child_budget(4_000, 500);
     budget.max_turns = 2;
     let backend = Arc::new(RecordingBackend::new(vec![
         vec![delegation(budget), completed(FinishReason::ToolCalls)],
         vec![
-            usage(600, 60),
+            usage(2_400, 300),
             text("child complete"),
             completed(FinishReason::Stop),
         ],
@@ -282,8 +282,8 @@ async fn child_replay_clamps_initial_request_to_remaining_budget() {
 
     let requests = child_requests(&backend);
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].profile.max_input_tokens, 600);
-    assert_eq!(requests[0].profile.max_output_tokens, 60);
+    assert_eq!(requests[0].profile.max_input_tokens, 2_400);
+    assert_eq!(requests[0].profile.max_output_tokens, 300);
     assert_eq!(child_snapshot.state, AgentState::Completed);
 }
 
@@ -331,12 +331,12 @@ async fn exhausted_child_replay_skips_model_request() {
 
 #[tokio::test]
 async fn queued_child_message_uses_remaining_token_budget() {
-    let mut budget = child_budget(1_000, 100);
+    let mut budget = child_budget(4_000, 500);
     budget.max_turns = 2;
     let (backend, child_snapshot) = run_queued_child(
         budget,
         vec![
-            usage(400, 40),
+            usage(1_600, 200),
             text("first turn"),
             completed(FinishReason::Stop),
         ],
@@ -345,10 +345,10 @@ async fn queued_child_message_uses_remaining_token_budget() {
 
     let requests = backend.child_requests();
     assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].profile.max_input_tokens, 1_000);
-    assert_eq!(requests[0].profile.max_output_tokens, 100);
-    assert_eq!(requests[1].profile.max_input_tokens, 600);
-    assert_eq!(requests[1].profile.max_output_tokens, 60);
+    assert_eq!(requests[0].profile.max_input_tokens, 4_000);
+    assert_eq!(requests[0].profile.max_output_tokens, 500);
+    assert_eq!(requests[1].profile.max_input_tokens, 2_400);
+    assert_eq!(requests[1].profile.max_output_tokens, 300);
     assert_eq!(child_snapshot.state, AgentState::Completed);
 }
 

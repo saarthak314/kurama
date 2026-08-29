@@ -45,8 +45,8 @@ impl BoundedOutput {
     pub fn new(limits: ToolLimits) -> Self {
         Self {
             limits,
-            head: Vec::with_capacity(limits.max_bytes.div_ceil(2)),
-            tail: VecDeque::with_capacity(limits.max_bytes / 2),
+            head: Vec::new(),
+            tail: VecDeque::new(),
             head_lines: 0,
             tail_lines: 0,
             total_bytes: 0,
@@ -126,16 +126,39 @@ impl BoundedOutput {
         let retained_lines = logical_lines(&retained);
         let truncated = retained_bytes < self.total_bytes || retained_lines < self.total_lines;
         let (head, tail) = fit_utf8_edges(&self.head, &self.tail, self.limits.max_bytes);
-        let text = format!("{head}{tail}");
+        let mut text = format!("{head}{tail}");
         let rendered_truncated = retained_bytes_to_utf8_len(&self.head, &self.tail) > text.len();
+        let mut omitted_bytes = self.total_bytes.saturating_sub(retained_bytes);
+        let mut omitted_lines = self.total_lines.saturating_sub(retained_lines);
+
+        if truncated || rendered_truncated {
+            for _ in 0..32 {
+                let marker = omission_marker(omitted_bytes, omitted_lines, self.limits.max_bytes);
+                let content_budget = self.limits.max_bytes.saturating_sub(marker.len());
+                let (head, tail) = fit_utf8_edges(&self.head, &self.tail, content_budget);
+                let retained_text = format!("{head}{tail}");
+                let next_omitted_bytes = self
+                    .total_bytes
+                    .saturating_sub(retained_bytes.min(retained_text.len()));
+                let next_omitted_lines = self
+                    .total_lines
+                    .saturating_sub(retained_lines.min(logical_lines(retained_text.as_bytes())));
+                text = format!("{head}{marker}{tail}");
+                if next_omitted_bytes == omitted_bytes && next_omitted_lines == omitted_lines {
+                    break;
+                }
+                omitted_bytes = next_omitted_bytes;
+                omitted_lines = next_omitted_lines;
+            }
+        }
 
         BoundedText {
             text,
             truncated: truncated || rendered_truncated,
             total_bytes: self.total_bytes,
             total_lines: self.total_lines,
-            omitted_bytes: self.total_bytes.saturating_sub(retained_bytes),
-            omitted_lines: self.total_lines.saturating_sub(retained_lines),
+            omitted_bytes,
+            omitted_lines,
             blob_ref,
             staged_path,
             staging_error,
@@ -191,6 +214,20 @@ fn logical_lines(bytes: &[u8]) -> usize {
 fn retained_bytes_to_utf8_len(head: &[u8], tail: &VecDeque<u8>) -> usize {
     let tail: Vec<u8> = tail.iter().copied().collect();
     String::from_utf8_lossy(head).len() + String::from_utf8_lossy(&tail).len()
+}
+
+fn omission_marker(omitted_bytes: usize, omitted_lines: usize, max_bytes: usize) -> String {
+    let verbose = format!("\n[... omitted {omitted_bytes} bytes / {omitted_lines} lines ...]\n");
+    if verbose.len() <= max_bytes {
+        return verbose;
+    }
+
+    let compact = format!("[omitted {omitted_bytes}B/{omitted_lines}L]");
+    if compact.len() <= max_bytes {
+        return compact;
+    }
+
+    format!("~{omitted_bytes}B/{omitted_lines}L~")
 }
 
 fn fit_utf8_edges(head: &[u8], tail: &VecDeque<u8>, max_bytes: usize) -> (String, String) {

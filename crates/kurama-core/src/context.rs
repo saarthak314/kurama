@@ -9,13 +9,14 @@ use kurama_protocol::{
 
 use crate::prompts::SYSTEM_PROMPT;
 
+const PROVIDER_ENVELOPE_RESERVE_TOKENS: u64 = 512;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextPolicy {
     pub max_input_tokens: u64,
     pub reserve_output_tokens: u64,
     pub compact_at_percent: u8,
     pub recent_turns: usize,
-    pub max_tool_result_tokens: u64,
 }
 
 impl Default for ContextPolicy {
@@ -25,7 +26,6 @@ impl Default for ContextPolicy {
             reserve_output_tokens: 8_000,
             compact_at_percent: 75,
             recent_turns: 4,
-            max_tool_result_tokens: 1_200,
         }
     }
 }
@@ -189,10 +189,24 @@ impl ContextManager {
             );
         let system_tokens = estimate_text(SYSTEM_PROMPT);
         let tool_tokens = estimate_serialized(serde_json::to_vec(&tools))?;
-        let fixed_tokens = system_tokens.saturating_add(tool_tokens);
+        let request_shell = ModelRequest {
+            session_id,
+            agent_id,
+            workspace_root: workspace_root.into(),
+            profile: profile.clone(),
+            system: SYSTEM_PROMPT.into(),
+            items: Vec::new(),
+            tools,
+            delegation: delegation_enabled.then(|| DelegationSchema {
+                parameters: delegation_schema(),
+            }),
+            continuation: None,
+        };
+        let fixed_tokens = estimate_serialized(serde_json::to_vec(&request_shell))?
+            .saturating_add(PROVIDER_ENVELOPE_RESERVE_TOKENS);
         if fixed_tokens > usable_tokens {
             return Err(KuramaError::Session(
-                "system prompt and tool schemas exceed the input budget".into(),
+                "model request instructions and tool schemas exceed the input budget".into(),
             ));
         }
 
@@ -206,6 +220,20 @@ impl ContextManager {
             ..ContextReport::default()
         };
 
+        let turns = split_turns(&self.canonical);
+        let current_items = turns
+            .iter()
+            .rev()
+            .find(|turn| !turn.complete)
+            .map_or_else(Vec::new, |turn| self.items_for_events(&turn.events));
+        let current_tokens = estimate_items(&current_items)?;
+        if fixed_tokens.saturating_add(current_tokens) > usable_tokens {
+            return Err(KuramaError::Session(
+                "current turn exceeds the model input context budget; tool output was preserved"
+                    .into(),
+            ));
+        }
+
         if let Some(summary) = &self.summary {
             let item = ModelItem::Summary {
                 text: summary.text.clone(),
@@ -216,20 +244,8 @@ impl ContextManager {
                 &mut items,
                 item,
                 &mut used,
-                usable_tokens,
+                usable_tokens.saturating_sub(current_tokens),
                 &mut report.summary_tokens,
-            )?;
-        }
-
-        let turns = split_turns(&self.canonical);
-        if let Some(current) = turns.iter().rev().find(|turn| !turn.complete) {
-            let current_items = self.items_for_events(&current.events);
-            push_items(
-                &mut items,
-                current_items,
-                &mut used,
-                usable_tokens,
-                &mut report.current_turn_tokens,
             )?;
         }
 
@@ -246,10 +262,17 @@ impl ContextManager {
                 &mut items,
                 turn_items,
                 &mut used,
-                usable_tokens,
+                usable_tokens.saturating_sub(current_tokens),
                 &mut report.recent_turn_tokens,
             )?;
         }
+
+        push_required_items(
+            &mut items,
+            current_items,
+            &mut used,
+            &mut report.current_turn_tokens,
+        )?;
 
         for evidence in self.evidence_items() {
             if !push_if_fits(
@@ -268,17 +291,8 @@ impl ContextManager {
             >= usable_tokens.saturating_mul(self.policy.compact_at_percent.into());
         Ok(AssembledContext {
             request: ModelRequest {
-                session_id,
-                agent_id,
-                workspace_root: workspace_root.into(),
-                profile: profile.clone(),
-                system: SYSTEM_PROMPT.into(),
                 items,
-                tools,
-                delegation: delegation_enabled.then(|| DelegationSchema {
-                    parameters: delegation_schema(),
-                }),
-                continuation: None,
+                ..request_shell
             },
             estimated_tokens: used,
             report,
@@ -301,10 +315,7 @@ impl ContextManager {
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("tool")
                         .into(),
-                    content: truncate_text(
-                        &result.output,
-                        self.policy.max_tool_result_tokens.saturating_mul(3) as usize,
-                    ),
+                    content: result.output.clone(),
                     is_error: result.is_error,
                     blob_refs: result.blob_refs.clone(),
                 }),
@@ -343,10 +354,7 @@ impl ContextManager {
                 };
                 evidence.push(ModelItem::Evidence {
                     path: path.into(),
-                    content: truncate_text(
-                        content,
-                        self.policy.max_tool_result_tokens.saturating_mul(3) as usize,
-                    ),
+                    content: content.into(),
                     blob: result.blob_refs.first().cloned(),
                 });
             }
@@ -427,6 +435,27 @@ fn push_items(
     Ok(())
 }
 
+fn push_required_items(
+    destination: &mut Vec<ModelItem>,
+    items: Vec<ModelItem>,
+    used: &mut u64,
+    category: &mut u64,
+) -> Result<(), KuramaError> {
+    for item in items {
+        let tokens = estimate_serialized(serde_json::to_vec(&item))?;
+        destination.push(item);
+        *used += tokens;
+        *category += tokens;
+    }
+    Ok(())
+}
+
+fn estimate_items(items: &[ModelItem]) -> Result<u64, KuramaError> {
+    items.iter().try_fold(0_u64, |total, item| {
+        estimate_serialized(serde_json::to_vec(item)).map(|tokens| total.saturating_add(tokens))
+    })
+}
+
 fn push_if_fits(
     destination: &mut Vec<ModelItem>,
     item: ModelItem,
@@ -456,17 +485,6 @@ fn estimate_serialized(serialized: Result<Vec<u8>, serde_json::Error>) -> Result
 
 fn estimate_bytes(bytes: usize) -> u64 {
     (bytes as u64).div_ceil(3)
-}
-
-fn truncate_text(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.into();
-    }
-    let mut boundary = max_bytes;
-    while !text.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    format!("{}\n[truncated]", &text[..boundary])
 }
 
 fn delegation_schema() -> serde_json::Value {

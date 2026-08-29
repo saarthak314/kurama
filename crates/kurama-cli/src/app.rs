@@ -1224,4 +1224,24 @@ mod tests {
         assert_eq!(state.transcript.len(), 1);
         assert_eq!(state.transcript[0].body, "final output");
     }
+
+    #[test]
+    fn page_up_scrolls_past_the_u16_line_limit() {
+        let mut app = App {
+            state: TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised),
+            engine: None,
+            runtime_events: None,
+            tool_events: None,
+            orchestrator: None,
+            session_id: None,
+            restart_args: None,
+            control: None,
+        };
+        app.state.scroll = usize::from(u16::MAX);
+
+        app.handle_main_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
+            .expect("page up");
+
+        assert!(app.state.scroll > usize::from(u16::MAX));
+    }
 }

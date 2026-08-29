@@ -215,7 +215,7 @@ async fn bash_bounds_stdout_and_stderr_with_head_and_tail() {
         "timeout_ms": 1000
     }));
     let small = ToolLimits {
-        max_bytes: 16,
+        max_bytes: 64,
         max_lines: 2,
     };
 
@@ -235,6 +235,12 @@ async fn bash_bounds_stdout_and_stderr_with_head_and_tail() {
         result.metadata["stdout"]
             .as_str()
             .unwrap()
+            .contains("omitted 19 bytes / 3 lines")
+    );
+    assert!(
+        result.metadata["stdout"]
+            .as_str()
+            .unwrap()
             .ends_with("tail2\n")
     );
     assert!(
@@ -242,6 +248,12 @@ async fn bash_bounds_stdout_and_stderr_with_head_and_tail() {
             .as_str()
             .unwrap()
             .starts_with("errhead")
+    );
+    assert!(
+        result.metadata["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("omitted 10 bytes / 1 lines")
     );
     assert!(
         result.metadata["stderr"]

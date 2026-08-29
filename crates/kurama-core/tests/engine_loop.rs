@@ -19,12 +19,53 @@ use kurama_protocol::{
     policy::{ApprovalResponse, AutoBoundaries, ExecutionMode, PolicyContext, PolicyDecision},
     runtime::RuntimeEvent,
     session::{EventEnvelope, FileCheckpoint, SessionEvent, SessionMetadata},
-    tool::{CommandClass, Operation, ToolContext, ToolDescriptor, ToolInvocation, ToolResult},
+    tool::{
+        CommandClass, Operation, ToolContext, ToolDescriptor, ToolInvocation, ToolLimits,
+        ToolResult,
+    },
     traits::{ApprovalPolicy, BoxFuture, CancelSignal, ModelBackend, SessionStore, Tool},
 };
 
 fn replay_event(sequence: u64, event: SessionEvent) -> EventEnvelope {
     EventEnvelope::new(sequence, sequence, SessionId::from("resume"), None, event)
+}
+
+#[derive(Default)]
+struct LimitRecordingTool {
+    observed: Arc<Mutex<Option<ToolLimits>>>,
+}
+
+impl Tool for LimitRecordingTool {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "limits".into(),
+            description: "record tool limits".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }
+    }
+
+    fn classify(
+        &self,
+        _context: &ToolContext,
+        _invocation: &ToolInvocation,
+    ) -> Result<Operation, kurama_protocol::KuramaError> {
+        Ok(Operation::Read {
+            path: PathBuf::from("."),
+            external: false,
+        })
+    }
+
+    fn execute<'a>(
+        &'a self,
+        context: ToolContext,
+        invocation: ToolInvocation,
+        _cancel: &'a dyn CancelSignal,
+    ) -> BoxFuture<'a, Result<ToolResult, kurama_protocol::KuramaError>> {
+        Box::pin(async move {
+            *self.observed.lock().expect("observed limits lock") = Some(context.limits);
+            Ok(ToolResult::success(invocation.call_id, "ok"))
+        })
+    }
 }
 
 fn resume_config(
@@ -141,6 +182,75 @@ async fn engine_executes_tool_and_finishes_turn() {
     assert!(saw_tool);
     assert_eq!(text, "Done.");
     assert_eq!(store.operation_completion_count("session", "o_1"), 1);
+}
+
+#[tokio::test]
+async fn engine_derives_tool_limits_from_the_effective_model_input_budget() {
+    let backend = ScriptedBackend::new(vec![
+        vec![
+            Ok(ModelEvent::ToolCall {
+                call_id: "call_1".into(),
+                name: "limits".into(),
+                arguments: serde_json::json!({}),
+            }),
+            Ok(ModelEvent::ResponseCompleted {
+                cursor: None,
+                finish_reason: FinishReason::ToolCalls,
+            }),
+        ],
+        vec![Ok(ModelEvent::ResponseCompleted {
+            cursor: None,
+            finish_reason: FinishReason::Stop,
+        })],
+    ]);
+    let tool = LimitRecordingTool::default();
+    let observed = tool.observed.clone();
+    let config = EngineConfig {
+        session: SessionMetadata {
+            id: "limits-session".into(),
+            created_at_ms: 0,
+            project_root: ".".into(),
+            profile: "test".into(),
+            mode: ExecutionMode::Supervised,
+            redaction_best_effort: false,
+        },
+        profile: ModelProfile::new("test", "frontier", 10_000, 1_000),
+        backend: Arc::new(backend),
+        tools: vec![Arc::new(tool)],
+        policy: Arc::new(AllowAllPolicy),
+        store: Arc::new(MemoryStore::default()),
+        sink: Arc::new(CollectingSink::default()),
+        orchestrator: Arc::new(NoDelegation),
+        ids: Arc::new(SequenceIds::new(1)),
+        context_policy: ContextPolicy {
+            max_input_tokens: 12_000,
+            reserve_output_tokens: 2_000,
+            ..ContextPolicy::default()
+        },
+        workspace_root: PathBuf::from("."),
+        write_scope: WriteScope::default(),
+        auto: AutoBoundaries::default(),
+        agent_id: None,
+        orchestration: None,
+        provider_retry_delays_ms: Vec::new(),
+        command_capacity: 32,
+        event_capacity: 128,
+    };
+    let (handle, mut events) = Engine::spawn(config, Vec::new()).expect("spawn engine");
+    handle.submit("inspect", false).await.expect("submit");
+
+    while !matches!(
+        events.recv().await.expect("runtime event"),
+        RuntimeEvent::TurnCompleted
+    ) {}
+
+    assert_eq!(
+        *observed.lock().expect("observed limits lock"),
+        Some(ToolLimits {
+            max_bytes: 27_000,
+            max_lines: usize::MAX,
+        })
+    );
 }
 
 #[tokio::test]
