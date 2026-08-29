@@ -1,9 +1,9 @@
 use std::{io, thread};
 
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
+    event::{self, Event},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode},
 };
 use tokio::sync::mpsc;
 
@@ -12,19 +12,9 @@ pub struct TerminalGuard;
 impl TerminalGuard {
     pub fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        if let Err(error) = execute!(
-            io::stdout(),
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            crossterm::cursor::Hide
-        ) {
+        if let Err(error) = execute!(io::stdout(), crossterm::cursor::Hide) {
             let _ = disable_raw_mode();
-            let _ = execute!(
-                io::stdout(),
-                crossterm::cursor::Show,
-                DisableMouseCapture,
-                LeaveAlternateScreen
-            );
+            let _ = execute!(io::stdout(), crossterm::cursor::Show);
             return Err(error);
         }
         Ok(Self)
@@ -34,12 +24,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            crossterm::cursor::Show,
-            DisableMouseCapture,
-            LeaveAlternateScreen
-        );
+        let _ = execute!(io::stdout(), crossterm::cursor::Show);
     }
 }
 

@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use kurama_adapters::{
     AppPaths, BashTool, ConfigRepository, CredentialResolver, FsSessionStore, HttpClient,
     JsonSearchBackend, OpenAiNativeSearch, ProviderFactory, RandomIds, ReadTool, SearchBackend,
@@ -32,7 +32,7 @@ use kurama_protocol::{
 };
 use kurama_sdk::AgentBuilder;
 use ratatui::{
-    Terminal,
+    Terminal, TerminalOptions, Viewport,
     backend::{Backend, CrosstermBackend},
 };
 use tokio::sync::mpsc;
@@ -426,7 +426,16 @@ impl App {
     pub async fn run(mut self) -> Result<(), String> {
         let _guard = TerminalGuard::enter().map_err(|error| error.to_string())?;
         let backend = CrosstermBackend::new(io::stdout());
-        let mut terminal = Terminal::new(backend).map_err(|error| error.to_string())?;
+        let rows = crossterm::terminal::size()
+            .map_err(|error| error.to_string())?
+            .1;
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(inline_viewport_height(rows)),
+            },
+        )
+        .map_err(|error| error.to_string())?;
         let mut input = spawn_input_thread(32);
         loop {
             let runtime_events = self.runtime_events.take();
@@ -456,13 +465,8 @@ impl App {
     }
 
     pub fn handle_event(&mut self, event: Event) -> Result<bool, String> {
-        let key = match event {
-            Event::Key(key) => key,
-            Event::Mouse(mouse) => {
-                self.handle_mouse(mouse);
-                return Ok(false);
-            }
-            _ => return Ok(false),
+        let Event::Key(key) = event else {
+            return Ok(false);
         };
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.state.queue_command(EngineCommand::Shutdown);
@@ -540,21 +544,6 @@ impl App {
             _ => {}
         }
         Ok(())
-    }
-
-    fn handle_mouse(&mut self, mouse: MouseEvent) {
-        if !self.transcript_is_visible() {
-            return;
-        }
-        match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                self.state.scroll = self.state.scroll.saturating_add(5);
-            }
-            MouseEventKind::ScrollDown => {
-                self.state.scroll = self.state.scroll.saturating_sub(5);
-            }
-            _ => {}
-        }
     }
 
     fn transcript_is_visible(&self) -> bool {
@@ -890,6 +879,10 @@ impl App {
         }
         Ok(())
     }
+}
+
+fn inline_viewport_height(rows: u16) -> u16 {
+    rows.saturating_sub(1).clamp(6, 24).min(rows)
 }
 
 pub async fn run(args: Args) -> Result<(), String> {
@@ -1288,7 +1281,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_wheel_scrolls_the_main_transcript() {
+    fn mouse_events_preserve_native_terminal_selection() {
         let mut app = App {
             state: TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised),
             engine: None,
@@ -1307,7 +1300,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         }))
         .expect("scroll up");
-        assert_eq!(app.state.scroll, 5);
+        assert_eq!(app.state.scroll, 0);
 
         app.handle_event(Event::Mouse(MouseEvent {
             kind: MouseEventKind::ScrollDown,
@@ -1317,5 +1310,12 @@ mod tests {
         }))
         .expect("scroll down");
         assert_eq!(app.state.scroll, 0);
+    }
+
+    #[test]
+    fn inline_viewport_height_stays_within_the_terminal() {
+        assert_eq!(inline_viewport_height(40), 24);
+        assert_eq!(inline_viewport_height(20), 19);
+        assert_eq!(inline_viewport_height(6), 6);
     }
 }
