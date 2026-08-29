@@ -5,7 +5,7 @@ use std::{
 };
 
 use kurama_core::{
-    context::ContextPolicy,
+    context::{ContextManager, ContextPolicy},
     engine::{Engine, EngineConfig},
     testing::{
         AllowAllPolicy, CollectingSink, EchoTool, MemoryStore, NoDelegation, ScriptedBackend,
@@ -14,7 +14,7 @@ use kurama_core::{
 };
 use kurama_protocol::{
     agent::{AgentSnapshot, AgentState, WriteScope},
-    id::{OperationId, SessionId},
+    id::{CallId, OperationId, SessionId},
     model::{FinishReason, ModelEvent, ModelProfile},
     policy::{ApprovalResponse, AutoBoundaries, ExecutionMode, PolicyContext, PolicyDecision},
     runtime::RuntimeEvent,
@@ -111,6 +111,190 @@ fn seed_replay(store: &MemoryStore, replay: &[EventEnvelope]) {
     for event in replay {
         store.append(event).expect("seed replay event");
     }
+}
+
+struct StagedOutputTool {
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+}
+
+impl Tool for StagedOutputTool {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "staged".into(),
+            description: "return staged display output".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }
+    }
+
+    fn classify(
+        &self,
+        _context: &ToolContext,
+        _invocation: &ToolInvocation,
+    ) -> Result<Operation, kurama_protocol::KuramaError> {
+        Ok(Operation::Read {
+            path: PathBuf::from("."),
+            external: false,
+        })
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _context: ToolContext,
+        invocation: ToolInvocation,
+        _cancel: &'a dyn CancelSignal,
+    ) -> BoxFuture<'a, Result<ToolResult, kurama_protocol::KuramaError>> {
+        Box::pin(async move {
+            Ok(ToolResult {
+                call_id: invocation.call_id,
+                output: "head\n[omitted]\ntail\n\n[stderr]\nwarn\n".into(),
+                is_error: false,
+                metadata: serde_json::json!({
+                    "_display_staging": {
+                        "stdout": self.stdout_path,
+                        "stderr": self.stderr_path
+                    }
+                }),
+                truncated: true,
+                blob_refs: Vec::new(),
+            })
+        })
+    }
+}
+
+fn unique_staging_path(stream: &str) -> PathBuf {
+    static NEXT_PATH: AtomicUsize = AtomicUsize::new(0);
+    std::env::temp_dir().join(format!(
+        "kurama-engine-test-{}-{}-{stream}",
+        std::process::id(),
+        NEXT_PATH.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+#[tokio::test]
+async fn tool_completion_persists_display_blobs_without_full_output_in_events() {
+    let full_stdout = "head\nfull middle output\ntail\n";
+    let full_stderr = "warn\n";
+    let stdout_path = unique_staging_path("stdout");
+    let stderr_path = unique_staging_path("stderr");
+    std::fs::write(&stdout_path, full_stdout).expect("stage stdout");
+    std::fs::write(&stderr_path, full_stderr).expect("stage stderr");
+    let backend = ScriptedBackend::new(vec![
+        vec![
+            Ok(ModelEvent::ToolCall {
+                call_id: CallId::from("call_1"),
+                name: "staged".into(),
+                arguments: serde_json::json!({}),
+            }),
+            Ok(ModelEvent::ResponseCompleted {
+                cursor: None,
+                finish_reason: FinishReason::ToolCalls,
+            }),
+        ],
+        vec![Ok(ModelEvent::ResponseCompleted {
+            cursor: None,
+            finish_reason: FinishReason::Stop,
+        })],
+    ]);
+    let store = Arc::new(MemoryStore::default());
+    let config = EngineConfig {
+        session: SessionMetadata {
+            id: "session".into(),
+            created_at_ms: 0,
+            project_root: ".".into(),
+            profile: "test".into(),
+            mode: ExecutionMode::Supervised,
+            redaction_best_effort: false,
+        },
+        profile: ModelProfile::new("test", "frontier", 4_000, 500),
+        backend: Arc::new(backend),
+        tools: vec![Arc::new(StagedOutputTool {
+            stdout_path: stdout_path.clone(),
+            stderr_path: stderr_path.clone(),
+        })],
+        policy: Arc::new(AllowAllPolicy),
+        store: store.clone(),
+        sink: Arc::new(CollectingSink::default()),
+        orchestrator: Arc::new(NoDelegation),
+        ids: Arc::new(SequenceIds::new(1)),
+        context_policy: ContextPolicy::default(),
+        workspace_root: PathBuf::from("."),
+        write_scope: WriteScope::default(),
+        auto: AutoBoundaries::default(),
+        agent_id: None,
+        orchestration: None,
+        provider_retry_delays_ms: Vec::new(),
+        command_capacity: 32,
+        event_capacity: 128,
+    };
+    let (handle, mut events) = Engine::spawn(config, Vec::new()).expect("spawn engine");
+    handle.submit("inspect", false).await.expect("submit");
+    while !matches!(events.recv().await, Some(RuntimeEvent::TurnCompleted)) {}
+
+    let completion = store
+        .events("session")
+        .into_iter()
+        .find(|event| matches!(event.event, SessionEvent::ToolCompleted { .. }))
+        .expect("tool completion");
+    let SessionEvent::ToolCompleted { result, .. } = &completion.event else {
+        unreachable!();
+    };
+    assert!(result.metadata.get("_display_staging").is_none());
+    assert!(result.metadata.get("display_output").is_none());
+    assert!(result.blob_refs.is_empty());
+    let display_blobs = result.metadata["display_blobs"]
+        .as_object()
+        .expect("display blob references");
+    let stdout: kurama_protocol::session::BlobRef =
+        serde_json::from_value(display_blobs["stdout"].clone()).expect("stdout blob reference");
+    let stderr: kurama_protocol::session::BlobRef =
+        serde_json::from_value(display_blobs["stderr"].clone()).expect("stderr blob reference");
+    assert_eq!(
+        store.get_blob(&stdout).expect("stdout blob"),
+        full_stdout.as_bytes()
+    );
+    assert_eq!(
+        store.get_blob(&stderr).expect("stderr blob"),
+        full_stderr.as_bytes()
+    );
+    assert!(
+        !serde_json::to_string(&completion)
+            .expect("serialize completion")
+            .contains("full middle output")
+    );
+    let mut context = ContextManager::new(ContextPolicy::default());
+    context.replay(store.replay(&SessionId::from("session")).expect("replay"));
+    let model_request = context
+        .assemble(
+            &ModelProfile::new("test", "frontier", 4_000, 500),
+            Vec::new(),
+            false,
+            ".",
+        )
+        .expect("assemble model context")
+        .request;
+    let model_tool_result = model_request
+        .items
+        .iter()
+        .find_map(|item| match item {
+            kurama_protocol::model::ModelItem::ToolResult {
+                content, blob_refs, ..
+            } => Some((content, blob_refs)),
+            _ => None,
+        })
+        .expect("model tool result");
+    assert_eq!(
+        model_tool_result.0,
+        "head\n[omitted]\ntail\n\n[stderr]\nwarn\n"
+    );
+    assert!(model_tool_result.1.is_empty());
+    assert!(
+        !serde_json::to_string(&model_request)
+            .expect("serialize model request")
+            .contains("full middle output")
+    );
+    assert!(!stdout_path.exists());
+    assert!(!stderr_path.exists());
 }
 
 #[tokio::test]

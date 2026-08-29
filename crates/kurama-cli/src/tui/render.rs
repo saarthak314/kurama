@@ -279,12 +279,13 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) {
                 Span::raw("")
             },
         ]));
-        lines.push(Line::from(Span::styled(
-            connection_note(index),
-            Style::default().fg(DIM),
-        )));
-        lines.push(Line::from(""));
     }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        connection_note(state.onboarding.selected()).trim_start(),
+        Style::default().fg(DIM),
+    )));
+    lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::styled(
             "REMOTE-FIRST",

@@ -220,6 +220,10 @@ async fn resume_hydrates_the_visible_transcript_once() {
         redaction_best_effort: false,
     };
     store.create(&metadata).expect("create session");
+    let stdout_blob = store
+        .put_blob(b"head\nfull middle output\ntail\n")
+        .expect("store stdout blob");
+    let stderr_blob = store.put_blob(b"warning\n").expect("store stderr blob");
     for (sequence, event) in [
         SessionEvent::SessionStarted { metadata },
         SessionEvent::UserMessage {
@@ -240,10 +244,16 @@ async fn resume_hydrates_the_visible_transcript_once() {
             operation_id: OperationId::from("operation"),
             result: ToolResult {
                 call_id: CallId::from("call"),
-                output: "parser.rs:12".into(),
+                output: "head\n[omitted]\ntail\n\n[stderr]\nwarning\n".into(),
                 is_error: false,
-                metadata: serde_json::json!({"tool_name": "read"}),
-                truncated: false,
+                metadata: serde_json::json!({
+                    "tool_name": "bash",
+                    "display_blobs": {
+                        "stdout": stdout_blob.clone(),
+                        "stderr": stderr_blob.clone()
+                    }
+                }),
+                truncated: true,
                 blob_refs: Vec::new(),
             },
         },
@@ -276,6 +286,27 @@ async fn resume_hydrates_the_visible_transcript_once() {
     )
     .expect("bootstrap");
 
+    let durable_replay = store
+        .replay(&"s_transcript".into())
+        .expect("durable replay");
+    let durable_result = durable_replay
+        .iter()
+        .find_map(|event| match &event.event {
+            SessionEvent::ToolCompleted { result, .. } => Some(result),
+            _ => None,
+        })
+        .expect("durable tool result");
+    assert_eq!(
+        durable_result.output,
+        "head\n[omitted]\ntail\n\n[stderr]\nwarning\n"
+    );
+    assert!(durable_result.metadata.get("display_output").is_none());
+    assert!(
+        !serde_json::to_string(&durable_replay)
+            .expect("serialize durable replay")
+            .contains("full middle output")
+    );
+
     assert_eq!(
         app.state
             .transcript
@@ -285,7 +316,10 @@ async fn resume_hydrates_the_visible_transcript_once() {
         [
             ("YOU", "inspect the parser"),
             ("KURAMA", "checking it"),
-            ("TOOL / read", "parser.rs:12"),
+            (
+                "TOOL / bash",
+                "head\nfull middle output\ntail\n\n[stderr]\nwarning\n"
+            ),
             ("ERROR", "provider disconnected"),
         ]
     );

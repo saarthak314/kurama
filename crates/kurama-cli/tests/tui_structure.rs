@@ -621,6 +621,20 @@ fn every_tui_view_uses_a_readable_dark_surface() {
 }
 
 #[test]
+fn onboarding_keeps_the_last_connection_option_visible() {
+    let mut state = TuiState::onboarding(".");
+    for _ in 0..4 {
+        state.onboarding.select_next();
+    }
+
+    let text = buffer_text(&rendered(&state, 100, 24));
+
+    assert!(text.contains("OpenAI-compatible or local endpoint"));
+    assert!(text.contains("Connect to an existing HTTP endpoint"));
+    assert!(text.contains("SELECTED"));
+}
+
+#[test]
 fn composer_cursor_tracks_the_visual_insertion_point() {
     let mut state = TuiState::new(
         "openai-main",

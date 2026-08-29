@@ -165,6 +165,81 @@ fn tool_completion_finalizes_the_streamed_entry_by_result_call_id() {
 }
 
 #[test]
+fn truncated_tool_completion_preserves_full_streamed_output() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.apply_runtime_event(tool_delta(
+        "call_1",
+        "stdout",
+        "head\nfull middle output\ntail\n",
+    ));
+    let mut result = tool_result("call_1", "head\n[omitted]\ntail\n", "bash");
+    result.truncated = true;
+
+    state.apply_runtime_event(RuntimeEvent::ToolCompleted {
+        operation_id: OperationId::from("operation_1"),
+        result,
+    });
+
+    assert_eq!(state.transcript.len(), 1);
+    assert_eq!(state.transcript[0].body, "head\nfull middle output\ntail\n");
+}
+
+#[test]
+fn truncated_mixed_streams_keep_explicit_stream_boundaries() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.apply_runtime_event(tool_delta("call_1", "stdout", "output"));
+    state.apply_runtime_event(tool_delta("call_1", "stderr", "warning"));
+    state.apply_runtime_event(tool_delta("call_1", "stdout", "done"));
+    let mut result = tool_result("call_1", "output\n[stderr]\nwarningdone", "bash");
+    result.truncated = true;
+
+    state.apply_runtime_event(RuntimeEvent::ToolCompleted {
+        operation_id: OperationId::from("operation_1"),
+        result,
+    });
+
+    assert_eq!(
+        state.transcript[0].body,
+        "output\n[stderr]\nwarning\n[stdout]\ndone"
+    );
+}
+
+#[test]
+fn execution_errors_append_after_streamed_diagnostics() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.apply_runtime_event(tool_delta("call_1", "stderr", "diagnostic\n"));
+    let mut result = tool_result("call_1", "command timed out after 1000 ms", "bash");
+    result.is_error = true;
+    result.metadata["execution_error"] = serde_json::Value::Bool(true);
+
+    state.apply_runtime_event(RuntimeEvent::ToolCompleted {
+        operation_id: OperationId::from("operation_1"),
+        result,
+    });
+
+    assert_eq!(
+        state.transcript[0].body,
+        "diagnostic\n\n[error]\ncommand timed out after 1000 ms"
+    );
+}
+
+#[test]
+fn replay_uses_display_hydrated_tool_output() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    let mut result = tool_result("call_1", "head\n[omitted]\ntail\n", "bash");
+    result.truncated = true;
+    result.metadata["display_output"] =
+        serde_json::Value::String("head\nfull middle output\ntail\n".into());
+
+    state.hydrate_replay(&[replay_event(SessionEvent::ToolCompleted {
+        operation_id: OperationId::from("operation_1"),
+        result,
+    })]);
+
+    assert_eq!(state.transcript[0].body, "head\nfull middle output\ntail\n");
+}
+
+#[test]
 fn tool_streams_with_different_call_ids_remain_separate() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
 

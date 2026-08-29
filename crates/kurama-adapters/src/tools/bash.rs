@@ -1,7 +1,10 @@
 use std::{
     path::PathBuf,
     process::{ExitStatus, Stdio},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -23,6 +26,8 @@ const MAX_COMMAND_BYTES: usize = 32_768;
 const MAX_TIMEOUT_MS: u64 = 3_600_000;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
 const EVENT_CHUNK_BYTES: usize = 4 * 1024;
+const DISPLAY_STAGING_KEY: &str = "_display_staging";
+static NEXT_STAGING_FILE: AtomicU64 = AtomicU64::new(0);
 
 pub struct BashTool {
     shell_path: PathBuf,
@@ -204,41 +209,57 @@ impl Tool for BashTool {
                     return Err(KuramaError::Cancelled);
                 }
             };
-            let stdout = stdout.expect("completed command has captured stdout");
-            let stderr = stderr.expect("completed command has captured stderr");
+            let mut stdout = stdout.expect("completed command has captured stdout");
+            let mut stderr = stderr.expect("completed command has captured stderr");
             let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
             let exit_code = status.code();
             let signal = exit_signal(&status);
             let is_error = !status.success();
             let truncated = stdout.truncated || stderr.truncated;
-            let mut blob_refs = Vec::new();
-            blob_refs.extend(stdout.blob_ref.clone());
-            blob_refs.extend(stderr.blob_ref.clone());
             let output = combined_output(&stdout.text, &stderr.text);
+            let mut metadata = serde_json::json!({
+                "command_class": classify_command(&arguments.command),
+                "cwd": cwd,
+                "exit_code": exit_code,
+                "signal": signal,
+                "elapsed_ms": elapsed_ms,
+                "stdout": stdout.text.clone(),
+                "stderr": stderr.text.clone(),
+                "stdout_truncated": stdout.truncated,
+                "stderr_truncated": stderr.truncated,
+                "stdout_total_bytes": stdout.total_bytes,
+                "stderr_total_bytes": stderr.total_bytes,
+                "stdout_omitted_bytes": stdout.omitted_bytes,
+                "stderr_omitted_bytes": stderr.omitted_bytes,
+                "stdout_omitted_lines": stdout.omitted_lines,
+                "stderr_omitted_lines": stderr.omitted_lines
+            });
+            if truncated {
+                let mut staging = serde_json::Map::new();
+                if let Some(path) = stdout.take_staged_path() {
+                    staging.insert(
+                        "stdout".into(),
+                        serde_json::Value::String(path.display().to_string()),
+                    );
+                }
+                if let Some(path) = stderr.take_staged_path() {
+                    staging.insert(
+                        "stderr".into(),
+                        serde_json::Value::String(path.display().to_string()),
+                    );
+                }
+                if !staging.is_empty() {
+                    metadata[DISPLAY_STAGING_KEY] = serde_json::Value::Object(staging);
+                }
+            }
 
             Ok(ToolResult {
                 call_id: invocation.call_id,
                 output,
                 is_error,
-                metadata: serde_json::json!({
-                    "command_class": classify_command(&arguments.command),
-                    "cwd": cwd,
-                    "exit_code": exit_code,
-                    "signal": signal,
-                    "elapsed_ms": elapsed_ms,
-                    "stdout": stdout.text,
-                    "stderr": stderr.text,
-                    "stdout_truncated": stdout.truncated,
-                    "stderr_truncated": stderr.truncated,
-                    "stdout_total_bytes": stdout.total_bytes,
-                    "stderr_total_bytes": stderr.total_bytes,
-                    "stdout_omitted_bytes": stdout.omitted_bytes,
-                    "stderr_omitted_bytes": stderr.omitted_bytes,
-                    "stdout_omitted_lines": stdout.omitted_lines,
-                    "stderr_omitted_lines": stderr.omitted_lines
-                }),
+                metadata,
                 truncated,
-                blob_refs,
+                blob_refs: Vec::new(),
             })
         })
     }
@@ -349,8 +370,12 @@ async fn capture_stream<R: AsyncRead + Unpin>(
     call_id: kurama_protocol::id::CallId,
     stream: &'static str,
     event_sink: Option<Arc<dyn EventSink>>,
-) -> Result<BoundedText, KuramaError> {
-    let mut bounded = BoundedOutput::new(limits);
+) -> Result<CapturedStream, KuramaError> {
+    let mut bounded = if event_sink.is_some() {
+        staged_output(limits, stream)
+    } else {
+        BoundedOutput::new(limits)
+    };
     let mut chunk = [0_u8; READ_CHUNK_BYTES];
     loop {
         let read = reader.read(&mut chunk).await?;
@@ -369,15 +394,61 @@ async fn capture_stream<R: AsyncRead + Unpin>(
             }
         }
     }
-    Ok(bounded.finish())
+    Ok(CapturedStream(bounded.finish()))
+}
+
+fn staged_output(limits: kurama_protocol::tool::ToolLimits, stream: &str) -> BoundedOutput {
+    for _ in 0..16 {
+        let sequence = NEXT_STAGING_FILE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "kurama-bash-{}-{sequence}-{stream}.tmp",
+            std::process::id()
+        ));
+        match BoundedOutput::with_staging(limits, path) {
+            Ok(output) => return output,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => break,
+        }
+    }
+    BoundedOutput::new(limits)
+}
+
+struct CapturedStream(BoundedText);
+
+impl CapturedStream {
+    fn take_staged_path(&mut self) -> Option<PathBuf> {
+        self.0.staged_path.take()
+    }
+}
+
+impl std::ops::Deref for CapturedStream {
+    type Target = BoundedText;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for CapturedStream {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for CapturedStream {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0.staged_path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 async fn finish_remaining_capture(
-    stdout_task: &mut tokio::task::JoinHandle<Result<BoundedText, KuramaError>>,
-    stderr_task: &mut tokio::task::JoinHandle<Result<BoundedText, KuramaError>>,
-    stdout: Option<BoundedText>,
-    stderr: Option<BoundedText>,
-) -> Result<(BoundedText, BoundedText), KuramaError> {
+    stdout_task: &mut tokio::task::JoinHandle<Result<CapturedStream, KuramaError>>,
+    stderr_task: &mut tokio::task::JoinHandle<Result<CapturedStream, KuramaError>>,
+    stdout: Option<CapturedStream>,
+    stderr: Option<CapturedStream>,
+) -> Result<(CapturedStream, CapturedStream), KuramaError> {
     let stdout = match stdout {
         Some(stdout) => stdout,
         None => join_capture(stdout_task.await)?,
@@ -390,8 +461,8 @@ async fn finish_remaining_capture(
 }
 
 fn join_capture(
-    result: Result<Result<BoundedText, KuramaError>, tokio::task::JoinError>,
-) -> Result<BoundedText, KuramaError> {
+    result: Result<Result<CapturedStream, KuramaError>, tokio::task::JoinError>,
+) -> Result<CapturedStream, KuramaError> {
     result.map_err(|error| KuramaError::Tool(format!("output capture task failed: {error}")))?
 }
 

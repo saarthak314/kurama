@@ -59,6 +59,7 @@ pub struct TuiState {
     pub agent_message: String,
     active_assistant_entry: Option<usize>,
     active_tool_entries: HashMap<CallId, usize>,
+    active_tool_streams: HashMap<CallId, String>,
     committed_transcript_entries: usize,
     sent_commands: Vec<EngineCommand>,
 }
@@ -90,6 +91,7 @@ impl TuiState {
             agent_message: String::new(),
             active_assistant_entry: None,
             active_tool_entries: HashMap::new(),
+            active_tool_streams: HashMap::new(),
             committed_transcript_entries: 0,
             sent_commands: Vec::new(),
         }
@@ -183,6 +185,7 @@ impl TuiState {
     pub fn hydrate_replay(&mut self, replay: &[EventEnvelope]) {
         self.active_assistant_entry = None;
         self.active_tool_entries.clear();
+        self.active_tool_streams.clear();
         self.committed_transcript_entries = 0;
         self.transcript.clear();
         self.agents.clear();
@@ -191,7 +194,7 @@ impl TuiState {
                 SessionEvent::UserMessage { text } => self.push_user(text.clone()),
                 SessionEvent::AssistantMessage { text } => self.push_assistant(text.clone()),
                 SessionEvent::ToolCompleted { result, .. } => {
-                    self.push_tool(tool_label(result), result.output.clone());
+                    self.push_tool(tool_label(result), tool_display_output(result).to_owned());
                 }
                 SessionEvent::ToolUnknown { reason, .. } => {
                     self.push_system("TOOL", reason.clone());
@@ -474,6 +477,7 @@ impl TuiState {
         }
         if completes_active_streams {
             self.active_tool_entries.clear();
+            self.active_tool_streams.clear();
         }
     }
 
@@ -491,38 +495,89 @@ impl TuiState {
     }
 
     fn append_tool_delta(&mut self, call_id: CallId, stream: String, chunk: String) {
-        if let Some(entry) = self
-            .active_tool_entries
-            .get(&call_id)
-            .and_then(|index| self.transcript.get_mut(*index))
-        {
-            entry.body.push_str(&chunk);
+        if let Some(index) = self.active_tool_entries.get(&call_id).copied() {
+            let stream_changed = self
+                .active_tool_streams
+                .get(&call_id)
+                .is_some_and(|active| active != &stream);
+            if let Some(entry) = self.transcript.get_mut(index) {
+                if stream_changed {
+                    append_stream_boundary(&mut entry.body, &stream);
+                }
+                entry.body.push_str(&chunk);
+            }
+            self.active_tool_streams.insert(call_id, stream);
             return;
         }
 
         self.push_tool(format!("BASH / {stream}"), chunk);
         if let Some(index) = self.transcript.len().checked_sub(1) {
-            self.active_tool_entries.insert(call_id, index);
+            self.active_tool_entries.insert(call_id.clone(), index);
+            self.active_tool_streams.insert(call_id, stream);
         }
     }
 
     fn complete_tool(&mut self, result: ToolResult) {
         let label = tool_label(&result);
-        let entry = TranscriptEntry {
-            kind: TranscriptKind::Tool,
-            label,
-            body: result.output,
-        };
+        let persisted_display_output = result
+            .metadata
+            .get("display_output")
+            .and_then(serde_json::Value::as_str);
+        let display_output = tool_display_output(&result).to_owned();
 
+        self.active_tool_streams.remove(&result.call_id);
         if let Some(index) = self.active_tool_entries.remove(&result.call_id)
             && let Some(active_entry) = self.transcript.get_mut(index)
         {
-            *active_entry = entry;
+            active_entry.label = label;
+            if result
+                .metadata
+                .get("execution_error")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                && !active_entry.body.is_empty()
+            {
+                append_error_boundary(&mut active_entry.body, &display_output);
+            } else if !result.truncated
+                || persisted_display_output.is_some()
+                || active_entry.body.is_empty()
+            {
+                active_entry.body = display_output;
+            }
             return;
         }
 
-        self.transcript.push(entry);
+        self.transcript.push(TranscriptEntry {
+            kind: TranscriptKind::Tool,
+            label,
+            body: display_output,
+        });
     }
+}
+
+fn append_stream_boundary(body: &mut String, stream: &str) {
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push('[');
+    body.push_str(stream);
+    body.push_str("]\n");
+}
+
+fn append_error_boundary(body: &mut String, error: &str) {
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str("\n[error]\n");
+    body.push_str(error);
+}
+
+fn tool_display_output(result: &ToolResult) -> &str {
+    result
+        .metadata
+        .get("display_output")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&result.output)
 }
 
 fn tool_label(result: &ToolResult) -> String {

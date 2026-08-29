@@ -27,7 +27,7 @@ use kurama_protocol::{
     model::ModelProfile,
     policy::{ApprovalResponse, AutoBoundaries, ExecutionMode},
     runtime::{EngineCommand, RuntimeEvent},
-    session::{EventEnvelope, SessionEvent, SessionMetadata},
+    session::{BlobRef, EventEnvelope, SessionEvent, SessionMetadata},
     traits::{EventSink, IdGenerator, Orchestrator, SessionStore, Tool},
 };
 use kurama_sdk::AgentBuilder;
@@ -325,7 +325,7 @@ impl App {
             mode,
             redaction_best_effort: mode == ExecutionMode::Yolo,
         };
-        let transcript_replay = replay.clone();
+        let transcript_replay = replay_for_transcript(&replay, store.as_ref());
         let (engine, runtime_events) = runtime
             .start(metadata, replay)
             .map_err(|error| error.to_string())?;
@@ -884,6 +884,61 @@ impl App {
             .map_err(|error| error.to_string())?;
         }
         Ok(())
+    }
+}
+
+fn replay_for_transcript(replay: &[EventEnvelope], store: &dyn SessionStore) -> Vec<EventEnvelope> {
+    let mut transcript_replay = replay.to_vec();
+    for event in &mut transcript_replay {
+        let SessionEvent::ToolCompleted { result, .. } = &mut event.event else {
+            continue;
+        };
+        let Some(display_blobs) = result
+            .metadata
+            .get("display_blobs")
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        let Ok(stdout) = display_blob_text(display_blobs.get("stdout"), store) else {
+            continue;
+        };
+        let Ok(stderr) = display_blob_text(display_blobs.get("stderr"), store) else {
+            continue;
+        };
+        if stdout.is_none() && stderr.is_none() {
+            continue;
+        }
+        let display_output = combined_tool_output(
+            stdout.as_deref().unwrap_or_default(),
+            stderr.as_deref().unwrap_or_default(),
+        );
+        result.metadata["display_output"] = serde_json::Value::String(display_output);
+    }
+    transcript_replay
+}
+
+fn display_blob_text(
+    value: Option<&serde_json::Value>,
+    store: &dyn SessionStore,
+) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let reference: BlobRef = serde_json::from_value(value.clone())
+        .map_err(|error| format!("invalid display blob reference: {error}"))?;
+    let bytes = store
+        .get_blob(&reference)
+        .map_err(|error| error.to_string())?;
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+fn combined_tool_output(stdout: &str, stderr: &str) -> String {
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (false, true) => stdout.to_owned(),
+        (true, false) => stderr.to_owned(),
+        (true, true) => String::new(),
+        (false, false) => format!("{stdout}\n[stderr]\n{stderr}"),
     }
 }
 

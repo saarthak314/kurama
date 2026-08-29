@@ -24,8 +24,18 @@ pub struct BoundedText {
 
 struct StagingFile {
     path: PathBuf,
-    file: File,
+    file: Option<File>,
     error: Option<String>,
+    preserve: bool,
+}
+
+impl Drop for StagingFile {
+    fn drop(&mut self) {
+        let _ = self.file.take();
+        if !self.preserve {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 pub struct BoundedOutput {
@@ -59,15 +69,20 @@ impl BoundedOutput {
 
     pub fn with_staging(limits: ToolLimits, path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path)?;
         let mut output = Self::new(limits);
         output.staging = Some(StagingFile {
             path,
-            file,
+            file: Some(file),
             error: None,
+            preserve: false,
         });
         Ok(output)
     }
@@ -80,7 +95,8 @@ impl BoundedOutput {
         self.hasher.update(bytes);
         if let Some(staging) = &mut self.staging
             && staging.error.is_none()
-            && let Err(error) = staging.file.write_all(bytes)
+            && let Some(file) = staging.file.as_mut()
+            && let Err(error) = file.write_all(bytes)
         {
             staging.error = Some(error.to_string());
         }
@@ -106,13 +122,24 @@ impl BoundedOutput {
     pub fn finish(mut self) -> BoundedText {
         let staging_error = self.staging.as_mut().and_then(|staging| {
             if staging.error.is_none()
-                && let Err(error) = staging.file.flush().and_then(|_| staging.file.sync_all())
+                && let Some(file) = staging.file.as_mut()
+                && let Err(error) = file.flush().and_then(|_| file.sync_all())
             {
                 staging.error = Some(error.to_string());
             }
+            let _ = staging.file.take();
             staging.error.clone()
         });
-        let staged_path = self.staging.as_ref().map(|staging| staging.path.clone());
+        if staging_error.is_none()
+            && let Some(staging) = &mut self.staging
+        {
+            staging.preserve = true;
+        }
+        let staged_path = self
+            .staging
+            .as_ref()
+            .filter(|_| staging_error.is_none())
+            .map(|staging| staging.path.clone());
         let blob_ref = self.staging.as_ref().and_then(|_| {
             staging_error.is_none().then(|| BlobRef {
                 sha256: hex_bytes(self.hasher.finalize().as_ref()),

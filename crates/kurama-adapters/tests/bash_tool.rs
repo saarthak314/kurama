@@ -209,6 +209,7 @@ async fn bash_uses_deterministic_environment_and_reports_failed_commands() {
 #[tokio::test]
 async fn bash_bounds_stdout_and_stderr_with_head_and_tail() {
     let fixture = Fixture::empty();
+    let sink = Arc::new(RecordingSink::default());
     let call = invocation(serde_json::json!({
         "command": "printf 'head1\\nhead2\\nmiddle\\ntail1\\ntail2\\n'; printf 'errhead\\nerrmiddle\\nerrtail\\n' >&2",
         "cwd": ".",
@@ -219,7 +220,7 @@ async fn bash_bounds_stdout_and_stderr_with_head_and_tail() {
         max_lines: 2,
     };
 
-    let result = BashTool::default()
+    let result = BashTool::with_event_sink("/bin/bash", sink)
         .execute(fixture.context(small), call, &NeverCancel)
         .await
         .expect("bounded command");
@@ -261,6 +262,22 @@ async fn bash_bounds_stdout_and_stderr_with_head_and_tail() {
             .unwrap()
             .ends_with("errtail\n")
     );
+    assert!(result.metadata.get("display_output").is_none());
+    let staging = result.metadata["_display_staging"]
+        .as_object()
+        .expect("display staging metadata");
+    let stdout_path = PathBuf::from(staging["stdout"].as_str().expect("staged stdout path"));
+    let stderr_path = PathBuf::from(staging["stderr"].as_str().expect("staged stderr path"));
+    assert_eq!(
+        fs::read_to_string(&stdout_path).expect("staged stdout"),
+        "head1\nhead2\nmiddle\ntail1\ntail2\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&stderr_path).expect("staged stderr"),
+        "errhead\nerrmiddle\nerrtail\n"
+    );
+    fs::remove_file(stdout_path).expect("remove staged stdout");
+    fs::remove_file(stderr_path).expect("remove staged stderr");
 }
 
 #[tokio::test]

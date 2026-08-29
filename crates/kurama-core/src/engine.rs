@@ -1150,8 +1150,9 @@ impl EngineActor {
     async fn complete_tool(
         &mut self,
         operation_id: OperationId,
-        result: ToolResult,
+        mut result: ToolResult,
     ) -> Result<ToolResult, KuramaError> {
+        self.persist_display_blobs(&mut result)?;
         self.append(SessionEvent::ToolCompleted {
             operation_id: operation_id.clone(),
             result: result.clone(),
@@ -1166,6 +1167,41 @@ impl EngineActor {
         })
         .await?;
         Ok(result)
+    }
+
+    fn persist_display_blobs(&self, result: &mut ToolResult) -> Result<(), KuramaError> {
+        let Some(staging) = result
+            .metadata
+            .as_object_mut()
+            .and_then(|metadata| metadata.remove("_display_staging"))
+        else {
+            return Ok(());
+        };
+        let serde_json::Value::Object(staging) = staging else {
+            return Err(KuramaError::Protocol(
+                "tool display staging metadata must be an object".into(),
+            ));
+        };
+        let staged_files = StagedDisplayFiles::from_metadata(staging)?;
+        if !result.truncated {
+            return Ok(());
+        }
+
+        let mut display_blobs = serde_json::Map::new();
+        for (stream, path) in &staged_files.files {
+            let bytes = std::fs::read(path)?;
+            let reference = self.store.put_blob(&bytes)?;
+            display_blobs.insert(stream.clone(), serde_json::json!(reference));
+        }
+        if !display_blobs.is_empty()
+            && let Some(metadata) = result.metadata.as_object_mut()
+        {
+            metadata.insert(
+                "display_blobs".into(),
+                serde_json::Value::Object(display_blobs),
+            );
+        }
+        Ok(())
     }
 
     async fn execute_delegation(
@@ -1446,6 +1482,35 @@ impl EngineActor {
     }
 }
 
+struct StagedDisplayFiles {
+    files: Vec<(String, PathBuf)>,
+}
+
+impl StagedDisplayFiles {
+    fn from_metadata(
+        staging: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Self, KuramaError> {
+        let mut staged_files = Self { files: Vec::new() };
+        for (stream, path) in staging {
+            let Some(path) = path.as_str() else {
+                return Err(KuramaError::Protocol(format!(
+                    "tool display staging path for {stream} must be a string"
+                )));
+            };
+            staged_files.files.push((stream, PathBuf::from(path)));
+        }
+        Ok(staged_files)
+    }
+}
+
+impl Drop for StagedDisplayFiles {
+    fn drop(&mut self) {
+        for (_, path) in &self.files {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 fn empty_arguments() -> serde_json::Value {
     serde_json::Value::Object(Default::default())
 }
@@ -1496,7 +1561,10 @@ fn error_result(
         call_id,
         output: message,
         is_error: true,
-        metadata: serde_json::json!({"tool_name": tool_name}),
+        metadata: serde_json::json!({
+            "tool_name": tool_name,
+            "execution_error": true
+        }),
         truncated: false,
         blob_refs: Vec::new(),
     }
