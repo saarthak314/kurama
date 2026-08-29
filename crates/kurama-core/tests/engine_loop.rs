@@ -313,6 +313,41 @@ struct CountingTool {
     executions: Arc<AtomicUsize>,
 }
 
+fn counting_config(
+    session_id: &str,
+    backend: Arc<dyn ModelBackend>,
+    tool: Arc<CountingTool>,
+    store: Arc<MemoryStore>,
+) -> EngineConfig {
+    EngineConfig {
+        session: SessionMetadata {
+            id: session_id.into(),
+            created_at_ms: 0,
+            project_root: ".".into(),
+            profile: "test".into(),
+            mode: ExecutionMode::Supervised,
+            redaction_best_effort: false,
+        },
+        profile: ModelProfile::new("test", "frontier", 4_000, 500),
+        backend,
+        tools: vec![tool],
+        policy: Arc::new(AllowAllPolicy),
+        store,
+        sink: Arc::new(CollectingSink::default()),
+        orchestrator: Arc::new(NoDelegation),
+        ids: Arc::new(SequenceIds::new(1)),
+        context_policy: ContextPolicy::default(),
+        workspace_root: PathBuf::from("."),
+        write_scope: WriteScope::default(),
+        auto: AutoBoundaries::default(),
+        agent_id: None,
+        orchestration: None,
+        provider_retry_delays_ms: Vec::new(),
+        command_capacity: 32,
+        event_capacity: 128,
+    }
+}
+
 impl Tool for CountingTool {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
@@ -373,41 +408,140 @@ async fn repeated_model_call_id_does_not_repeat_the_side_effect() {
             finish_reason: FinishReason::Stop,
         })],
     ]));
-    let tool = CountingTool::default();
+    let tool = Arc::new(CountingTool::default());
     let executions = tool.executions.clone();
-    let config = EngineConfig {
-        session: SessionMetadata {
-            id: "dedupe".into(),
-            created_at_ms: 0,
-            project_root: ".".into(),
-            profile: "test".into(),
-            mode: ExecutionMode::Supervised,
-            redaction_best_effort: false,
-        },
-        profile: ModelProfile::new("test", "frontier", 4_000, 500),
-        backend,
-        tools: vec![Arc::new(tool)],
-        policy: Arc::new(AllowAllPolicy),
-        store: Arc::new(MemoryStore::default()),
-        sink: Arc::new(CollectingSink::default()),
-        orchestrator: Arc::new(NoDelegation),
-        ids: Arc::new(SequenceIds::new(1)),
-        context_policy: ContextPolicy::default(),
-        workspace_root: PathBuf::from("."),
-        write_scope: WriteScope::default(),
-        auto: AutoBoundaries::default(),
-        agent_id: None,
-        orchestration: None,
-        provider_retry_delays_ms: Vec::new(),
-        command_capacity: 32,
-        event_capacity: 128,
-    };
+    let config = counting_config("dedupe", backend, tool, Arc::new(MemoryStore::default()));
     let (handle, mut events) = Engine::spawn(config, Vec::new()).expect("spawn");
     handle.submit("count", false).await.expect("submit");
     while !matches!(
         events.recv().await.expect("event"),
         RuntimeEvent::TurnCompleted
     ) {}
+    assert_eq!(executions.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn model_call_ids_are_reusable_after_turn_completion() {
+    let call = || ModelEvent::ToolCall {
+        call_id: "same_call".into(),
+        name: "count".into(),
+        arguments: serde_json::json!({}),
+    };
+    let backend: Arc<dyn ModelBackend> = Arc::new(ScriptedBackend::new(vec![
+        vec![
+            Ok(call()),
+            Ok(ModelEvent::ResponseCompleted {
+                cursor: None,
+                finish_reason: FinishReason::ToolCalls,
+            }),
+        ],
+        vec![Ok(ModelEvent::ResponseCompleted {
+            cursor: None,
+            finish_reason: FinishReason::Stop,
+        })],
+        vec![
+            Ok(call()),
+            Ok(ModelEvent::ResponseCompleted {
+                cursor: None,
+                finish_reason: FinishReason::ToolCalls,
+            }),
+        ],
+        vec![Ok(ModelEvent::ResponseCompleted {
+            cursor: None,
+            finish_reason: FinishReason::Stop,
+        })],
+    ]));
+    let tool = Arc::new(CountingTool::default());
+    let executions = tool.executions.clone();
+    let (handle, mut events) = Engine::spawn(
+        counting_config(
+            "call-id-turns",
+            backend,
+            tool,
+            Arc::new(MemoryStore::default()),
+        ),
+        Vec::new(),
+    )
+    .expect("spawn");
+
+    for prompt in ["first", "second"] {
+        handle.submit(prompt, false).await.expect("submit");
+        while !matches!(
+            events.recv().await.expect("event"),
+            RuntimeEvent::TurnCompleted
+        ) {}
+    }
+
+    assert_eq!(executions.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn resumed_turn_ignores_call_ids_from_completed_turns() {
+    let operation_id = OperationId::from("old-operation");
+    let call_id = kurama_protocol::id::CallId::from("same_call");
+    let operation = Operation::Read {
+        path: ".".into(),
+        external: false,
+    };
+    let replay = vec![
+        replay_event(
+            0,
+            SessionEvent::UserMessage {
+                text: "old turn".into(),
+            },
+        ),
+        replay_event(
+            1,
+            SessionEvent::ToolProposed {
+                operation_id: operation_id.clone(),
+                call_id: call_id.clone(),
+                operation,
+            },
+        ),
+        replay_event(
+            2,
+            SessionEvent::ToolCompleted {
+                operation_id,
+                result: ToolResult::success(call_id.clone(), "old result"),
+            },
+        ),
+        replay_event(3, SessionEvent::TurnCompleted),
+        replay_event(
+            4,
+            SessionEvent::UserMessage {
+                text: "resumed turn".into(),
+            },
+        ),
+    ];
+    let backend: Arc<dyn ModelBackend> = Arc::new(ScriptedBackend::new(vec![
+        vec![
+            Ok(ModelEvent::ToolCall {
+                call_id,
+                name: "count".into(),
+                arguments: serde_json::json!({}),
+            }),
+            Ok(ModelEvent::ResponseCompleted {
+                cursor: None,
+                finish_reason: FinishReason::ToolCalls,
+            }),
+        ],
+        vec![Ok(ModelEvent::ResponseCompleted {
+            cursor: None,
+            finish_reason: FinishReason::Stop,
+        })],
+    ]));
+    let store = Arc::new(MemoryStore::default());
+    seed_replay(&store, &replay);
+    let tool = Arc::new(CountingTool::default());
+    let executions = tool.executions.clone();
+    let (_handle, mut events) =
+        Engine::spawn(counting_config("resume", backend, tool, store), replay).expect("spawn");
+
+    while !matches!(
+        events.recv().await.expect("event"),
+        RuntimeEvent::TurnCompleted
+    ) {}
+
     assert_eq!(executions.load(Ordering::Relaxed), 1);
 }
 

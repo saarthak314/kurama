@@ -403,7 +403,7 @@ fn render_agents(frame: &mut Frame<'_>, state: &TuiState) {
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "ID        ROLE          MODEL        TASK                  STATE",
+            "ID        ROLE          PROFILE      TASK                  STATE",
             Style::default().fg(DIM),
         )),
     ];

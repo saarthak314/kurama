@@ -170,19 +170,7 @@ impl Engine {
 
         let (command_tx, command_rx) = mpsc::channel(config.command_capacity);
         let (runtime_tx, runtime_rx) = mpsc::channel(config.event_capacity);
-        let completed_tool_calls = replay
-            .iter()
-            .filter_map(|event| match &event.event {
-                SessionEvent::ToolCompleted {
-                    operation_id,
-                    result,
-                } => Some((
-                    result.call_id.clone(),
-                    (operation_id.clone(), result.clone()),
-                )),
-                _ => None,
-            })
-            .collect();
+        let completed_tool_calls = completed_tool_calls_for_active_turn(&replay);
         let mut context = ContextManager::new(config.context_policy);
         context.replay(replay);
         let agent_manager = config.orchestration.as_ref().map(|orchestration| {
@@ -778,6 +766,7 @@ impl EngineActor {
         text: String,
         explicit_delegation: bool,
     ) -> Result<(), KuramaError> {
+        self.completed_tool_calls.clear();
         self.append(SessionEvent::UserMessage { text })?;
         self.continue_turn(explicit_delegation).await
     }
@@ -1441,6 +1430,33 @@ impl EngineActor {
 
 fn empty_arguments() -> serde_json::Value {
     serde_json::Value::Object(Default::default())
+}
+
+fn completed_tool_calls_for_active_turn(
+    replay: &[EventEnvelope],
+) -> BTreeMap<kurama_protocol::id::CallId, (OperationId, ToolResult)> {
+    let start = replay
+        .iter()
+        .rposition(|event| {
+            matches!(
+                event.event,
+                SessionEvent::TurnCompleted | SessionEvent::TurnFailed { .. }
+            )
+        })
+        .map_or(0, |index| index + 1);
+    replay[start..]
+        .iter()
+        .filter_map(|event| match &event.event {
+            SessionEvent::ToolCompleted {
+                operation_id,
+                result,
+            } => Some((
+                result.call_id.clone(),
+                (operation_id.clone(), result.clone()),
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
 #[derive(Default)]

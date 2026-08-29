@@ -145,6 +145,7 @@ impl TuiState {
 
     pub fn hydrate_replay(&mut self, replay: &[EventEnvelope]) {
         self.transcript.clear();
+        self.agents.clear();
         for envelope in replay {
             match &envelope.event {
                 SessionEvent::UserMessage { text } => self.push_user(text.clone()),
@@ -163,6 +164,12 @@ impl TuiState {
                     "RECOVERY",
                     format!("removed {removed_bytes} incomplete transcript bytes"),
                 ),
+                SessionEvent::AgentQueued { snapshot }
+                | SessionEvent::AgentStarted { snapshot }
+                | SessionEvent::AgentProgress { snapshot }
+                | SessionEvent::AgentCompleted { snapshot, .. }
+                | SessionEvent::AgentFailed { snapshot, .. }
+                | SessionEvent::AgentCancelled { snapshot } => self.upsert_agent(snapshot.clone()),
                 _ => {}
             }
         }

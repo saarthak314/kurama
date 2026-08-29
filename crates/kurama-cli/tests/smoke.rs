@@ -83,14 +83,6 @@ async fn fake_provider_runs_tools_approval_child_panel_and_exact_once_resume() {
                 finish_reason: FinishReason::Stop,
             }),
         ],
-        tool_round(
-            "write_call",
-            "write",
-            serde_json::json!({
-                "path": "updated.txt",
-                "content": "duplicated\n"
-            }),
-        ),
         vec![
             Ok(ModelEvent::TextDelta {
                 text: "resumed without repeating the write".into(),

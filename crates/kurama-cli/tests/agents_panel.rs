@@ -1,9 +1,10 @@
 use kurama_cli::tui::{AgentRow, Overlay, TuiState, render};
 use kurama_protocol::{
     agent::{AgentSnapshot, AgentState},
-    id::AgentId,
+    id::{AgentId, SessionId},
     policy::ExecutionMode,
     runtime::{AgentCommand, EngineCommand, RuntimeEvent},
+    session::{EventEnvelope, SessionEvent},
 };
 use ratatui::{Terminal, backend::TestBackend};
 
@@ -68,6 +69,66 @@ fn panel_shows_control_fields_but_not_tool_statistics() {
     assert!(!text.contains("tool calls"));
     assert!(!text.contains("SCOPE"));
     assert!(!text.contains("TIME"));
+    assert!(text.contains("ID        ROLE          PROFILE      TASK                  STATE"));
+}
+
+#[test]
+fn replay_restores_terminal_agents_without_duplicating_startup_updates() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    let session_id = SessionId::from("s_resume");
+    let events = [
+        SessionEvent::AgentCompleted {
+            snapshot: snapshot("a_completed", AgentState::Completed),
+            summary: "review complete".into(),
+        },
+        SessionEvent::AgentFailed {
+            snapshot: snapshot("a_failed", AgentState::Failed),
+            error: "provider disconnected".into(),
+        },
+        SessionEvent::AgentCancelled {
+            snapshot: snapshot("a_cancelled", AgentState::Cancelled),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(sequence, event)| {
+        EventEnvelope::new(
+            sequence as u64,
+            sequence as u64 + 1,
+            session_id.clone(),
+            None,
+            event,
+        )
+    })
+    .collect::<Vec<_>>();
+
+    state.hydrate_replay(&events);
+    state.apply_runtime_event(RuntimeEvent::AgentUpdated {
+        snapshot: snapshot("a_failed", AgentState::Failed),
+    });
+
+    assert_eq!(state.agents.len(), 3);
+    assert!(
+        state
+            .agents
+            .iter()
+            .any(|agent| agent.id == AgentId::from("a_completed")
+                && agent.state == AgentState::Completed)
+    );
+    assert!(
+        state
+            .agents
+            .iter()
+            .any(|agent| agent.id == AgentId::from("a_failed")
+                && agent.state == AgentState::Failed)
+    );
+    assert!(
+        state
+            .agents
+            .iter()
+            .any(|agent| agent.id == AgentId::from("a_cancelled")
+                && agent.state == AgentState::Cancelled)
+    );
 }
 
 #[test]
