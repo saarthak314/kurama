@@ -58,13 +58,18 @@ fn duplicate_tools_are_rejected() {
 #[tokio::test]
 async fn runtime_launches_explicit_depth_one_children() {
     let budget = child_budget(16_000, 2_000);
-    let backend = Arc::new(ScriptedBackend::new(vec![
+    let backend = Arc::new(RecordingBackend::new(vec![
         vec![delegation(budget), completed(FinishReason::ToolCalls)],
         vec![text("child complete"), completed(FinishReason::Stop)],
         vec![text("parent complete"), completed(FinishReason::Stop)],
     ]));
     let store = Arc::new(MemoryStore::default());
-    let runtime = orchestrated_runtime(backend, Arc::new(AllowAllPolicy), store.clone(), None);
+    let runtime = orchestrated_runtime(
+        backend.clone(),
+        Arc::new(AllowAllPolicy),
+        store.clone(),
+        None,
+    );
     let (handle, mut events) = runtime
         .start(session("session"), Vec::new())
         .expect("start");
@@ -78,6 +83,14 @@ async fn runtime_launches_explicit_depth_one_children() {
             .iter()
             .any(|event| matches!(event.event, SessionEvent::AgentCompleted { .. }))
     );
+    let requests = backend.requests();
+    let parent_requests = requests
+        .iter()
+        .filter(|request| request.agent_id.is_none())
+        .collect::<Vec<_>>();
+    assert_eq!(parent_requests.len(), 2);
+    assert!(parent_requests[0].delegation.is_some());
+    assert!(parent_requests[1].delegation.is_none());
 }
 
 #[tokio::test]

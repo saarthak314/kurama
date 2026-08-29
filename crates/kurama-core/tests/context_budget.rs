@@ -53,7 +53,7 @@ fn keeps_recent_turns_and_summary_within_budget() {
     manager.apply_compaction(18, "durable facts".into(), 4);
     let profile = ModelProfile::new("test", "frontier", 1_000, 200);
     let assembled = manager
-        .assemble(&profile, Vec::new(), false)
+        .assemble(&profile, Vec::new(), false, "/workspace/project")
         .expect("assemble context");
     assert!(assembled.estimated_tokens <= 800);
     assert!(
@@ -82,7 +82,7 @@ fn delegation_schema_describes_a_round_trippable_request() {
     manager.replay(long_session());
     let profile = ModelProfile::new("test", "frontier", 128_000, 8_000);
     let schema = manager
-        .assemble(&profile, Vec::new(), true)
+        .assemble(&profile, Vec::new(), true, "/workspace/project")
         .expect("assemble context")
         .request
         .delegation

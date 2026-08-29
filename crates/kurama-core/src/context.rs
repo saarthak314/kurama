@@ -173,6 +173,7 @@ impl ContextManager {
         profile: &ModelProfile,
         tools: Vec<ToolDescriptor>,
         delegation_enabled: bool,
+        workspace_root: &str,
     ) -> Result<AssembledContext, KuramaError> {
         let (session_id, agent_id) = self.identity.clone().ok_or_else(|| {
             KuramaError::Session("cannot assemble context without a session event".into())
@@ -269,6 +270,7 @@ impl ContextManager {
             request: ModelRequest {
                 session_id,
                 agent_id,
+                workspace_root: workspace_root.into(),
                 profile: profile.clone(),
                 system: SYSTEM_PROMPT.into(),
                 items,

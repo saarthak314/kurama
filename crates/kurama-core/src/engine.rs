@@ -802,11 +802,13 @@ impl EngineActor {
         capability_enabled: bool,
         cancel: &CancelToken,
     ) -> Result<(), KuramaError> {
+        let mut delegation_available = capability_enabled && self.agent_id.is_none();
         loop {
             let mut assembled = self.context.assemble(
                 &self.profile,
                 self.tool_descriptors.clone(),
-                capability_enabled && self.agent_id.is_none(),
+                delegation_available,
+                &self.workspace_root.to_string_lossy(),
             )?;
             if assembled.request.continuation.is_none() {
                 assembled.request.continuation = self.recovery_continuation.take();
@@ -819,8 +821,11 @@ impl EngineActor {
                 self.execute_tool(invocation, cancel).await?;
             }
             for request in round.delegations {
-                self.execute_delegation(request, capability_enabled, cancel)
+                self.execute_delegation(request, delegation_available, cancel)
                     .await?;
+            }
+            if !round.delegations_empty {
+                delegation_available = false;
             }
             if !round.tool_calls_empty || !round.delegations_empty {
                 continue;
@@ -1334,6 +1339,7 @@ impl EngineActor {
         let request = ModelRequest {
             session_id: self.session_id.clone(),
             agent_id: self.agent_id.clone(),
+            workspace_root: self.workspace_root.to_string_lossy().into_owned(),
             profile: self.profile.clone(),
             system: compaction.prompt,
             items: vec![ModelItem::User { text: input }],

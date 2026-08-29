@@ -174,6 +174,24 @@ fn parent_and_child_logs_validate_sequences_independently() {
 }
 
 #[test]
+fn replaying_a_new_child_log_returns_empty_history() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = FsSessionStore::open(temp.path().to_owned()).expect("store");
+    store
+        .create(&metadata("session-child", 20))
+        .expect("create");
+
+    let events = store
+        .replay_agent(
+            &SessionId::from("session-child"),
+            &AgentId::from("agent-new"),
+        )
+        .expect("new child history");
+
+    assert!(events.is_empty());
+}
+
+#[test]
 fn blobs_are_content_addressed_deduplicated_and_verified() {
     let temp = tempfile::tempdir().expect("tempdir");
     let store = FsSessionStore::open(temp.path().to_owned()).expect("store");

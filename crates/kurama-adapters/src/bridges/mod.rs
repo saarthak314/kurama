@@ -92,15 +92,31 @@ impl BridgeCommand {
             KuramaError::Model(format!("{} stderr task: {error}", self.program))
         })??;
         if !status.success() {
+            let diagnostic = if stderr.trim().is_empty() {
+                jsonl_error(&output).unwrap_or_else(|| output.join("\n"))
+            } else {
+                stderr
+            };
             return Err(KuramaError::Model(format!(
                 "{} exited with {}: {}",
                 self.program,
                 status,
-                control::bounded_error(&stderr, secrets)
+                control::bounded_error(&diagnostic, secrets)
             )));
         }
         Ok(output)
     }
+}
+
+fn jsonl_error(lines: &[String]) -> Option<String> {
+    lines.iter().rev().find_map(|line| {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        value
+            .pointer("/error/message")
+            .or_else(|| value.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+    })
 }
 
 pub(crate) fn event_stream(

@@ -194,6 +194,13 @@ impl SessionStore for FsSessionStore {
         session_id: &SessionId,
         agent_id: &AgentId,
     ) -> Result<Vec<EventEnvelope>, KuramaError> {
+        let session_dir = self.session_dir(session_id)?;
+        if !session_dir.join(METADATA_FILE).is_file() {
+            return Err(KuramaError::NotFound(format!("session {session_id}")));
+        }
+        if !self.log_path(session_id, Some(agent_id))?.exists() {
+            return Ok(Vec::new());
+        }
         self.replay_log(session_id, Some(agent_id))
     }
 

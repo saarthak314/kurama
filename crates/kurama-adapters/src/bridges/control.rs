@@ -6,77 +6,61 @@ use kurama_protocol::{
     id::CallId,
     model::{ModelEvent, ModelRequest},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de::Error as _};
 use serde_json::{Value, json};
 
 const MAX_PROMPT_BYTES: usize = 256 * 1024;
 const MAX_ERROR_BYTES: usize = 16 * 1024;
 
 pub fn control_schema(delegation_enabled: bool) -> Value {
-    let mut branches = vec![
-        json!({
-            "type": "object",
-            "properties": {"kind": {"const": "final"}, "text": {"type": "string"}},
-            "required": ["kind", "text"],
-            "additionalProperties": false
-        }),
-        json!({
-            "type": "object",
-            "properties": {
-                "kind": {"const": "tool_calls"},
-                "calls": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 8,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "call_id": {"type": "string"},
-                            "name": {"enum": ["read", "write", "bash", "web-search"]},
-                            "arguments": {"type": "object"}
-                        },
-                        "required": ["call_id", "name", "arguments"],
-                        "additionalProperties": false
-                    }
-                }
-            },
-            "required": ["kind", "calls"],
-            "additionalProperties": false
-        }),
-    ];
+    let mut kinds = vec!["final", "tool_calls"];
     if delegation_enabled {
-        branches.push(json!({
-            "type": "object",
-            "properties": {
-                "kind": {"const": "delegate"},
-                "agents": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 8,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "objective": {"type": "string"},
-                            "write_roots": {"type": "array", "items": {"type": "string"}},
-                            "write_files": {"type": "array", "items": {"type": "string"}},
-                            "depends_on": {
-                                "type": "array",
-                                "description": "Exact objective strings of prerequisite agents.",
-                                "items": {"type": "string"}
-                            }
-                        },
-                        "required": ["objective", "write_roots", "write_files", "depends_on"],
-                        "additionalProperties": false
-                    }
-                }
-            },
-            "required": ["kind", "agents"],
-            "additionalProperties": false
-        }));
+        kinds.push("delegate");
     }
     json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "oneOf": branches
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "enum": kinds},
+            "text": {"type": "string"},
+            "calls": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "call_id": {"type": "string"},
+                        "name": {"type": "string", "enum": ["read", "write", "bash", "web-search"]},
+                        "arguments": {
+                            "type": "string",
+                            "description": "A JSON-encoded object containing the tool arguments."
+                        }
+                    },
+                    "required": ["call_id", "name", "arguments"],
+                    "additionalProperties": false
+                }
+            },
+            "agents": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "objective": {"type": "string"},
+                        "write_roots": {"type": "array", "items": {"type": "string"}},
+                        "write_files": {"type": "array", "items": {"type": "string"}},
+                        "depends_on": {
+                            "type": "array",
+                            "description": "Exact objective strings of prerequisite agents.",
+                            "items": {"type": "string"}
+                        }
+                    },
+                    "required": ["objective", "write_roots", "write_files", "depends_on"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["kind", "text", "calls", "agents"],
+        "additionalProperties": false
     })
 }
 
@@ -111,9 +95,12 @@ pub fn bridge_prompt(request: &ModelRequest) -> String {
         })
         .collect::<Vec<_>>();
     let context = serde_json::to_string(&request.items).unwrap_or_else(|_| "[]".into());
+    let workspace_root =
+        serde_json::to_string(&request.workspace_root).unwrap_or_else(|_| "\".\"".into());
     let mut prompt = format!(
-        "{}\n\nYou are a model bridge. Do not use any CLI-provided tools, filesystem access, shell access, web access, plugins, skills, agents, or custom instructions. Return exactly one JSON control object matching the supplied schema.\n\nAvailable Kurama tools:\n{}\n\nActive context:\n{}",
+        "{}\n\nYou are a model bridge. Do not use any CLI-provided tools, filesystem access, shell access, web access, plugins, skills, agents, or custom instructions. Return exactly one JSON control object matching the supplied schema. Set fields unused by the selected kind to empty values; encode each tool arguments object as a JSON string.\n\nKurama workspace root: {}\nResolve every relative tool path against that root. For bash calls without a user-specified working directory, set cwd to that exact root; never use the bridge process working directory.\n\nAvailable Kurama tools:\n{}\n\nActive context:\n{}",
         request.system,
+        workspace_root,
         serde_json::to_string(&tools).unwrap_or_else(|_| "[]".into()),
         context
     );
@@ -130,9 +117,10 @@ pub fn parse_control(text: &str, delegation_enabled: bool) -> Result<Vec<ModelEv
     let control: Control = serde_json::from_str(text).map_err(|error| {
         KuramaError::Protocol(format!("invalid bridge control output: {error}"))
     })?;
-    match control {
-        Control::Final { text } => Ok(vec![ModelEvent::TextDelta { text }]),
-        Control::ToolCalls { calls } => {
+    match control.kind {
+        ControlKind::Final => Ok(vec![ModelEvent::TextDelta { text: control.text }]),
+        ControlKind::ToolCalls => {
+            let calls = control.calls;
             if calls.is_empty() || calls.len() > 8 {
                 return Err(KuramaError::Protocol(
                     "bridge returned an invalid tool-call count".into(),
@@ -140,12 +128,13 @@ pub fn parse_control(text: &str, delegation_enabled: bool) -> Result<Vec<ModelEv
             }
             calls.into_iter().map(ControlCall::event).collect()
         }
-        Control::Delegate { agents } => {
+        ControlKind::Delegate => {
             if !delegation_enabled {
                 return Err(KuramaError::Protocol(
                     "bridge returned delegation while disabled".into(),
                 ));
             }
+            let agents = control.agents;
             if agents.is_empty() || agents.len() > 8 {
                 return Err(KuramaError::Protocol(
                     "bridge returned an invalid agent count".into(),
@@ -191,11 +180,23 @@ pub fn bounded_kurama_error(error: KuramaError, secrets: &[String]) -> KuramaErr
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum Control {
-    Final { text: String },
-    ToolCalls { calls: Vec<ControlCall> },
-    Delegate { agents: Vec<ControlAgent> },
+#[serde(deny_unknown_fields)]
+struct Control {
+    kind: ControlKind,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    calls: Vec<ControlCall>,
+    #[serde(default)]
+    agents: Vec<ControlAgent>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ControlKind {
+    Final,
+    ToolCalls,
+    Delegate,
 }
 
 #[derive(Deserialize)]
@@ -203,7 +204,19 @@ enum Control {
 struct ControlCall {
     call_id: String,
     name: String,
+    #[serde(deserialize_with = "deserialize_arguments")]
     arguments: Value,
+}
+
+fn deserialize_arguments<'de, D>(deserializer: D) -> Result<Value, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::String(encoded) => serde_json::from_str(&encoded).map_err(D::Error::custom),
+        value => Ok(value),
+    }
 }
 
 impl ControlCall {

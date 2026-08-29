@@ -10,7 +10,7 @@ use std::{fs, time::Instant};
 use bridges::{
     claude::ClaudeBridge,
     codex::CodexBridge,
-    control::{control_schema, parse_control},
+    control::{bridge_prompt, control_schema, parse_control},
 };
 use futures_util::StreamExt;
 use kurama_protocol::{
@@ -24,6 +24,7 @@ fn request() -> ModelRequest {
     ModelRequest {
         session_id: SessionId::from("session-1"),
         agent_id: None,
+        workspace_root: "/workspace/project".into(),
         profile: ModelProfile::new("subscription", "frontier", 32_000, 4_000),
         system: "Be exact.".into(),
         items: vec![ModelItem::User {
@@ -70,6 +71,14 @@ fn codex_initial_command_is_read_only_isolated_and_jsonl() {
             .iter()
             .any(|argument| argument.contains("token"))
     );
+}
+
+#[test]
+fn bridge_prompt_anchors_relative_tools_to_the_kurama_workspace() {
+    let prompt = bridge_prompt(&request());
+
+    assert!(prompt.contains("Kurama workspace root: \"/workspace/project\""));
+    assert!(prompt.contains("never use the bridge process working directory"));
 }
 
 #[test]
@@ -125,13 +134,26 @@ fn control_schema_omits_delegation_when_disabled() {
     let disabled = control_schema(false);
     let enabled = control_schema(true);
 
-    assert_eq!(disabled["oneOf"].as_array().expect("branches").len(), 2);
-    assert_eq!(enabled["oneOf"].as_array().expect("branches").len(), 3);
+    assert!(disabled.get("oneOf").is_none());
+    assert!(disabled.get("$schema").is_none());
+    assert_eq!(disabled["type"], "object");
+    assert_eq!(
+        disabled["properties"]["kind"]["enum"],
+        serde_json::json!(["final", "tool_calls"])
+    );
+    assert_eq!(
+        enabled["properties"]["kind"]["enum"],
+        serde_json::json!(["final", "tool_calls", "delegate"])
+    );
+    assert_eq!(
+        enabled["required"],
+        serde_json::json!(["kind", "text", "calls", "agents"])
+    );
 }
 
 #[test]
 fn strict_control_parser_normalizes_tools_and_delegation() {
-    let tools = parse_control(r#"{"kind":"tool_calls","calls":[{"call_id":"c1","name":"read","arguments":{"files":[]}}]}"#, true)
+    let tools = parse_control(r#"{"kind":"tool_calls","text":"ignored","calls":[{"call_id":"c1","name":"read","arguments":"{\"files\":[]}"}],"agents":[{"objective":"ignored","write_roots":[],"write_files":[],"depends_on":[]}] }"#, true)
         .expect("tools");
     assert!(matches!(tools.as_slice(), [ModelEvent::ToolCall { name, .. }] if name == "read"));
 
@@ -249,6 +271,32 @@ async fn bridge_nonzero_errors_are_bounded_and_redacted() {
 
     assert!(!message.contains("secret-value"));
     assert!(message.contains("[REDACTED]"));
+}
+
+#[tokio::test]
+async fn bridge_nonzero_errors_fall_back_to_jsonl_stdout() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let executable = temporary.path().join("codex");
+    write_executable(
+        &executable,
+        r#"#!/bin/sh
+printf '%s\n' '{"type":"error","message":"invalid_json_schema: oneOf is not permitted"}'
+printf '%s\n' '{"type":"turn.failed","error":{"message":"invalid_json_schema: oneOf is not permitted"}}'
+exit 1
+"#,
+    );
+    let bridge = CodexBridge::new(
+        temporary.path().join("work"),
+        temporary.path().join("control.json"),
+    )
+    .with_program(executable.display().to_string());
+
+    let error = match bridge.stream(request(), &NeverCancel).await {
+        Ok(_) => panic!("nonzero process unexpectedly succeeded"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("invalid_json_schema"));
 }
 
 fn write_executable(path: &Path, contents: &str) {

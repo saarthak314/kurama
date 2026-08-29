@@ -25,6 +25,7 @@ fn request() -> ModelRequest {
     ModelRequest {
         session_id: SessionId::from("session-1"),
         agent_id: None,
+        workspace_root: "/workspace/project".into(),
         profile: ModelProfile::new("main", "gpt-test", 32_000, 4_000),
         system: "Be exact.".into(),
         items: vec![ModelItem::User {

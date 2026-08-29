@@ -104,6 +104,7 @@ pub struct DelegationSchema {
 pub struct ModelRequest {
     pub session_id: SessionId,
     pub agent_id: Option<AgentId>,
+    pub workspace_root: String,
     pub profile: ModelProfile,
     pub system: String,
     pub items: Vec<ModelItem>,
