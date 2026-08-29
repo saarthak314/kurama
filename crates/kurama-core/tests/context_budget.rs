@@ -1,10 +1,12 @@
 use kurama_core::context::{ContextManager, ContextPolicy};
 use kurama_protocol::{
+    agent::DelegationRequest,
     id::SessionId,
     model::{ModelItem, ModelProfile},
     policy::ExecutionMode,
     session::{EventEnvelope, SessionEvent, SessionMetadata},
 };
+use serde_json::json;
 
 fn event(sequence: u64, event: SessionEvent) -> EventEnvelope {
     EventEnvelope::new(sequence, sequence, SessionId::from("session"), None, event)
@@ -73,4 +75,150 @@ fn compaction_preserves_canonical_events() {
     manager.apply_compaction(request.covered_through_sequence, "facts".into(), 2);
     assert_eq!(manager.canonical_event_count(), events.len());
     assert_eq!(manager.report().summary_tokens, 2);
+}
+
+#[test]
+fn delegation_schema_describes_a_round_trippable_request() {
+    let mut manager = ContextManager::new(ContextPolicy::default());
+    manager.replay(long_session());
+    let profile = ModelProfile::new("test", "frontier", 128_000, 8_000);
+    let schema = manager
+        .assemble(&profile, Vec::new(), true)
+        .expect("assemble context")
+        .request
+        .delegation
+        .expect("delegation schema")
+        .parameters;
+
+    assert_eq!(
+        schema,
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["agents"],
+            "properties": {
+                "agents": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                            "role",
+                            "objective",
+                            "profile",
+                            "context_refs",
+                            "write_scope",
+                            "budget",
+                            "depends_on"
+                        ],
+                        "properties": {
+                            "role": {"type": "string"},
+                            "objective": {"type": "string"},
+                            "profile": {"type": ["string", "null"]},
+                            "context_refs": {
+                                "type": "array",
+                                "items": {"type": "string"}
+                            },
+                            "write_scope": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["roots", "files"],
+                                "properties": {
+                                    "roots": {
+                                        "type": "array",
+                                        "items": {"type": "string"}
+                                    },
+                                    "files": {
+                                        "type": "array",
+                                        "items": {"type": "string"}
+                                    }
+                                }
+                            },
+                            "budget": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [
+                                    "max_input_tokens",
+                                    "max_output_tokens",
+                                    "max_turns",
+                                    "max_seconds"
+                                ],
+                                "properties": {
+                                    "max_input_tokens": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "maximum": 80000
+                                    },
+                                    "max_output_tokens": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "maximum": 8000
+                                    },
+                                    "max_turns": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "maximum": 12
+                                    },
+                                    "max_seconds": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "maximum": 1800
+                                    }
+                                }
+                            },
+                            "depends_on": {
+                                "type": "array",
+                                "items": {"type": "string"}
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    );
+
+    let representative = json!({
+        "agents": [
+            {
+                "role": "implementer",
+                "objective": "Implement the delegation contract",
+                "profile": "fast",
+                "context_refs": ["crates/kurama-core/src/context.rs"],
+                "write_scope": {
+                    "roots": ["crates/kurama-core/src"],
+                    "files": ["crates/kurama-core/tests/context_budget.rs"]
+                },
+                "budget": {
+                    "max_input_tokens": 12000,
+                    "max_output_tokens": 2000,
+                    "max_turns": 4,
+                    "max_seconds": 300
+                },
+                "depends_on": []
+            },
+            {
+                "role": "reviewer",
+                "objective": "Review the implementation",
+                "profile": null,
+                "context_refs": [],
+                "write_scope": {"roots": [], "files": []},
+                "budget": {
+                    "max_input_tokens": 8000,
+                    "max_output_tokens": 1000,
+                    "max_turns": 2,
+                    "max_seconds": 120
+                },
+                "depends_on": ["implementer"]
+            }
+        ]
+    });
+    let request: DelegationRequest =
+        serde_json::from_value(representative.clone()).expect("deserialize delegation request");
+
+    assert_eq!(
+        serde_json::to_value(request).expect("serialize delegation request"),
+        representative
+    );
 }

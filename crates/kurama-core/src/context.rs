@@ -1,5 +1,6 @@
 use kurama_protocol::{
     KuramaError,
+    agent::AgentBudget,
     id::{AgentId, SessionId},
     model::{DelegationSchema, ModelItem, ModelProfile, ModelRequest},
     session::{EventEnvelope, SessionEvent},
@@ -467,14 +468,89 @@ fn truncate_text(text: &str, max_bytes: usize) -> String {
 }
 
 fn delegation_schema() -> serde_json::Value {
+    let maximum_budget = AgentBudget::default();
     serde_json::json!({
         "type": "object",
+        "additionalProperties": false,
         "required": ["agents"],
         "properties": {
             "agents": {
                 "type": "array",
+                "minItems": 1,
                 "maxItems": 8,
-                "items": {"type": "object"}
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "role",
+                        "objective",
+                        "profile",
+                        "context_refs",
+                        "write_scope",
+                        "budget",
+                        "depends_on"
+                    ],
+                    "properties": {
+                        "role": {"type": "string"},
+                        "objective": {"type": "string"},
+                        "profile": {"type": ["string", "null"]},
+                        "context_refs": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        },
+                        "write_scope": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["roots", "files"],
+                            "properties": {
+                                "roots": {
+                                    "type": "array",
+                                    "items": {"type": "string"}
+                                },
+                                "files": {
+                                    "type": "array",
+                                    "items": {"type": "string"}
+                                }
+                            }
+                        },
+                        "budget": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                                "max_input_tokens",
+                                "max_output_tokens",
+                                "max_turns",
+                                "max_seconds"
+                            ],
+                            "properties": {
+                                "max_input_tokens": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "maximum": maximum_budget.max_input_tokens
+                                },
+                                "max_output_tokens": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "maximum": maximum_budget.max_output_tokens
+                                },
+                                "max_turns": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "maximum": maximum_budget.max_turns
+                                },
+                                "max_seconds": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "maximum": maximum_budget.max_seconds
+                                }
+                            }
+                        },
+                        "depends_on": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        }
+                    }
+                }
             }
         }
     })
