@@ -1,9 +1,10 @@
-use kurama_cli::tui::{OnboardingState, Overlay, TuiState};
+use kurama_cli::tui::{OnboardingState, Overlay, TranscriptKind, TuiState};
 use kurama_protocol::{
-    id::OperationId,
+    id::{CallId, OperationId, SessionId},
     policy::{ApprovalRequest, ApprovalResponse, ExecutionMode},
     runtime::{EngineCommand, RuntimeEvent},
-    tool::Operation,
+    session::{EventEnvelope, SessionEvent},
+    tool::{Operation, ToolResult},
 };
 
 #[test]
@@ -136,6 +137,92 @@ fn unresolved_approval_cannot_be_dismissed() {
     assert!(state.sent_commands().is_empty());
 }
 
+#[test]
+fn tool_output_deltas_for_the_same_call_update_one_entry() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+
+    state.apply_runtime_event(tool_delta("call_1", "stdout", "first "));
+    state.apply_runtime_event(tool_delta("call_1", "stdout", "second"));
+
+    assert_eq!(state.transcript.len(), 1);
+    assert_eq!(state.transcript[0].kind, TranscriptKind::Tool);
+    assert_eq!(state.transcript[0].body, "first second");
+}
+
+#[test]
+fn tool_completion_finalizes_the_streamed_entry_by_result_call_id() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+
+    state.apply_runtime_event(tool_delta("call_1", "stdout", "partial"));
+    state.apply_runtime_event(RuntimeEvent::ToolCompleted {
+        operation_id: OperationId::from("operation_unrelated_to_call_id"),
+        result: tool_result("call_1", "final output", "bash"),
+    });
+
+    assert_eq!(state.transcript.len(), 1);
+    assert_eq!(state.transcript[0].label, "TOOL / bash");
+    assert_eq!(state.transcript[0].body, "final output");
+}
+
+#[test]
+fn tool_streams_with_different_call_ids_remain_separate() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+
+    state.apply_runtime_event(tool_delta("call_1", "stdout", "one"));
+    state.apply_runtime_event(tool_delta("call_2", "stderr", "two"));
+    state.apply_runtime_event(tool_delta("call_1", "stdout", " more"));
+
+    assert_eq!(state.transcript.len(), 2);
+    assert_eq!(state.transcript[0].body, "one more");
+    assert_eq!(state.transcript[1].body, "two");
+}
+
+#[test]
+fn assistant_deltas_coalesce_only_while_adjacent() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+
+    state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+        text: "first ".into(),
+    });
+    state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+        text: "second".into(),
+    });
+
+    assert_eq!(state.transcript.len(), 1);
+    assert_eq!(state.transcript[0].kind, TranscriptKind::Assistant);
+    assert_eq!(state.transcript[0].body, "first second");
+    state.push_user("interrupt");
+    state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+        text: "third".into(),
+    });
+
+    assert_eq!(state.transcript.len(), 3);
+    assert_eq!(state.transcript[1].kind, TranscriptKind::User);
+    assert_eq!(state.transcript[2].kind, TranscriptKind::Assistant);
+    assert_eq!(state.transcript[2].body, "third");
+}
+
+#[test]
+fn replay_hydration_clears_active_tool_stream_tracking() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.apply_runtime_event(tool_delta("call_1", "stdout", "stale"));
+
+    state.hydrate_replay(&[replay_event(SessionEvent::ToolCompleted {
+        operation_id: OperationId::from("replayed_operation"),
+        result: tool_result("replayed_call", "replayed", "read"),
+    })]);
+    state.apply_runtime_event(RuntimeEvent::ToolCompleted {
+        operation_id: OperationId::from("operation_1"),
+        result: tool_result("call_1", "fresh", "bash"),
+    });
+
+    assert_eq!(state.transcript.len(), 2);
+    assert_eq!(state.transcript[0].kind, TranscriptKind::Tool);
+    assert_eq!(state.transcript[0].body, "replayed");
+    assert_eq!(state.transcript[1].kind, TranscriptKind::Tool);
+    assert_eq!(state.transcript[1].body, "fresh");
+}
+
 fn approval_state() -> TuiState {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.begin_approval(ApprovalRequest {
@@ -149,4 +236,22 @@ fn approval_state() -> TuiState {
         arguments: serde_json::json!({"path":"unsafe.txt","content":"unsafe"}),
     });
     state
+}
+
+fn tool_delta(call_id: &str, stream: &str, chunk: &str) -> RuntimeEvent {
+    RuntimeEvent::ToolOutputDelta {
+        call_id: CallId::from(call_id),
+        stream: stream.into(),
+        chunk: chunk.into(),
+    }
+}
+
+fn tool_result(call_id: &str, output: &str, tool_name: &str) -> ToolResult {
+    let mut result = ToolResult::success(CallId::from(call_id), output);
+    result.metadata = serde_json::json!({"tool_name": tool_name});
+    result
+}
+
+fn replay_event(event: SessionEvent) -> EventEnvelope {
+    EventEnvelope::new(1, 1, SessionId::from("session_1"), None, event)
 }

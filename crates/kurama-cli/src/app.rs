@@ -888,6 +888,31 @@ where
     Ok(app)
 }
 
+fn apply_runtime_event_in_order(
+    state: &mut TuiState,
+    event: RuntimeEvent,
+    tool_receiver: &mut mpsc::UnboundedReceiver<RuntimeEvent>,
+) -> bool {
+    let mut tool_open = true;
+    if matches!(
+        &event,
+        RuntimeEvent::ToolCompleted { .. } | RuntimeEvent::TurnCompleted
+    ) {
+        loop {
+            match tool_receiver.try_recv() {
+                Ok(event) => state.apply_runtime_event(event),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    tool_open = false;
+                    break;
+                }
+            }
+        }
+    }
+    state.apply_runtime_event(event);
+    tool_open
+}
+
 async fn run_loop<B>(
     app: &mut App,
     terminal: &mut Terminal<B>,
@@ -935,7 +960,15 @@ where
                 match event {
                     Some(event) => {
                         exit = matches!(event, RuntimeEvent::Shutdown);
-                        app.state.apply_runtime_event(event);
+                        if tool_open {
+                            tool_open = apply_runtime_event_in_order(
+                                &mut app.state,
+                                event,
+                                &mut tool_receiver,
+                            );
+                        } else {
+                            app.state.apply_runtime_event(event);
+                        }
                     }
                     None => runtime_open = false,
                 }
@@ -1149,5 +1182,46 @@ impl EventSink for ToolEventSink {
                 .map_err(|_| KuramaError::Cancelled)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kurama_protocol::{
+        id::{CallId, OperationId},
+        tool::ToolResult,
+    };
+
+    use super::*;
+
+    #[test]
+    fn queued_tool_delta_is_applied_before_completion() {
+        let mut state = TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised);
+        let (tool_sender, mut tool_receiver) = mpsc::unbounded_channel();
+        tool_sender
+            .send(RuntimeEvent::ToolOutputDelta {
+                call_id: CallId::from("call_1"),
+                stream: "stdout".into(),
+                chunk: "partial output".into(),
+            })
+            .expect("queue tool delta");
+
+        let mut result = ToolResult::success(CallId::from("call_1"), "final output");
+        result.metadata = serde_json::json!({"tool_name": "bash"});
+        apply_runtime_event_in_order(
+            &mut state,
+            RuntimeEvent::ToolCompleted {
+                operation_id: OperationId::from("operation_1"),
+                result,
+            },
+            &mut tool_receiver,
+        );
+
+        while let Ok(event) = tool_receiver.try_recv() {
+            state.apply_runtime_event(event);
+        }
+
+        assert_eq!(state.transcript.len(), 1);
+        assert_eq!(state.transcript[0].body, "final output");
     }
 }

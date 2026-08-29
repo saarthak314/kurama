@@ -1,5 +1,8 @@
+use std::collections::HashMap;
+
 use kurama_protocol::{
     agent::{AgentSnapshot, AgentState},
+    id::CallId,
     policy::{ApprovalRequest, ApprovalResponse, ExecutionMode},
     runtime::{AgentCommand, EngineCommand, RuntimeEvent},
     session::{EventEnvelope, SessionEvent},
@@ -54,6 +57,8 @@ pub struct TuiState {
     pub agents: Vec<AgentRow>,
     pub selected_agent: usize,
     pub agent_message: String,
+    active_assistant_entry: Option<usize>,
+    active_tool_entries: HashMap<CallId, usize>,
     sent_commands: Vec<EngineCommand>,
 }
 
@@ -82,6 +87,8 @@ impl TuiState {
             agents: Vec::new(),
             selected_agent: 0,
             agent_message: String::new(),
+            active_assistant_entry: None,
+            active_tool_entries: HashMap::new(),
             sent_commands: Vec::new(),
         }
     }
@@ -112,6 +119,7 @@ impl TuiState {
     }
 
     pub fn push_user(&mut self, body: impl Into<String>) {
+        self.active_assistant_entry = None;
         self.transcript.push(TranscriptEntry {
             kind: TranscriptKind::User,
             label: "YOU".into(),
@@ -120,6 +128,7 @@ impl TuiState {
     }
 
     pub fn push_assistant(&mut self, body: impl Into<String>) {
+        self.active_assistant_entry = None;
         self.transcript.push(TranscriptEntry {
             kind: TranscriptKind::Assistant,
             label: "KURAMA".into(),
@@ -128,6 +137,7 @@ impl TuiState {
     }
 
     pub fn push_tool(&mut self, label: impl Into<String>, body: impl Into<String>) {
+        self.active_assistant_entry = None;
         self.transcript.push(TranscriptEntry {
             kind: TranscriptKind::Tool,
             label: label.into(),
@@ -136,6 +146,7 @@ impl TuiState {
     }
 
     pub fn push_system(&mut self, label: impl Into<String>, body: impl Into<String>) {
+        self.active_assistant_entry = None;
         self.transcript.push(TranscriptEntry {
             kind: TranscriptKind::System,
             label: label.into(),
@@ -144,6 +155,8 @@ impl TuiState {
     }
 
     pub fn hydrate_replay(&mut self, replay: &[EventEnvelope]) {
+        self.active_assistant_entry = None;
+        self.active_tool_entries.clear();
         self.transcript.clear();
         self.agents.clear();
         for envelope in replay {
@@ -390,19 +403,25 @@ impl TuiState {
     }
 
     pub fn apply_runtime_event(&mut self, event: RuntimeEvent) {
+        if !matches!(&event, RuntimeEvent::AssistantDelta { .. }) {
+            self.active_assistant_entry = None;
+        }
         match event {
             RuntimeEvent::Status { message } => self.status = message,
-            RuntimeEvent::AssistantDelta { text } => self.push_assistant(text),
+            RuntimeEvent::AssistantDelta { text } => self.append_assistant_delta(text),
             RuntimeEvent::ApprovalRequired { request } => {
                 self.begin_approval(request);
             }
             RuntimeEvent::ToolStarted { name, .. } => self.status = format!("running {name}"),
-            RuntimeEvent::ToolOutputDelta { chunk, stream, .. } => {
-                self.push_tool(format!("BASH / {stream}"), chunk);
+            RuntimeEvent::ToolOutputDelta {
+                call_id,
+                chunk,
+                stream,
+            } => {
+                self.append_tool_delta(call_id, stream, chunk);
             }
             RuntimeEvent::ToolCompleted { result, .. } => {
-                let label = tool_label(&result);
-                self.push_tool(label, result.output);
+                self.complete_tool(result);
             }
             RuntimeEvent::AgentUpdated { snapshot } => self.upsert_agent(snapshot),
             RuntimeEvent::AgentInspection {
@@ -419,6 +438,53 @@ impl TuiState {
             RuntimeEvent::Error { message } => self.status = message,
             RuntimeEvent::Shutdown => self.status = "shutdown".into(),
         }
+    }
+
+    fn append_assistant_delta(&mut self, text: String) {
+        if let Some(entry) = self
+            .active_assistant_entry
+            .and_then(|index| self.transcript.get_mut(index))
+        {
+            entry.body.push_str(&text);
+            return;
+        }
+
+        self.push_assistant(text);
+        self.active_assistant_entry = self.transcript.len().checked_sub(1);
+    }
+
+    fn append_tool_delta(&mut self, call_id: CallId, stream: String, chunk: String) {
+        if let Some(entry) = self
+            .active_tool_entries
+            .get(&call_id)
+            .and_then(|index| self.transcript.get_mut(*index))
+        {
+            entry.body.push_str(&chunk);
+            return;
+        }
+
+        self.push_tool(format!("BASH / {stream}"), chunk);
+        if let Some(index) = self.transcript.len().checked_sub(1) {
+            self.active_tool_entries.insert(call_id, index);
+        }
+    }
+
+    fn complete_tool(&mut self, result: ToolResult) {
+        let label = tool_label(&result);
+        let entry = TranscriptEntry {
+            kind: TranscriptKind::Tool,
+            label,
+            body: result.output,
+        };
+
+        if let Some(index) = self.active_tool_entries.remove(&result.call_id)
+            && let Some(active_entry) = self.transcript.get_mut(index)
+        {
+            *active_entry = entry;
+            return;
+        }
+
+        self.transcript.push(entry);
     }
 }
 
