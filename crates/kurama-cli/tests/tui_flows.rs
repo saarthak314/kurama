@@ -249,6 +249,17 @@ fn stable_transcript_prefix_excludes_mutable_assistant_and_tool_entries() {
 }
 
 #[test]
+fn committed_transcript_marker_never_moves_backwards() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_user("first");
+    state.push_user("second");
+    state.mark_transcript_committed(2);
+    state.mark_transcript_committed(1);
+
+    assert!(state.live_transcript().is_empty());
+}
+
+#[test]
 fn replay_hydration_clears_active_tool_stream_tracking() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.apply_runtime_event(tool_delta("call_1", "stdout", "stale"));

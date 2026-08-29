@@ -170,7 +170,9 @@ impl TuiState {
     }
 
     pub fn mark_transcript_committed(&mut self, end: usize) {
-        self.committed_transcript_entries = end.min(self.transcript.len());
+        self.committed_transcript_entries = self
+            .committed_transcript_entries
+            .max(end.min(self.stable_transcript_end()));
         self.scroll = 0;
     }
 
@@ -428,6 +430,10 @@ impl TuiState {
     }
 
     pub fn apply_runtime_event(&mut self, event: RuntimeEvent) {
+        let completes_active_streams = matches!(
+            &event,
+            RuntimeEvent::TurnCompleted | RuntimeEvent::Error { .. } | RuntimeEvent::Shutdown
+        );
         if !matches!(&event, RuntimeEvent::AssistantDelta { .. }) {
             self.active_assistant_entry = None;
         }
@@ -465,6 +471,9 @@ impl TuiState {
                 self.status = "ready".into();
             }
             RuntimeEvent::Shutdown => self.status = "shutdown".into(),
+        }
+        if completes_active_streams {
+            self.active_tool_entries.clear();
         }
     }
 

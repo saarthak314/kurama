@@ -450,6 +450,7 @@ impl App {
                 &mut input,
                 runtime_events,
                 tool_events,
+                true,
             )
             .await?;
             let Some(args) = self.restart_args.take() else {
@@ -919,7 +920,15 @@ pub async fn run_with<B>(
 where
     B: Backend,
 {
-    run_loop(&mut app, terminal, &mut input, Some(runtime_events), None).await?;
+    run_loop(
+        &mut app,
+        terminal,
+        &mut input,
+        Some(runtime_events),
+        None,
+        false,
+    )
+    .await?;
     Ok(app)
 }
 
@@ -931,7 +940,10 @@ fn apply_runtime_event_in_order(
     let mut tool_open = true;
     if matches!(
         &event,
-        RuntimeEvent::ToolCompleted { .. } | RuntimeEvent::TurnCompleted
+        RuntimeEvent::ToolCompleted { .. }
+            | RuntimeEvent::TurnCompleted
+            | RuntimeEvent::Error { .. }
+            | RuntimeEvent::Shutdown
     ) {
         loop {
             match tool_receiver.try_recv() {
@@ -954,6 +966,7 @@ async fn run_loop<B>(
     input: &mut mpsc::Receiver<Event>,
     runtime_events: Option<mpsc::Receiver<RuntimeEvent>>,
     tool_events: Option<mpsc::UnboundedReceiver<RuntimeEvent>>,
+    commit_to_scrollback: bool,
 ) -> Result<(), String>
 where
     B: Backend,
@@ -975,7 +988,9 @@ where
         false
     };
     let mut input_open = true;
-    commit_stable_transcript(&mut app.state, terminal)?;
+    if commit_to_scrollback {
+        commit_stable_transcript(&mut app.state, terminal)?;
+    }
     terminal
         .draw(|frame| render(frame, &app.state))
         .map_err(|error| error.to_string())?;
@@ -1016,7 +1031,9 @@ where
                 }
             }
         }
-        commit_stable_transcript(&mut app.state, terminal)?;
+        if commit_to_scrollback {
+            commit_stable_transcript(&mut app.state, terminal)?;
+        }
         terminal
             .draw(|frame| render(frame, &app.state))
             .map_err(|error| error.to_string())?;
@@ -1034,12 +1051,16 @@ fn commit_stable_transcript<B>(
 where
     B: Backend,
 {
+    terminal.autoresize().map_err(|error| error.to_string())?;
     let committed_end = state.stable_transcript_end();
     if state.stable_transcript().is_empty() {
         return Ok(());
     }
 
     let terminal_width = terminal.get_frame().area().width as usize;
+    if terminal_width <= TRANSCRIPT_HORIZONTAL_PADDING * 2 {
+        return Ok(());
+    }
     let content_width = terminal_width
         .saturating_sub(TRANSCRIPT_HORIZONTAL_PADDING * 2)
         .max(1);
@@ -1302,6 +1323,34 @@ mod tests {
     }
 
     #[test]
+    fn queued_tool_delta_is_applied_before_runtime_error() {
+        let mut state = TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised);
+        let (tool_sender, mut tool_receiver) = mpsc::unbounded_channel();
+        tool_sender
+            .send(RuntimeEvent::ToolOutputDelta {
+                call_id: CallId::from("call_1"),
+                stream: "stdout".into(),
+                chunk: "partial output".into(),
+            })
+            .expect("queue tool delta");
+
+        apply_runtime_event_in_order(
+            &mut state,
+            RuntimeEvent::Error {
+                message: "cancelled".into(),
+            },
+            &mut tool_receiver,
+        );
+
+        assert!(tool_receiver.try_recv().is_err());
+        assert_eq!(state.transcript.len(), 2);
+        assert_eq!(state.transcript[0].kind, crate::tui::TranscriptKind::Tool);
+        assert_eq!(state.transcript[0].body, "partial output");
+        assert_eq!(state.transcript[1].label, "ERROR");
+        assert_eq!(state.stable_transcript_end(), 2);
+    }
+
+    #[test]
     fn page_up_scrolls_past_the_u16_line_limit() {
         let mut app = App {
             state: TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised),
@@ -1388,14 +1437,21 @@ mod tests {
             },
         )
         .expect("inline terminal");
-        let (input_sender, input) = mpsc::channel(1);
+        let (input_sender, mut input) = mpsc::channel(1);
         let (runtime_sender, runtime_events) = mpsc::channel(1);
         drop(input_sender);
         drop(runtime_sender);
 
-        let app = run_with(app, &mut terminal, input, runtime_events)
-            .await
-            .expect("run inline terminal");
+        run_loop(
+            &mut app,
+            &mut terminal,
+            &mut input,
+            Some(runtime_events),
+            None,
+            true,
+        )
+        .await
+        .expect("run inline terminal");
         let inserted_row = (0..80)
             .map(|x| {
                 terminal
@@ -1409,5 +1465,89 @@ mod tests {
 
         assert!(inserted_row.contains("› committed question"));
         assert!(app.state.live_transcript().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fullscreen_run_with_keeps_transcript_in_the_live_view() {
+        let mut app = App {
+            state: TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised),
+            engine: None,
+            runtime_events: None,
+            tool_events: None,
+            orchestrator: None,
+            session_id: None,
+            restart_args: None,
+            control: None,
+        };
+        app.state.push_user("visible fullscreen question");
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).expect("fullscreen terminal");
+        let (input_sender, input) = mpsc::channel(1);
+        let (runtime_sender, runtime_events) = mpsc::channel(1);
+        drop(input_sender);
+        drop(runtime_sender);
+
+        let app = run_with(app, &mut terminal, input, runtime_events)
+            .await
+            .expect("run fullscreen terminal");
+        let visible = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(visible.contains("visible fullscreen question"));
+        assert_eq!(app.state.live_transcript().len(), 1);
+    }
+
+    #[test]
+    fn transcript_commit_uses_current_terminal_width_after_resize() {
+        let mut backend = TestBackend::new(30, 16);
+        backend
+            .set_cursor_position(Position::new(0, 4))
+            .expect("position inline viewport");
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(8),
+            },
+        )
+        .expect("inline terminal");
+        terminal.backend_mut().resize(60, 16);
+        let mut state = TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised);
+        state.push_user("123456789012345678901234567890");
+
+        commit_stable_transcript(&mut state, &mut terminal).expect("commit transcript");
+        let visible = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(visible.contains("› 123456789012345678901234567890"));
+    }
+
+    #[test]
+    fn tiny_inline_terminal_defers_invisible_transcript_commit() {
+        let mut backend = TestBackend::new(4, 8);
+        backend
+            .set_cursor_position(Position::new(0, 2))
+            .expect("position inline viewport");
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(4),
+            },
+        )
+        .expect("inline terminal");
+        let mut state = TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised);
+        state.push_user("defer me");
+
+        commit_stable_transcript(&mut state, &mut terminal).expect("defer transcript");
+
+        assert_eq!(state.live_transcript().len(), 1);
     }
 }
