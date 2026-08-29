@@ -1,6 +1,6 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
@@ -105,25 +105,41 @@ fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
     );
 
     let composer = if state.composer.is_empty() {
-        Line::from(vec![
+        Text::from(Line::from(vec![
             Span::styled("›  ", Style::default().fg(RED).add_modifier(Modifier::BOLD)),
             Span::styled(
                 "Message Kurama or type / for commands",
                 Style::default().fg(DIM),
             ),
-        ])
+        ]))
     } else {
-        Line::from(vec![
-            Span::styled("›  ", Style::default().fg(RED).add_modifier(Modifier::BOLD)),
-            Span::styled(state.composer.as_str(), Style::default().fg(TEXT)),
-        ])
+        Text::from(
+            state
+                .composer
+                .split('\n')
+                .map(|line| {
+                    Line::from(vec![
+                        Span::styled("›  ", Style::default().fg(RED).add_modifier(Modifier::BOLD)),
+                        Span::styled(line, Style::default().fg(TEXT)),
+                    ])
+                })
+                .collect::<Vec<_>>(),
+        )
     };
+    let composer_area = inset(chunks[2], 2, 0);
+    let composer_block = panel_block();
+    let composer_inner = composer_block.inner(composer_area);
     frame.render_widget(
         Paragraph::new(composer)
             .wrap(Wrap { trim: false })
-            .block(panel_block()),
-        inset(chunks[2], 2, 1),
+            .block(composer_block),
+        composer_area,
     );
+    if state.overlay == Overlay::None
+        && let Some(position) = composer_cursor_position(state, composer_inner)
+    {
+        frame.set_cursor_position(position);
+    }
 
     let agents = format!(
         "agents {} running · {} queued",
@@ -499,6 +515,42 @@ fn panel_block() -> Block<'static> {
 
 fn composer_height(state: &TuiState) -> u16 {
     (state.composer.lines().count().max(1) as u16 + 2).clamp(3, 8)
+}
+
+fn composer_cursor_position(state: &TuiState, area: Rect) -> Option<Position> {
+    if area.is_empty() {
+        return None;
+    }
+
+    let mut cursor = state.cursor.min(state.composer.len());
+    while !state.composer.is_char_boundary(cursor) {
+        cursor = cursor.saturating_sub(1);
+    }
+
+    let prefix_width = Line::from("›  ").width() as u16;
+    let mut row = 0_u16;
+    let mut lines = state.composer[..cursor].split('\n').peekable();
+    while let Some(line) = lines.next() {
+        let line_width = prefix_width.saturating_add(Line::from(line).width() as u16);
+        if lines.peek().is_some() {
+            row = row.saturating_add(line_width.div_ceil(area.width).max(1));
+            continue;
+        }
+
+        row = row.saturating_add(line_width / area.width);
+        let column = line_width % area.width;
+        return Some(Position::new(
+            area.x.saturating_add(column),
+            area.y
+                .saturating_add(row.min(area.height.saturating_sub(1))),
+        ));
+    }
+
+    Some(Position::new(
+        area.x
+            .saturating_add(prefix_width.min(area.width.saturating_sub(1))),
+        area.y,
+    ))
 }
 
 fn mode_label(mode: ExecutionMode) -> &'static str {

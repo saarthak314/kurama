@@ -1,5 +1,5 @@
 use kurama_protocol::{
-    agent::AgentState,
+    agent::{AgentSnapshot, AgentState},
     policy::{ApprovalRequest, ApprovalResponse, ExecutionMode},
     runtime::{AgentCommand, EngineCommand, RuntimeEvent},
 };
@@ -125,13 +125,38 @@ impl TuiState {
     }
 
     pub fn set_agents(&mut self, mut agents: Vec<AgentRow>) {
+        let selected_id = self.selected_agent().map(|agent| agent.id.clone());
         sort_agents(&mut agents);
         self.agents = agents;
+        self.restore_agent_selection(selected_id.as_ref());
+        self.refresh_agent_counts();
+    }
+
+    fn upsert_agent(&mut self, snapshot: AgentSnapshot) {
+        let selected_id = self.selected_agent().map(|agent| agent.id.clone());
+        if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == snapshot.id) {
+            agent.update_from_snapshot(snapshot);
+        } else {
+            self.agents.push(AgentRow::from_snapshot(snapshot));
+        }
+        sort_agents(&mut self.agents);
+        self.restore_agent_selection(selected_id.as_ref());
+        self.refresh_agent_counts();
+    }
+
+    fn restore_agent_selection(&mut self, selected_id: Option<&kurama_protocol::id::AgentId>) {
         if self.agents.is_empty() {
             self.selected_agent = 0;
+        } else if let Some(index) =
+            selected_id.and_then(|id| self.agents.iter().position(|agent| &agent.id == id))
+        {
+            self.selected_agent = index;
         } else {
             self.selected_agent = self.selected_agent.min(self.agents.len() - 1);
         }
+    }
+
+    fn refresh_agent_counts(&mut self) {
         self.running_agents = self
             .agents
             .iter()
@@ -167,7 +192,9 @@ impl TuiState {
     }
 
     pub fn inspect_selected_agent(&mut self) {
-        if self.selected_agent().is_some() {
+        if let Some(agent_id) = self.selected_agent().map(|agent| agent.id.clone()) {
+            self.sent_commands
+                .push(EngineCommand::Agent(AgentCommand::Inspect { agent_id }));
             self.overlay = Overlay::AgentInspect;
         }
     }
@@ -213,6 +240,14 @@ impl TuiState {
 
     pub fn close_overlay(&mut self) {
         self.overlay = match self.overlay {
+            Overlay::Approval => Overlay::Approval,
+            Overlay::ApprovalEdit => {
+                if let Some(approval) = &mut self.approval {
+                    approval.editing = false;
+                }
+                self.status = "approval pending".into();
+                Overlay::Approval
+            }
             Overlay::AgentInspect | Overlay::AgentMessage | Overlay::ConfirmAgentCancel => {
                 Overlay::Agents
             }
@@ -249,13 +284,34 @@ impl TuiState {
         }
     }
 
+    pub fn set_approval_editor(&mut self, editor: impl Into<String>) {
+        if let Some(approval) = &mut self.approval {
+            approval.editor = editor.into();
+        }
+    }
+
     pub fn submit_approval_edit(&mut self) -> Result<(), String> {
-        let arguments = self
+        let editor = self
             .approval
             .as_ref()
             .ok_or_else(|| "no approval is pending".to_owned())?
-            .arguments
+            .editor
             .clone();
+        let arguments: serde_json::Value = match serde_json::from_str(&editor) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                let message = format!("invalid approval arguments: {error}");
+                self.status = message.clone();
+                self.overlay = Overlay::ApprovalEdit;
+                if let Some(approval) = &mut self.approval {
+                    approval.editing = true;
+                }
+                return Err(message);
+            }
+        };
+        if let Some(approval) = &mut self.approval {
+            approval.arguments = arguments.clone();
+        }
         self.resolve_approval(ApprovalResponse::Edit { arguments });
         Ok(())
     }
@@ -284,9 +340,14 @@ impl TuiState {
                 self.push_tool(format!("BASH / {stream}"), chunk);
             }
             RuntimeEvent::ToolCompleted { result, .. } => self.push_tool("TOOL", result.output),
-            RuntimeEvent::AgentUpdated { .. } => {}
-            RuntimeEvent::AgentInspection { transcript, .. } => {
-                if let Some(agent) = self.agents.get_mut(self.selected_agent) {
+            RuntimeEvent::AgentUpdated { snapshot } => self.upsert_agent(snapshot),
+            RuntimeEvent::AgentInspection {
+                snapshot,
+                transcript,
+            } => {
+                let agent_id = snapshot.id.clone();
+                self.upsert_agent(snapshot);
+                if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == agent_id) {
                     agent.transcript = transcript;
                 }
             }

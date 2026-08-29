@@ -1,10 +1,15 @@
 use kurama_cli::{
     app::App,
     commands::{Command, parse_command},
-    tui::{TuiState, render},
+    tui::{Overlay, TuiState, render},
 };
 use kurama_protocol::{id::SessionId, policy::ExecutionMode};
-use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
+use ratatui::{
+    Terminal,
+    backend::{Backend, TestBackend},
+    buffer::Buffer,
+    layout::Position,
+};
 
 fn buffer_text(buffer: &Buffer) -> String {
     let mut text = String::new();
@@ -58,6 +63,49 @@ fn main_screen_is_transcript_first_without_tool_statistics() {
         assert!(!text.contains("tool calls"));
         assert!(!text.contains("tokens/sec"));
     }
+}
+
+#[test]
+fn composer_cursor_tracks_the_visual_insertion_point() {
+    let mut state = TuiState::new(
+        "openai-main",
+        "gpt-5.6",
+        "~/src/kurama",
+        ExecutionMode::Supervised,
+    );
+    state.composer = "kurama".into();
+    state.cursor = 2;
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &state)).unwrap();
+
+    let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+    assert_eq!(cursor, Position::new(9, 21));
+    assert_eq!(
+        terminal.backend().buffer().cell(cursor).unwrap().symbol(),
+        "r"
+    );
+    assert!(format!("{:?}", terminal.backend()).contains("cursor: true"));
+}
+
+#[test]
+fn overlays_hide_the_composer_cursor() {
+    let mut state = TuiState::new(
+        "openai-main",
+        "gpt-5.6",
+        "~/src/kurama",
+        ExecutionMode::Supervised,
+    );
+    state.composer = "kurama".into();
+    state.cursor = state.composer.len();
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &state)).unwrap();
+    assert!(format!("{:?}", terminal.backend()).contains("cursor: true"));
+
+    state.overlay = Overlay::Agents;
+    terminal.draw(|frame| render(frame, &state)).unwrap();
+    assert!(format!("{:?}", terminal.backend()).contains("cursor: false"));
 }
 
 #[test]
