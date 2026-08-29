@@ -1,0 +1,14 @@
+data: {"type":"response.created","response":{"id":"resp_1"}}
+
+data: {"type":"response.output_text.delta","delta":"Checking"}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read","arguments":""}}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"{\"files\":[{\"path\":\"Cargo.toml\"}]}"}
+
+data: {"type":"response.function_call_arguments.done","item_id":"fc_1","output_index":0,"arguments":"{\"files\":[{\"path\":\"Cargo.toml\"}]}"}
+
+data: {"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":120,"output_tokens":18,"input_tokens_details":{"cached_tokens":100}}}}
+
+data: [DONE]
+

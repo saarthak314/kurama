@@ -8,12 +8,12 @@ license.workspace = true
 [features]
 default = []
 http = ["dep:reqwest", "dep:rustls", "dep:url"]
-openai = ["http"]
-anthropic = ["http"]
-openai-compatible = ["http"]
-codex-bridge = ["dep:futures-core", "dep:futures-util", "dep:tokio"]
-claude-bridge = ["dep:futures-core", "dep:futures-util", "dep:tokio"]
-tools = ["dep:diffy", "dep:libc", "dep:reqwest", "dep:shlex", "dep:tokio", "dep:url"]
+openai = ["http", "dep:futures-core", "dep:futures-util", "dep:tokio", "dep:zeroize"]
+anthropic = ["http", "dep:futures-core", "dep:futures-util", "dep:tokio", "dep:zeroize"]
+openai-compatible = ["http", "dep:futures-core", "dep:futures-util", "dep:tokio", "dep:zeroize"]
+codex-bridge = ["dep:futures-core", "dep:futures-util", "dep:libc", "dep:tokio", "dep:zeroize"]
+claude-bridge = ["dep:futures-core", "dep:futures-util", "dep:libc", "dep:tokio", "dep:zeroize"]
+tools = ["dep:diffy", "dep:futures-util", "dep:libc", "dep:reqwest", "dep:sha2", "dep:shlex", "dep:tokio", "dep:url", "dep:zeroize"]
 fs-store = ["dep:libc", "dep:sha2"]
 native-credentials = ["dep:basic-toml", "dep:libc", "dep:zeroize"]
 
@@ -22,6 +22,7 @@ basic-toml = { workspace = true, optional = true }
 diffy = { workspace = true, optional = true }
 futures-core = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
+getrandom.workspace = true
 kurama-protocol = { path = "../kurama-protocol" }
 libc = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }

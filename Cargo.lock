@@ -794,6 +794,7 @@ dependencies = [
  "diffy",
  "futures-core",
  "futures-util",
+ "getrandom 0.4.3",
  "kurama-protocol",
  "libc",
  "reqwest",

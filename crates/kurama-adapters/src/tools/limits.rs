@@ -1,0 +1,241 @@
+use std::{
+    collections::VecDeque,
+    fmt::Write as _,
+    fs::{File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+};
+
+use kurama_protocol::{session::BlobRef, tool::ToolLimits};
+use sha2::{Digest, Sha256};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedText {
+    pub text: String,
+    pub truncated: bool,
+    pub total_bytes: usize,
+    pub total_lines: usize,
+    pub omitted_bytes: usize,
+    pub omitted_lines: usize,
+    pub blob_ref: Option<BlobRef>,
+    pub staged_path: Option<PathBuf>,
+    pub staging_error: Option<String>,
+}
+
+struct StagingFile {
+    path: PathBuf,
+    file: File,
+    error: Option<String>,
+}
+
+pub struct BoundedOutput {
+    limits: ToolLimits,
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+    head_lines: usize,
+    tail_lines: usize,
+    total_bytes: usize,
+    total_lines: usize,
+    last_byte: Option<u8>,
+    hasher: Sha256,
+    staging: Option<StagingFile>,
+}
+
+impl BoundedOutput {
+    pub fn new(limits: ToolLimits) -> Self {
+        Self {
+            limits,
+            head: Vec::with_capacity(limits.max_bytes.div_ceil(2)),
+            tail: VecDeque::with_capacity(limits.max_bytes / 2),
+            head_lines: 0,
+            tail_lines: 0,
+            total_bytes: 0,
+            total_lines: 0,
+            last_byte: None,
+            hasher: Sha256::new(),
+            staging: None,
+        }
+    }
+
+    pub fn with_staging(limits: ToolLimits, path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        let mut output = Self::new(limits);
+        output.staging = Some(StagingFile {
+            path,
+            file,
+            error: None,
+        });
+        Ok(output)
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+
+        self.hasher.update(bytes);
+        if let Some(staging) = &mut self.staging
+            && staging.error.is_none()
+            && let Err(error) = staging.file.write_all(bytes)
+        {
+            staging.error = Some(error.to_string());
+        }
+
+        for &byte in bytes {
+            if self.total_bytes == 0 || self.last_byte == Some(b'\n') {
+                self.total_lines = self.total_lines.saturating_add(1);
+            }
+            self.total_bytes = self.total_bytes.saturating_add(1);
+            self.last_byte = Some(byte);
+
+            if self.can_push_head(byte) {
+                if self.head.is_empty() || self.head.last() == Some(&b'\n') {
+                    self.head_lines += 1;
+                }
+                self.head.push(byte);
+            } else {
+                self.push_tail(byte);
+            }
+        }
+    }
+
+    pub fn finish(mut self) -> BoundedText {
+        let staging_error = self.staging.as_mut().and_then(|staging| {
+            if staging.error.is_none()
+                && let Err(error) = staging.file.flush().and_then(|_| staging.file.sync_all())
+            {
+                staging.error = Some(error.to_string());
+            }
+            staging.error.clone()
+        });
+        let staged_path = self.staging.as_ref().map(|staging| staging.path.clone());
+        let blob_ref = self.staging.as_ref().and_then(|_| {
+            staging_error.is_none().then(|| BlobRef {
+                sha256: hex_bytes(self.hasher.finalize().as_ref()),
+                bytes: self.total_bytes as u64,
+            })
+        });
+
+        let retained_bytes = self.head.len() + self.tail.len();
+        let mut retained = self.head.clone();
+        retained.extend(self.tail.iter().copied());
+        let retained_lines = logical_lines(&retained);
+        let truncated = retained_bytes < self.total_bytes || retained_lines < self.total_lines;
+        let (head, tail) = fit_utf8_edges(&self.head, &self.tail, self.limits.max_bytes);
+        let text = format!("{head}{tail}");
+        let rendered_truncated = retained_bytes_to_utf8_len(&self.head, &self.tail) > text.len();
+
+        BoundedText {
+            text,
+            truncated: truncated || rendered_truncated,
+            total_bytes: self.total_bytes,
+            total_lines: self.total_lines,
+            omitted_bytes: self.total_bytes.saturating_sub(retained_bytes),
+            omitted_lines: self.total_lines.saturating_sub(retained_lines),
+            blob_ref,
+            staged_path,
+            staging_error,
+        }
+    }
+
+    fn can_push_head(&self, byte: u8) -> bool {
+        let head_byte_limit = self.limits.max_bytes.div_ceil(2);
+        let head_line_limit = self.limits.max_lines.div_ceil(2);
+        if self.head.len() >= head_byte_limit || head_line_limit == 0 {
+            return false;
+        }
+
+        let adds_line = self.head.is_empty() || self.head.last() == Some(&b'\n');
+        let lines_after = self.head_lines + usize::from(adds_line);
+        let _ = byte;
+        lines_after <= head_line_limit
+    }
+
+    fn push_tail(&mut self, byte: u8) {
+        let tail_byte_limit = self.limits.max_bytes / 2;
+        let tail_line_limit = self.limits.max_lines / 2;
+        if tail_byte_limit == 0 || tail_line_limit == 0 {
+            return;
+        }
+
+        if self.tail.is_empty() || self.tail.back() == Some(&b'\n') {
+            self.tail_lines += 1;
+        }
+        self.tail.push_back(byte);
+
+        while self.tail.len() > tail_byte_limit || self.tail_lines > tail_line_limit {
+            if let Some(removed) = self.tail.pop_front() {
+                if self.tail.is_empty() {
+                    self.tail_lines = 0;
+                } else if removed == b'\n' {
+                    self.tail_lines = self.tail_lines.saturating_sub(1);
+                }
+            }
+        }
+    }
+}
+
+fn logical_lines(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        0
+    } else {
+        bytes.iter().filter(|&&byte| byte == b'\n').count()
+            + usize::from(bytes.last() != Some(&b'\n'))
+    }
+}
+
+fn retained_bytes_to_utf8_len(head: &[u8], tail: &VecDeque<u8>) -> usize {
+    let tail: Vec<u8> = tail.iter().copied().collect();
+    String::from_utf8_lossy(head).len() + String::from_utf8_lossy(&tail).len()
+}
+
+fn fit_utf8_edges(head: &[u8], tail: &VecDeque<u8>, max_bytes: usize) -> (String, String) {
+    let head = String::from_utf8_lossy(head).into_owned();
+    let tail_bytes: Vec<u8> = tail.iter().copied().collect();
+    let tail = String::from_utf8_lossy(&tail_bytes).into_owned();
+    if head.len() + tail.len() <= max_bytes {
+        return (head, tail);
+    }
+
+    let head_budget = max_bytes.div_ceil(2);
+    let tail_budget = max_bytes.saturating_sub(head_budget);
+    (
+        truncate_utf8_end(&head, head_budget).to_owned(),
+        truncate_utf8_start(&tail, tail_budget).to_owned(),
+    )
+}
+
+fn truncate_utf8_end(value: &str, max_bytes: usize) -> &str {
+    let mut end = value.len().min(max_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn truncate_utf8_start(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut start = value.len() - max_bytes;
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    &value[start..]
+}
+
+pub(super) fn sha256_hex(bytes: &[u8]) -> String {
+    hex_bytes(Sha256::digest(bytes).as_ref())
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut output, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    output
+}
