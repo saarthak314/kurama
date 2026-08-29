@@ -1,6 +1,10 @@
-use kurama_cli::args::{HELP, parse_from};
+use kurama_cli::{
+    app,
+    args::{HELP, parse_from},
+};
 
-fn main() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
     let args = match parse_from(std::env::args_os().skip(1)) {
         Ok(args) => args,
         Err(error) => {
@@ -18,6 +22,8 @@ fn main() {
         return;
     }
 
-    eprintln!("Kurama runtime is not initialized");
-    std::process::exit(2);
+    if let Err(error) = app::run(args).await {
+        eprintln!("kurama: {error}");
+        std::process::exit(2);
+    }
 }
