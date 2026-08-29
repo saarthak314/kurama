@@ -8,7 +8,7 @@ use kurama_cli::{
     tui::Overlay,
 };
 use kurama_protocol::{
-    config::{KuramaConfig, OrchestrationConfig, ProfileConfig, ProfileKind},
+    config::{AuthRef, KuramaConfig, OrchestrationConfig, ProfileConfig, ProfileKind},
     policy::{AutoBoundaries, ExecutionMode},
     runtime::EngineCommand,
     session::{EventEnvelope, SessionEvent, SessionMetadata},
@@ -65,11 +65,20 @@ fn fixture() -> (TempDir, AppPaths, PathBuf) {
 #[test]
 fn missing_configuration_opens_onboarding_without_a_runtime() {
     let (_temp, paths, project) = fixture();
-    let app =
+    let mut app =
         App::bootstrap_with_paths(&Args::default(), project, paths, SessionSecrets::default())
             .expect("bootstrap");
     assert_eq!(app.state.overlay(), Overlay::Onboarding);
     assert!(!app.is_connected());
+
+    app.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )))
+    .expect("select connection");
+
+    assert_eq!(app.state.overlay(), Overlay::Onboarding);
+    assert!(app.state.status.contains("profile name"));
 }
 
 #[tokio::test]
@@ -299,6 +308,73 @@ async fn live_controls_list_context_persist_mode_and_switch_profile() {
     ));
 }
 
+#[test]
+fn onboarding_writes_a_cli_profile_and_requests_restart() {
+    let (_temp, paths, project) = fixture();
+    let mut app = App::bootstrap_with_paths(
+        &Args::default(),
+        project,
+        paths.clone(),
+        SessionSecrets::default(),
+    )
+    .expect("bootstrap");
+
+    press_enter(&mut app);
+    press_enter(&mut app);
+    type_command(&mut app, "frontier-model");
+    let exit = press_enter(&mut app);
+
+    assert!(exit);
+    let config = ConfigRepository::open(paths)
+        .expect("repository")
+        .read_config()
+        .expect("read config")
+        .expect("config");
+    let profile = config.profiles.get("codex").expect("codex profile");
+    assert_eq!(profile.kind, ProfileKind::CodexCli);
+    assert_eq!(profile.model, "frontier-model");
+    assert_eq!(profile.command.as_deref(), Some("codex"));
+    assert_eq!(
+        app.restart_args().and_then(|args| args.profile.as_deref()),
+        Some("codex")
+    );
+}
+
+#[test]
+fn session_auth_profiles_prompt_for_a_masked_runtime_secret() {
+    let (_temp, paths, project) = fixture();
+    let repository = ConfigRepository::open(paths.clone()).expect("repository");
+    let mut config = bridge_config();
+    config.profiles.insert(
+        "remote".into(),
+        ProfileConfig {
+            kind: ProfileKind::OpenAi,
+            model: "remote-model".into(),
+            endpoint: None,
+            auth: Some(AuthRef::Session),
+            command: None,
+            max_input_tokens: 100_000,
+            max_output_tokens: 10_000,
+            escalation_profiles: Vec::new(),
+        },
+    );
+    config.default_profile = Some("remote".into());
+    repository.write_config(&config).expect("write config");
+    let mut app =
+        App::bootstrap_with_paths(&Args::default(), project, paths, SessionSecrets::default())
+            .expect("bootstrap");
+
+    assert!(!app.is_connected());
+    assert_eq!(app.state.overlay(), Overlay::Onboarding);
+    assert!(app.state.onboarding.prompt().contains("remote"));
+    type_command(&mut app, "top-secret");
+    assert_eq!(app.state.onboarding.display_input(), "••••••••••");
+    let exit = press_enter(&mut app);
+
+    assert!(exit);
+    assert!(app.restart_args().is_some());
+}
+
 fn type_command(app: &mut App, command: &str) {
     for character in command.chars() {
         app.handle_event(Event::Key(KeyEvent::new(
@@ -311,9 +387,13 @@ fn type_command(app: &mut App, command: &str) {
 
 fn submit_command(app: &mut App, command: &str) {
     type_command(app, command);
+    press_enter(app);
+}
+
+fn press_enter(app: &mut App) -> bool {
     app.handle_event(Event::Key(KeyEvent::new(
         KeyCode::Enter,
         KeyModifiers::NONE,
     )))
-    .expect("submit command");
+    .expect("submit command")
 }

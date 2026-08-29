@@ -188,9 +188,50 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) {
         frame.area(),
     );
     let area = inset(frame.area(), 4, 2);
+    if !state.onboarding.is_selecting_connection() {
+        let input = state.onboarding.display_input();
+        let lines = vec![
+            Line::from(Span::styled(
+                state.onboarding.step_label(),
+                Style::default().fg(RED).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                state.onboarding.prompt(),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("›  ", Style::default().fg(RED).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    if input.is_empty() {
+                        " "
+                    } else {
+                        input.as_str()
+                    },
+                    Style::default().fg(TEXT),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Enter confirms · Esc closes setup · secrets remain masked",
+                Style::default().fg(DIM),
+            )),
+        ];
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(BORDER))
+                    .padding(Padding::new(2, 2, 1, 1)),
+            ),
+            area,
+        );
+        return;
+    }
     let mut lines = vec![
         Line::from(Span::styled(
-            "STEP 1 / 3",
+            state.onboarding.step_label(),
             Style::default().fg(RED).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),

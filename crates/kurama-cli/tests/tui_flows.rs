@@ -28,6 +28,24 @@ fn onboarding_offers_only_supported_connection_types() {
 }
 
 #[test]
+fn onboarding_masks_session_credentials_in_the_rendered_form() {
+    let mut state = TuiState::credential(".", "remote");
+    for character in "top-secret".chars() {
+        state.onboarding.push(character);
+    }
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+
+    terminal
+        .draw(|frame| kurama_cli::tui::render(frame, &state))
+        .expect("render");
+    let buffer = format!("{:?}", terminal.backend().buffer());
+
+    assert!(!buffer.contains("top-secret"));
+    assert!(buffer.contains("••••••••••"));
+}
+
+#[test]
 fn approval_overlay_supports_approve_deny_and_edited_arguments() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.begin_approval(

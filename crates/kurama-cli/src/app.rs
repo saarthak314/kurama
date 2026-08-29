@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -10,7 +10,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use kurama_adapters::{
     AppPaths, BashTool, ConfigRepository, CredentialResolver, FsSessionStore, HttpClient,
     JsonSearchBackend, OpenAiNativeSearch, ProviderFactory, RandomIds, ReadTool, SearchBackend,
-    SessionSecrets, WebSearchTool, WriteTool,
+    SecretValue, SessionSecrets, WebSearchTool, WriteTool,
 };
 use kurama_core::{
     engine::{EngineHandle, RuntimeEvents},
@@ -20,10 +20,12 @@ use kurama_core::{
 use kurama_protocol::{
     KuramaError,
     agent::{OrchestrationContext, WriteScope},
-    config::{KuramaConfig, ProfileConfig, ProfileKind, SearchConfig},
+    config::{
+        AuthRef, KuramaConfig, OrchestrationConfig, ProfileConfig, ProfileKind, SearchConfig,
+    },
     id::SessionId,
     model::ModelProfile,
-    policy::{ApprovalResponse, ExecutionMode},
+    policy::{ApprovalResponse, AutoBoundaries, ExecutionMode},
     runtime::{EngineCommand, RuntimeEvent},
     session::{EventEnvelope, SessionEvent, SessionMetadata},
     traits::{EventSink, IdGenerator, Orchestrator, SessionStore, Tool},
@@ -38,7 +40,7 @@ use tokio::sync::mpsc;
 use crate::{
     args::{Args, ResumeChoice},
     commands::{Command, parse_command},
-    tui::{Overlay, TerminalGuard, TuiState, render, spawn_input_thread},
+    tui::{OnboardingSubmission, Overlay, TerminalGuard, TuiState, render, spawn_input_thread},
 };
 
 pub struct App {
@@ -55,11 +57,12 @@ pub struct App {
 struct AppControl {
     project: PathBuf,
     paths: AppPaths,
-    session_secrets: Arc<SessionSecrets>,
+    session_secrets: Arc<Mutex<SessionSecrets>>,
     repository: ConfigRepository,
     store: Arc<FsSessionStore>,
     profiles: Vec<String>,
     max_input_tokens: u64,
+    launch_args: Args,
 }
 
 impl App {
@@ -78,14 +81,14 @@ impl App {
         paths: AppPaths,
         session_secrets: SessionSecrets,
     ) -> Result<Self, String> {
-        Self::bootstrap_with_shared_paths(args, cwd, paths, Arc::new(session_secrets))
+        Self::bootstrap_with_shared_paths(args, cwd, paths, Arc::new(Mutex::new(session_secrets)))
     }
 
     fn bootstrap_with_shared_paths(
         args: &Args,
         cwd: PathBuf,
         paths: AppPaths,
-        session_secrets: Arc<SessionSecrets>,
+        session_secrets: Arc<Mutex<SessionSecrets>>,
     ) -> Result<Self, String> {
         let project = cwd
             .canonicalize()
@@ -112,6 +115,7 @@ impl App {
                     store,
                     profiles: Vec::new(),
                     max_input_tokens: 0,
+                    launch_args: args.clone(),
                 },
             ));
         };
@@ -126,6 +130,7 @@ impl App {
                     store,
                     profiles: Vec::new(),
                     max_input_tokens: 0,
+                    launch_args: args.clone(),
                 },
             ));
         }
@@ -190,12 +195,45 @@ impl App {
         } else {
             mutable_state.last_mode.unwrap_or(config.default_mode)
         };
+        let profile_names: Vec<_> = config.profiles.keys().cloned().collect();
+        let missing_session_profile = {
+            let secrets = session_secrets
+                .lock()
+                .map_err(|_| "session credential store is unavailable".to_owned())?;
+            config
+                .profiles
+                .iter()
+                .find(|(name, profile)| {
+                    matches!(profile.auth, Some(AuthRef::Session)) && !secrets.contains(name)
+                })
+                .map(|(name, _)| name.clone())
+        };
+        if let Some(profile) = missing_session_profile {
+            let mut state = TuiState::credential(project.display().to_string(), profile);
+            state.mode = mode;
+            return Ok(Self::disconnected(
+                state,
+                AppControl {
+                    project,
+                    paths,
+                    session_secrets,
+                    repository,
+                    store,
+                    profiles: profile_names,
+                    max_input_tokens: active.max_input_tokens,
+                    launch_args: args.clone(),
+                },
+            ));
+        }
 
         let http = HttpClient::try_new().map_err(|error| error.to_string())?;
         let credentials = CredentialResolver;
         let provider_factory = ProviderFactory::new(http.clone(), paths.clone(), credentials);
         let mut profiles = BTreeMap::new();
         let mut builder = AgentBuilder::new();
+        let secrets = session_secrets
+            .lock()
+            .map_err(|_| "session credential store is unavailable".to_owned())?;
         for (name, profile) in &config.profiles {
             let model_profile = ModelProfile::new(
                 name.clone(),
@@ -204,7 +242,7 @@ impl App {
                 profile.max_output_tokens,
             );
             let backend = provider_factory
-                .build(name, profile, session_secrets.as_ref())
+                .build(name, profile, &secrets)
                 .map_err(|error| error.to_string())?;
             profiles.insert(name.clone(), model_profile.clone());
             builder = builder.profile(model_profile, backend);
@@ -227,10 +265,11 @@ impl App {
             &config,
             active_profile.as_str(),
             active,
-            session_secrets.as_ref(),
+            &secrets,
             credentials,
             http.clone(),
         )?;
+        drop(secrets);
         let (tool_tx, tool_rx) = mpsc::unbounded_channel();
         let tool_sink: Arc<dyn EventSink> = Arc::new(ToolEventSink { sender: tool_tx });
         let tools = standard_tools(http, search_backend, Some(tool_sink));
@@ -319,8 +358,9 @@ impl App {
                 session_secrets,
                 repository,
                 store,
-                profiles: config.profiles.keys().cloned().collect(),
+                profiles: profile_names,
                 max_input_tokens: active.max_input_tokens,
+                launch_args: args.clone(),
             }),
         })
     }
@@ -621,14 +661,81 @@ impl App {
         match key.code {
             KeyCode::Up => self.state.onboarding.select_previous(),
             KeyCode::Down => self.state.onboarding.select_next(),
-            KeyCode::Enter => {
-                self.state.status =
-                    "create ~/.kurama/config.toml for the selected connection, then restart".into();
-                self.state.overlay = Overlay::None;
-            }
+            KeyCode::Char(character) => self.state.onboarding.push(character),
+            KeyCode::Backspace => self.state.onboarding.backspace(),
+            KeyCode::Enter => match self.state.onboarding.submit() {
+                Ok(Some(submission)) => {
+                    if let Err(error) = self.apply_onboarding_submission(submission) {
+                        self.state.status = error;
+                    }
+                }
+                Ok(None) => self.state.status = self.state.onboarding.prompt().to_lowercase(),
+                Err(error) => self.state.status = error,
+            },
             KeyCode::Esc => self.state.overlay = Overlay::None,
             _ => {}
         }
+    }
+
+    fn apply_onboarding_submission(
+        &mut self,
+        submission: OnboardingSubmission,
+    ) -> Result<(), String> {
+        let control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| "connection setup is unavailable".to_owned())?;
+        let repository = control.repository.clone();
+        let project = control.project.clone();
+        let session_secrets = control.session_secrets.clone();
+        let launch_args = control.launch_args.clone();
+        match submission {
+            OnboardingSubmission::Profile {
+                name,
+                profile,
+                secret,
+            } => {
+                let mut config = repository
+                    .read_config()
+                    .map_err(|error| error.to_string())?
+                    .unwrap_or_else(empty_config);
+                if config.profiles.contains_key(&name) {
+                    return Err(format!("profile {name} already exists"));
+                }
+                config.profiles.insert(name.clone(), profile);
+                if config.default_profile.is_none() {
+                    config.default_profile = Some(name.clone());
+                }
+                repository
+                    .write_config(&config)
+                    .map_err(|error| error.to_string())?;
+                repository
+                    .remember_project_profile(&project, &name)
+                    .map_err(|error| error.to_string())?;
+                if let Some(secret) = secret {
+                    session_secrets
+                        .lock()
+                        .map_err(|_| "session credential store is unavailable".to_owned())?
+                        .insert(name.clone(), SecretValue::new(secret));
+                }
+                self.request_restart(
+                    Args {
+                        profile: Some(name.clone()),
+                        yolo: self.state.mode == ExecutionMode::Yolo,
+                        ..Args::default()
+                    },
+                    format!("connecting profile {name}"),
+                );
+            }
+            OnboardingSubmission::Credential { profile, secret } => {
+                session_secrets
+                    .lock()
+                    .map_err(|_| "session credential store is unavailable".to_owned())?
+                    .insert(profile.clone(), SecretValue::new(secret));
+                self.request_restart(launch_args, format!("connecting profile {profile}"));
+            }
+        }
+        Ok(())
     }
 
     fn handle_approval_key(&mut self, key: KeyEvent) {
@@ -907,6 +1014,19 @@ fn orchestration_context(
         depth: 0,
         yolo: mode == ExecutionMode::Yolo,
     })
+}
+
+fn empty_config() -> KuramaConfig {
+    KuramaConfig {
+        version: 1,
+        default_profile: None,
+        default_mode: ExecutionMode::Supervised,
+        profiles: BTreeMap::new(),
+        roles: BTreeMap::new(),
+        orchestration: OrchestrationConfig::default(),
+        auto: AutoBoundaries::default(),
+        search: None,
+    }
 }
 
 fn resolve_resume(

@@ -95,6 +95,20 @@ impl TuiState {
         state
     }
 
+    pub fn credential(project: impl Into<String>, profile: impl Into<String>) -> Self {
+        let profile = profile.into();
+        let mut state = Self::new(
+            profile.clone(),
+            "credential required",
+            project,
+            ExecutionMode::Supervised,
+        );
+        state.onboarding = OnboardingState::credential(profile);
+        state.overlay = Overlay::Onboarding;
+        state.status = "enter session credential".into();
+        state
+    }
+
     pub fn push_user(&mut self, body: impl Into<String>) {
         self.transcript.push(TranscriptEntry {
             kind: TranscriptKind::User,
