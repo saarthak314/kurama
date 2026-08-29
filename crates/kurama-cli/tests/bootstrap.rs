@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use kurama_adapters::{AppPaths, ConfigRepository, FsSessionStore, SessionSecrets};
 use kurama_cli::{
     app::App,
@@ -9,6 +10,7 @@ use kurama_cli::{
 use kurama_protocol::{
     config::{KuramaConfig, OrchestrationConfig, ProfileConfig, ProfileKind},
     policy::{AutoBoundaries, ExecutionMode},
+    runtime::EngineCommand,
     session::{EventEnvelope, SessionEvent, SessionMetadata},
     traits::SessionStore,
 };
@@ -36,6 +38,19 @@ fn bridge_config() -> KuramaConfig {
         orchestration: OrchestrationConfig::default(),
         auto: AutoBoundaries::default(),
         search: None,
+    }
+}
+
+fn bridge_profile(model: &str) -> ProfileConfig {
+    ProfileConfig {
+        kind: ProfileKind::CodexCli,
+        model: model.into(),
+        endpoint: None,
+        auth: None,
+        command: Some("codex".into()),
+        max_input_tokens: 100_000,
+        max_output_tokens: 10_000,
+        escalation_profiles: Vec::new(),
     }
 }
 
@@ -123,4 +138,182 @@ async fn continue_resumes_the_project_session_and_downgrades_old_yolo() {
     assert_eq!(app.session_id().map(AsRef::as_ref), Some("s_previous"));
     assert_eq!(app.state.mode, ExecutionMode::Supervised);
     assert!(app.state.status.contains("Previous run used YOLO"));
+}
+
+#[tokio::test]
+async fn resume_uses_the_recorded_profile() {
+    let (_temp, paths, project) = fixture();
+    let repository = ConfigRepository::open(paths.clone()).expect("repository");
+    let mut config = bridge_config();
+    config
+        .profiles
+        .insert("archive".into(), bridge_profile("archive-model"));
+    repository.write_config(&config).expect("write config");
+    let store = FsSessionStore::open(paths.root().to_path_buf()).expect("store");
+    let metadata = SessionMetadata {
+        id: "s_archive".into(),
+        created_at_ms: 1,
+        project_root: project
+            .canonicalize()
+            .expect("canonical")
+            .display()
+            .to_string(),
+        profile: "archive".into(),
+        mode: ExecutionMode::Supervised,
+        redaction_best_effort: false,
+    };
+    store.create(&metadata).expect("create session");
+    store
+        .append(&EventEnvelope::new(
+            0,
+            1,
+            metadata.id.clone(),
+            None,
+            SessionEvent::SessionStarted { metadata },
+        ))
+        .expect("append start");
+
+    let app = App::bootstrap_with_paths(
+        &Args {
+            resume: Some(ResumeChoice::Id("s_archive".into())),
+            ..Args::default()
+        },
+        project,
+        paths,
+        SessionSecrets::default(),
+    )
+    .expect("bootstrap");
+
+    assert_eq!(app.state.profile, "archive");
+    assert_eq!(app.state.model, "archive-model");
+}
+
+#[tokio::test]
+async fn remembered_safe_mode_is_restored_on_the_next_launch() {
+    let (_temp, paths, project) = fixture();
+    let repository = ConfigRepository::open(paths.clone()).expect("repository");
+    repository
+        .write_config(&bridge_config())
+        .expect("write config");
+    repository
+        .remember_mode(ExecutionMode::Auto)
+        .expect("remember mode");
+
+    let app =
+        App::bootstrap_with_paths(&Args::default(), project, paths, SessionSecrets::default())
+            .expect("bootstrap");
+
+    assert_eq!(app.state.mode, ExecutionMode::Auto);
+}
+
+#[tokio::test]
+async fn session_commands_request_an_in_process_restart() {
+    let (_temp, paths, project) = fixture();
+    let repository = ConfigRepository::open(paths.clone()).expect("repository");
+    repository
+        .write_config(&bridge_config())
+        .expect("write config");
+    let mut app =
+        App::bootstrap_with_paths(&Args::default(), project, paths, SessionSecrets::default())
+            .expect("bootstrap");
+
+    type_command(&mut app, "/resume s_previous");
+    let exit = app
+        .handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("submit command");
+
+    assert!(!exit, "the TUI waits for the runtime shutdown event");
+    assert!(matches!(
+        app.state.sent_commands().last(),
+        Some(EngineCommand::Shutdown)
+    ));
+    assert_eq!(
+        app.restart_args().and_then(|args| args.resume.as_ref()),
+        Some(&ResumeChoice::Id("s_previous".into()))
+    );
+}
+
+#[tokio::test]
+async fn invalid_slash_commands_report_status_without_exiting() {
+    let (_temp, paths, project) = fixture();
+    let repository = ConfigRepository::open(paths.clone()).expect("repository");
+    repository
+        .write_config(&bridge_config())
+        .expect("write config");
+    let mut app =
+        App::bootstrap_with_paths(&Args::default(), project, paths, SessionSecrets::default())
+            .expect("bootstrap");
+
+    type_command(&mut app, "/does-not-exist");
+    let exit = app
+        .handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("invalid command remains inside the TUI");
+
+    assert!(!exit);
+    assert!(app.state.status.contains("unknown or invalid command"));
+}
+
+#[tokio::test]
+async fn live_controls_list_context_persist_mode_and_switch_profile() {
+    let (_temp, paths, project) = fixture();
+    let repository = ConfigRepository::open(paths.clone()).expect("repository");
+    let mut config = bridge_config();
+    config
+        .profiles
+        .insert("archive".into(), bridge_profile("archive-model"));
+    repository.write_config(&config).expect("write config");
+    let mut app = App::bootstrap_with_paths(
+        &Args::default(),
+        project,
+        paths.clone(),
+        SessionSecrets::default(),
+    )
+    .expect("bootstrap");
+    let session_id = app.session_id().expect("session id").to_string();
+
+    submit_command(&mut app, "/sessions");
+    assert!(app.state.status.contains(&session_id));
+    submit_command(&mut app, "/context");
+    assert!(app.state.status.contains("100000 token input limit"));
+    assert!(app.state.status.contains(&session_id));
+    submit_command(&mut app, "/mode auto");
+    assert_eq!(
+        repository.read_state().expect("state").last_mode,
+        Some(ExecutionMode::Auto)
+    );
+
+    submit_command(&mut app, "/model archive");
+    assert_eq!(
+        app.restart_args().and_then(|args| args.profile.as_deref()),
+        Some("archive")
+    );
+    assert!(matches!(
+        app.state.sent_commands().last(),
+        Some(EngineCommand::Shutdown)
+    ));
+}
+
+fn type_command(app: &mut App, command: &str) {
+    for character in command.chars() {
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(character),
+            KeyModifiers::NONE,
+        )))
+        .expect("type command");
+    }
+}
+
+fn submit_command(app: &mut App, command: &str) {
+    type_command(app, command);
+    app.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )))
+    .expect("submit command");
 }

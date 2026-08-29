@@ -48,6 +48,18 @@ pub struct App {
     tool_events: Option<mpsc::UnboundedReceiver<RuntimeEvent>>,
     orchestrator: Option<Arc<dyn Orchestrator>>,
     session_id: Option<SessionId>,
+    restart_args: Option<Args>,
+    control: Option<AppControl>,
+}
+
+struct AppControl {
+    project: PathBuf,
+    paths: AppPaths,
+    session_secrets: Arc<SessionSecrets>,
+    repository: ConfigRepository,
+    store: Arc<FsSessionStore>,
+    profiles: Vec<String>,
+    max_input_tokens: u64,
 }
 
 impl App {
@@ -66,11 +78,23 @@ impl App {
         paths: AppPaths,
         session_secrets: SessionSecrets,
     ) -> Result<Self, String> {
+        Self::bootstrap_with_shared_paths(args, cwd, paths, Arc::new(session_secrets))
+    }
+
+    fn bootstrap_with_shared_paths(
+        args: &Args,
+        cwd: PathBuf,
+        paths: AppPaths,
+        session_secrets: Arc<SessionSecrets>,
+    ) -> Result<Self, String> {
         let project = cwd
             .canonicalize()
             .map_err(|error| format!("canonicalize project: {error}"))?;
         let repository =
             ConfigRepository::open(paths.clone()).map_err(|error| error.to_string())?;
+        let store = Arc::new(
+            FsSessionStore::open(paths.root().to_path_buf()).map_err(|error| error.to_string())?,
+        );
         let Some(config) = repository
             .read_config()
             .map_err(|error| error.to_string())?
@@ -78,91 +102,33 @@ impl App {
             if args.profile.is_some() || args.resume.is_some() {
                 return Err("Kurama is not configured; create ~/.kurama/config.toml first".into());
             }
-            return Ok(Self::disconnected(TuiState::onboarding(
-                project.display().to_string(),
-            )));
+            return Ok(Self::disconnected(
+                TuiState::onboarding(project.display().to_string()),
+                AppControl {
+                    project,
+                    paths,
+                    session_secrets,
+                    repository,
+                    store,
+                    profiles: Vec::new(),
+                    max_input_tokens: 0,
+                },
+            ));
         };
         if config.profiles.is_empty() {
-            return Ok(Self::disconnected(TuiState::onboarding(
-                project.display().to_string(),
-            )));
+            return Ok(Self::disconnected(
+                TuiState::onboarding(project.display().to_string()),
+                AppControl {
+                    project,
+                    paths,
+                    session_secrets,
+                    repository,
+                    store,
+                    profiles: Vec::new(),
+                    max_input_tokens: 0,
+                },
+            ));
         }
-
-        let active_profile = repository
-            .resolve_profile(&project, args.profile.as_deref())
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "no active profile is configured".to_owned())?;
-        let active = config
-            .profiles
-            .get(&active_profile)
-            .ok_or_else(|| format!("unknown active profile: {active_profile}"))?;
-        let mode = if args.yolo {
-            ExecutionMode::Yolo
-        } else {
-            config.default_mode
-        };
-
-        let http = HttpClient::try_new().map_err(|error| error.to_string())?;
-        let credentials = CredentialResolver;
-        let provider_factory = ProviderFactory::new(http.clone(), paths.clone(), credentials);
-        let mut profiles = BTreeMap::new();
-        let mut builder = AgentBuilder::new();
-        for (name, profile) in &config.profiles {
-            let model_profile = ModelProfile::new(
-                name.clone(),
-                profile.model.clone(),
-                profile.max_input_tokens,
-                profile.max_output_tokens,
-            );
-            let backend = provider_factory
-                .build(name, profile, &session_secrets)
-                .map_err(|error| error.to_string())?;
-            profiles.insert(name.clone(), model_profile.clone());
-            builder = builder.profile(model_profile, backend);
-        }
-
-        let ids = Arc::new(RandomIds);
-        let orchestrator = Arc::new(SmartOrchestrator::new(ids.clone()));
-        let write_scope = WriteScope {
-            roots: vec![project.clone()],
-            files: Vec::new(),
-        };
-        let orchestration = orchestration_context(
-            &config,
-            active_profile.as_str(),
-            &profiles,
-            write_scope.clone(),
-            mode,
-        )?;
-        let search_backend = search_backend(
-            &config,
-            active_profile.as_str(),
-            active,
-            &session_secrets,
-            credentials,
-            http.clone(),
-        )?;
-        let (tool_tx, tool_rx) = mpsc::unbounded_channel();
-        let tool_sink: Arc<dyn EventSink> = Arc::new(ToolEventSink { sender: tool_tx });
-        let tools = standard_tools(http, search_backend, Some(tool_sink));
-        let store = Arc::new(
-            FsSessionStore::open(paths.root().to_path_buf()).map_err(|error| error.to_string())?,
-        );
-        let sink: Arc<dyn EventSink> = Arc::new(NoopSink);
-        builder = builder
-            .active_profile(active_profile.clone())
-            .policy(Arc::new(DefaultPolicy::new(mode, config.auto.clone())))
-            .store(store.clone())
-            .sink(sink)
-            .orchestrator(orchestrator.clone())
-            .ids(ids.clone())
-            .write_scope(write_scope)
-            .auto_boundaries(config.auto.clone())
-            .orchestration_context(orchestration);
-        for tool in tools {
-            builder = builder.tool(tool);
-        }
-        let runtime = builder.build().map_err(|error| error.to_string())?;
 
         let resume_id = resolve_resume(args, &repository, store.as_ref(), &project)?;
         let mut replay = resume_id
@@ -189,7 +155,101 @@ impl App {
                     metadata.id
                 ));
             }
+            if args
+                .profile
+                .as_deref()
+                .is_some_and(|profile| profile != metadata.profile)
+            {
+                return Err(format!(
+                    "session {} is pinned to profile {}; start a new session to switch profiles",
+                    metadata.id, metadata.profile
+                ));
+            }
         }
+        let active_profile = if let Some(metadata) = &previous_metadata {
+            metadata.profile.clone()
+        } else {
+            repository
+                .resolve_profile(&project, args.profile.as_deref())
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "no active profile is configured".to_owned())?
+        };
+        let active = config
+            .profiles
+            .get(&active_profile)
+            .ok_or_else(|| format!("unknown active profile: {active_profile}"))?;
+        let mutable_state = repository.read_state().map_err(|error| error.to_string())?;
+        let mode = if args.yolo {
+            ExecutionMode::Yolo
+        } else if let Some(metadata) = &previous_metadata {
+            if metadata.mode == ExecutionMode::Yolo {
+                mutable_state.last_mode.unwrap_or(ExecutionMode::Supervised)
+            } else {
+                metadata.mode
+            }
+        } else {
+            mutable_state.last_mode.unwrap_or(config.default_mode)
+        };
+
+        let http = HttpClient::try_new().map_err(|error| error.to_string())?;
+        let credentials = CredentialResolver;
+        let provider_factory = ProviderFactory::new(http.clone(), paths.clone(), credentials);
+        let mut profiles = BTreeMap::new();
+        let mut builder = AgentBuilder::new();
+        for (name, profile) in &config.profiles {
+            let model_profile = ModelProfile::new(
+                name.clone(),
+                profile.model.clone(),
+                profile.max_input_tokens,
+                profile.max_output_tokens,
+            );
+            let backend = provider_factory
+                .build(name, profile, session_secrets.as_ref())
+                .map_err(|error| error.to_string())?;
+            profiles.insert(name.clone(), model_profile.clone());
+            builder = builder.profile(model_profile, backend);
+        }
+
+        let ids = Arc::new(RandomIds);
+        let orchestrator = Arc::new(SmartOrchestrator::new(ids.clone()));
+        let write_scope = WriteScope {
+            roots: vec![project.clone()],
+            files: Vec::new(),
+        };
+        let orchestration = orchestration_context(
+            &config,
+            active_profile.as_str(),
+            &profiles,
+            write_scope.clone(),
+            mode,
+        )?;
+        let search_backend = search_backend(
+            &config,
+            active_profile.as_str(),
+            active,
+            session_secrets.as_ref(),
+            credentials,
+            http.clone(),
+        )?;
+        let (tool_tx, tool_rx) = mpsc::unbounded_channel();
+        let tool_sink: Arc<dyn EventSink> = Arc::new(ToolEventSink { sender: tool_tx });
+        let tools = standard_tools(http, search_backend, Some(tool_sink));
+        let sink: Arc<dyn EventSink> = Arc::new(NoopSink);
+        builder = builder
+            .active_profile(active_profile.clone())
+            .policy(Arc::new(DefaultPolicy::new(mode, config.auto.clone())))
+            .store(store.clone())
+            .sink(sink)
+            .orchestrator(orchestrator.clone())
+            .ids(ids.clone())
+            .write_scope(write_scope)
+            .auto_boundaries(config.auto.clone())
+            .orchestration_context(orchestration);
+        for tool in tools {
+            builder = builder.tool(tool);
+        }
+        let runtime = builder.build().map_err(|error| error.to_string())?;
+
         let session_id = resume_id.unwrap_or_else(|| ids.session_id());
         let created_at_ms = previous_metadata
             .as_ref()
@@ -252,6 +312,16 @@ impl App {
             tool_events: Some(tool_rx),
             orchestrator: Some(orchestrator),
             session_id: Some(session_id),
+            restart_args: None,
+            control: Some(AppControl {
+                project,
+                paths,
+                session_secrets,
+                repository,
+                store,
+                profiles: config.profiles.keys().cloned().collect(),
+                max_input_tokens: active.max_input_tokens,
+            }),
         })
     }
 
@@ -268,10 +338,12 @@ impl App {
             tool_events: None,
             orchestrator: Some(orchestrator),
             session_id: Some(session_id),
+            restart_args: None,
+            control: None,
         }
     }
 
-    fn disconnected(state: TuiState) -> Self {
+    fn disconnected(state: TuiState, control: AppControl) -> Self {
         Self {
             state,
             engine: None,
@@ -279,6 +351,8 @@ impl App {
             tool_events: None,
             orchestrator: None,
             session_id: None,
+            restart_args: None,
+            control: Some(control),
         }
     }
 
@@ -290,6 +364,18 @@ impl App {
         self.session_id.as_ref()
     }
 
+    pub fn restart_args(&self) -> Option<&Args> {
+        self.restart_args.as_ref()
+    }
+
+    fn request_restart(&mut self, args: Args, status: impl Into<String>) {
+        self.restart_args = Some(args);
+        self.state.status = status.into();
+        if self.engine.is_some() {
+            self.state.queue_command(EngineCommand::Shutdown);
+        }
+    }
+
     pub const fn tool_names() -> [&'static str; 4] {
         ["bash", "read", "web-search", "write"]
     }
@@ -298,11 +384,32 @@ impl App {
         let _guard = TerminalGuard::enter().map_err(|error| error.to_string())?;
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::new(backend).map_err(|error| error.to_string())?;
-        let input = spawn_input_thread(32);
-        let runtime_events = self.runtime_events.take();
-        let tool_events = self.tool_events.take();
-        run_loop(&mut self, &mut terminal, input, runtime_events, tool_events).await?;
-        Ok(())
+        let mut input = spawn_input_thread(32);
+        loop {
+            let runtime_events = self.runtime_events.take();
+            let tool_events = self.tool_events.take();
+            run_loop(
+                &mut self,
+                &mut terminal,
+                &mut input,
+                runtime_events,
+                tool_events,
+            )
+            .await?;
+            let Some(args) = self.restart_args.take() else {
+                return Ok(());
+            };
+            let control = self
+                .control
+                .as_ref()
+                .ok_or_else(|| "runtime cannot restart without bootstrap context".to_owned())?;
+            self = Self::bootstrap_with_shared_paths(
+                &args,
+                control.project.clone(),
+                control.paths.clone(),
+                control.session_secrets.clone(),
+            )?;
+        }
     }
 
     pub fn handle_event(&mut self, event: Event) -> Result<bool, String> {
@@ -323,7 +430,7 @@ impl App {
             | Overlay::ConfirmAgentCancel => self.handle_agents_key(key),
             Overlay::None => self.handle_main_key(key)?,
         }
-        Ok(false)
+        Ok(self.restart_args.is_some() && self.engine.is_none())
     }
 
     fn handle_main_key(&mut self, key: KeyEvent) -> Result<(), String> {
@@ -384,27 +491,84 @@ impl App {
             return Ok(());
         }
         if trimmed.starts_with('/') {
-            match parse_command(trimmed)? {
+            let command = match parse_command(trimmed) {
+                Ok(command) => command,
+                Err(error) => {
+                    self.state.status = error;
+                    return Ok(());
+                }
+            };
+            match command {
                 Command::Agents => self.state.open_agents(),
                 Command::Model(profile) => {
-                    self.state.status = profile.map_or_else(
-                        || "select model".into(),
-                        |profile| format!("restart with --profile {profile} to switch models"),
-                    )
+                    if let Some(profile) = profile {
+                        let known = self
+                            .control
+                            .as_ref()
+                            .is_some_and(|control| control.profiles.contains(&profile));
+                        if !known {
+                            self.state.status = format!("unknown profile: {profile}");
+                        } else if profile == self.state.profile {
+                            self.state.status = format!("profile {profile} is already active");
+                        } else {
+                            self.request_restart(
+                                Args {
+                                    profile: Some(profile.clone()),
+                                    yolo: self.state.mode == ExecutionMode::Yolo,
+                                    ..Args::default()
+                                },
+                                format!("switching to profile {profile}"),
+                            );
+                        }
+                    } else {
+                        self.state.status = self.control.as_ref().map_or_else(
+                            || "profile selection is unavailable".into(),
+                            |control| format!("profiles: {}", control.profiles.join(", ")),
+                        );
+                    }
                 }
                 Command::Connect => self.state.overlay = Overlay::Onboarding,
-                Command::Sessions => {
-                    self.state.status = "use --resume or --continue to resume".into()
-                }
+                Command::Sessions => self.show_sessions()?,
                 Command::Resume(session) => {
-                    self.state.status = format!("restart with --resume {session}")
+                    self.request_restart(
+                        Args {
+                            resume: Some(ResumeChoice::Id(session.to_string())),
+                            yolo: self.state.mode == ExecutionMode::Yolo,
+                            ..Args::default()
+                        },
+                        format!("resuming session {session}"),
+                    );
                 }
                 Command::New => {
-                    self.state.status = "restart without --resume for a new session".into()
+                    self.request_restart(
+                        Args {
+                            profile: self.is_connected().then(|| self.state.profile.clone()),
+                            yolo: self.state.mode == ExecutionMode::Yolo,
+                            ..Args::default()
+                        },
+                        "starting a new session",
+                    );
                 }
-                Command::Context => self.state.status = "context is compacted automatically".into(),
+                Command::Context => {
+                    self.state.status = self.control.as_ref().map_or_else(
+                        || "context details are unavailable".into(),
+                        |control| {
+                            format!(
+                                "context: {} token input limit; automatic compaction; session {}",
+                                control.max_input_tokens,
+                                self.session_id.as_ref().map_or("none", AsRef::as_ref)
+                            )
+                        },
+                    )
+                }
                 Command::Compact => self.state.queue_command(EngineCommand::Compact),
                 Command::Mode(mode) => {
+                    if let Some(control) = &self.control {
+                        control
+                            .repository
+                            .remember_mode(mode)
+                            .map_err(|error| error.to_string())?;
+                    }
                     self.state.mode = mode;
                     self.state.queue_command(EngineCommand::SetMode(mode));
                 }
@@ -423,6 +587,33 @@ impl App {
             });
             self.state.status = "thinking".into();
         }
+        Ok(())
+    }
+
+    fn show_sessions(&mut self) -> Result<(), String> {
+        let Some(control) = &self.control else {
+            self.state.status = "session listing is unavailable".into();
+            return Ok(());
+        };
+        let project = control.project.display().to_string();
+        let sessions: Vec<_> = control
+            .store
+            .list()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|session| session.project_root == project)
+            .take(4)
+            .collect();
+        self.state.status = if sessions.is_empty() {
+            "no saved sessions for this project".into()
+        } else {
+            let summaries = sessions
+                .iter()
+                .map(|session| format!("{} ({})", session.id, session.profile))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("sessions: {summaries}")
+        };
         Ok(())
     }
 
@@ -544,20 +735,20 @@ pub fn prompt_bundle() -> String {
 pub async fn run_with<B>(
     mut app: App,
     terminal: &mut Terminal<B>,
-    input: mpsc::Receiver<Event>,
+    mut input: mpsc::Receiver<Event>,
     runtime_events: mpsc::Receiver<RuntimeEvent>,
 ) -> Result<App, String>
 where
     B: Backend,
 {
-    run_loop(&mut app, terminal, input, Some(runtime_events), None).await?;
+    run_loop(&mut app, terminal, &mut input, Some(runtime_events), None).await?;
     Ok(app)
 }
 
 async fn run_loop<B>(
     app: &mut App,
     terminal: &mut Terminal<B>,
-    mut input: mpsc::Receiver<Event>,
+    input: &mut mpsc::Receiver<Event>,
     runtime_events: Option<mpsc::Receiver<RuntimeEvent>>,
     tool_events: Option<mpsc::UnboundedReceiver<RuntimeEvent>>,
 ) -> Result<(), String>
