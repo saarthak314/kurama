@@ -1384,8 +1384,7 @@ fn render_markdown_table(
     let separator_width = column_count.saturating_sub(1) * 3;
     let available = width
         .saturating_sub(prefix_width)
-        .saturating_sub(separator_width)
-        .max(column_count);
+        .saturating_sub(separator_width);
     let natural_column_widths = (0..column_count)
         .map(|column| {
             std::iter::once(header.get(column))
@@ -1397,7 +1396,10 @@ fn render_markdown_table(
                 .max(1)
         })
         .collect::<Vec<_>>();
-    if !rows.is_empty() && natural_column_widths.iter().sum::<usize>() > available {
+    let natural_grid_width = prefix_width
+        .saturating_add(separator_width)
+        .saturating_add(natural_column_widths.iter().sum::<usize>());
+    if !rows.is_empty() && natural_grid_width > width {
         render_stacked_markdown_table(header, rows, width, context, marker, lines);
         return;
     }
@@ -1457,35 +1459,100 @@ fn render_stacked_markdown_table(
     let column_count = header
         .len()
         .max(rows.iter().map(Vec::len).max().unwrap_or(0));
+    let record_context = MarkdownContext {
+        indent: context.indent + marker.map(display_width).unwrap_or(0),
+        ..context
+    };
     for (row_index, row) in rows.iter().enumerate() {
         for column in 0..column_count {
-            let label = header
-                .get(column)
-                .map(|fragments| fragments_text(fragments))
-                .filter(|label| !label.trim().is_empty())
-                .unwrap_or_else(|| format!("Column {}", column + 1));
-            let field_marker = (row_index == 0 && column == 0).then_some(marker).flatten();
-            let (mut first_prefix, mut continuation_prefix) =
-                markdown_prefixes(context, field_marker, None);
-            let label_style = Style::default().fg(DIM).add_modifier(Modifier::BOLD);
-            push_fragment(&mut first_prefix, format!("{label}: "), label_style);
-            push_fragment(
-                &mut continuation_prefix,
-                " ".repeat(display_width(&label) + 2),
-                text_style(),
-            );
+            let first_field = row_index == 0 && column == 0;
+            let field_context = if first_field { context } else { record_context };
+            let field_marker = first_field.then_some(marker).flatten();
+            let (base_first_prefix, base_continuation_prefix) =
+                markdown_prefixes(field_context, field_marker, None);
+            let label = stacked_table_label(header, column);
+            let label_width = fragments_width(&label);
             let value = row.get(column).map(Vec::as_slice).unwrap_or(&[]);
-            lines.extend(wrap_styled_fragments(
-                value,
-                width,
-                &first_prefix,
-                &continuation_prefix,
-            ));
+
+            if fragments_width(&base_first_prefix)
+                .saturating_add(label_width)
+                .saturating_add(2)
+                < width
+            {
+                let mut first_prefix = base_first_prefix;
+                append_fragments(&mut first_prefix, &label);
+                push_fragment(
+                    &mut first_prefix,
+                    ": ".into(),
+                    Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+                );
+                let mut continuation_prefix = base_continuation_prefix;
+                push_fragment(
+                    &mut continuation_prefix,
+                    " ".repeat(label_width + 2),
+                    text_style(),
+                );
+                lines.extend(wrap_styled_fragments(
+                    value,
+                    width,
+                    &first_prefix,
+                    &continuation_prefix,
+                ));
+            } else {
+                let mut label_line = label;
+                push_fragment(
+                    &mut label_line,
+                    ":".into(),
+                    Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+                );
+                lines.extend(wrap_styled_fragments(
+                    &label_line,
+                    width,
+                    &base_first_prefix,
+                    &base_continuation_prefix,
+                ));
+                let (mut value_first_prefix, mut value_continuation_prefix) =
+                    markdown_prefixes(record_context, None, None);
+                push_fragment(&mut value_first_prefix, "  ".into(), text_style());
+                push_fragment(&mut value_continuation_prefix, "  ".into(), text_style());
+                lines.extend(wrap_styled_fragments(
+                    value,
+                    width,
+                    &value_first_prefix,
+                    &value_continuation_prefix,
+                ));
+            }
         }
         if row_index + 1 < rows.len() {
-            push_markdown_blank(lines, context);
+            push_markdown_blank(lines, record_context);
         }
     }
+}
+
+fn stacked_table_label(header: &[Vec<StyledFragment>], column: usize) -> Vec<StyledFragment> {
+    let label = header.get(column).filter(|fragments| {
+        fragments
+            .iter()
+            .any(|fragment| !fragment.content.trim().is_empty())
+    });
+    label.map_or_else(
+        || {
+            vec![StyledFragment {
+                content: format!("Column {}", column + 1),
+                style: Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+            }]
+        },
+        |fragments| {
+            fragments
+                .iter()
+                .cloned()
+                .map(|fragment| StyledFragment {
+                    content: fragment.content,
+                    style: fragment.style.add_modifier(Modifier::BOLD),
+                })
+                .collect()
+        },
+    )
 }
 
 fn table_row_line(

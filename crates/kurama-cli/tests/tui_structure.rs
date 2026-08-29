@@ -339,6 +339,53 @@ fn narrow_markdown_tables_render_as_stacked_records() {
 }
 
 #[test]
+fn stacked_tables_keep_values_visible_after_long_headers() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_assistant(concat!(
+        "| ExtremelyLongHeader |\n",
+        "| --- |\n",
+        "| visible-value |"
+    ));
+
+    let text = buffer_text(&rendered(&state, 16, 20));
+    let compact = text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+
+    assert!(compact.contains("ExtremelyLongHeader:visible-value"));
+}
+
+#[test]
+fn tables_stack_when_separators_do_not_fit() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_assistant("| A | B |\n| --- | --- |\n| x | y |");
+
+    let text = buffer_text(&rendered(&state, 8, 16));
+
+    assert!(text.contains("A: x"));
+    assert!(text.contains("B: y"));
+}
+
+#[test]
+fn stacked_table_headers_preserve_inline_markdown_styles() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_assistant(concat!(
+        "| *Field* | Value |\n",
+        "| --- | --- |\n",
+        "| command | cargo test --workspace --all-features |"
+    ));
+
+    let buffer = rendered(&state, 40, 20);
+
+    assert!(
+        cell_at_text(&buffer, "Field")
+            .modifier
+            .contains(Modifier::ITALIC)
+    );
+}
+
+#[test]
 fn transcript_scroll_reaches_visual_lines_beyond_u16_max() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     let output = (0..65_550)
