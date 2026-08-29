@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{borrow::Cow, fs, path::Path};
 
 use kurama_protocol::{
     KuramaError,
@@ -6,7 +6,10 @@ use kurama_protocol::{
     id::CallId,
     model::{ModelEvent, ModelRequest},
 };
-use serde::{Deserialize, Deserializer, de::Error as _};
+use serde::{
+    Deserialize, Deserializer,
+    de::{DeserializeOwned, Error as _},
+};
 use serde_json::{Value, json};
 
 const MAX_ERROR_BYTES: usize = 16 * 1024;
@@ -112,7 +115,7 @@ pub fn bridge_prompt(request: &ModelRequest) -> String {
 }
 
 pub fn parse_control(text: &str, delegation_enabled: bool) -> Result<Vec<ModelEvent>, KuramaError> {
-    let control: Control = serde_json::from_str(text).map_err(|error| {
+    let control: Control = parse_json_with_escape_recovery(text).map_err(|error| {
         KuramaError::Protocol(format!("invalid bridge control output: {error}"))
     })?;
     match control.kind {
@@ -212,8 +215,81 @@ where
 {
     let value = Value::deserialize(deserializer)?;
     match value {
-        Value::String(encoded) => serde_json::from_str(&encoded).map_err(D::Error::custom),
+        Value::String(encoded) => {
+            parse_json_with_escape_recovery(&encoded).map_err(D::Error::custom)
+        }
         value => Ok(value),
+    }
+}
+
+fn parse_json_with_escape_recovery<T: DeserializeOwned>(
+    text: &str,
+) -> Result<T, serde_json::Error> {
+    match serde_json::from_str(text) {
+        Ok(value) => Ok(value),
+        Err(error) => match repair_invalid_json_escapes(text) {
+            Cow::Borrowed(_) => Err(error),
+            Cow::Owned(repaired) => serde_json::from_str(&repaired),
+        },
+    }
+}
+
+fn repair_invalid_json_escapes(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let mut repaired = Vec::with_capacity(bytes.len());
+    let mut in_string = false;
+    let mut changed = false;
+    let mut index = 0;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if !in_string {
+            repaired.push(byte);
+            if byte == b'"' {
+                in_string = true;
+            }
+            index += 1;
+            continue;
+        }
+
+        match byte {
+            b'"' => {
+                repaired.push(byte);
+                in_string = false;
+                index += 1;
+            }
+            b'\\' => {
+                let valid_escape_len = match bytes.get(index + 1).copied() {
+                    Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => 2,
+                    Some(b'u')
+                        if bytes
+                            .get(index + 2..index + 6)
+                            .is_some_and(|digits| digits.iter().all(u8::is_ascii_hexdigit)) =>
+                    {
+                        6
+                    }
+                    _ => 0,
+                };
+                if valid_escape_len == 0 {
+                    repaired.extend_from_slice(b"\\\\");
+                    changed = true;
+                    index += 1;
+                } else {
+                    repaired.extend_from_slice(&bytes[index..index + valid_escape_len]);
+                    index += valid_escape_len;
+                }
+            }
+            _ => {
+                repaired.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    if changed {
+        Cow::Owned(String::from_utf8(repaired).expect("repair preserves UTF-8"))
+    } else {
+        Cow::Borrowed(text)
     }
 }
 

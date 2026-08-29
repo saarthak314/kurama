@@ -207,6 +207,37 @@ fn strict_control_parser_normalizes_tools_and_delegation() {
 }
 
 #[test]
+fn control_parser_recovers_literal_backslashes_inside_strings() {
+    let final_events = parse_control(
+        r#"{"kind":"final","text":"Use \_emphasis\_ and \`code\`.","calls":[],"agents":[]}"#,
+        false,
+    )
+    .expect("final control");
+    assert!(matches!(
+        final_events.as_slice(),
+        [ModelEvent::TextDelta { text }] if text == r"Use \_emphasis\_ and \`code\`."
+    ));
+
+    let tool_events = parse_control(
+        r#"{"kind":"tool_calls","text":"","calls":[{"call_id":"c1","name":"bash","arguments":"{\"command\":\"printf \\q\"}"}],"agents":[]}"#,
+        false,
+    )
+    .expect("tool control");
+    assert!(matches!(
+        tool_events.as_slice(),
+        [ModelEvent::ToolCall { arguments, .. }] if arguments["command"] == r"printf \q"
+    ));
+
+    assert!(
+        parse_control(
+            r#"{"kind":"final","text":"bad \q","calls":[],"agents":[],"extra":true}"#,
+            false,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn codex_and_claude_jsonl_fixtures_normalize() {
     let codex = CodexBridge::parse_fixture(include_str!(
         "../../../tests/fixtures/codex/tool_turn.jsonl"

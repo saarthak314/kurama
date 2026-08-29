@@ -203,6 +203,25 @@ fn assistant_deltas_coalesce_only_while_adjacent() {
 }
 
 #[test]
+fn runtime_errors_are_appended_to_the_transcript() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.status = "running model".into();
+
+    state.apply_runtime_event(RuntimeEvent::Error {
+        message: "protocol error: malformed bridge output".into(),
+    });
+
+    assert_eq!(state.status, "ready");
+    assert_eq!(state.transcript.len(), 1);
+    assert_eq!(state.transcript[0].kind, TranscriptKind::System);
+    assert_eq!(state.transcript[0].label, "ERROR");
+    assert_eq!(
+        state.transcript[0].body,
+        "protocol error: malformed bridge output"
+    );
+}
+
+#[test]
 fn replay_hydration_clears_active_tool_stream_tracking() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.apply_runtime_event(tool_delta("call_1", "stdout", "stale"));

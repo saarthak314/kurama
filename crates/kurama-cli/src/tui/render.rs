@@ -1491,6 +1491,15 @@ fn transcript_lines(state: &TuiState, width: usize) -> Vec<Line<'static>> {
                     ]));
                 }
             }
+            TranscriptKind::System if entry.label == "ERROR" => push_prefixed_lines(
+                &mut lines,
+                &format!("{} · {}", entry.label, entry.body),
+                "× ",
+                "  ",
+                Style::default().fg(RED).add_modifier(Modifier::BOLD),
+                Style::default().fg(RED),
+                width,
+            ),
             TranscriptKind::System => push_prefixed_lines(
                 &mut lines,
                 &format!("{} · {}", entry.label, entry.body),

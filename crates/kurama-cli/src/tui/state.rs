@@ -435,7 +435,10 @@ impl TuiState {
                 }
             }
             RuntimeEvent::TurnCompleted => self.status = "ready".into(),
-            RuntimeEvent::Error { message } => self.status = message,
+            RuntimeEvent::Error { message } => {
+                self.push_system("ERROR", message);
+                self.status = "ready".into();
+            }
             RuntimeEvent::Shutdown => self.status = "shutdown".into(),
         }
     }

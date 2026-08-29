@@ -7,6 +7,7 @@ use kurama_protocol::{
     agent::AgentState,
     id::{AgentId, OperationId, SessionId},
     policy::{ApprovalRequest, ExecutionMode},
+    runtime::RuntimeEvent,
     tool::Operation,
 };
 use ratatui::{
@@ -133,6 +134,24 @@ fn transcript_uses_compact_codex_style_hierarchy() {
     assert!(!text.contains("│ YOU"));
     assert!(!text.contains("│ KURAMA"));
     assert!(!text.contains("TOOL / bash  /"));
+}
+
+#[test]
+fn runtime_errors_render_in_the_transcript_instead_of_the_status_line() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.apply_runtime_event(RuntimeEvent::Error {
+        message: "protocol error: malformed bridge output".into(),
+    });
+
+    let buffer = rendered(&state, 100, 20);
+    let text = buffer_text(&buffer);
+
+    assert!(text.contains("× ERROR · protocol error: malformed bridge output"));
+    assert!(
+        text.lines()
+            .any(|line| line.contains("work/model") && line.contains("ready"))
+    );
+    assert_eq!(cell_at_text(&buffer, "ERROR").fg, Color::Rgb(255, 92, 82));
 }
 
 #[test]
