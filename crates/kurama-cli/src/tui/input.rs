@@ -1,7 +1,7 @@
 use std::{io, thread};
 
 use crossterm::{
-    event::{self, Event},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -12,8 +12,19 @@ pub struct TerminalGuard;
 impl TerminalGuard {
     pub fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen, crossterm::cursor::Hide) {
+        if let Err(error) = execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            crossterm::cursor::Hide
+        ) {
             let _ = disable_raw_mode();
+            let _ = execute!(
+                io::stdout(),
+                crossterm::cursor::Show,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            );
             return Err(error);
         }
         Ok(Self)
@@ -23,7 +34,12 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), crossterm::cursor::Show, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            crossterm::cursor::Show,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
     }
 }
 

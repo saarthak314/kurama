@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use kurama_adapters::{
     AppPaths, BashTool, ConfigRepository, CredentialResolver, FsSessionStore, HttpClient,
     JsonSearchBackend, OpenAiNativeSearch, ProviderFactory, RandomIds, ReadTool, SearchBackend,
@@ -456,12 +456,30 @@ impl App {
     }
 
     pub fn handle_event(&mut self, event: Event) -> Result<bool, String> {
-        let Event::Key(key) = event else {
-            return Ok(false);
+        let key = match event {
+            Event::Key(key) => key,
+            Event::Mouse(mouse) => {
+                self.handle_mouse(mouse);
+                return Ok(false);
+            }
+            _ => return Ok(false),
         };
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.state.queue_command(EngineCommand::Shutdown);
             return Ok(true);
+        }
+        if self.transcript_is_visible() {
+            match key.code {
+                KeyCode::PageUp => {
+                    self.state.scroll = self.state.scroll.saturating_add(5);
+                    return Ok(false);
+                }
+                KeyCode::PageDown => {
+                    self.state.scroll = self.state.scroll.saturating_sub(5);
+                    return Ok(false);
+                }
+                _ => {}
+            }
         }
 
         match self.state.overlay {
@@ -514,8 +532,6 @@ impl App {
                     .map(char::len_utf8)
                     .unwrap_or(0);
             }
-            KeyCode::PageUp => self.state.scroll = self.state.scroll.saturating_add(5),
-            KeyCode::PageDown => self.state.scroll = self.state.scroll.saturating_sub(5),
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.state.composer.insert(self.state.cursor, '\n');
                 self.state.cursor += 1;
@@ -524,6 +540,28 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if !self.transcript_is_visible() {
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.state.scroll = self.state.scroll.saturating_add(5);
+            }
+            MouseEventKind::ScrollDown => {
+                self.state.scroll = self.state.scroll.saturating_sub(5);
+            }
+            _ => {}
+        }
+    }
+
+    fn transcript_is_visible(&self) -> bool {
+        matches!(
+            self.state.overlay,
+            Overlay::None | Overlay::Approval | Overlay::ApprovalEdit
+        )
     }
 
     fn submit_composer(&mut self) -> Result<(), String> {
@@ -1187,6 +1225,7 @@ impl EventSink for ToolEventSink {
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::{MouseEvent, MouseEventKind};
     use kurama_protocol::{
         id::{CallId, OperationId},
         tool::ToolResult,
@@ -1239,9 +1278,44 @@ mod tests {
         };
         app.state.scroll = usize::from(u16::MAX);
 
-        app.handle_main_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
-            .expect("page up");
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::PageUp,
+            KeyModifiers::NONE,
+        )))
+        .expect("page up");
 
         assert!(app.state.scroll > usize::from(u16::MAX));
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_the_main_transcript() {
+        let mut app = App {
+            state: TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised),
+            engine: None,
+            runtime_events: None,
+            tool_events: None,
+            orchestrator: None,
+            session_id: None,
+            restart_args: None,
+            control: None,
+        };
+
+        app.handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .expect("scroll up");
+        assert_eq!(app.state.scroll, 5);
+
+        app.handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .expect("scroll down");
+        assert_eq!(app.state.scroll, 0);
     }
 }
