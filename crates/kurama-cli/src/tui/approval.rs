@@ -9,7 +9,8 @@ pub struct ApprovalState {
 }
 
 impl ApprovalState {
-    pub fn new(request: ApprovalRequest, arguments: serde_json::Value) -> Self {
+    pub fn new(request: ApprovalRequest) -> Self {
+        let arguments = request.arguments.clone();
         let editor = serde_json::to_string_pretty(&arguments).unwrap_or_else(|_| "{}".into());
         Self {
             request,

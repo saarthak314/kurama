@@ -56,14 +56,16 @@ pub fn control_schema(delegation_enabled: bool) -> Value {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "role": {"type": "string"},
                             "objective": {"type": "string"},
-                            "profile": {"type": ["string", "null"]},
                             "write_roots": {"type": "array", "items": {"type": "string"}},
                             "write_files": {"type": "array", "items": {"type": "string"}},
-                            "depends_on": {"type": "array", "items": {"type": "string"}}
+                            "depends_on": {
+                                "type": "array",
+                                "description": "Exact objective strings of prerequisite agents.",
+                                "items": {"type": "string"}
+                            }
                         },
-                        "required": ["role", "objective", "profile", "write_roots", "write_files", "depends_on"],
+                        "required": ["objective", "write_roots", "write_files", "depends_on"],
                         "additionalProperties": false
                     }
                 }
@@ -117,6 +119,8 @@ pub fn bridge_prompt(request: &ModelRequest) -> String {
     );
     if request.delegation.is_none() {
         prompt.push_str("\n\nDelegation is disabled for this turn.");
+    } else {
+        prompt.push_str("\n\nKurama assigns child roles and profiles. Delegation dependencies must name the exact objective text of prerequisite agents.");
     }
     truncate_utf8(&mut prompt, MAX_PROMPT_BYTES);
     prompt
@@ -226,9 +230,7 @@ impl ControlCall {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ControlAgent {
-    role: String,
     objective: String,
-    profile: Option<String>,
     write_roots: Vec<String>,
     write_files: Vec<String>,
     depends_on: Vec<String>,
@@ -237,9 +239,9 @@ struct ControlAgent {
 impl ControlAgent {
     fn spec(self) -> AgentSpec {
         AgentSpec {
-            role: self.role,
+            role: String::new(),
             objective: self.objective,
-            profile: self.profile,
+            profile: None,
             context_refs: Vec::new(),
             write_scope: WriteScope {
                 roots: self.write_roots.into_iter().map(Into::into).collect(),

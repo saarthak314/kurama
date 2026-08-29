@@ -25,8 +25,6 @@ fn row(id: &str, state: AgentState) -> AgentRow {
         role: "reviewer".into(),
         profile: "gpt-5.6".into(),
         task: "inspect auth".into(),
-        scope: "read-only".into(),
-        elapsed: "00:38".into(),
         state,
         activity: "reading policy".into(),
         transcript: vec!["Inspecting policy boundaries.".into()],
@@ -61,7 +59,6 @@ fn panel_shows_control_fields_but_not_tool_statistics() {
         "reviewer",
         "gpt-5.6",
         "inspect auth",
-        "read-only",
         "RUNNING",
         "a_2",
         "QUEUED",
@@ -69,6 +66,8 @@ fn panel_shows_control_fields_but_not_tool_statistics() {
         assert!(text.contains(expected), "missing {expected}: {text}");
     }
     assert!(!text.contains("tool calls"));
+    assert!(!text.contains("SCOPE"));
+    assert!(!text.contains("TIME"));
 }
 
 #[test]
@@ -122,7 +121,10 @@ fn runtime_updates_populate_and_update_agents_panel() {
     assert_eq!(state.running_agents, 0);
     assert_eq!(state.agents[0].state, AgentState::Completed);
     assert_eq!(state.agents[0].activity, "summarizing findings");
-    assert_eq!(state.agents[0].scope, "1 file");
+    state.open_agents();
+    let text = rendered(&state);
+    assert!(!text.contains("1 file"));
+    assert!(!text.contains("elapsed"));
 }
 
 #[test]

@@ -8,7 +8,7 @@ use kurama_adapters::{BoundedOutput, ReadTool, WriteTool, html_to_text};
 use kurama_protocol::{
     KuramaError,
     agent::WriteScope,
-    id::{CallId, SessionId},
+    id::{AgentId, CallId, SessionId},
     policy::ExecutionMode,
     tool::{Operation, ToolContext, ToolInvocation, ToolLimits},
     traits::{BoxFuture, CancelSignal, Tool},
@@ -300,6 +300,49 @@ async fn yolo_writes_outside_workspace() {
         canonical_target.to_str()
     );
     assert_eq!(result.metadata["external"], true);
+}
+
+#[tokio::test]
+async fn yolo_overwrites_existing_files_without_a_hash_for_parent_and_child() {
+    for agent_id in [None, Some(AgentId::from("child-1"))] {
+        let fixture = Fixture::with_file("existing.txt", b"old\n");
+        let call = invocation(
+            "write",
+            serde_json::json!({"path": "existing.txt", "content": "new\n"}),
+        );
+        let mut context = fixture.context_with_mode(normal_limits(), ExecutionMode::Yolo);
+        context.agent_id = agent_id;
+
+        WriteTool::default()
+            .execute(context, call, &NeverCancel)
+            .await
+            .expect("YOLO overwrite without expected hash");
+
+        assert_eq!(fs::read(fixture.path("existing.txt")).unwrap(), b"new\n");
+    }
+}
+
+#[tokio::test]
+async fn non_yolo_overwrites_still_require_a_hash_for_parent_and_child() {
+    for mode in [ExecutionMode::Supervised, ExecutionMode::Auto] {
+        for agent_id in [None, Some(AgentId::from("child-1"))] {
+            let fixture = Fixture::with_file("existing.txt", b"old\n");
+            let call = invocation(
+                "write",
+                serde_json::json!({"path": "existing.txt", "content": "new\n"}),
+            );
+            let mut context = fixture.context_with_mode(normal_limits(), mode);
+            context.agent_id = agent_id;
+
+            let error = WriteTool::default()
+                .execute(context, call, &NeverCancel)
+                .await
+                .expect_err("non-YOLO overwrite without expected hash");
+
+            assert!(matches!(error, KuramaError::Tool(_)));
+            assert_eq!(fs::read(fixture.path("existing.txt")).unwrap(), b"old\n");
+        }
+    }
 }
 
 #[tokio::test]

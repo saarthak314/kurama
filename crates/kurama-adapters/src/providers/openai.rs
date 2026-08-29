@@ -11,7 +11,10 @@ use zeroize::Zeroizing;
 
 use crate::http::{HttpClient, bounded_redacted_error};
 
-use super::{delegation_from_arguments, responses_input, responses_tools, sse::SseDecoder};
+use super::{
+    normalize_delegation_events, provider_instructions, responses_input, responses_tools,
+    sse::SseDecoder,
+};
 
 use super::endpoint_url;
 
@@ -46,9 +49,9 @@ impl OpenAiBackend {
     pub fn request_body(request: &ModelRequest) -> Value {
         let mut body = json!({
             "model": request.profile.model,
-            "instructions": request.system,
+            "instructions": provider_instructions(request),
             "input": responses_input(request),
-            "tools": responses_tools(&request.tools, request.delegation.as_ref()),
+            "tools": responses_tools(&request.tools),
             "parallel_tool_calls": true,
             "max_output_tokens": request.profile.max_output_tokens,
             "stream": true,
@@ -128,7 +131,7 @@ impl OpenAiBackend {
             events.extend(normalizer.push(&event.data)?);
         }
         events.extend(normalizer.finish());
-        Ok(events)
+        normalize_delegation_events(events, request.delegation.is_some())
     }
 }
 
@@ -263,17 +266,11 @@ impl OpenAiNormalizer {
                 }
                 let arguments = parse_arguments(&call.arguments, "OpenAI")?;
                 self.emitted_call = true;
-                if call.name == "__kurama_delegate" {
-                    events.push(ModelEvent::Delegation {
-                        request: delegation_from_arguments(arguments)?,
-                    });
-                } else {
-                    events.push(ModelEvent::ToolCall {
-                        call_id: CallId::from(call.call_id),
-                        name: call.name,
-                        arguments,
-                    });
-                }
+                events.push(ModelEvent::ToolCall {
+                    call_id: CallId::from(call.call_id),
+                    name: call.name,
+                    arguments,
+                });
             }
             "response.completed" => {
                 let response = value.get("response").unwrap_or(&Value::Null);

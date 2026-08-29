@@ -9,9 +9,11 @@ use kurama_cli::{
 };
 use kurama_protocol::{
     config::{AuthRef, KuramaConfig, OrchestrationConfig, ProfileConfig, ProfileKind},
+    id::{CallId, OperationId},
     policy::{AutoBoundaries, ExecutionMode},
-    runtime::EngineCommand,
+    runtime::{EngineCommand, RuntimeEvent},
     session::{EventEnvelope, SessionEvent, SessionMetadata},
+    tool::{Operation, ToolResult},
     traits::SessionStore,
 };
 use tempfile::TempDir;
@@ -195,6 +197,114 @@ async fn resume_uses_the_recorded_profile() {
 
     assert_eq!(app.state.profile, "archive");
     assert_eq!(app.state.model, "archive-model");
+}
+
+#[tokio::test]
+async fn resume_hydrates_the_visible_transcript_once() {
+    let (_temp, paths, project) = fixture();
+    let repository = ConfigRepository::open(paths.clone()).expect("repository");
+    repository
+        .write_config(&bridge_config())
+        .expect("write config");
+    let store = FsSessionStore::open(paths.root().to_path_buf()).expect("store");
+    let metadata = SessionMetadata {
+        id: "s_transcript".into(),
+        created_at_ms: 1,
+        project_root: project
+            .canonicalize()
+            .expect("canonical")
+            .display()
+            .to_string(),
+        profile: "work".into(),
+        mode: ExecutionMode::Supervised,
+        redaction_best_effort: false,
+    };
+    store.create(&metadata).expect("create session");
+    for (sequence, event) in [
+        SessionEvent::SessionStarted { metadata },
+        SessionEvent::UserMessage {
+            text: "inspect the parser".into(),
+        },
+        SessionEvent::AssistantMessage {
+            text: "checking it".into(),
+        },
+        SessionEvent::ToolProposed {
+            operation_id: OperationId::from("operation"),
+            call_id: CallId::from("call"),
+            operation: Operation::Read {
+                path: "parser.rs".into(),
+                external: false,
+            },
+        },
+        SessionEvent::ToolCompleted {
+            operation_id: OperationId::from("operation"),
+            result: ToolResult {
+                call_id: CallId::from("call"),
+                output: "parser.rs:12".into(),
+                is_error: false,
+                metadata: serde_json::json!({"tool_name": "read"}),
+                truncated: false,
+                blob_refs: Vec::new(),
+            },
+        },
+        SessionEvent::TurnFailed {
+            error: "provider disconnected".into(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        store
+            .append(&EventEnvelope::new(
+                sequence as u64,
+                sequence as u64 + 1,
+                "s_transcript".into(),
+                None,
+                event,
+            ))
+            .expect("append replay event");
+    }
+
+    let mut app = App::bootstrap_with_paths(
+        &Args {
+            resume: Some(ResumeChoice::Id("s_transcript".into())),
+            ..Args::default()
+        },
+        project,
+        paths,
+        SessionSecrets::default(),
+    )
+    .expect("bootstrap");
+
+    assert_eq!(
+        app.state
+            .transcript
+            .iter()
+            .map(|entry| (entry.label.as_str(), entry.body.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("YOU", "inspect the parser"),
+            ("KURAMA", "checking it"),
+            ("TOOL / read", "parser.rs:12"),
+            ("ERROR", "provider disconnected"),
+        ]
+    );
+
+    app.state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+        text: "retrying now".into(),
+    });
+    assert_eq!(
+        app.state
+            .transcript
+            .iter()
+            .filter(|entry| entry.body == "checking it")
+            .count(),
+        1
+    );
+    assert_eq!(
+        app.state.transcript.last().map(|entry| entry.body.as_str()),
+        Some("retrying now")
+    );
 }
 
 #[tokio::test]

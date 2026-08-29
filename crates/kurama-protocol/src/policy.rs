@@ -39,6 +39,12 @@ pub struct ApprovalRequest {
     pub operation_id: OperationId,
     pub operation: Operation,
     pub summary: String,
+    #[serde(default = "empty_arguments")]
+    pub arguments: serde_json::Value,
+}
+
+fn empty_arguments() -> serde_json::Value {
+    serde_json::Value::Object(Default::default())
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

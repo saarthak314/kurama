@@ -9,8 +9,6 @@ pub struct AgentRow {
     pub role: String,
     pub profile: String,
     pub task: String,
-    pub scope: String,
-    pub elapsed: String,
     pub state: AgentState,
     pub activity: String,
     pub transcript: Vec<String>,
@@ -26,14 +24,9 @@ impl AgentRow {
             state,
             phase,
             active_operation,
-            changed_files,
+            changed_files: _,
             last_error,
         } = snapshot;
-        let scope = match changed_files.len() {
-            0 => "—".into(),
-            1 => "1 file".into(),
-            count => format!("{count} files"),
-        };
         let activity = active_operation
             .or(phase)
             .or(last_error)
@@ -44,8 +37,6 @@ impl AgentRow {
             role,
             profile,
             task: objective,
-            scope,
-            elapsed: "—".into(),
             state,
             activity,
             transcript: Vec::new(),

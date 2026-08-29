@@ -30,7 +30,7 @@ use tokio::{
 fn agent(role: &str, profile: Option<&str>, depends_on: &[&str]) -> AgentSpec {
     AgentSpec {
         role: role.into(),
-        objective: format!("do {role}"),
+        objective: role.into(),
         profile: profile.map(str::to_owned),
         context_refs: Vec::new(),
         write_scope: WriteScope::default(),
@@ -73,11 +73,11 @@ fn explicit_delegation_gate_is_off_for_ordinary_turns() {
 }
 
 #[test]
-fn routes_profiles_and_queues_above_concurrency() {
+fn derives_roles_routes_profiles_and_queues_above_concurrency() {
     let orchestrator = SmartOrchestrator::new(Arc::new(SequenceIds::new(1)));
     let request = DelegationRequest {
         agents: vec![
-            agent("custom", Some("user"), &[]),
+            agent("custom", Some("missing"), &[]),
             agent("reviewer", None, &[]),
             agent("third", None, &[]),
             agent("fourth", None, &[]),
@@ -85,7 +85,9 @@ fn routes_profiles_and_queues_above_concurrency() {
         ],
     };
     let plan = orchestrator.resolve(request, &context()).expect("resolve");
-    assert_eq!(plan.ready[0].profile.name, "user");
+    assert_eq!(plan.ready[0].role, "implementer");
+    assert_eq!(plan.ready[0].profile.name, "parent");
+    assert_eq!(plan.ready[1].role, "reviewer");
     assert_eq!(plan.ready[1].profile.name, "review");
     assert_eq!(plan.ready[2].profile.name, "parent");
     assert_eq!(plan.ready.len(), 4);
@@ -271,6 +273,7 @@ impl ChildRunner for ApprovalRunner {
                             external: false,
                         },
                         summary: context.agent_id.to_string(),
+                        arguments: serde_json::json!({"path":"child.txt"}),
                     },
                     response,
                 })
@@ -343,6 +346,7 @@ async fn terminal_child_approval_is_removed_and_next_live_request_is_promoted() 
     requested_rx.recv().await.expect("first approval request");
     requested_rx.recv().await.expect("second approval request");
     let active = next_approval(&mut runtime_rx).await;
+    assert_eq!(active.arguments, serde_json::json!({"path":"child.txt"}));
     let active_agent = agent_ids
         .iter()
         .find(|agent_id| agent_id.to_string() == active.summary)
@@ -354,6 +358,7 @@ async fn terminal_child_approval_is_removed_and_next_live_request_is_promoted() 
         .expect("cancel active child");
 
     let promoted = next_approval(&mut runtime_rx).await;
+    assert_eq!(promoted.arguments, serde_json::json!({"path":"child.txt"}));
     assert_ne!(promoted.summary, active.summary);
     let error = manager
         .resolve_approval(&active.operation_id, ApprovalResponse::ApproveOnce)
@@ -387,6 +392,7 @@ async fn next_approval(events: &mut mpsc::Receiver<RuntimeEvent>) -> ApprovalReq
 struct EscalatingRunner {
     attempts: AtomicUsize,
     profiles: Mutex<Vec<String>>,
+    delays: [Duration; 3],
 }
 
 impl ChildRunner for EscalatingRunner {
@@ -399,7 +405,9 @@ impl ChildRunner for EscalatingRunner {
             .lock()
             .expect("profiles")
             .push(context.launch.profile.name.clone());
+        let delay = self.delays.get(attempt).copied().unwrap_or_default();
         Box::pin(async move {
+            tokio::time::sleep(delay).await;
             if attempt < 2 {
                 Err(KuramaError::Model("capability mismatch".into()))
             } else {
@@ -432,6 +440,7 @@ async fn manager_retries_twice_then_uses_configured_escalation() {
     let runner = Arc::new(EscalatingRunner {
         attempts: AtomicUsize::new(0),
         profiles: Mutex::new(Vec::new()),
+        delays: [Duration::ZERO; 3],
     });
     let manager = AgentManager::new(
         "escalation".into(),
@@ -450,4 +459,51 @@ async fn manager_retries_twice_then_uses_configured_escalation() {
         runner.profiles.lock().expect("profiles").as_slice(),
         &["review", "review", "user"]
     );
+}
+
+#[tokio::test]
+async fn manager_enforces_seconds_across_retries_and_escalation() {
+    let mut orchestration = context();
+    orchestration
+        .role_escalations
+        .insert("reviewer".into(), vec!["user".into()]);
+    let profiles = orchestration.profiles.clone();
+    let mut spec = agent("reviewer", None, &[]);
+    spec.budget.max_seconds = 1;
+    let plan = SmartOrchestrator::new(Arc::new(SequenceIds::new(40)))
+        .resolve(DelegationRequest { agents: vec![spec] }, &orchestration)
+        .expect("resolve");
+    let agent_id = plan.ready[0].id.clone();
+    let runner = Arc::new(EscalatingRunner {
+        attempts: AtomicUsize::new(0),
+        profiles: Mutex::new(Vec::new()),
+        delays: [
+            Duration::from_millis(150),
+            Duration::from_millis(150),
+            Duration::from_millis(850),
+        ],
+    });
+    let manager = AgentManager::new(
+        "time-budget".into(),
+        None,
+        1,
+        Arc::new(MemoryStore::default()),
+        Arc::new(CollectingSink::default()),
+    )
+    .with_profiles(profiles);
+
+    let results = manager
+        .execute(plan, "project".into(), runner.clone())
+        .await
+        .expect("execute");
+
+    assert!(results.is_empty());
+    assert_eq!(runner.attempts.load(Ordering::Relaxed), 3);
+    assert_eq!(
+        runner.profiles.lock().expect("profiles").as_slice(),
+        &["review", "review", "user"]
+    );
+    let inspection = manager.inspect(&agent_id).await.expect("inspect");
+    assert_eq!(inspection.snapshot.state, AgentState::Failed);
+    assert_eq!(inspection.snapshot.last_error.as_deref(), Some("cancelled"));
 }

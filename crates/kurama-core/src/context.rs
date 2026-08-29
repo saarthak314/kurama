@@ -482,18 +482,14 @@ fn delegation_schema() -> serde_json::Value {
                     "type": "object",
                     "additionalProperties": false,
                     "required": [
-                        "role",
                         "objective",
-                        "profile",
                         "context_refs",
                         "write_scope",
                         "budget",
                         "depends_on"
                     ],
                     "properties": {
-                        "role": {"type": "string"},
                         "objective": {"type": "string"},
-                        "profile": {"type": ["string", "null"]},
                         "context_refs": {
                             "type": "array",
                             "items": {"type": "string"}
@@ -547,6 +543,7 @@ fn delegation_schema() -> serde_json::Value {
                         },
                         "depends_on": {
                             "type": "array",
+                            "description": "Exact objective strings of prerequisite agents.",
                             "items": {"type": "string"}
                         }
                     }

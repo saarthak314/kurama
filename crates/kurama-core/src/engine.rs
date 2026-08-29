@@ -473,6 +473,7 @@ impl EngineActor {
                         operation_id: operation_id.clone(),
                         operation: operation.clone(),
                         summary: format!("{summary}: {reason}"),
+                        arguments: invocation.arguments.clone(),
                     },
                 })
                 .await?;
@@ -503,11 +504,15 @@ impl EngineActor {
         summary: String,
         cancel: &CancelToken,
     ) -> Result<ToolResult, KuramaError> {
+        let arguments = invocation
+            .as_ref()
+            .map_or_else(empty_arguments, |invocation| invocation.arguments.clone());
         self.emit(RuntimeEvent::ApprovalRequired {
             request: ApprovalRequest {
                 operation_id: operation_id.clone(),
                 operation: operation.clone(),
                 summary,
+                arguments,
             },
         })
         .await?;
@@ -543,6 +548,9 @@ impl EngineActor {
         pending: bool,
         cancel: &CancelToken,
     ) -> Result<ToolResult, KuramaError> {
+        let arguments = invocation
+            .as_ref()
+            .map_or_else(empty_arguments, |invocation| invocation.arguments.clone());
         if !pending {
             self.append(SessionEvent::ApprovalRequested {
                 operation_id: operation_id.clone(),
@@ -554,6 +562,7 @@ impl EngineActor {
                 operation_id: operation_id.clone(),
                 operation: operation.clone(),
                 summary: format!("Retry interrupted operation? {reason}"),
+                arguments,
             },
         })
         .await?;
@@ -1009,6 +1018,7 @@ impl EngineActor {
                             operation_id: operation_id.clone(),
                             operation: operation.clone(),
                             summary: format!("{summary}: {reason}"),
+                            arguments: invocation.arguments.clone(),
                         },
                     })
                     .await?;
@@ -1427,6 +1437,10 @@ impl EngineActor {
                 }
             })
     }
+}
+
+fn empty_arguments() -> serde_json::Value {
+    serde_json::Value::Object(Default::default())
 }
 
 #[derive(Default)]

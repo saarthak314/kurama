@@ -90,9 +90,7 @@ impl Tool for WriteTool {
             };
             let original_hash = existed.then(|| sha256_hex(&original));
 
-            if existed
-                && (context.mode != ExecutionMode::Yolo || context.agent_id.is_some())
-                && arguments.expected_sha256.is_none()
+            if existed && context.mode != ExecutionMode::Yolo && arguments.expected_sha256.is_none()
             {
                 return Err(KuramaError::Tool(format!(
                     "expected_sha256 is required for existing file {}",

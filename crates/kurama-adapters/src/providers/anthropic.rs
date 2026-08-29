@@ -11,7 +11,10 @@ use zeroize::Zeroizing;
 
 use crate::http::{HttpClient, bounded_redacted_error};
 
-use super::{anthropic_messages, anthropic_tools, delegation_from_arguments, sse::SseDecoder};
+use super::{
+    anthropic_messages, anthropic_tools, normalize_delegation_events, provider_instructions,
+    sse::SseDecoder,
+};
 
 use super::endpoint_url;
 
@@ -46,9 +49,9 @@ impl AnthropicBackend {
     pub fn request_body(request: &ModelRequest) -> Value {
         json!({
             "model": request.profile.model,
-            "system": request.system,
+            "system": provider_instructions(request),
             "messages": anthropic_messages(request),
-            "tools": anthropic_tools(&request.tools, request.delegation.as_ref()),
+            "tools": anthropic_tools(&request.tools),
             "max_tokens": request.profile.max_output_tokens,
             "stream": true
         })
@@ -114,7 +117,7 @@ impl AnthropicBackend {
             events.extend(normalizer.push(&event.data)?);
         }
         events.extend(normalizer.finish());
-        Ok(events)
+        normalize_delegation_events(events, request.delegation.is_some())
     }
 }
 
@@ -262,17 +265,11 @@ impl AnthropicNormalizer {
                         KuramaError::Protocol(format!("invalid Anthropic tool arguments: {error}"))
                     })?;
                     self.emitted_call = true;
-                    if call.name == "__kurama_delegate" {
-                        events.push(ModelEvent::Delegation {
-                            request: delegation_from_arguments(arguments)?,
-                        });
-                    } else {
-                        events.push(ModelEvent::ToolCall {
-                            call_id: CallId::from(call.call_id),
-                            name: call.name,
-                            arguments,
-                        });
-                    }
+                    events.push(ModelEvent::ToolCall {
+                        call_id: CallId::from(call.call_id),
+                        name: call.name,
+                        arguments,
+                    });
                 }
             }
             "message_delta" => {

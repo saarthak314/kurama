@@ -2,7 +2,7 @@ use kurama_cli::tui::{OnboardingState, Overlay, TuiState};
 use kurama_protocol::{
     id::OperationId,
     policy::{ApprovalRequest, ApprovalResponse, ExecutionMode},
-    runtime::EngineCommand,
+    runtime::{EngineCommand, RuntimeEvent},
     tool::Operation,
 };
 
@@ -48,18 +48,16 @@ fn onboarding_masks_session_credentials_in_the_rendered_form() {
 #[test]
 fn approval_overlay_supports_approve_deny_and_edited_arguments() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-    state.begin_approval(
-        ApprovalRequest {
-            operation_id: OperationId::from("o_1"),
-            operation: Operation::Write {
-                paths: vec!["safe.txt".into()],
-                destructive: false,
-                external: false,
-            },
-            summary: "Write safe.txt".into(),
+    state.begin_approval(ApprovalRequest {
+        operation_id: OperationId::from("o_1"),
+        operation: Operation::Write {
+            paths: vec!["safe.txt".into()],
+            destructive: false,
+            external: false,
         },
-        serde_json::json!({"path":"unsafe.txt","content":"unsafe"}),
-    );
+        summary: "Write safe.txt".into(),
+        arguments: serde_json::json!({"path":"unsafe.txt","content":"unsafe"}),
+    });
     state.begin_approval_edit();
     state.set_approval_editor(r#"{"path":"safe.txt","content":"safe"}"#);
     state.submit_approval_edit().expect("submit edit");
@@ -70,6 +68,32 @@ fn approval_overlay_supports_approve_deny_and_edited_arguments() {
             response: ApprovalResponse::Edit { arguments },
         }) if operation_id.as_ref() == "o_1" && arguments["path"] == "safe.txt"
     ));
+}
+
+#[test]
+fn runtime_approval_hydrates_editor_from_request_arguments() {
+    let arguments = serde_json::json!({"path":"safe.txt","content":"safe"});
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+
+    state.apply_runtime_event(RuntimeEvent::ApprovalRequired {
+        request: ApprovalRequest {
+            operation_id: OperationId::from("o_1"),
+            operation: Operation::Write {
+                paths: vec!["safe.txt".into()],
+                destructive: false,
+                external: false,
+            },
+            summary: "Write safe.txt".into(),
+            arguments: arguments.clone(),
+        },
+    });
+
+    let approval = state.approval.as_ref().expect("approval");
+    assert_eq!(approval.arguments, arguments);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&approval.editor).expect("editor JSON"),
+        arguments
+    );
 }
 
 #[test]
@@ -114,17 +138,15 @@ fn unresolved_approval_cannot_be_dismissed() {
 
 fn approval_state() -> TuiState {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-    state.begin_approval(
-        ApprovalRequest {
-            operation_id: OperationId::from("o_1"),
-            operation: Operation::Write {
-                paths: vec!["safe.txt".into()],
-                destructive: false,
-                external: false,
-            },
-            summary: "Write safe.txt".into(),
+    state.begin_approval(ApprovalRequest {
+        operation_id: OperationId::from("o_1"),
+        operation: Operation::Write {
+            paths: vec!["safe.txt".into()],
+            destructive: false,
+            external: false,
         },
-        serde_json::json!({"path":"unsafe.txt","content":"unsafe"}),
-    );
+        summary: "Write safe.txt".into(),
+        arguments: serde_json::json!({"path":"unsafe.txt","content":"unsafe"}),
+    });
     state
 }

@@ -1,11 +1,15 @@
 use kurama_protocol::{
     KuramaError,
-    agent::DelegationRequest,
-    model::{DelegationSchema, ModelItem, ModelRequest},
+    agent::{AgentBudget, AgentSpec, DelegationRequest, WriteScope},
+    model::{ModelItem, ModelRequest},
     tool::ToolDescriptor,
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 use url::Url;
+
+const DELEGATION_OPEN: &str = "<kurama_delegate>";
+const DELEGATION_CLOSE: &str = "</kurama_delegate>";
 
 #[cfg(feature = "anthropic")]
 pub mod anthropic;
@@ -111,11 +115,8 @@ pub fn anthropic_messages(request: &ModelRequest) -> Vec<Value> {
     feature = "anthropic",
     feature = "openai-compatible"
 ))]
-pub fn responses_tools(
-    tools: &[ToolDescriptor],
-    delegation: Option<&DelegationSchema>,
-) -> Vec<Value> {
-    let mut values = tools
+pub fn responses_tools(tools: &[ToolDescriptor]) -> Vec<Value> {
+    tools
         .iter()
         .map(|tool| {
             json!({
@@ -126,22 +127,12 @@ pub fn responses_tools(
                 "strict": true
             })
         })
-        .collect::<Vec<_>>();
-    if let Some(delegation) = delegation {
-        values.push(json!({
-            "type": "function",
-            "name": "__kurama_delegate",
-            "description": "Delegate explicit work to bounded child agents.",
-            "parameters": delegation.parameters,
-            "strict": true
-        }));
-    }
-    values
+        .collect()
 }
 
 #[cfg(feature = "openai-compatible")]
-pub fn chat_tools(tools: &[ToolDescriptor], delegation: Option<&DelegationSchema>) -> Vec<Value> {
-    responses_tools(tools, delegation)
+pub fn chat_tools(tools: &[ToolDescriptor]) -> Vec<Value> {
+    responses_tools(tools)
         .into_iter()
         .map(|tool| {
             json!({
@@ -158,11 +149,8 @@ pub fn chat_tools(tools: &[ToolDescriptor], delegation: Option<&DelegationSchema
 }
 
 #[cfg(feature = "anthropic")]
-pub fn anthropic_tools(
-    tools: &[ToolDescriptor],
-    delegation: Option<&DelegationSchema>,
-) -> Vec<Value> {
-    responses_tools(tools, delegation)
+pub fn anthropic_tools(tools: &[ToolDescriptor]) -> Vec<Value> {
+    responses_tools(tools)
         .into_iter()
         .map(|tool| {
             json!({
@@ -175,9 +163,118 @@ pub fn anthropic_tools(
         .collect()
 }
 
+pub fn provider_instructions(request: &ModelRequest) -> String {
+    let Some(delegation) = request.delegation.as_ref() else {
+        return request.system.clone();
+    };
+    format!(
+        "{}\n\nDelegation is not a tool. To delegate, return exactly {DELEGATION_OPEN}JSON{DELEGATION_CLOSE} as the entire assistant text, with JSON matching this schema: {}. Do not add prose or Markdown around the control block. Kurama assigns child roles and profiles; dependencies must name exact prerequisite objective strings.",
+        request.system, delegation.parameters
+    )
+}
+
+pub fn normalize_delegation_events(
+    events: Vec<kurama_protocol::model::ModelEvent>,
+    delegation_enabled: bool,
+) -> Result<Vec<kurama_protocol::model::ModelEvent>, KuramaError> {
+    use kurama_protocol::model::{FinishReason, ModelEvent};
+
+    let text = events
+        .iter()
+        .filter_map(|event| match event {
+            ModelEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    if !text.contains(DELEGATION_OPEN) && !text.contains(DELEGATION_CLOSE) {
+        return Ok(events);
+    }
+    if !delegation_enabled {
+        return Err(KuramaError::Protocol(
+            "provider returned delegation while disabled".into(),
+        ));
+    }
+    let trimmed = text.trim();
+    let Some(payload) = trimmed
+        .strip_prefix(DELEGATION_OPEN)
+        .and_then(|value| value.strip_suffix(DELEGATION_CLOSE))
+    else {
+        return Err(KuramaError::Protocol(
+            "delegation control block must be the entire response".into(),
+        ));
+    };
+    if payload.contains(DELEGATION_OPEN) || payload.contains(DELEGATION_CLOSE) {
+        return Err(KuramaError::Protocol(
+            "delegation control block must not be nested".into(),
+        ));
+    }
+    let arguments = serde_json::from_str(payload)
+        .map_err(|error| KuramaError::Protocol(format!("invalid delegation JSON: {error}")))?;
+    let mut delegation = Some(ModelEvent::Delegation {
+        request: delegation_from_arguments(arguments)?,
+    });
+    let mut normalized = Vec::with_capacity(events.len());
+    for event in events {
+        match event {
+            ModelEvent::TextDelta { .. } => {
+                if let Some(event) = delegation.take() {
+                    normalized.push(event);
+                }
+            }
+            ModelEvent::ResponseCompleted { cursor, .. } => {
+                if let Some(event) = delegation.take() {
+                    normalized.push(event);
+                }
+                normalized.push(ModelEvent::ResponseCompleted {
+                    cursor,
+                    finish_reason: FinishReason::ToolCalls,
+                });
+            }
+            event => normalized.push(event),
+        }
+    }
+    if let Some(event) = delegation {
+        normalized.push(event);
+    }
+    Ok(normalized)
+}
+
 pub fn delegation_from_arguments(arguments: Value) -> Result<DelegationRequest, KuramaError> {
-    serde_json::from_value(arguments)
-        .map_err(|error| KuramaError::Protocol(format!("invalid delegation request: {error}")))
+    let request: ModelDelegationRequest = serde_json::from_value(arguments)
+        .map_err(|error| KuramaError::Protocol(format!("invalid delegation request: {error}")))?;
+    Ok(DelegationRequest {
+        agents: request
+            .agents
+            .into_iter()
+            .map(|agent| AgentSpec {
+                role: String::new(),
+                objective: agent.objective,
+                profile: None,
+                context_refs: agent.context_refs,
+                write_scope: agent.write_scope,
+                budget: agent.budget,
+                depends_on: agent.depends_on,
+            })
+            .collect(),
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelDelegationRequest {
+    agents: Vec<ModelAgentSpec>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelAgentSpec {
+    objective: String,
+    #[serde(default)]
+    context_refs: Vec<String>,
+    write_scope: WriteScope,
+    budget: AgentBudget,
+    #[serde(default)]
+    depends_on: Vec<String>,
 }
 
 #[cfg(feature = "openai")]

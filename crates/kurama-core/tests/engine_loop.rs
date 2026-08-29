@@ -266,6 +266,7 @@ async fn approval_edit_is_reclassified_before_execution() {
         match events.recv().await.expect("event") {
             RuntimeEvent::ApprovalRequired { request } if approvals == 0 => {
                 approvals += 1;
+                assert_eq!(request.arguments, serde_json::json!({"path":"unsafe.txt"}));
                 handle
                     .resolve_approval(
                         OperationId::from("stale-operation"),
@@ -285,6 +286,7 @@ async fn approval_edit_is_reclassified_before_execution() {
             }
             RuntimeEvent::ApprovalRequired { request } => {
                 approvals += 1;
+                assert_eq!(request.arguments, serde_json::json!({"path":"safe.txt"}));
                 handle
                     .resolve_approval(request.operation_id, ApprovalResponse::ApproveOnce)
                     .await
@@ -495,7 +497,7 @@ async fn resume_restores_pending_approval_before_write() {
         arguments: serde_json::json!({"path": path}),
     };
     let operation = Operation::Write {
-        paths: vec![path],
+        paths: vec![path.clone()],
         destructive: false,
         external: false,
     };
@@ -543,6 +545,7 @@ async fn resume_restores_pending_approval_before_write() {
         RuntimeEvent::ApprovalRequired { request } => {
             assert_eq!(request.operation_id, operation_id);
             assert_eq!(request.operation, operation);
+            assert_eq!(request.arguments, serde_json::json!({"path": path}));
         }
         event => panic!("expected approval, got {event:?}"),
     }
@@ -556,6 +559,71 @@ async fn resume_restores_pending_approval_before_write() {
     ) {}
 
     assert_eq!(executed.lock().expect("executed lock").len(), 1);
+}
+
+#[tokio::test]
+async fn resume_approval_uses_empty_arguments_without_durable_invocation() {
+    let operation_id = OperationId::from("operation");
+    let path = std::env::temp_dir().join(format!(
+        "kurama-missing-approval-invocation-{}",
+        std::process::id()
+    ));
+    let operation = Operation::Write {
+        paths: vec![path],
+        destructive: false,
+        external: false,
+    };
+    let replay = vec![
+        replay_event(
+            0,
+            SessionEvent::UserMessage {
+                text: "edit".into(),
+            },
+        ),
+        replay_event(
+            1,
+            SessionEvent::ToolProposed {
+                operation_id: operation_id.clone(),
+                call_id: "call".into(),
+                operation: operation.clone(),
+            },
+        ),
+        replay_event(
+            2,
+            SessionEvent::ApprovalRequested {
+                operation_id: operation_id.clone(),
+                summary: "write one path".into(),
+            },
+        ),
+    ];
+    let store = Arc::new(MemoryStore::default());
+    seed_replay(&store, &replay);
+    let (handle, mut events) = Engine::spawn(
+        resume_config(
+            store,
+            vec![Arc::new(ArgumentTool::default())],
+            Arc::new(AskPolicy),
+        ),
+        replay,
+    )
+    .expect("resume engine");
+
+    match events.recv().await.expect("approval event") {
+        RuntimeEvent::ApprovalRequired { request } => {
+            assert_eq!(request.operation_id, operation_id);
+            assert_eq!(request.operation, operation);
+            assert_eq!(request.arguments, serde_json::json!({}));
+        }
+        event => panic!("expected approval, got {event:?}"),
+    }
+    handle
+        .resolve_approval(operation_id, ApprovalResponse::Deny)
+        .await
+        .expect("deny recovery");
+    while !matches!(
+        events.recv().await.expect("recovery event"),
+        RuntimeEvent::TurnCompleted
+    ) {}
 }
 
 #[tokio::test]
@@ -746,6 +814,10 @@ async fn resume_requires_a_decision_before_retrying_unknown_bash() {
         RuntimeEvent::ApprovalRequired { request } => {
             assert_eq!(request.operation_id, operation_id);
             assert_eq!(request.operation, operation);
+            assert_eq!(
+                request.arguments,
+                serde_json::json!({"command":"make install"})
+            );
             assert!(request.summary.contains("outcome is unknown"));
         }
         event => panic!("expected recovery decision, got {event:?}"),
@@ -849,6 +921,10 @@ async fn resume_requires_a_new_decision_after_an_authorized_bash_retry_is_interr
         RuntimeEvent::ApprovalRequired { request } => {
             assert_eq!(request.operation_id, operation_id);
             assert_eq!(request.operation, operation);
+            assert_eq!(
+                request.arguments,
+                serde_json::json!({"command":"make install"})
+            );
             assert!(request.summary.contains("outcome is unknown"));
         }
         event => panic!("expected recovery decision, got {event:?}"),

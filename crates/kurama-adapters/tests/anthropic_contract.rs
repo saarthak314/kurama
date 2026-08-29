@@ -8,7 +8,7 @@ mod providers;
 
 use kurama_protocol::{
     id::SessionId,
-    model::{ModelEvent, ModelItem, ModelProfile, ModelRequest},
+    model::{DelegationSchema, ModelEvent, ModelItem, ModelProfile, ModelRequest},
     tool::ToolDescriptor,
 };
 use providers::anthropic::AnthropicBackend;
@@ -27,7 +27,14 @@ fn request() -> ModelRequest {
             description: "Read files".into(),
             parameters: serde_json::json!({"type":"object","additionalProperties":false}),
         }],
-        delegation: None,
+        delegation: Some(DelegationSchema {
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"agents": {"type": "array"}},
+                "required": ["agents"],
+                "additionalProperties": false
+            }),
+        }),
         continuation: None,
     }
 }
@@ -41,6 +48,13 @@ fn messages_request_uses_anthropic_tool_shape() {
     assert_eq!(body["max_tokens"], 4_000);
     assert_eq!(body["tools"][0]["name"], "read");
     assert!(body["tools"][0].get("input_schema").is_some());
+    assert_eq!(body["tools"].as_array().expect("tools").len(), 1);
+    assert!(
+        body["system"]
+            .as_str()
+            .expect("system")
+            .contains("<kurama_delegate>")
+    );
 }
 
 #[test]

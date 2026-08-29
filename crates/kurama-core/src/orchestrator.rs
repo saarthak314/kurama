@@ -44,6 +44,7 @@ impl SmartOrchestrator {
 
         let mut keys = BTreeSet::new();
         let mut roles: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut objectives: BTreeMap<&str, usize> = BTreeMap::new();
         for spec in &request.agents {
             let key = agent_key(spec);
             if !keys.insert(key) {
@@ -52,6 +53,7 @@ impl SmartOrchestrator {
                 ));
             }
             *roles.entry(&spec.role).or_default() += 1;
+            *objectives.entry(&spec.objective).or_default() += 1;
             validate_budget(&spec.budget)?;
             if !context.yolo && !scope_is_subset(&spec.write_scope, &context.parent_write_scope) {
                 return Err(KuramaError::Policy(format!(
@@ -59,18 +61,11 @@ impl SmartOrchestrator {
                     spec.role
                 )));
             }
-            if let Some(profile) = &spec.profile
-                && !context.profiles.contains_key(profile)
-            {
-                return Err(KuramaError::Configuration(format!(
-                    "unknown agent profile {profile}"
-                )));
-            }
         }
 
         for spec in &request.agents {
             for dependency in &spec.depends_on {
-                if !dependency_exists(dependency, &keys, &roles) {
+                if !dependency_exists(dependency, &keys, &roles, &objectives) {
                     return Err(KuramaError::Protocol(format!(
                         "unknown dependency {dependency} for {}",
                         spec.role
@@ -78,7 +73,7 @@ impl SmartOrchestrator {
                 }
             }
         }
-        ensure_acyclic(&request.agents, &roles)
+        ensure_acyclic(&request.agents, &roles, &objectives)
     }
 
     fn resolve_spec(
@@ -86,10 +81,10 @@ impl SmartOrchestrator {
         spec: AgentSpec,
         context: &OrchestrationContext,
     ) -> Result<ResolvedAgentSpec, KuramaError> {
-        let profile_name = spec
-            .profile
-            .clone()
-            .or_else(|| context.role_routes.get(&spec.role).cloned())
+        let profile_name = context
+            .role_routes
+            .get(&spec.role)
+            .cloned()
             .unwrap_or_else(|| context.parent_profile.name.clone());
         let profile = context
             .profiles
@@ -181,9 +176,13 @@ impl Orchestrator for SmartOrchestrator {
 
     fn resolve(
         &self,
-        request: DelegationRequest,
+        mut request: DelegationRequest,
         context: &OrchestrationContext,
     ) -> Result<SchedulePlan, KuramaError> {
+        for spec in &mut request.agents {
+            spec.role = infer_role(&spec.objective, context);
+            spec.profile = None;
+        }
         self.validate_request(&request, context)?;
         let max_concurrency = context.max_concurrency.clamp(1, 8);
         let mut ready = Vec::new();
@@ -268,26 +267,36 @@ fn dependency_exists(
     dependency: &str,
     keys: &BTreeSet<String>,
     roles: &BTreeMap<&str, usize>,
+    objectives: &BTreeMap<&str, usize>,
 ) -> bool {
-    keys.contains(dependency) || roles.get(dependency).is_some_and(|count| *count == 1)
+    keys.contains(dependency)
+        || roles.get(dependency).is_some_and(|count| *count == 1)
+        || objectives.get(dependency).is_some_and(|count| *count == 1)
 }
 
 fn dependency_index(
     dependency: &str,
     specs: &[AgentSpec],
     roles: &BTreeMap<&str, usize>,
+    objectives: &BTreeMap<&str, usize>,
 ) -> Option<usize> {
     specs.iter().position(|spec| {
         agent_key(spec) == dependency
             || (spec.role == dependency && roles.get(spec.role.as_str()) == Some(&1))
+            || (spec.objective == dependency && objectives.get(spec.objective.as_str()) == Some(&1))
     })
 }
 
-fn ensure_acyclic(specs: &[AgentSpec], roles: &BTreeMap<&str, usize>) -> Result<(), KuramaError> {
+fn ensure_acyclic(
+    specs: &[AgentSpec],
+    roles: &BTreeMap<&str, usize>,
+    objectives: &BTreeMap<&str, usize>,
+) -> Result<(), KuramaError> {
     fn visit(
         index: usize,
         specs: &[AgentSpec],
         roles: &BTreeMap<&str, usize>,
+        objectives: &BTreeMap<&str, usize>,
         visiting: &mut [bool],
         visited: &mut [bool],
     ) -> Result<(), KuramaError> {
@@ -301,9 +310,9 @@ fn ensure_acyclic(specs: &[AgentSpec], roles: &BTreeMap<&str, usize>) -> Result<
         }
         visiting[index] = true;
         for dependency in &specs[index].depends_on {
-            let dependency = dependency_index(dependency, specs, roles)
+            let dependency = dependency_index(dependency, specs, roles, objectives)
                 .ok_or_else(|| KuramaError::Protocol(format!("unknown dependency {dependency}")))?;
-            visit(dependency, specs, roles, visiting, visited)?;
+            visit(dependency, specs, roles, objectives, visiting, visited)?;
         }
         visiting[index] = false;
         visited[index] = true;
@@ -313,9 +322,66 @@ fn ensure_acyclic(specs: &[AgentSpec], roles: &BTreeMap<&str, usize>) -> Result<
     let mut visiting = vec![false; specs.len()];
     let mut visited = vec![false; specs.len()];
     for index in 0..specs.len() {
-        visit(index, specs, roles, &mut visiting, &mut visited)?;
+        visit(index, specs, roles, objectives, &mut visiting, &mut visited)?;
     }
     Ok(())
+}
+
+fn infer_role(objective: &str, context: &OrchestrationContext) -> String {
+    let words = objective
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    for role in context
+        .role_routes
+        .keys()
+        .chain(context.role_escalations.keys())
+    {
+        let normalized = role.to_ascii_lowercase();
+        if words.iter().any(|word| word == &normalized) {
+            return role.clone();
+        }
+    }
+    if contains_any(
+        &words,
+        &[
+            "review", "reviewer", "audit", "critique", "inspect", "verify", "validate", "test",
+        ],
+    ) {
+        "reviewer".into()
+    } else if contains_any(
+        &words,
+        &[
+            "research",
+            "researcher",
+            "investigate",
+            "explore",
+            "search",
+            "discover",
+            "analyze",
+        ],
+    ) {
+        "researcher".into()
+    } else if contains_any(
+        &words,
+        &[
+            "plan",
+            "planner",
+            "design",
+            "architect",
+            "architecture",
+            "spec",
+        ],
+    ) {
+        "planner".into()
+    } else {
+        "implementer".into()
+    }
+}
+
+fn contains_any(words: &[String], candidates: &[&str]) -> bool {
+    words.iter().any(|word| candidates.contains(&word.as_str()))
 }
 
 fn canonical_scope(scope: WriteScope) -> WriteScope {

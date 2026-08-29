@@ -403,7 +403,7 @@ fn render_agents(frame: &mut Frame<'_>, state: &TuiState) {
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "ID        ROLE          MODEL        TASK                  SCOPE          TIME    STATE",
+            "ID        ROLE          MODEL        TASK                  STATE",
             Style::default().fg(DIM),
         )),
     ];
@@ -420,13 +420,11 @@ fn render_agents(frame: &mut Frame<'_>, state: &TuiState) {
             Span::styled(if selected { "▶ " } else { "  " }, Style::default().fg(RED)),
             Span::styled(
                 format!(
-                    "{:<10}{:<14}{:<13}{:<22}{:<15}{:<8}",
+                    "{:<10}{:<14}{:<13}{:<22}",
                     agent.id,
                     truncate(&agent.role, 12),
                     truncate(&agent.profile, 11),
-                    truncate(&agent.task, 20),
-                    truncate(&agent.scope, 13),
-                    agent.elapsed
+                    truncate(&agent.task, 20)
                 ),
                 Style::default()
                     .fg(if selected { TEXT } else { DIM })
@@ -495,10 +493,7 @@ fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) {
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            format!(
-                "{}  ·  scope {}  ·  elapsed {}",
-                agent.profile, agent.scope, agent.elapsed
-            ),
+            format!("{}  ·  {:?}", agent.profile, agent.state),
             Style::default().fg(DIM),
         )),
         Line::from(""),

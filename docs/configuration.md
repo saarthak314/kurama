@@ -52,7 +52,7 @@ Plaintext keys are invalid. Kurama never reads Codex or Claude credential stores
 
 ## Routing and Search
 
-`[roles.<name>]` routes a delegated role to a profile. Model selection uses an explicit child profile first, then the role route, then the parent profile. `escalation_profiles` is an ordered allowlist; automatic escalation never crosses to an unlisted provider or downgrade.
+`[roles.<name>]` routes an orchestrator-assigned child role to a profile. The model supplies objectives, scopes, budgets, and dependencies; it cannot select roles or profiles. Kurama derives roles from each objective, applies the matching role route, and otherwise inherits the parent profile. Dependency entries name the exact objective text of prerequisite agents. `escalation_profiles` is an ordered allowlist; automatic escalation never crosses to an unlisted provider or downgrade.
 
 `[search] kind = "provider"` uses provider-native search when supported. Use `kind = "json"` with an HTTP endpoint for a configured search service; it must accept `{ "query", "limit" }` and return ranked `{ "title", "url", "snippet" }` results.
 

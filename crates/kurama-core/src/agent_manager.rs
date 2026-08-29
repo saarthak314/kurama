@@ -18,7 +18,10 @@ use kurama_protocol::{
     session::{EventEnvelope, SessionEvent},
     traits::{BoxFuture, EventSink, SessionStore},
 };
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::{
+    sync::{Mutex, mpsc, oneshot},
+    time::Instant,
+};
 
 use crate::{cancel::CancelToken, orchestrator::scopes_overlap};
 
@@ -86,6 +89,7 @@ struct ManagedAgent {
     pending_messages: Vec<String>,
     profile_attempts: u8,
     next_escalation: usize,
+    execution_deadline: Option<Instant>,
 }
 
 impl AgentManager {
@@ -355,6 +359,7 @@ impl AgentManager {
                     pending_messages: Vec::new(),
                     profile_attempts: 0,
                     next_escalation: 0,
+                    execution_deadline: None,
                 };
                 self.append_agent_event(
                     &agent,
@@ -424,6 +429,9 @@ impl AgentManager {
                 }
                 agent.messages = Some(message_tx);
                 agent.profile_attempts = agent.profile_attempts.saturating_add(1);
+                let execution_deadline = *agent.execution_deadline.get_or_insert_with(|| {
+                    Instant::now() + Duration::from_secs(agent.spec.budget.max_seconds)
+                });
                 agent.snapshot.state = AgentState::Running;
                 agent.snapshot.phase = Some("starting".into());
                 let snapshot = agent.snapshot.clone();
@@ -438,6 +446,7 @@ impl AgentManager {
                     agent.cancel.clone(),
                     message_rx,
                     snapshot,
+                    execution_deadline,
                 )
             };
             self.emit(RuntimeEvent::AgentUpdated {
@@ -445,7 +454,7 @@ impl AgentManager {
             })
             .await?;
 
-            let (spec, cancel, messages, _) = launch;
+            let (spec, cancel, messages, _, execution_deadline) = launch;
             let (child_progress_tx, mut child_progress_rx) = mpsc::channel(32);
             let forwarding = progress_tx.clone();
             let forwarding_id = spec.id.clone();
@@ -484,10 +493,9 @@ impl AgentManager {
                 approvals: approval_tx.clone(),
             };
             let agent_id = spec.id.clone();
-            let timeout = Duration::from_secs(spec.budget.max_seconds);
             let future = runner.run(context);
             running.push(Box::pin(async move {
-                let result = tokio::time::timeout(timeout, future)
+                let result = tokio::time::timeout_at(execution_deadline, future)
                     .await
                     .unwrap_or(Err(KuramaError::Cancelled));
                 let _ = forward_task.await;

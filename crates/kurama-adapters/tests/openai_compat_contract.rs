@@ -8,7 +8,7 @@ mod providers;
 
 use kurama_protocol::{
     id::SessionId,
-    model::{ModelEvent, ModelItem, ModelProfile, ModelRequest},
+    model::{DelegationSchema, ModelEvent, ModelItem, ModelProfile, ModelRequest},
     tool::ToolDescriptor,
 };
 use providers::openai_compat::OpenAiCompatBackend;
@@ -27,7 +27,14 @@ fn request() -> ModelRequest {
             description: "Read files".into(),
             parameters: serde_json::json!({"type":"object","additionalProperties":false}),
         }],
-        delegation: None,
+        delegation: Some(DelegationSchema {
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"agents": {"type": "array"}},
+                "required": ["agents"],
+                "additionalProperties": false
+            }),
+        }),
         continuation: None,
     }
 }
@@ -42,6 +49,13 @@ fn chat_request_supports_optional_parallel_tool_calls() {
     assert_eq!(body["max_tokens"], 4_000);
     assert_eq!(body["parallel_tool_calls"], false);
     assert_eq!(body["tools"][0]["function"]["name"], "read");
+    assert_eq!(body["tools"].as_array().expect("tools").len(), 1);
+    assert!(
+        body["messages"][0]["content"]
+            .as_str()
+            .expect("system")
+            .contains("<kurama_delegate>")
+    );
 }
 
 #[test]

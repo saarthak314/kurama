@@ -14,7 +14,7 @@ use kurama_protocol::{
     tool::ToolDescriptor,
     traits::{BoxFuture, CancelSignal, ModelBackend},
 };
-use providers::{openai::OpenAiBackend, sse::SseDecoder};
+use providers::{normalize_delegation_events, openai::OpenAiBackend, sse::SseDecoder};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -84,7 +84,45 @@ fn responses_request_uses_strict_tools_and_no_storage() {
     assert_eq!(body["previous_response_id"], "resp_previous");
     assert_eq!(body["tools"][0]["name"], "read");
     assert_eq!(body["tools"][0]["strict"], true);
-    assert_eq!(body["tools"][1]["name"], "__kurama_delegate");
+    assert_eq!(body["tools"].as_array().expect("tools").len(), 1);
+    assert!(
+        body["instructions"]
+            .as_str()
+            .expect("instructions")
+            .contains("<kurama_delegate>")
+    );
+}
+
+#[test]
+fn text_control_block_normalizes_to_delegation() {
+    let events = normalize_delegation_events(
+        vec![
+            ModelEvent::TextDelta {
+                text: r#"<kurama_delegate>{"agents":[{"objective":"Review the patch","context_refs":[],"write_scope":{"roots":[],"files":[]},"budget":{"max_input_tokens":8000,"max_output_tokens":1000,"max_turns":2,"max_seconds":120},"depends_on":[]}]}</kurama_delegate>"#.into(),
+            },
+            ModelEvent::ResponseCompleted {
+                cursor: None,
+                finish_reason: kurama_protocol::model::FinishReason::Stop,
+            },
+        ],
+        true,
+    )
+    .expect("delegation block");
+
+    assert!(matches!(
+        events.as_slice(),
+        [ModelEvent::Delegation { request }, ModelEvent::ResponseCompleted { .. }]
+            if request.agents[0].role.is_empty() && request.agents[0].profile.is_none()
+    ));
+    assert!(
+        normalize_delegation_events(
+            vec![ModelEvent::TextDelta {
+                text: "prose <kurama_delegate>{}</kurama_delegate>".into(),
+            }],
+            true,
+        )
+        .is_err()
+    );
 }
 
 #[test]

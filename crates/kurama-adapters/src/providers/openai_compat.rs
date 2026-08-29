@@ -11,7 +11,9 @@ use zeroize::Zeroizing;
 
 use crate::http::{HttpClient, bounded_redacted_error};
 
-use super::{chat_messages, chat_tools, delegation_from_arguments, sse::SseDecoder};
+use super::{
+    chat_messages, chat_tools, normalize_delegation_events, provider_instructions, sse::SseDecoder,
+};
 
 use super::endpoint_url;
 
@@ -54,8 +56,8 @@ impl OpenAiCompatBackend {
     pub fn request_body(request: &ModelRequest, parallel_tool_calls: Option<bool>) -> Value {
         let mut body = json!({
             "model": request.profile.model,
-            "messages": chat_messages(request),
-            "tools": chat_tools(&request.tools, request.delegation.as_ref()),
+            "messages": chat_messages_with_system(request),
+            "tools": chat_tools(&request.tools),
             "max_tokens": request.profile.max_output_tokens,
             "stream": true,
             "stream_options": {"include_usage": true}
@@ -130,7 +132,7 @@ impl OpenAiCompatBackend {
             events.extend(normalizer.push(&event.data)?);
         }
         events.extend(normalizer.finish()?);
-        Ok(events)
+        normalize_delegation_events(events, request.delegation.is_some())
     }
 }
 
@@ -292,17 +294,11 @@ impl CompatNormalizer {
             let arguments = serde_json::from_str(&call.arguments).map_err(|error| {
                 KuramaError::Protocol(format!("invalid Chat tool arguments: {error}"))
             })?;
-            if call.name == "__kurama_delegate" {
-                events.push(ModelEvent::Delegation {
-                    request: delegation_from_arguments(arguments)?,
-                });
-            } else {
-                events.push(ModelEvent::ToolCall {
-                    call_id: CallId::from(call.call_id),
-                    name: call.name,
-                    arguments,
-                });
-            }
+            events.push(ModelEvent::ToolCall {
+                call_id: CallId::from(call.call_id),
+                name: call.name,
+                arguments,
+            });
         }
         Ok(events)
     }
@@ -332,4 +328,10 @@ impl CompatNormalizer {
             self.finish_events()
         }
     }
+}
+
+fn chat_messages_with_system(request: &ModelRequest) -> Vec<Value> {
+    let mut request = request.clone();
+    request.system = provider_instructions(&request);
+    chat_messages(&request)
 }

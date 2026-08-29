@@ -135,8 +135,11 @@ fn strict_control_parser_normalizes_tools_and_delegation() {
         .expect("tools");
     assert!(matches!(tools.as_slice(), [ModelEvent::ToolCall { name, .. }] if name == "read"));
 
-    let delegation = parse_control(r#"{"kind":"delegate","agents":[{"role":"reviewer","objective":"Review","profile":null,"write_roots":[],"write_files":[],"depends_on":[]}]}"#, true)
-        .expect("delegation");
+    let delegation = parse_control(
+        r#"{"kind":"delegate","agents":[{"objective":"Review","write_roots":[],"write_files":[],"depends_on":[]}]}"#,
+        true,
+    )
+    .expect("delegation");
     assert!(matches!(
         delegation.as_slice(),
         [ModelEvent::Delegation { .. }]

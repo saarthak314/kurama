@@ -320,6 +320,7 @@ impl App {
             mode,
             redaction_best_effort: mode == ExecutionMode::Yolo,
         };
+        let transcript_replay = replay.clone();
         let (engine, runtime_events) = runtime
             .start(metadata, replay)
             .map_err(|error| error.to_string())?;
@@ -342,6 +343,7 @@ impl App {
             project.display().to_string(),
             mode,
         );
+        state.hydrate_replay(&transcript_replay);
         if resumed_yolo {
             state.status = "Previous run used YOLO; resumed in supervised mode".into();
         }

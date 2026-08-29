@@ -2,6 +2,8 @@ use kurama_protocol::{
     agent::{AgentSnapshot, AgentState},
     policy::{ApprovalRequest, ApprovalResponse, ExecutionMode},
     runtime::{AgentCommand, EngineCommand, RuntimeEvent},
+    session::{EventEnvelope, SessionEvent},
+    tool::ToolResult,
 };
 
 use super::{AgentRow, ApprovalState, OnboardingState, sort_agents};
@@ -131,6 +133,39 @@ impl TuiState {
             label: label.into(),
             body: body.into(),
         });
+    }
+
+    pub fn push_system(&mut self, label: impl Into<String>, body: impl Into<String>) {
+        self.transcript.push(TranscriptEntry {
+            kind: TranscriptKind::System,
+            label: label.into(),
+            body: body.into(),
+        });
+    }
+
+    pub fn hydrate_replay(&mut self, replay: &[EventEnvelope]) {
+        self.transcript.clear();
+        for envelope in replay {
+            match &envelope.event {
+                SessionEvent::UserMessage { text } => self.push_user(text.clone()),
+                SessionEvent::AssistantMessage { text } => self.push_assistant(text.clone()),
+                SessionEvent::ToolCompleted { result, .. } => {
+                    self.push_tool(tool_label(result), result.output.clone());
+                }
+                SessionEvent::ToolUnknown { reason, .. } => {
+                    self.push_system("TOOL", reason.clone());
+                }
+                SessionEvent::ModeSelected { mode } => {
+                    self.push_system("MODE", mode_label(*mode).to_owned());
+                }
+                SessionEvent::TurnFailed { error } => self.push_system("ERROR", error.clone()),
+                SessionEvent::RecoveryRepair { removed_bytes } => self.push_system(
+                    "RECOVERY",
+                    format!("removed {removed_bytes} incomplete transcript bytes"),
+                ),
+                _ => {}
+            }
+        }
     }
 
     pub fn set_agent_counts(&mut self, running: usize, queued: usize) {
@@ -269,8 +304,8 @@ impl TuiState {
         };
     }
 
-    pub fn begin_approval(&mut self, request: ApprovalRequest, arguments: serde_json::Value) {
-        self.approval = Some(ApprovalState::new(request, arguments));
+    pub fn begin_approval(&mut self, request: ApprovalRequest) {
+        self.approval = Some(ApprovalState::new(request));
         self.overlay = Overlay::Approval;
         self.status = "approval pending".into();
     }
@@ -352,13 +387,16 @@ impl TuiState {
             RuntimeEvent::Status { message } => self.status = message,
             RuntimeEvent::AssistantDelta { text } => self.push_assistant(text),
             RuntimeEvent::ApprovalRequired { request } => {
-                self.begin_approval(request, serde_json::Value::Object(Default::default()));
+                self.begin_approval(request);
             }
             RuntimeEvent::ToolStarted { name, .. } => self.status = format!("running {name}"),
             RuntimeEvent::ToolOutputDelta { chunk, stream, .. } => {
                 self.push_tool(format!("BASH / {stream}"), chunk);
             }
-            RuntimeEvent::ToolCompleted { result, .. } => self.push_tool("TOOL", result.output),
+            RuntimeEvent::ToolCompleted { result, .. } => {
+                let label = tool_label(&result);
+                self.push_tool(label, result.output);
+            }
             RuntimeEvent::AgentUpdated { snapshot } => self.upsert_agent(snapshot),
             RuntimeEvent::AgentInspection {
                 snapshot,
@@ -374,5 +412,21 @@ impl TuiState {
             RuntimeEvent::Error { message } => self.status = message,
             RuntimeEvent::Shutdown => self.status = "shutdown".into(),
         }
+    }
+}
+
+fn tool_label(result: &ToolResult) -> String {
+    result
+        .metadata
+        .get("tool_name")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| "TOOL".into(), |name| format!("TOOL / {name}"))
+}
+
+fn mode_label(mode: ExecutionMode) -> &'static str {
+    match mode {
+        ExecutionMode::Supervised => "supervised",
+        ExecutionMode::Auto => "auto",
+        ExecutionMode::Yolo => "yolo",
     }
 }
