@@ -209,10 +209,9 @@ fn assistant_markdown_renders_inline_styles_and_links() {
             .modifier
             .contains(Modifier::CROSSED_OUT)
     );
-    assert_eq!(
-        cell_at_text(&buffer, "cargo test").fg,
-        Color::Rgb(220, 178, 73)
-    );
+    let inline_code = cell_at_text(&buffer, "cargo test");
+    assert_eq!(inline_code.fg, Color::Rgb(224, 226, 232));
+    assert!(inline_code.modifier.contains(Modifier::BOLD));
     let link = cell_at_text(&buffer, "docs");
     assert_eq!(link.fg, Color::Rgb(116, 177, 255));
     assert!(link.modifier.contains(Modifier::UNDERLINED));
@@ -269,6 +268,10 @@ fn assistant_markdown_renders_blocks_lists_code_quotes_rules_and_tables() {
             .modifier
             .contains(Modifier::BOLD)
     );
+    assert_eq!(
+        cell_at_text(&buffer, "fn main()").fg,
+        Color::Rgb(220, 178, 73)
+    );
     assert!(
         cell_at_text(&buffer, "Name")
             .modifier
@@ -297,6 +300,42 @@ fn assistant_markdown_preserves_viewport_wrapping_and_style() {
             .modifier
             .contains(Modifier::BOLD)
     );
+}
+
+#[test]
+fn assistant_markdown_wraps_words_without_orphan_punctuation() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_assistant("1234567890 **hello**.");
+
+    let buffer = rendered(&state, 20, 16);
+    let text = buffer_text(&buffer);
+    let lines = text.lines().map(str::trim).collect::<Vec<_>>();
+
+    assert!(lines.contains(&"1234567890"));
+    assert!(lines.contains(&"hello."));
+    assert!(!lines.contains(&"."));
+    assert!(
+        cell_at_text(&buffer, "hello")
+            .modifier
+            .contains(Modifier::BOLD)
+    );
+}
+
+#[test]
+fn narrow_markdown_tables_render_as_stacked_records() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_assistant(concat!(
+        "| Field | Value |\n",
+        "| --- | --- |\n",
+        "| command | cargo test --workspace --all-features |"
+    ));
+
+    let text = buffer_text(&rendered(&state, 40, 20));
+
+    assert!(text.contains("Field: command"));
+    assert!(text.contains("Value: cargo test --workspace"));
+    assert!(text.contains("--all-features"));
+    assert!(!text.contains('…'));
 }
 
 #[test]
@@ -357,14 +396,16 @@ fn table_cells_preserve_inline_markdown_styles() {
             .modifier
             .contains(Modifier::BOLD)
     );
-    assert_eq!(cell_at_text(&buffer, "ready").fg, Color::Rgb(220, 178, 73));
+    let inline_code = cell_at_text(&buffer, "ready");
+    assert_eq!(inline_code.fg, Color::Rgb(224, 226, 232));
+    assert!(inline_code.modifier.contains(Modifier::BOLD));
     let link = cell_at_text(&buffer, "docs");
     assert_eq!(link.fg, Color::Rgb(116, 177, 255));
     assert!(link.modifier.contains(Modifier::UNDERLINED));
 }
 
 #[test]
-fn narrow_tables_truncate_only_whole_grapheme_clusters() {
+fn narrow_tables_stack_without_truncating_grapheme_clusters() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.push_assistant(concat!(
         "| A | B |\n",
@@ -373,8 +414,15 @@ fn narrow_tables_truncate_only_whole_grapheme_clusters() {
     ));
 
     let text = buffer_text(&rendered(&state, 14, 20));
+    let compact = text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
 
-    assert!(text.lines().any(|line| line.contains("👨‍👩‍👧‍👦")));
+    assert!(text.contains("A: x"));
+    assert!(text.lines().any(|line| line.contains("B: 👨‍👩‍👧‍👦")));
+    assert!(compact.contains("B:👨‍👩‍👧‍👦abcdefghijk"));
+    assert!(!text.contains('…'));
 }
 
 #[test]

@@ -734,7 +734,7 @@ fn parse_markdown_blocks<'a>(
             }
             Event::Code(code) => blocks.push(MarkdownBlock::Paragraph(vec![StyledFragment {
                 content: code.into_string(),
-                style: code_style(),
+                style: inline_code_style(),
             }])),
             Event::SoftBreak | Event::HardBreak => {
                 blocks.push(MarkdownBlock::Paragraph(Vec::new()));
@@ -769,7 +769,7 @@ fn parse_inline_fragments<'a>(
                 push_fragment(
                     &mut fragments,
                     code.into_string(),
-                    style.patch(code_style()),
+                    style.patch(inline_code_style()),
                 );
             }
             Event::SoftBreak => push_fragment(&mut fragments, " ".into(), style),
@@ -1021,7 +1021,7 @@ fn render_markdown_block(
                 );
             }
             let code_marker = if language.is_some() { None } else { marker };
-            render_fragments(
+            render_hard_fragments(
                 &[StyledFragment {
                     content: content.clone(),
                     style: code_style(),
@@ -1120,6 +1120,34 @@ fn render_fragments(
     ));
 }
 
+fn render_hard_fragments(
+    fragments: &[StyledFragment],
+    width: usize,
+    context: MarkdownContext,
+    marker: Option<&str>,
+    decoration: Option<(&str, &str, Style)>,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let (mut first_prefix, mut continuation_prefix) =
+        markdown_prefixes(context, marker, decoration);
+    if let Some((first, continuation, style)) = decoration {
+        first_prefix.push(StyledFragment {
+            content: first.to_owned(),
+            style,
+        });
+        continuation_prefix.push(StyledFragment {
+            content: continuation.to_owned(),
+            style,
+        });
+    }
+    lines.extend(hard_wrap_styled_fragments(
+        fragments,
+        width,
+        &first_prefix,
+        &continuation_prefix,
+    ));
+}
+
 fn markdown_prefixes(
     context: MarkdownContext,
     marker: Option<&str>,
@@ -1177,6 +1205,80 @@ fn wrap_styled_fragments(
     let mut current = first_prefix.to_vec();
     let mut current_width = fragments_width(&current);
     let mut content_width = 0_usize;
+    let mut pending_whitespace = Vec::new();
+
+    for token in styled_wrap_tokens(fragments) {
+        match token {
+            StyledWrapToken::Whitespace(whitespace) => pending_whitespace = whitespace,
+            StyledWrapToken::Break => {
+                lines.push(Line::from(fragments_into_spans(current)));
+                current = continuation_prefix.to_vec();
+                current_width = fragments_width(&current);
+                content_width = 0;
+                pending_whitespace.clear();
+            }
+            StyledWrapToken::Word(word) => {
+                let word_width = fragments_width(&word);
+                let whitespace_width = if content_width == 0 {
+                    0
+                } else {
+                    fragments_width(&pending_whitespace)
+                };
+                if content_width > 0
+                    && current_width
+                        .saturating_add(whitespace_width)
+                        .saturating_add(word_width)
+                        > width
+                {
+                    lines.push(Line::from(fragments_into_spans(current)));
+                    current = continuation_prefix.to_vec();
+                    current_width = fragments_width(&current);
+                    content_width = 0;
+                }
+
+                if content_width > 0 {
+                    append_fragments(&mut current, &pending_whitespace);
+                    current_width = current_width.saturating_add(whitespace_width);
+                    content_width = content_width.saturating_add(whitespace_width);
+                }
+                pending_whitespace.clear();
+
+                for fragment in word {
+                    for grapheme in fragment.content.graphemes(true) {
+                        let grapheme_width = display_width(grapheme);
+                        if content_width > 0 && current_width.saturating_add(grapheme_width) > width
+                        {
+                            lines.push(Line::from(fragments_into_spans(current)));
+                            current = continuation_prefix.to_vec();
+                            current_width = fragments_width(&current);
+                            content_width = 0;
+                        }
+                        push_fragment(&mut current, grapheme.to_owned(), fragment.style);
+                        current_width = current_width.saturating_add(grapheme_width);
+                        content_width = content_width.saturating_add(grapheme_width);
+                    }
+                }
+            }
+        }
+    }
+
+    if content_width > 0 || lines.is_empty() {
+        lines.push(Line::from(fragments_into_spans(current)));
+    }
+    lines
+}
+
+fn hard_wrap_styled_fragments(
+    fragments: &[StyledFragment],
+    width: usize,
+    first_prefix: &[StyledFragment],
+    continuation_prefix: &[StyledFragment],
+) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = first_prefix.to_vec();
+    let mut current_width = fragments_width(&current);
+    let mut content_width = 0_usize;
 
     for fragment in fragments {
         for grapheme in fragment.content.graphemes(true) {
@@ -1206,6 +1308,60 @@ fn wrap_styled_fragments(
     lines
 }
 
+enum StyledWrapToken {
+    Word(Vec<StyledFragment>),
+    Whitespace(Vec<StyledFragment>),
+    Break,
+}
+
+fn styled_wrap_tokens(fragments: &[StyledFragment]) -> Vec<StyledWrapToken> {
+    let mut tokens = Vec::new();
+    let mut current = Vec::new();
+    let mut current_is_whitespace = None;
+
+    for fragment in fragments {
+        for grapheme in fragment.content.graphemes(true) {
+            if grapheme == "\n" {
+                push_wrap_token(&mut tokens, &mut current, current_is_whitespace);
+                current_is_whitespace = None;
+                tokens.push(StyledWrapToken::Break);
+                continue;
+            }
+
+            let is_whitespace = grapheme.chars().all(char::is_whitespace);
+            if current_is_whitespace.is_some_and(|current| current != is_whitespace) {
+                push_wrap_token(&mut tokens, &mut current, current_is_whitespace);
+            }
+            current_is_whitespace = Some(is_whitespace);
+            push_fragment(&mut current, grapheme.to_owned(), fragment.style);
+        }
+    }
+    push_wrap_token(&mut tokens, &mut current, current_is_whitespace);
+    tokens
+}
+
+fn push_wrap_token(
+    tokens: &mut Vec<StyledWrapToken>,
+    current: &mut Vec<StyledFragment>,
+    is_whitespace: Option<bool>,
+) {
+    if current.is_empty() {
+        return;
+    }
+    let fragments = std::mem::take(current);
+    if is_whitespace.unwrap_or(false) {
+        tokens.push(StyledWrapToken::Whitespace(fragments));
+    } else {
+        tokens.push(StyledWrapToken::Word(fragments));
+    }
+}
+
+fn append_fragments(target: &mut Vec<StyledFragment>, fragments: &[StyledFragment]) {
+    for fragment in fragments {
+        push_fragment(target, fragment.content.clone(), fragment.style);
+    }
+}
+
 fn render_markdown_table(
     alignments: &[Alignment],
     header: &[Vec<StyledFragment>],
@@ -1230,7 +1386,7 @@ fn render_markdown_table(
         .saturating_sub(prefix_width)
         .saturating_sub(separator_width)
         .max(column_count);
-    let mut column_widths = (0..column_count)
+    let natural_column_widths = (0..column_count)
         .map(|column| {
             std::iter::once(header.get(column))
                 .chain(rows.iter().map(|row| row.get(column)))
@@ -1241,6 +1397,11 @@ fn render_markdown_table(
                 .max(1)
         })
         .collect::<Vec<_>>();
+    if !rows.is_empty() && natural_column_widths.iter().sum::<usize>() > available {
+        render_stacked_markdown_table(header, rows, width, context, marker, lines);
+        return;
+    }
+    let mut column_widths = natural_column_widths;
     while column_widths.iter().sum::<usize>() > available {
         let Some((index, _)) = column_widths
             .iter()
@@ -1282,6 +1443,48 @@ fn render_markdown_table(
             &continuation_prefix,
             false,
         ));
+    }
+}
+
+fn render_stacked_markdown_table(
+    header: &[Vec<StyledFragment>],
+    rows: &[Vec<Vec<StyledFragment>>],
+    width: usize,
+    context: MarkdownContext,
+    marker: Option<&str>,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let column_count = header
+        .len()
+        .max(rows.iter().map(Vec::len).max().unwrap_or(0));
+    for (row_index, row) in rows.iter().enumerate() {
+        for column in 0..column_count {
+            let label = header
+                .get(column)
+                .map(|fragments| fragments_text(fragments))
+                .filter(|label| !label.trim().is_empty())
+                .unwrap_or_else(|| format!("Column {}", column + 1));
+            let field_marker = (row_index == 0 && column == 0).then_some(marker).flatten();
+            let (mut first_prefix, mut continuation_prefix) =
+                markdown_prefixes(context, field_marker, None);
+            let label_style = Style::default().fg(DIM).add_modifier(Modifier::BOLD);
+            push_fragment(&mut first_prefix, format!("{label}: "), label_style);
+            push_fragment(
+                &mut continuation_prefix,
+                " ".repeat(display_width(&label) + 2),
+                text_style(),
+            );
+            let value = row.get(column).map(Vec::as_slice).unwrap_or(&[]);
+            lines.extend(wrap_styled_fragments(
+                value,
+                width,
+                &first_prefix,
+                &continuation_prefix,
+            ));
+        }
+        if row_index + 1 < rows.len() {
+            push_markdown_blank(lines, context);
+        }
     }
 }
 
@@ -1452,6 +1655,10 @@ fn text_style() -> Style {
 
 fn code_style() -> Style {
     Style::default().fg(AMBER)
+}
+
+fn inline_code_style() -> Style {
+    text_style().add_modifier(Modifier::BOLD)
 }
 
 pub(crate) fn transcript_lines(
