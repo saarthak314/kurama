@@ -375,6 +375,105 @@ fn session_auth_profiles_prompt_for_a_masked_runtime_secret() {
     assert!(app.restart_args().is_some());
 }
 
+#[tokio::test]
+async fn inactive_session_profile_does_not_block_the_selected_profile() {
+    let (_temp, paths, project) = fixture();
+    let repository = ConfigRepository::open(paths.clone()).expect("repository");
+    let mut config = bridge_config();
+    config.profiles.insert(
+        "remote".into(),
+        ProfileConfig {
+            kind: ProfileKind::OpenAi,
+            model: "remote-model".into(),
+            endpoint: None,
+            auth: Some(AuthRef::Session),
+            command: None,
+            max_input_tokens: 100_000,
+            max_output_tokens: 10_000,
+            escalation_profiles: Vec::new(),
+        },
+    );
+    repository.write_config(&config).expect("write config");
+
+    let app =
+        App::bootstrap_with_paths(&Args::default(), project, paths, SessionSecrets::default())
+            .expect("bootstrap");
+
+    assert!(app.is_connected());
+    assert_eq!(app.state.profile, "work");
+}
+
+#[tokio::test]
+async fn connect_adds_a_profile_without_stopping_the_active_session() {
+    let (_temp, paths, project) = fixture();
+    let repository = ConfigRepository::open(paths.clone()).expect("repository");
+    repository
+        .write_config(&bridge_config())
+        .expect("write config");
+    let mut app = App::bootstrap_with_paths(
+        &Args::default(),
+        project.clone(),
+        paths,
+        SessionSecrets::default(),
+    )
+    .expect("bootstrap");
+
+    submit_command(&mut app, "/connect");
+    app.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
+        .expect("select Claude");
+    press_enter(&mut app);
+    press_enter(&mut app);
+    type_command(&mut app, "claude-model");
+    press_enter(&mut app);
+
+    assert!(app.is_connected());
+    assert_eq!(app.state.profile, "work");
+    assert!(app.restart_args().is_none());
+    assert!(
+        !app.state
+            .sent_commands()
+            .iter()
+            .any(|command| matches!(command, EngineCommand::Shutdown))
+    );
+    assert_eq!(
+        repository
+            .resolve_profile(&project, None)
+            .expect("resolve profile")
+            .as_deref(),
+        Some("work")
+    );
+    assert!(
+        repository
+            .read_config()
+            .expect("read config")
+            .expect("config")
+            .profiles
+            .contains_key("claude")
+    );
+}
+
+#[tokio::test]
+async fn reopening_connect_resets_a_cancelled_wizard() {
+    let (_temp, paths, project) = fixture();
+    let repository = ConfigRepository::open(paths.clone()).expect("repository");
+    repository
+        .write_config(&bridge_config())
+        .expect("write config");
+    let mut app =
+        App::bootstrap_with_paths(&Args::default(), project, paths, SessionSecrets::default())
+            .expect("bootstrap");
+
+    submit_command(&mut app, "/connect");
+    press_enter(&mut app);
+    type_command(&mut app, "discarded");
+    app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .expect("cancel wizard");
+    submit_command(&mut app, "/connect");
+
+    assert!(app.state.onboarding.is_selecting_connection());
+    assert_eq!(app.state.onboarding.display_input(), "");
+}
+
 fn type_command(app: &mut App, command: &str) {
     for character in command.chars() {
         app.handle_event(Event::Key(KeyEvent::new(

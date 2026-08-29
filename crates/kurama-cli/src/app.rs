@@ -40,7 +40,10 @@ use tokio::sync::mpsc;
 use crate::{
     args::{Args, ResumeChoice},
     commands::{Command, parse_command},
-    tui::{OnboardingSubmission, Overlay, TerminalGuard, TuiState, render, spawn_input_thread},
+    tui::{
+        OnboardingState, OnboardingSubmission, Overlay, TerminalGuard, TuiState, render,
+        spawn_input_thread,
+    },
 };
 
 pub struct App {
@@ -196,20 +199,15 @@ impl App {
             mutable_state.last_mode.unwrap_or(config.default_mode)
         };
         let profile_names: Vec<_> = config.profiles.keys().cloned().collect();
-        let missing_session_profile = {
+        let active_session_missing = {
             let secrets = session_secrets
                 .lock()
                 .map_err(|_| "session credential store is unavailable".to_owned())?;
-            config
-                .profiles
-                .iter()
-                .find(|(name, profile)| {
-                    matches!(profile.auth, Some(AuthRef::Session)) && !secrets.contains(name)
-                })
-                .map(|(name, _)| name.clone())
+            matches!(active.auth, Some(AuthRef::Session)) && !secrets.contains(&active_profile)
         };
-        if let Some(profile) = missing_session_profile {
-            let mut state = TuiState::credential(project.display().to_string(), profile);
+        if active_session_missing {
+            let mut state =
+                TuiState::credential(project.display().to_string(), active_profile.clone());
             state.mode = mode;
             return Ok(Self::disconnected(
                 state,
@@ -235,6 +233,9 @@ impl App {
             .lock()
             .map_err(|_| "session credential store is unavailable".to_owned())?;
         for (name, profile) in &config.profiles {
+            if matches!(profile.auth, Some(AuthRef::Session)) && !secrets.contains(name) {
+                continue;
+            }
             let model_profile = ModelProfile::new(
                 name.clone(),
                 profile.model.clone(),
@@ -567,7 +568,10 @@ impl App {
                         );
                     }
                 }
-                Command::Connect => self.state.overlay = Overlay::Onboarding,
+                Command::Connect => {
+                    self.state.onboarding = OnboardingState::new();
+                    self.state.overlay = Overlay::Onboarding;
+                }
                 Command::Sessions => self.show_sessions()?,
                 Command::Resume(session) => {
                     self.request_restart(
@@ -666,13 +670,18 @@ impl App {
             KeyCode::Enter => match self.state.onboarding.submit() {
                 Ok(Some(submission)) => {
                     if let Err(error) = self.apply_onboarding_submission(submission) {
+                        self.state.onboarding = OnboardingState::new();
+                        self.state.overlay = Overlay::None;
                         self.state.status = error;
                     }
                 }
                 Ok(None) => self.state.status = self.state.onboarding.prompt().to_lowercase(),
                 Err(error) => self.state.status = error,
             },
-            KeyCode::Esc => self.state.overlay = Overlay::None,
+            KeyCode::Esc => {
+                self.state.onboarding = OnboardingState::new();
+                self.state.overlay = Overlay::None;
+            }
             _ => {}
         }
     }
@@ -681,6 +690,7 @@ impl App {
         &mut self,
         submission: OnboardingSubmission,
     ) -> Result<(), String> {
+        let connected = self.is_connected();
         let control = self
             .control
             .as_ref()
@@ -702,6 +712,18 @@ impl App {
                 if config.profiles.contains_key(&name) {
                     return Err(format!("profile {name} already exists"));
                 }
+                let http = HttpClient::try_new().map_err(|error| error.to_string())?;
+                let factory = ProviderFactory::new(http, control.paths.clone(), CredentialResolver);
+                let mut secrets = session_secrets
+                    .lock()
+                    .map_err(|_| "session credential store is unavailable".to_owned())?;
+                if let Some(secret) = secret {
+                    secrets.insert(name.clone(), SecretValue::new(secret));
+                }
+                let validation = factory.build(&name, &profile, &secrets);
+                let secret = secrets.remove(&name);
+                validation.map_err(|error| error.to_string())?;
+                drop(secrets);
                 config.profiles.insert(name.clone(), profile);
                 if config.default_profile.is_none() {
                     config.default_profile = Some(name.clone());
@@ -709,23 +731,32 @@ impl App {
                 repository
                     .write_config(&config)
                     .map_err(|error| error.to_string())?;
-                repository
-                    .remember_project_profile(&project, &name)
-                    .map_err(|error| error.to_string())?;
                 if let Some(secret) = secret {
                     session_secrets
                         .lock()
                         .map_err(|_| "session credential store is unavailable".to_owned())?
-                        .insert(name.clone(), SecretValue::new(secret));
+                        .insert(name.clone(), secret);
                 }
-                self.request_restart(
-                    Args {
-                        profile: Some(name.clone()),
-                        yolo: self.state.mode == ExecutionMode::Yolo,
-                        ..Args::default()
-                    },
-                    format!("connecting profile {name}"),
-                );
+                if connected {
+                    if let Some(control) = self.control.as_mut() {
+                        control.profiles = config.profiles.keys().cloned().collect();
+                    }
+                    self.state.onboarding = OnboardingState::new();
+                    self.state.overlay = Overlay::None;
+                    self.state.status = format!("added profile {name}");
+                } else {
+                    repository
+                        .remember_project_profile(&project, &name)
+                        .map_err(|error| error.to_string())?;
+                    self.request_restart(
+                        Args {
+                            profile: Some(name.clone()),
+                            yolo: self.state.mode == ExecutionMode::Yolo,
+                            ..Args::default()
+                        },
+                        format!("connecting profile {name}"),
+                    );
+                }
             }
             OnboardingSubmission::Credential { profile, secret } => {
                 session_secrets
@@ -997,17 +1028,40 @@ fn orchestration_context(
         role_routes: config
             .roles
             .iter()
+            .filter(|(_, route)| profiles.contains_key(&route.profile))
             .map(|(role, route)| (role.clone(), route.profile.clone()))
             .collect(),
         role_escalations: config
             .roles
             .iter()
-            .map(|(role, route)| (role.clone(), route.escalation_profiles.clone()))
+            .filter(|(_, route)| profiles.contains_key(&route.profile))
+            .map(|(role, route)| {
+                (
+                    role.clone(),
+                    route
+                        .escalation_profiles
+                        .iter()
+                        .filter(|profile| profiles.contains_key(*profile))
+                        .cloned()
+                        .collect(),
+                )
+            })
             .collect(),
         profile_escalations: config
             .profiles
             .iter()
-            .map(|(name, profile)| (name.clone(), profile.escalation_profiles.clone()))
+            .filter(|(name, _)| profiles.contains_key(*name))
+            .map(|(name, profile)| {
+                (
+                    name.clone(),
+                    profile
+                        .escalation_profiles
+                        .iter()
+                        .filter(|profile| profiles.contains_key(*profile))
+                        .cloned()
+                        .collect(),
+                )
+            })
             .collect(),
         parent_write_scope,
         max_concurrency: config.orchestration.max_concurrency,
