@@ -222,6 +222,33 @@ fn runtime_errors_are_appended_to_the_transcript() {
 }
 
 #[test]
+fn stable_transcript_prefix_excludes_mutable_assistant_and_tool_entries() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_user("inspect it");
+    assert_eq!(state.stable_transcript_end(), 1);
+
+    state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+        text: "working".into(),
+    });
+    assert_eq!(state.stable_transcript_end(), 1);
+
+    state.mark_transcript_committed(1);
+    assert_eq!(state.live_transcript().len(), 1);
+    assert_eq!(state.live_transcript()[0].body, "working");
+
+    state.apply_runtime_event(RuntimeEvent::TurnCompleted);
+    assert_eq!(state.stable_transcript_end(), 2);
+
+    state.apply_runtime_event(tool_delta("call_1", "stdout", "partial"));
+    assert_eq!(state.stable_transcript_end(), 2);
+    state.apply_runtime_event(RuntimeEvent::ToolCompleted {
+        operation_id: OperationId::from("operation_1"),
+        result: tool_result("call_1", "complete", "bash"),
+    });
+    assert_eq!(state.stable_transcript_end(), 3);
+}
+
+#[test]
 fn replay_hydration_clears_active_tool_stream_tracking() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.apply_runtime_event(tool_delta("call_1", "stdout", "stale"));

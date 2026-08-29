@@ -10,4 +10,5 @@ pub use approval::ApprovalState;
 pub use input::{TerminalGuard, spawn_input_thread};
 pub use onboarding::{OnboardingState, OnboardingSubmission};
 pub use render::render;
+pub(crate) use render::transcript_lines;
 pub use state::{Overlay, TranscriptEntry, TranscriptKind, TuiState};

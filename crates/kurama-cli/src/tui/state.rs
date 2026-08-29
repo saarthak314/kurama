@@ -59,6 +59,7 @@ pub struct TuiState {
     pub agent_message: String,
     active_assistant_entry: Option<usize>,
     active_tool_entries: HashMap<CallId, usize>,
+    committed_transcript_entries: usize,
     sent_commands: Vec<EngineCommand>,
 }
 
@@ -89,6 +90,7 @@ impl TuiState {
             agent_message: String::new(),
             active_assistant_entry: None,
             active_tool_entries: HashMap::new(),
+            committed_transcript_entries: 0,
             sent_commands: Vec::new(),
         }
     }
@@ -154,9 +156,32 @@ impl TuiState {
         });
     }
 
+    pub fn stable_transcript_end(&self) -> usize {
+        self.active_assistant_entry
+            .into_iter()
+            .chain(self.active_tool_entries.values().copied())
+            .min()
+            .unwrap_or(self.transcript.len())
+            .max(self.committed_transcript_entries)
+    }
+
+    pub fn stable_transcript(&self) -> &[TranscriptEntry] {
+        &self.transcript[self.committed_transcript_entries..self.stable_transcript_end()]
+    }
+
+    pub fn mark_transcript_committed(&mut self, end: usize) {
+        self.committed_transcript_entries = end.min(self.transcript.len());
+        self.scroll = 0;
+    }
+
+    pub fn live_transcript(&self) -> &[TranscriptEntry] {
+        &self.transcript[self.committed_transcript_entries..]
+    }
+
     pub fn hydrate_replay(&mut self, replay: &[EventEnvelope]) {
         self.active_assistant_entry = None;
         self.active_tool_entries.clear();
+        self.committed_transcript_entries = 0;
         self.transcript.clear();
         self.agents.clear();
         for envelope in replay {

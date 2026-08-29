@@ -137,6 +137,19 @@ fn transcript_uses_compact_codex_style_hierarchy() {
 }
 
 #[test]
+fn committed_transcript_is_not_redrawn_in_the_live_viewport() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_user("committed question");
+    state.mark_transcript_committed(1);
+    state.push_assistant("live answer");
+
+    let text = buffer_text(&rendered(&state, 80, 20));
+
+    assert!(!text.contains("committed question"));
+    assert!(text.contains("live answer"));
+}
+
+#[test]
 fn runtime_errors_render_in_the_transcript_instead_of_the_status_line() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.apply_runtime_event(RuntimeEvent::Error {

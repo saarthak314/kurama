@@ -82,7 +82,7 @@ fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
     let transcript_block = Block::default().padding(Padding::new(2, 2, 1, 0));
     let transcript_area = transcript_block.inner(chunks[1]);
     let transcript_width = transcript_area.width as usize;
-    let transcript = transcript_lines(state, transcript_width);
+    let transcript = transcript_lines(state.live_transcript(), transcript_width);
     let viewport_height = transcript_area.height as usize;
     let scroll = state
         .scroll
@@ -1454,9 +1454,12 @@ fn code_style() -> Style {
     Style::default().fg(AMBER)
 }
 
-fn transcript_lines(state: &TuiState, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn transcript_lines(
+    entries: &[super::TranscriptEntry],
+    width: usize,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for entry in &state.transcript {
+    for entry in entries {
         match entry.kind {
             TranscriptKind::User => push_prefixed_lines(
                 &mut lines,

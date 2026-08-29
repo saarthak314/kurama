@@ -34,6 +34,7 @@ use kurama_sdk::AgentBuilder;
 use ratatui::{
     Terminal, TerminalOptions, Viewport,
     backend::{Backend, CrosstermBackend},
+    widgets::{Block, Padding, Paragraph, Widget},
 };
 use tokio::sync::mpsc;
 
@@ -42,9 +43,12 @@ use crate::{
     commands::{Command, parse_command},
     tui::{
         OnboardingState, OnboardingSubmission, Overlay, TerminalGuard, TuiState, render,
-        spawn_input_thread,
+        spawn_input_thread, transcript_lines,
     },
 };
+
+const TRANSCRIPT_HORIZONTAL_PADDING: usize = 2;
+const MAX_TRANSCRIPT_INSERT_HEIGHT: usize = 1_024;
 
 pub struct App {
     pub state: TuiState,
@@ -971,6 +975,7 @@ where
         false
     };
     let mut input_open = true;
+    commit_stable_transcript(&mut app.state, terminal)?;
     terminal
         .draw(|frame| render(frame, &app.state))
         .map_err(|error| error.to_string())?;
@@ -1011,6 +1016,7 @@ where
                 }
             }
         }
+        commit_stable_transcript(&mut app.state, terminal)?;
         terminal
             .draw(|frame| render(frame, &app.state))
             .map_err(|error| error.to_string())?;
@@ -1018,6 +1024,43 @@ where
             break;
         }
     }
+    Ok(())
+}
+
+fn commit_stable_transcript<B>(
+    state: &mut TuiState,
+    terminal: &mut Terminal<B>,
+) -> Result<(), String>
+where
+    B: Backend,
+{
+    let committed_end = state.stable_transcript_end();
+    if state.stable_transcript().is_empty() {
+        return Ok(());
+    }
+
+    let terminal_width = terminal.get_frame().area().width as usize;
+    let content_width = terminal_width
+        .saturating_sub(TRANSCRIPT_HORIZONTAL_PADDING * 2)
+        .max(1);
+    let lines = transcript_lines(state.stable_transcript(), content_width);
+
+    for chunk in lines.chunks(MAX_TRANSCRIPT_INSERT_HEIGHT) {
+        terminal
+            .insert_before(chunk.len() as u16, |buffer| {
+                Paragraph::new(chunk.to_vec())
+                    .block(Block::default().padding(Padding::new(
+                        TRANSCRIPT_HORIZONTAL_PADDING as u16,
+                        TRANSCRIPT_HORIZONTAL_PADDING as u16,
+                        0,
+                        0,
+                    )))
+                    .render(*buffer.area(), buffer);
+            })
+            .map_err(|error| error.to_string())?;
+    }
+
+    state.mark_transcript_committed(committed_end);
     Ok(())
 }
 
@@ -1223,6 +1266,7 @@ mod tests {
         id::{CallId, OperationId},
         tool::ToolResult,
     };
+    use ratatui::{TerminalOptions, Viewport, backend::TestBackend, layout::Position};
 
     use super::*;
 
@@ -1317,5 +1361,53 @@ mod tests {
         assert_eq!(inline_viewport_height(40), 24);
         assert_eq!(inline_viewport_height(20), 19);
         assert_eq!(inline_viewport_height(6), 6);
+    }
+
+    #[tokio::test]
+    async fn completed_transcript_is_inserted_above_the_inline_viewport() {
+        let mut app = App {
+            state: TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised),
+            engine: None,
+            runtime_events: None,
+            tool_events: None,
+            orchestrator: None,
+            session_id: None,
+            restart_args: None,
+            control: None,
+        };
+        app.state.push_user("committed question");
+
+        let mut backend = TestBackend::new(80, 16);
+        backend
+            .set_cursor_position(Position::new(0, 4))
+            .expect("position inline viewport");
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(8),
+            },
+        )
+        .expect("inline terminal");
+        let (input_sender, input) = mpsc::channel(1);
+        let (runtime_sender, runtime_events) = mpsc::channel(1);
+        drop(input_sender);
+        drop(runtime_sender);
+
+        let app = run_with(app, &mut terminal, input, runtime_events)
+            .await
+            .expect("run inline terminal");
+        let inserted_row = (0..80)
+            .map(|x| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((x, 4))
+                    .expect("inserted cell")
+                    .symbol()
+            })
+            .collect::<String>();
+
+        assert!(inserted_row.contains("› committed question"));
+        assert!(app.state.live_transcript().is_empty());
     }
 }
