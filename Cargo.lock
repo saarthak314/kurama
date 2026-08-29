@@ -822,6 +822,7 @@ dependencies = [
  "lexopt",
  "ratatui",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

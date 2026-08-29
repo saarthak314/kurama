@@ -1,10 +1,34 @@
-use std::{io, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    io,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use kurama_protocol::{
-    policy::ApprovalResponse,
-    runtime::{EngineCommand, RuntimeEvent},
+use kurama_adapters::{
+    AppPaths, BashTool, ConfigRepository, CredentialResolver, FsSessionStore, HttpClient,
+    JsonSearchBackend, OpenAiNativeSearch, ProviderFactory, RandomIds, ReadTool, SearchBackend,
+    SessionSecrets, WebSearchTool, WriteTool,
 };
+use kurama_core::{
+    engine::{EngineHandle, RuntimeEvents},
+    orchestrator::SmartOrchestrator,
+    policy::DefaultPolicy,
+};
+use kurama_protocol::{
+    KuramaError,
+    agent::{OrchestrationContext, WriteScope},
+    config::{KuramaConfig, ProfileConfig, ProfileKind, SearchConfig},
+    id::SessionId,
+    model::ModelProfile,
+    policy::{ApprovalResponse, ExecutionMode},
+    runtime::{EngineCommand, RuntimeEvent},
+    session::{EventEnvelope, SessionEvent, SessionMetadata},
+    traits::{EventSink, IdGenerator, Orchestrator, SessionStore, Tool},
+};
+use kurama_sdk::AgentBuilder;
 use ratatui::{
     Terminal,
     backend::{Backend, CrosstermBackend},
@@ -12,37 +36,258 @@ use ratatui::{
 use tokio::sync::mpsc;
 
 use crate::{
-    args::Args,
+    args::{Args, ResumeChoice},
     commands::{Command, parse_command},
     tui::{Overlay, TerminalGuard, TuiState, render, spawn_input_thread},
 };
 
 pub struct App {
     pub state: TuiState,
+    engine: Option<EngineHandle>,
+    runtime_events: Option<RuntimeEvents>,
+    tool_events: Option<mpsc::UnboundedReceiver<RuntimeEvent>>,
+    orchestrator: Option<Arc<dyn Orchestrator>>,
+    session_id: Option<SessionId>,
 }
 
 impl App {
     pub fn bootstrap(args: &Args, cwd: PathBuf) -> Result<Self, String> {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| "HOME is not set".to_owned())?;
-        let config_exists = home.join(".kurama/config.toml").is_file();
-        let project = cwd.display().to_string();
-        let state = if config_exists || args.profile.is_some() {
-            TuiState::new(
-                args.profile.as_deref().unwrap_or("default"),
-                "configured model",
-                project,
-                if args.yolo {
-                    kurama_protocol::policy::ExecutionMode::Yolo
-                } else {
-                    kurama_protocol::policy::ExecutionMode::Supervised
-                },
-            )
-        } else {
-            TuiState::onboarding(project)
+        Self::bootstrap_with_paths(
+            args,
+            cwd,
+            AppPaths::discover().map_err(|error| error.to_string())?,
+            SessionSecrets::default(),
+        )
+    }
+
+    pub fn bootstrap_with_paths(
+        args: &Args,
+        cwd: PathBuf,
+        paths: AppPaths,
+        session_secrets: SessionSecrets,
+    ) -> Result<Self, String> {
+        let project = cwd
+            .canonicalize()
+            .map_err(|error| format!("canonicalize project: {error}"))?;
+        let repository =
+            ConfigRepository::open(paths.clone()).map_err(|error| error.to_string())?;
+        let Some(config) = repository
+            .read_config()
+            .map_err(|error| error.to_string())?
+        else {
+            if args.profile.is_some() || args.resume.is_some() {
+                return Err("Kurama is not configured; create ~/.kurama/config.toml first".into());
+            }
+            return Ok(Self::disconnected(TuiState::onboarding(
+                project.display().to_string(),
+            )));
         };
-        Ok(Self { state })
+        if config.profiles.is_empty() {
+            return Ok(Self::disconnected(TuiState::onboarding(
+                project.display().to_string(),
+            )));
+        }
+
+        let active_profile = repository
+            .resolve_profile(&project, args.profile.as_deref())
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "no active profile is configured".to_owned())?;
+        let active = config
+            .profiles
+            .get(&active_profile)
+            .ok_or_else(|| format!("unknown active profile: {active_profile}"))?;
+        let mode = if args.yolo {
+            ExecutionMode::Yolo
+        } else {
+            config.default_mode
+        };
+
+        let http = HttpClient::try_new().map_err(|error| error.to_string())?;
+        let credentials = CredentialResolver;
+        let provider_factory = ProviderFactory::new(http.clone(), paths.clone(), credentials);
+        let mut profiles = BTreeMap::new();
+        let mut builder = AgentBuilder::new();
+        for (name, profile) in &config.profiles {
+            let model_profile = ModelProfile::new(
+                name.clone(),
+                profile.model.clone(),
+                profile.max_input_tokens,
+                profile.max_output_tokens,
+            );
+            let backend = provider_factory
+                .build(name, profile, &session_secrets)
+                .map_err(|error| error.to_string())?;
+            profiles.insert(name.clone(), model_profile.clone());
+            builder = builder.profile(model_profile, backend);
+        }
+
+        let ids = Arc::new(RandomIds);
+        let orchestrator = Arc::new(SmartOrchestrator::new(ids.clone()));
+        let write_scope = WriteScope {
+            roots: vec![project.clone()],
+            files: Vec::new(),
+        };
+        let orchestration = orchestration_context(
+            &config,
+            active_profile.as_str(),
+            &profiles,
+            write_scope.clone(),
+            mode,
+        )?;
+        let search_backend = search_backend(
+            &config,
+            active_profile.as_str(),
+            active,
+            &session_secrets,
+            credentials,
+            http.clone(),
+        )?;
+        let (tool_tx, tool_rx) = mpsc::unbounded_channel();
+        let tool_sink: Arc<dyn EventSink> = Arc::new(ToolEventSink { sender: tool_tx });
+        let tools = standard_tools(http, search_backend, Some(tool_sink));
+        let store = Arc::new(
+            FsSessionStore::open(paths.root().to_path_buf()).map_err(|error| error.to_string())?,
+        );
+        let sink: Arc<dyn EventSink> = Arc::new(NoopSink);
+        builder = builder
+            .active_profile(active_profile.clone())
+            .policy(Arc::new(DefaultPolicy::new(mode, config.auto.clone())))
+            .store(store.clone())
+            .sink(sink)
+            .orchestrator(orchestrator.clone())
+            .ids(ids.clone())
+            .write_scope(write_scope)
+            .auto_boundaries(config.auto.clone())
+            .orchestration_context(orchestration);
+        for tool in tools {
+            builder = builder.tool(tool);
+        }
+        let runtime = builder.build().map_err(|error| error.to_string())?;
+
+        let resume_id = resolve_resume(args, &repository, store.as_ref(), &project)?;
+        let mut replay = resume_id
+            .as_ref()
+            .map(|session_id| store.replay(session_id))
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .unwrap_or_default();
+        let previous_metadata = replay.iter().find_map(|event| {
+            if let SessionEvent::SessionStarted { metadata } = &event.event {
+                Some(metadata.clone())
+            } else {
+                None
+            }
+        });
+        if resume_id.is_some() && previous_metadata.is_none() {
+            return Err("resumed session has no durable session metadata".into());
+        }
+        if let Some(metadata) = &previous_metadata {
+            let recorded = PathBuf::from(&metadata.project_root);
+            if recorded.canonicalize().ok().as_ref() != Some(&project) {
+                return Err(format!(
+                    "session {} belongs to another project",
+                    metadata.id
+                ));
+            }
+        }
+        let session_id = resume_id.unwrap_or_else(|| ids.session_id());
+        let created_at_ms = previous_metadata
+            .as_ref()
+            .map_or_else(now_ms, |metadata| metadata.created_at_ms);
+        let resumed_yolo = previous_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.mode == ExecutionMode::Yolo)
+            && mode != ExecutionMode::Yolo;
+        if previous_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.mode != mode)
+        {
+            let event = EventEnvelope::new(
+                replay.last().map_or(0, |event| event.sequence + 1),
+                now_ms(),
+                session_id.clone(),
+                None,
+                SessionEvent::ModeSelected { mode },
+            );
+            store.append(&event).map_err(|error| error.to_string())?;
+            replay.push(event);
+        }
+        let metadata = SessionMetadata {
+            id: session_id.clone(),
+            created_at_ms,
+            project_root: project.display().to_string(),
+            profile: active_profile.clone(),
+            mode,
+            redaction_best_effort: mode == ExecutionMode::Yolo,
+        };
+        let (engine, runtime_events) = runtime
+            .start(metadata, replay)
+            .map_err(|error| error.to_string())?;
+
+        repository
+            .remember_project_profile(&project, &active_profile)
+            .map_err(|error| error.to_string())?;
+        repository
+            .remember_latest_session(&project, &session_id)
+            .map_err(|error| error.to_string())?;
+        if mode != ExecutionMode::Yolo {
+            repository
+                .remember_mode(mode)
+                .map_err(|error| error.to_string())?;
+        }
+
+        let mut state = TuiState::new(
+            active_profile,
+            active.model.clone(),
+            project.display().to_string(),
+            mode,
+        );
+        if resumed_yolo {
+            state.status = "Previous run used YOLO; resumed in supervised mode".into();
+        }
+        Ok(Self {
+            state,
+            engine: Some(engine),
+            runtime_events: Some(runtime_events),
+            tool_events: Some(tool_rx),
+            orchestrator: Some(orchestrator),
+            session_id: Some(session_id),
+        })
+    }
+
+    pub fn from_runtime(
+        state: TuiState,
+        engine: EngineHandle,
+        orchestrator: Arc<dyn Orchestrator>,
+        session_id: SessionId,
+    ) -> Self {
+        Self {
+            state,
+            engine: Some(engine),
+            runtime_events: None,
+            tool_events: None,
+            orchestrator: Some(orchestrator),
+            session_id: Some(session_id),
+        }
+    }
+
+    fn disconnected(state: TuiState) -> Self {
+        Self {
+            state,
+            engine: None,
+            runtime_events: None,
+            tool_events: None,
+            orchestrator: None,
+            session_id: None,
+        }
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.engine.is_some()
+    }
+
+    pub fn session_id(&self) -> Option<&SessionId> {
+        self.session_id.as_ref()
     }
 
     pub const fn tool_names() -> [&'static str; 4] {
@@ -53,20 +298,10 @@ impl App {
         let _guard = TerminalGuard::enter().map_err(|error| error.to_string())?;
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::new(backend).map_err(|error| error.to_string())?;
-        let mut input = spawn_input_thread(32);
-        terminal
-            .draw(|frame| render(frame, &self.state))
-            .map_err(|error| error.to_string())?;
-
-        while let Some(event) = input.recv().await {
-            let should_exit = self.handle_event(event)?;
-            terminal
-                .draw(|frame| render(frame, &self.state))
-                .map_err(|error| error.to_string())?;
-            if should_exit {
-                break;
-            }
-        }
+        let input = spawn_input_thread(32);
+        let runtime_events = self.runtime_events.take();
+        let tool_events = self.tool_events.take();
+        run_loop(&mut self, &mut terminal, input, runtime_events, tool_events).await?;
         Ok(())
     }
 
@@ -75,7 +310,7 @@ impl App {
             return Ok(false);
         };
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.state.take_commands();
+            self.state.queue_command(EngineCommand::Shutdown);
             return Ok(true);
         }
 
@@ -154,23 +389,34 @@ impl App {
                 Command::Model(profile) => {
                     self.state.status = profile.map_or_else(
                         || "select model".into(),
-                        |profile| format!("model profile: {profile}"),
+                        |profile| format!("restart with --profile {profile} to switch models"),
                     )
                 }
                 Command::Connect => self.state.overlay = Overlay::Onboarding,
-                Command::Sessions => self.state.status = "session browser".into(),
-                Command::Resume(session) => self.state.status = format!("resume {session}"),
-                Command::New => self.state.status = "new session".into(),
-                Command::Context => self.state.status = "context report".into(),
+                Command::Sessions => {
+                    self.state.status = "use --resume or --continue to resume".into()
+                }
+                Command::Resume(session) => {
+                    self.state.status = format!("restart with --resume {session}")
+                }
+                Command::New => {
+                    self.state.status = "restart without --resume for a new session".into()
+                }
+                Command::Context => self.state.status = "context is compacted automatically".into(),
                 Command::Compact => self.state.queue_command(EngineCommand::Compact),
                 Command::Mode(mode) => {
                     self.state.mode = mode;
                     self.state.queue_command(EngineCommand::SetMode(mode));
                 }
             }
+        } else if self.engine.is_none() {
+            self.state.status = "not connected; configure ~/.kurama/config.toml".into();
         } else {
             self.state.push_user(trimmed);
-            let explicit_delegation = delegation_intent(trimmed);
+            let explicit_delegation = self
+                .orchestrator
+                .as_ref()
+                .is_some_and(|orchestrator| orchestrator.explicit_delegation(trimmed));
             self.state.queue_command(EngineCommand::SubmitTurn {
                 text: trimmed.to_owned(),
                 explicit_delegation,
@@ -185,7 +431,8 @@ impl App {
             KeyCode::Up => self.state.onboarding.select_previous(),
             KeyCode::Down => self.state.onboarding.select_next(),
             KeyCode::Enter => {
-                self.state.status = format!("selected {}", self.state.onboarding.selected_option());
+                self.state.status =
+                    "create ~/.kurama/config.toml for the selected connection, then restart".into();
                 self.state.overlay = Overlay::None;
             }
             KeyCode::Esc => self.state.overlay = Overlay::None,
@@ -205,17 +452,11 @@ impl App {
             (Overlay::ApprovalEdit, KeyCode::Char(character)) => {
                 if let Some(approval) = &mut self.state.approval {
                     approval.editor.push(character);
-                    if let Ok(arguments) = serde_json::from_str(&approval.editor) {
-                        approval.arguments = arguments;
-                    }
                 }
             }
             (Overlay::ApprovalEdit, KeyCode::Backspace) => {
                 if let Some(approval) = &mut self.state.approval {
                     approval.editor.pop();
-                    if let Ok(arguments) = serde_json::from_str(&approval.editor) {
-                        approval.arguments = arguments;
-                    }
                 }
             }
             (Overlay::ApprovalEdit, KeyCode::Enter) => {
@@ -251,21 +492,32 @@ impl App {
             _ => {}
         }
     }
-}
 
-fn delegation_intent(text: &str) -> bool {
-    let text = text.to_ascii_lowercase();
-    [
-        "sub-agent",
-        "subagent",
-        "delegate",
-        "parallelize",
-        "parallelise",
-        "use agents",
-        "split this between",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle))
+    async fn flush_commands(&mut self) -> Result<(), String> {
+        let commands = self.state.take_commands();
+        let Some(engine) = &self.engine else {
+            if !commands.is_empty() {
+                self.state.status = "not connected; configure ~/.kurama/config.toml".into();
+            }
+            return Ok(());
+        };
+        for command in commands {
+            match command {
+                EngineCommand::SubmitTurn {
+                    text,
+                    explicit_delegation,
+                } => engine.submit(text, explicit_delegation).await,
+                EngineCommand::ResolveApproval(response) => engine.resolve_approval(response).await,
+                EngineCommand::CancelTurn => engine.cancel_turn().await,
+                EngineCommand::Compact => engine.compact().await,
+                EngineCommand::SetMode(mode) => engine.set_mode(mode).await,
+                EngineCommand::Agent(command) => engine.agent_command(command).await,
+                EngineCommand::Shutdown => engine.shutdown().await,
+            }
+            .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
 }
 
 pub async fn run(args: Args) -> Result<(), String> {
@@ -278,54 +530,254 @@ pub async fn run(args: Args) -> Result<(), String> {
 }
 
 pub fn prompt_bundle() -> String {
-    let schemas = serde_json::json!([
-        {"name":"read","parameters":{"type":"object","properties":{"paths":{"type":"array"},"start_line":{"type":"integer"},"max_lines":{"type":"integer"}},"required":["paths"],"additionalProperties":false}},
-        {"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"patch":{"type":"string"},"expected_hash":{"type":"string"}},"required":["path"],"additionalProperties":false}},
-        {"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"},"timeout_ms":{"type":"integer"}},"required":["command","cwd","timeout_ms"],"additionalProperties":false}},
-        {"name":"web-search","parameters":{"oneOf":[{"type":"object","properties":{"operation":{"const":"search"},"query":{"type":"string"},"limit":{"type":"integer"},"contains_workspace_data":{"type":"boolean"}},"required":["operation","query","limit","contains_workspace_data"],"additionalProperties":false},{"type":"object","properties":{"operation":{"const":"open"},"url":{"type":"string"}},"required":["operation","url"],"additionalProperties":false}]}}
-    ]);
-    format!("{}\n{}", kurama_core::prompts::SYSTEM_PROMPT, schemas)
+    let descriptors: Vec<_> = standard_tools(HttpClient::new(), None, None)
+        .into_iter()
+        .map(|tool| tool.descriptor())
+        .collect();
+    format!(
+        "{}\n{}",
+        kurama_core::prompts::SYSTEM_PROMPT,
+        serde_json::to_string(&descriptors).expect("serialize standard tool schemas")
+    )
 }
 
 pub async fn run_with<B>(
     mut app: App,
     terminal: &mut Terminal<B>,
-    mut input: mpsc::Receiver<Event>,
-    mut runtime_events: mpsc::Receiver<RuntimeEvent>,
+    input: mpsc::Receiver<Event>,
+    runtime_events: mpsc::Receiver<RuntimeEvent>,
 ) -> Result<App, String>
 where
     B: Backend,
 {
+    run_loop(&mut app, terminal, input, Some(runtime_events), None).await?;
+    Ok(app)
+}
+
+async fn run_loop<B>(
+    app: &mut App,
+    terminal: &mut Terminal<B>,
+    mut input: mpsc::Receiver<Event>,
+    runtime_events: Option<mpsc::Receiver<RuntimeEvent>>,
+    tool_events: Option<mpsc::UnboundedReceiver<RuntimeEvent>>,
+) -> Result<(), String>
+where
+    B: Backend,
+{
+    let (runtime_tx, mut runtime_receiver) = mpsc::channel(1);
+    let mut runtime_open = if let Some(events) = runtime_events {
+        runtime_receiver = events;
+        true
+    } else {
+        drop(runtime_tx);
+        false
+    };
+    let (tool_tx, mut tool_receiver) = mpsc::unbounded_channel();
+    let mut tool_open = if let Some(events) = tool_events {
+        tool_receiver = events;
+        true
+    } else {
+        drop(tool_tx);
+        false
+    };
+    let mut input_open = true;
     terminal
         .draw(|frame| render(frame, &app.state))
         .map_err(|error| error.to_string())?;
 
-    loop {
+    while input_open || runtime_open || tool_open {
+        let mut exit = false;
         tokio::select! {
-            event = input.recv() => {
-                let Some(event) = event else {
-                    if runtime_events.is_closed() {
-                        break;
+            event = input.recv(), if input_open => {
+                match event {
+                    Some(event) => {
+                        exit = app.handle_event(event)?;
+                        app.flush_commands().await?;
                     }
-                    continue;
-                };
-                if app.handle_event(event)? {
-                    break;
+                    None => input_open = false,
                 }
             }
-            event = runtime_events.recv() => {
-                let Some(event) = event else {
-                    if input.is_closed() {
-                        break;
+            event = runtime_receiver.recv(), if runtime_open => {
+                match event {
+                    Some(event) => {
+                        exit = matches!(event, RuntimeEvent::Shutdown);
+                        app.state.apply_runtime_event(event);
                     }
-                    continue;
-                };
-                app.state.apply_runtime_event(event);
+                    None => runtime_open = false,
+                }
+            }
+            event = tool_receiver.recv(), if tool_open => {
+                match event {
+                    Some(event) => app.state.apply_runtime_event(event),
+                    None => tool_open = false,
+                }
             }
         }
         terminal
             .draw(|frame| render(frame, &app.state))
             .map_err(|error| error.to_string())?;
+        if exit {
+            break;
+        }
     }
-    Ok(app)
+    Ok(())
+}
+
+fn standard_tools(
+    http: HttpClient,
+    search_backend: Option<Arc<dyn SearchBackend>>,
+    bash_sink: Option<Arc<dyn EventSink>>,
+) -> Vec<Arc<dyn Tool>> {
+    let bash: Arc<dyn Tool> = match bash_sink {
+        Some(sink) => Arc::new(BashTool::with_event_sink("/bin/bash", sink)),
+        None => Arc::new(BashTool::default()),
+    };
+    vec![
+        bash,
+        Arc::new(ReadTool::default()),
+        Arc::new(WebSearchTool::new(http, search_backend)),
+        Arc::new(WriteTool::default()),
+    ]
+}
+
+fn search_backend(
+    config: &KuramaConfig,
+    active_profile: &str,
+    active: &ProfileConfig,
+    session_secrets: &SessionSecrets,
+    credentials: CredentialResolver,
+    http: HttpClient,
+) -> Result<Option<Arc<dyn SearchBackend>>, String> {
+    match config.search.as_ref() {
+        None => Ok(None),
+        Some(SearchConfig::Json { endpoint, auth }) => {
+            let secret = credentials
+                .resolve_optional("search", auth.as_ref(), session_secrets)
+                .map_err(|error| error.to_string())?;
+            Ok(Some(Arc::new(JsonSearchBackend::with_client(
+                http,
+                endpoint.clone(),
+                secret,
+            ))))
+        }
+        Some(SearchConfig::Provider) if active.kind == ProfileKind::OpenAi => {
+            let auth = active
+                .auth
+                .as_ref()
+                .ok_or_else(|| "OpenAI native search requires profile auth".to_owned())?;
+            let secret = credentials
+                .resolve(active_profile, auth, session_secrets)
+                .map_err(|error| error.to_string())?;
+            Ok(Some(Arc::new(OpenAiNativeSearch::new(
+                http,
+                active
+                    .endpoint
+                    .clone()
+                    .unwrap_or_else(|| "https://api.openai.com/v1".into()),
+                secret,
+                active.model.clone(),
+            ))))
+        }
+        Some(SearchConfig::Provider) => Ok(None),
+    }
+}
+
+fn orchestration_context(
+    config: &KuramaConfig,
+    active_profile: &str,
+    profiles: &BTreeMap<String, ModelProfile>,
+    parent_write_scope: WriteScope,
+    mode: ExecutionMode,
+) -> Result<OrchestrationContext, String> {
+    let parent_profile = profiles
+        .get(active_profile)
+        .cloned()
+        .ok_or_else(|| format!("unknown active profile: {active_profile}"))?;
+    Ok(OrchestrationContext {
+        parent_profile,
+        profiles: profiles.clone(),
+        role_routes: config
+            .roles
+            .iter()
+            .map(|(role, route)| (role.clone(), route.profile.clone()))
+            .collect(),
+        role_escalations: config
+            .roles
+            .iter()
+            .map(|(role, route)| (role.clone(), route.escalation_profiles.clone()))
+            .collect(),
+        profile_escalations: config
+            .profiles
+            .iter()
+            .map(|(name, profile)| (name.clone(), profile.escalation_profiles.clone()))
+            .collect(),
+        parent_write_scope,
+        max_concurrency: config.orchestration.max_concurrency,
+        depth: 0,
+        yolo: mode == ExecutionMode::Yolo,
+    })
+}
+
+fn resolve_resume(
+    args: &Args,
+    repository: &ConfigRepository,
+    store: &dyn SessionStore,
+    project: &Path,
+) -> Result<Option<SessionId>, String> {
+    match &args.resume {
+        None => Ok(None),
+        Some(ResumeChoice::Id(session_id)) => Ok(Some(SessionId::from(session_id.clone()))),
+        Some(ResumeChoice::Continue) => {
+            let state = repository.read_state().map_err(|error| error.to_string())?;
+            if let Some(session_id) = state.latest_sessions.get(project) {
+                return Ok(Some(session_id.clone()));
+            }
+            let session = store
+                .list()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|summary| {
+                    PathBuf::from(&summary.project_root)
+                        .canonicalize()
+                        .ok()
+                        .as_ref()
+                        == Some(&project.to_path_buf())
+                })
+                .map(|summary| summary.id)
+                .ok_or_else(|| "no resumable session exists for this project".to_owned())?;
+            Ok(Some(session))
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+struct NoopSink;
+
+impl EventSink for NoopSink {
+    fn emit(&self, _event: RuntimeEvent) -> Result<(), KuramaError> {
+        Ok(())
+    }
+}
+
+struct ToolEventSink {
+    sender: mpsc::UnboundedSender<RuntimeEvent>,
+}
+
+impl EventSink for ToolEventSink {
+    fn emit(&self, event: RuntimeEvent) -> Result<(), KuramaError> {
+        if matches!(event, RuntimeEvent::ToolOutputDelta { .. }) {
+            self.sender
+                .send(event)
+                .map_err(|_| KuramaError::Cancelled)?;
+        }
+        Ok(())
+    }
 }
