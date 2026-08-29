@@ -149,3 +149,20 @@ fn read_only_child_cannot_write_outside_its_scope() {
         PolicyDecision::Deny { .. }
     ));
 }
+
+#[test]
+fn policy_follows_the_runtime_context_mode() {
+    let mut context = context(ExecutionMode::Supervised);
+    let policy = DefaultPolicy::new(ExecutionMode::Supervised, context.auto.clone());
+    let operation = Operation::Write {
+        paths: vec![context.workspace_root.join("new.txt")],
+        destructive: false,
+        external: false,
+    };
+    assert!(matches!(
+        policy.decide(&context, &operation),
+        PolicyDecision::Ask { .. }
+    ));
+    context.mode = ExecutionMode::Auto;
+    assert_eq!(policy.decide(&context, &operation), PolicyDecision::Allow);
+}

@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 kurama-core = { path = "../kurama-core" }
 kurama-protocol = { path = "../kurama-protocol" }
+tokio.workspace = true

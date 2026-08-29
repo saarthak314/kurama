@@ -13,12 +13,11 @@ use kurama_protocol::{
 #[derive(Debug, Clone)]
 pub struct DefaultPolicy {
     mode: ExecutionMode,
-    boundaries: AutoBoundaries,
 }
 
 impl DefaultPolicy {
-    pub fn new(mode: ExecutionMode, boundaries: AutoBoundaries) -> Self {
-        Self { mode, boundaries }
+    pub fn new(mode: ExecutionMode, _boundaries: AutoBoundaries) -> Self {
+        Self { mode }
     }
 
     pub fn mode(&self) -> ExecutionMode {
@@ -103,7 +102,7 @@ impl DefaultPolicy {
                 if *external
                     || paths
                         .iter()
-                        .any(|path| !within_any(path, &self.boundaries.write_roots, context))
+                        .any(|path| !within_any(path, &context.auto.write_roots, context))
                 {
                     deny("write exceeds configured automatic roots")
                 } else {
@@ -130,7 +129,8 @@ impl DefaultPolicy {
                     return deny("child write scope is read-only");
                 }
                 if executable.is_some_and(|name| {
-                    self.boundaries
+                    context
+                        .auto
                         .allowed_commands
                         .iter()
                         .any(|allowed| allowed == name)
@@ -157,7 +157,8 @@ impl DefaultPolicy {
                 let host = public_http_url(url);
                 if !private_target
                     && host.is_some_and(|host| {
-                        self.boundaries
+                        context
+                            .auto
                             .allowed_hosts
                             .iter()
                             .any(|allowed| host_matches(&host, allowed))
@@ -174,7 +175,7 @@ impl DefaultPolicy {
 
 impl ApprovalPolicy for DefaultPolicy {
     fn decide(&self, context: &PolicyContext, operation: &Operation) -> PolicyDecision {
-        match self.mode {
+        match context.mode {
             ExecutionMode::Supervised => self.supervised(context, operation),
             ExecutionMode::Auto => self.automatic(context, operation),
             ExecutionMode::Yolo => PolicyDecision::Allow,

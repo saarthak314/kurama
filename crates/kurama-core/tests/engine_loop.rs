@@ -71,6 +71,8 @@ async fn engine_executes_tool_and_finishes_turn() {
         agent_id: None,
         orchestration: None,
         provider_retry_delays_ms: Vec::new(),
+        command_capacity: 32,
+        event_capacity: 128,
     };
     let (handle, mut events) = Engine::spawn(config, Vec::new()).expect("spawn engine");
     handle.submit("inspect", false).await.expect("submit");
@@ -203,6 +205,8 @@ async fn approval_edit_is_reclassified_before_execution() {
         agent_id: None,
         orchestration: None,
         provider_retry_delays_ms: Vec::new(),
+        command_capacity: 32,
+        event_capacity: 128,
     };
     let (handle, mut events) = Engine::spawn(config, Vec::new()).expect("spawn");
     handle.submit("edit", false).await.expect("submit");
@@ -328,6 +332,8 @@ async fn repeated_model_call_id_does_not_repeat_the_side_effect() {
         agent_id: None,
         orchestration: None,
         provider_retry_delays_ms: Vec::new(),
+        command_capacity: 32,
+        event_capacity: 128,
     };
     let (handle, mut events) = Engine::spawn(config, Vec::new()).expect("spawn");
     handle.submit("count", false).await.expect("submit");

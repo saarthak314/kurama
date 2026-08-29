@@ -72,7 +72,6 @@ struct ManagedAgent {
     pending_messages: Vec<String>,
     profile_attempts: u8,
     next_escalation: usize,
-    next_sequence: u64,
 }
 
 impl AgentManager {
@@ -213,14 +212,14 @@ impl AgentManager {
             agent.transcript.push(format!("parent: {text}"));
             if agent.messages.is_none() {
                 agent.pending_messages.push(text.clone());
+                self.append_agent_event(
+                    agent,
+                    SessionEvent::AgentMessage {
+                        agent_id: agent_id.clone(),
+                        text: text.clone(),
+                    },
+                )?;
             }
-            self.append_agent_event(
-                agent,
-                SessionEvent::AgentMessage {
-                    agent_id: agent_id.clone(),
-                    text: text.clone(),
-                },
-            )?;
             agent.messages.clone()
         };
         if let Some(sender) = sender {
@@ -280,8 +279,6 @@ impl AgentManager {
                 last_error: None,
             };
             {
-                let replay = self.store.replay_agent(&self.session_id, &spec.id)?;
-                let next_sequence = replay.last().map_or(0, |event| event.sequence + 1);
                 let mut state = self.state.lock().await;
                 if state.agents.contains_key(&spec.id) {
                     return Err(KuramaError::Protocol(format!(
@@ -289,7 +286,7 @@ impl AgentManager {
                         spec.id
                     )));
                 }
-                let mut agent = ManagedAgent {
+                let agent = ManagedAgent {
                     spec: spec.clone(),
                     snapshot: snapshot.clone(),
                     transcript: Vec::new(),
@@ -298,10 +295,9 @@ impl AgentManager {
                     pending_messages: Vec::new(),
                     profile_attempts: 0,
                     next_escalation: 0,
-                    next_sequence,
                 };
                 self.append_agent_event(
-                    &mut agent,
+                    &agent,
                     SessionEvent::AgentQueued {
                         snapshot: snapshot.clone(),
                     },
@@ -463,14 +459,7 @@ impl AgentManager {
                 agent.cancel.cancel();
                 agent.snapshot.last_error = Some("child budget exhausted".into());
             }
-            let snapshot = agent.snapshot.clone();
-            self.append_agent_event(
-                agent,
-                SessionEvent::AgentProgress {
-                    snapshot: snapshot.clone(),
-                },
-            )?;
-            snapshot
+            agent.snapshot.clone()
         };
         self.emit(RuntimeEvent::AgentUpdated { snapshot }).await
     }
@@ -626,18 +615,22 @@ impl AgentManager {
 
     fn append_agent_event(
         &self,
-        agent: &mut ManagedAgent,
+        agent: &ManagedAgent,
         event: SessionEvent,
     ) -> Result<(), KuramaError> {
+        let next_sequence = self
+            .store
+            .replay_agent(&self.session_id, &agent.spec.id)?
+            .last()
+            .map_or(0, |event| event.sequence + 1);
         let envelope = EventEnvelope::new(
-            agent.next_sequence,
+            next_sequence,
             0,
             self.session_id.clone(),
             Some(agent.spec.id.clone()),
             event,
         );
         self.store.append(&envelope)?;
-        agent.next_sequence += 1;
         Ok(())
     }
 

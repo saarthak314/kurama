@@ -105,6 +105,8 @@ pub struct EngineConfig {
     pub agent_id: Option<AgentId>,
     pub orchestration: Option<EngineOrchestration>,
     pub provider_retry_delays_ms: Vec<u64>,
+    pub command_capacity: usize,
+    pub event_capacity: usize,
 }
 
 pub struct Engine;
@@ -123,7 +125,13 @@ impl Engine {
         }
 
         let mut sequence = replay.last().map_or(0, |event| event.sequence + 1);
-        if replay.is_empty() {
+        if config.command_capacity == 0 || config.event_capacity == 0 {
+            return Err(KuramaError::Configuration(
+                "engine channel capacities must be non-zero".into(),
+            ));
+        }
+
+        if replay.is_empty() && config.agent_id.is_none() {
             config.store.create(&config.session)?;
             let event = EventEnvelope::new(
                 sequence,
@@ -164,8 +172,8 @@ impl Engine {
             replay.push(event);
         }
 
-        let (command_tx, command_rx) = mpsc::channel(64);
-        let (runtime_tx, runtime_rx) = mpsc::channel(256);
+        let (command_tx, command_rx) = mpsc::channel(config.command_capacity);
+        let (runtime_tx, runtime_rx) = mpsc::channel(config.event_capacity);
         let completed_tool_calls = replay
             .iter()
             .filter_map(|event| match &event.event {

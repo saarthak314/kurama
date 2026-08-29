@@ -2,7 +2,9 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use kurama_protocol::{
     KuramaError,
+    agent::{OrchestrationContext, WriteScope},
     model::ModelProfile,
+    policy::AutoBoundaries,
     traits::{
         ApprovalPolicy, EventSink, IdGenerator, ModelBackend, Orchestrator, SessionStore, Tool,
     },
@@ -22,6 +24,10 @@ pub struct AgentBuilder {
     ids: Option<Arc<dyn IdGenerator>>,
     command_capacity: usize,
     event_capacity: usize,
+    write_scope: Option<WriteScope>,
+    auto: AutoBoundaries,
+    orchestration: Option<OrchestrationContext>,
+    provider_retry_delays_ms: Vec<u64>,
     error: Option<String>,
 }
 
@@ -30,6 +36,7 @@ impl AgentBuilder {
         Self {
             command_capacity: 32,
             event_capacity: 128,
+            provider_retry_delays_ms: vec![250, 1_000],
             ..Self::default()
         }
     }
@@ -93,6 +100,26 @@ impl AgentBuilder {
         self
     }
 
+    pub fn write_scope(mut self, write_scope: WriteScope) -> Self {
+        self.write_scope = Some(write_scope);
+        self
+    }
+
+    pub fn auto_boundaries(mut self, auto: AutoBoundaries) -> Self {
+        self.auto = auto;
+        self
+    }
+
+    pub fn orchestration_context(mut self, orchestration: OrchestrationContext) -> Self {
+        self.orchestration = Some(orchestration);
+        self
+    }
+
+    pub fn provider_retry_delays_ms(mut self, delays: Vec<u64>) -> Self {
+        self.provider_retry_delays_ms = delays;
+        self
+    }
+
     pub fn build(self) -> Result<AgentRuntime, KuramaError> {
         if let Some(error) = self.error {
             return Err(KuramaError::Configuration(error));
@@ -133,6 +160,10 @@ impl AgentBuilder {
                 .ok_or_else(|| KuramaError::Configuration("ID generator is required".into()))?,
             command_capacity: self.command_capacity,
             event_capacity: self.event_capacity,
+            write_scope: self.write_scope,
+            auto: self.auto,
+            orchestration: self.orchestration,
+            provider_retry_delays_ms: self.provider_retry_delays_ms,
         }))
     }
 }
