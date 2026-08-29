@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use kurama_protocol::{KuramaError, agent::WriteScope, tool::ToolContext};
+use kurama_protocol::{KuramaError, agent::WriteScope, policy::ExecutionMode, tool::ToolContext};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuardedPath {
@@ -12,6 +12,7 @@ pub struct GuardedPath {
 pub struct PathGuard {
     cwd: PathBuf,
     workspace_root: PathBuf,
+    unrestricted: bool,
 }
 
 impl PathGuard {
@@ -21,6 +22,7 @@ impl PathGuard {
         Ok(Self {
             cwd,
             workspace_root,
+            unrestricted: context.mode == ExecutionMode::Yolo,
         })
     }
 
@@ -60,7 +62,7 @@ impl PathGuard {
                 guarded.absolute.display()
             )));
         }
-        if guarded.external {
+        if guarded.external && !self.unrestricted {
             return Err(KuramaError::Policy(format!(
                 "working directory escapes the workspace: {}",
                 guarded.absolute.display()
@@ -74,7 +76,7 @@ impl PathGuard {
         path: impl AsRef<Path>,
         scope: &WriteScope,
     ) -> Result<GuardedPath, KuramaError> {
-        if scope.is_read_only() {
+        if scope.is_read_only() && !self.unrestricted {
             return Err(KuramaError::Policy("write scope is read-only".into()));
         }
 
@@ -94,7 +96,7 @@ impl PathGuard {
             canonical_parent.join(file_name)
         };
 
-        if !self.scope_allows(&absolute, scope)? {
+        if !self.unrestricted && !self.scope_allows(&absolute, scope)? {
             return Err(KuramaError::Policy(format!(
                 "write path is outside the allowed scope: {}",
                 absolute.display()

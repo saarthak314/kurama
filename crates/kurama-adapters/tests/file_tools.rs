@@ -41,12 +41,16 @@ impl Fixture {
     }
 
     fn context(&self, limits: ToolLimits) -> ToolContext {
+        self.context_with_mode(limits, ExecutionMode::Supervised)
+    }
+
+    fn context_with_mode(&self, limits: ToolLimits, mode: ExecutionMode) -> ToolContext {
         ToolContext {
             session_id: SessionId::from("test-session"),
             agent_id: None,
             cwd: self.root.clone(),
             workspace_root: self.root.clone(),
-            mode: ExecutionMode::Supervised,
+            mode,
             limits,
             write_scope: WriteScope {
                 roots: vec![self.root.clone()],
@@ -261,6 +265,66 @@ async fn write_rejects_symlink_escapes_and_ambiguous_payloads() {
             .expect_err("scope escape");
         assert!(matches!(error, KuramaError::Policy(_)));
         assert!(!outside.join("pwned.txt").exists());
+    }
+}
+
+#[tokio::test]
+async fn yolo_writes_outside_workspace() {
+    let fixture = Fixture::empty();
+    let outside = fixture._temp.path().join("outside");
+    fs::create_dir(&outside).expect("outside dir");
+    let target = outside.join("created.txt");
+    let canonical_target = outside
+        .canonicalize()
+        .expect("canonical outside")
+        .join("created.txt");
+    let call = invocation(
+        "write",
+        serde_json::json!({"path": target, "content": "unrestricted\n"}),
+    );
+    let context = fixture.context_with_mode(normal_limits(), ExecutionMode::Yolo);
+
+    let operation = WriteTool::default()
+        .classify(&context, &call)
+        .expect("classify external write");
+    assert!(matches!(operation, Operation::Write { external: true, .. }));
+
+    let result = WriteTool::default()
+        .execute(context, call, &NeverCancel)
+        .await
+        .expect("write outside workspace");
+
+    assert_eq!(fs::read(&target).unwrap(), b"unrestricted\n");
+    assert_eq!(
+        result.metadata["absolute_path"].as_str(),
+        canonical_target.to_str()
+    );
+    assert_eq!(result.metadata["external"], true);
+}
+
+#[tokio::test]
+async fn write_contains_external_paths_outside_yolo() {
+    let fixture = Fixture::empty();
+    let outside = fixture._temp.path().join("outside");
+    fs::create_dir(&outside).expect("outside dir");
+
+    for mode in [ExecutionMode::Supervised, ExecutionMode::Auto] {
+        let target = outside.join(format!("{mode:?}.txt"));
+        let call = invocation(
+            "write",
+            serde_json::json!({"path": target, "content": "contained\n"}),
+        );
+        let error = WriteTool::default()
+            .execute(
+                fixture.context_with_mode(normal_limits(), mode),
+                call,
+                &NeverCancel,
+            )
+            .await
+            .expect_err("external write must remain contained");
+
+        assert!(matches!(error, KuramaError::Policy(_)));
+        assert!(!target.exists());
     }
 }
 

@@ -40,18 +40,80 @@ impl Fixture {
     }
 
     fn context(&self, limits: ToolLimits) -> ToolContext {
+        self.context_with_mode(limits, ExecutionMode::Supervised)
+    }
+
+    fn context_with_mode(&self, limits: ToolLimits, mode: ExecutionMode) -> ToolContext {
         ToolContext {
             session_id: SessionId::from("test-session"),
             agent_id: None,
             cwd: self.root.clone(),
             workspace_root: self.root.clone(),
-            mode: ExecutionMode::Supervised,
+            mode,
             limits,
             write_scope: WriteScope {
                 roots: vec![self.root.clone()],
                 files: Vec::new(),
             },
         }
+    }
+}
+
+#[tokio::test]
+async fn yolo_uses_external_cwd() {
+    let fixture = Fixture::empty();
+    let outside = fixture._temp.path().join("outside");
+    fs::create_dir(&outside).expect("outside dir");
+    let canonical_outside = outside.canonicalize().expect("canonical outside");
+    let call = invocation(serde_json::json!({
+        "command": "pwd",
+        "cwd": outside,
+        "timeout_ms": 1000
+    }));
+    let context = fixture.context_with_mode(limits(), ExecutionMode::Yolo);
+
+    let operation = BashTool::default()
+        .classify(&context, &call)
+        .expect("classify external cwd");
+    assert!(matches!(
+        operation,
+        Operation::Bash { cwd, .. } if cwd == canonical_outside
+    ));
+
+    let result = BashTool::default()
+        .execute(context, call, &NeverCancel)
+        .await
+        .expect("run in external cwd");
+
+    assert_eq!(result.metadata["cwd"].as_str(), canonical_outside.to_str());
+    assert_eq!(
+        result.metadata["stdout"],
+        format!("{}\n", canonical_outside.display())
+    );
+}
+
+#[tokio::test]
+async fn bash_contains_external_cwd_outside_yolo() {
+    let fixture = Fixture::empty();
+    let outside = fixture._temp.path().join("outside");
+    fs::create_dir(&outside).expect("outside dir");
+
+    for mode in [ExecutionMode::Supervised, ExecutionMode::Auto] {
+        let call = invocation(serde_json::json!({
+            "command": "pwd",
+            "cwd": outside,
+            "timeout_ms": 1000
+        }));
+        let error = BashTool::default()
+            .execute(
+                fixture.context_with_mode(limits(), mode),
+                call,
+                &NeverCancel,
+            )
+            .await
+            .expect_err("external cwd must remain contained");
+
+        assert!(matches!(error, KuramaError::Policy(_)));
     }
 }
 
