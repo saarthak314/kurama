@@ -263,6 +263,11 @@ pub(super) fn staged_output(
 pub(super) fn take_truncated_staging(
     bounded: &mut BoundedText,
 ) -> std::io::Result<Option<PathBuf>> {
+    if bounded.truncated
+        && let Some(error) = &bounded.staging_error
+    {
+        return Err(std::io::Error::other(error.clone()));
+    }
     let Some(path) = bounded.staged_path.take() else {
         return Ok(None);
     };
@@ -347,4 +352,30 @@ fn hex_bytes(bytes: &[u8]) -> String {
         write!(&mut output, "{byte:02x}").expect("writing to a string cannot fail");
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn take_truncated_staging_rejects_staging_failures() {
+        let mut bounded = BoundedText {
+            text: "visible output".to_owned(),
+            truncated: true,
+            total_bytes: 32,
+            total_lines: 1,
+            omitted_bytes: 18,
+            omitted_lines: 0,
+            blob_ref: None,
+            staged_path: None,
+            staging_error: Some("staging write failed".to_owned()),
+        };
+
+        let error = take_truncated_staging(&mut bounded)
+            .expect_err("truncated output must fail when display staging failed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "staging write failed");
+    }
 }
