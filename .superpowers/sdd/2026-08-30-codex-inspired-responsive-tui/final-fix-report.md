@@ -120,3 +120,16 @@ Complete. Residual implementation commit: `6fe67923b91bcb3bcffdd2f50c46b8cc645d1
 - The new failure path is gated by `bounded.truncated`, so a staging failure remains non-fatal when the complete output is already present in `BoundedText.text`.
 - Read and web-open callers now propagate the recorded staging I/O failure rather than returning truncated output without a display blob source.
 - The correction changes no commands, dependencies, durable output limits, or successful staging behavior.
+
+## Final Visual Audit And Release Verification
+
+- Rendered and inspected 28 semantic terminal frames: seven states at `120x32`, `80x24`, `48x16`, and `32x10`.
+- Every frame retained `Color::Reset` backgrounds and preserved transcript hierarchy, approval actions, controls, activity visibility, and responsive footer priorities.
+- The audit exposed an orphaned JSON comma in the `48x16` approval editor. Commit `29adc92` adds punctuation-aware hard wrapping and a focused regression; the repeated gallery is clean.
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` — passed.
+- `cargo test --locked --workspace --all-features` — passed, including the end-to-end CLI smoke flow.
+- `cargo build --locked --release -p kurama-cli` — passed.
+- `scripts/check-size.sh target/release/kurama` — passed at `2,672,200` bytes.
+- `scripts/check-prompt-budget.sh target/release/kurama` — passed at `501` tokens.
+- No temporary visual-audit test, uncommitted product change, or pushed commit remains.
