@@ -37,6 +37,15 @@ fn event(session: &str, sequence: u64, timestamp_ms: u64, agent: Option<&str>) -
     )
 }
 
+fn write_log(path: &std::path::Path, events: impl IntoIterator<Item = EventEnvelope>) {
+    let mut file = std::io::BufWriter::new(std::fs::File::create(path).expect("create log"));
+    for event in events {
+        serde_json::to_writer(&mut file, &event).expect("serialize event");
+        file.write_all(b"\n").expect("terminate event");
+    }
+    file.flush().expect("flush log");
+}
+
 #[test]
 fn open_creates_owner_only_layout_without_overwriting_files() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -235,4 +244,88 @@ fn list_uses_durable_metadata_and_latest_event_time() {
     assert_eq!(sessions[0].updated_at_ms, 30);
     assert_eq!(sessions[1].id, SessionId::from("newer"));
     assert_eq!(sessions[1].updated_at_ms, 20);
+}
+
+#[test]
+fn replay_repairs_a_torn_tail_with_one_durable_sync() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = FsSessionStore::open(temp.path().to_owned()).expect("store");
+    store.create(&metadata("repair-sync", 10)).expect("create");
+    store
+        .append(&event("repair-sync", 0, 11, None))
+        .expect("append");
+
+    let log = temp.path().join("sessions/repair-sync/events.jsonl");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(log)
+        .expect("open")
+        .write_all(br#"{"schema_version":1"#)
+        .expect("write torn tail");
+
+    let (events, syncs) = store
+        .replay_with_operation_counts_for_test(&SessionId::from("repair-sync"))
+        .expect("repair");
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(syncs, 1);
+}
+
+#[test]
+fn append_inspects_only_the_final_record_of_a_large_log() {
+    const EVENT_COUNT: u64 = 512;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = FsSessionStore::open(temp.path().to_owned()).expect("store");
+    store
+        .create(&metadata("bounded-append", 10))
+        .expect("create");
+    let log = temp.path().join("sessions/bounded-append/events.jsonl");
+    write_log(
+        &log,
+        (0..EVENT_COUNT).map(|sequence| event("bounded-append", sequence, 11 + sequence, None)),
+    );
+    let log_bytes = std::fs::metadata(&log).expect("log metadata").len();
+
+    let (tail_bytes_read, records_deserialized, syncs) = store
+        .append_with_operation_counts_for_test(&event(
+            "bounded-append",
+            EVENT_COUNT,
+            11 + EVENT_COUNT,
+            None,
+        ))
+        .expect("append");
+
+    assert!(tail_bytes_read <= 8 * 1024);
+    assert!(tail_bytes_read < log_bytes);
+    assert_eq!(records_deserialized, 1);
+    assert_eq!(syncs, 1);
+}
+
+#[test]
+fn list_streams_log_summaries_without_materializing_replay_vectors() {
+    const PARENT_EVENTS: u64 = 128;
+    const CHILD_EVENTS: u64 = 96;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = FsSessionStore::open(temp.path().to_owned()).expect("store");
+    store.create(&metadata("stream-list", 10)).expect("create");
+    let session_dir = temp.path().join("sessions/stream-list");
+    write_log(
+        &session_dir.join("events.jsonl"),
+        (0..PARENT_EVENTS).map(|sequence| event("stream-list", sequence, 11 + sequence, None)),
+    );
+    write_log(
+        &session_dir.join("agents/child.jsonl"),
+        (0..CHILD_EVENTS)
+            .map(|sequence| event("stream-list", sequence, 1000 + sequence, Some("child"))),
+    );
+
+    let (sessions, records_deserialized, replay_events_materialized) =
+        store.list_with_operation_counts_for_test().expect("list");
+
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].updated_at_ms, 1000 + CHILD_EVENTS - 1);
+    assert_eq!(records_deserialized, PARENT_EVENTS + CHILD_EVENTS);
+    assert_eq!(replay_events_materialized, 0);
 }
