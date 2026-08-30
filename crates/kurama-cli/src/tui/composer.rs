@@ -252,7 +252,12 @@ fn approval_layout(approval: &ApprovalState, width: usize, max_height: usize) ->
         };
     }
 
-    let controls = approval_controls(approval.editing, width, max_height.saturating_sub(1));
+    let control_height = if max_height == 1 {
+        1
+    } else {
+        max_height.saturating_sub(1)
+    };
+    let controls = approval_controls(approval.editing, width, control_height);
     let body_height = max_height.saturating_sub(controls.len());
     let detail = indented_lines(
         &approval_detail(&approval.request.operation),
@@ -338,7 +343,7 @@ fn approval_layout(approval: &ApprovalState, width: usize, max_height: usize) ->
 }
 
 fn approval_controls(editing: bool, width: usize, max_lines: usize) -> Vec<Line<'static>> {
-    if max_lines == 0 {
+    if width == 0 || max_lines == 0 {
         return Vec::new();
     }
 
@@ -367,30 +372,42 @@ fn approval_controls(editing: bool, width: usize, max_lines: usize) -> Vec<Line<
         .copied()
         .map(|label| Line::from(vec![Span::raw("  "), Span::styled(label, style)]))
         .collect::<Vec<_>>();
-    if stacked.len() <= max_lines {
+    if stacked.len() <= max_lines && stacked.iter().all(|line| line.width() <= width) {
         return stacked;
     }
 
     let compact_labels = if editing {
-        ["Enter submit", "Esc return"].as_slice()
+        ["Enter", "Esc"].as_slice()
     } else {
         ["a approve", "d deny", "e edit"].as_slice()
     };
-    let compact_combined = compact_labels.join("  ");
+    let compact_combined = compact_labels.join(if editing { "/" } else { "  " });
     if Line::from(compact_combined.as_str()).width() <= width {
         return vec![Line::from(Span::styled(compact_combined, style))];
     }
 
-    if !editing && Line::from("a/d/e").width() <= width {
-        return vec![Line::from(Span::styled("a/d/e", style))];
-    }
-
-    compact_labels
+    let compact_stacked = compact_labels
         .iter()
         .copied()
-        .take(max_lines)
         .map(|label| Line::from(Span::styled(label, style)))
-        .collect()
+        .collect::<Vec<_>>();
+    if compact_stacked.len() <= max_lines
+        && compact_stacked.iter().all(|line| line.width() <= width)
+    {
+        return compact_stacked;
+    }
+
+    let shortest = if editing {
+        "↵⎋"
+    } else if width >= Line::from("a/d/e").width() {
+        "a/d/e"
+    } else {
+        "ade"
+    };
+    vec![Line::from(Span::styled(
+        truncate_display(shortest, width),
+        style,
+    ))]
 }
 
 fn indented_lines(value: &str, width: usize, style: Style, prose: bool) -> Vec<Line<'static>> {
@@ -485,4 +502,56 @@ fn mode_style(mode: ExecutionMode) -> Style {
         ExecutionMode::Auto => Color::Yellow,
         ExecutionMode::Yolo => Color::Red,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use kurama_protocol::{id::OperationId, policy::ApprovalRequest, tool::CommandClass};
+
+    use super::*;
+
+    #[test]
+    fn single_line_approval_uses_slash_shortcuts_at_width_five() {
+        assert_eq!(single_line_controls(false, 5), "a/d/e");
+    }
+
+    #[test]
+    fn single_line_approval_uses_key_only_controls_at_width_four() {
+        assert_eq!(single_line_controls(false, 4), "ade");
+    }
+
+    #[test]
+    fn single_line_approval_uses_key_only_controls_at_width_three() {
+        assert_eq!(single_line_controls(false, 3), "ade");
+    }
+
+    #[test]
+    fn single_line_edit_approval_keeps_submit_and_return_at_width_two() {
+        assert_eq!(single_line_controls(true, 2), "↵⎋");
+    }
+
+    fn single_line_controls(editing: bool, width: usize) -> String {
+        let request = ApprovalRequest {
+            operation_id: OperationId::from("o_test"),
+            operation: Operation::Bash {
+                command: "cargo test -p kurama-cli".into(),
+                cwd: ".".into(),
+                class: CommandClass::ReadOnly,
+                timeout_ms: 30_000,
+            },
+            summary: "Run the focused CLI tests".into(),
+            arguments: serde_json::json!({"command":"cargo test -p kurama-cli"}),
+        };
+        let mut approval = ApprovalState::new(request);
+        approval.editing = editing;
+        let layout = approval_layout(&approval, width, 1);
+
+        assert_eq!(layout.lines.len(), 1);
+        assert!(layout.lines[0].width() <= width);
+        layout.lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
 }
