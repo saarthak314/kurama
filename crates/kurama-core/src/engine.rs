@@ -8,7 +8,9 @@ use std::{
 use futures_util::StreamExt;
 use kurama_protocol::{
     KuramaError,
-    agent::{AgentResult, OrchestrationContext, WriteScope},
+    agent::{
+        AgentResult, AgentSnapshot, AgentState, OrchestrationContext, ResolvedAgentSpec, WriteScope,
+    },
     id::{AgentId, OperationId},
     model::{BackendCursor, FinishReason, ModelEvent, ModelItem, ModelProfile, ModelRequest},
     policy::{
@@ -1268,19 +1270,24 @@ impl EngineActor {
                 "model emitted delegation without an enabled parent capability".into(),
             ));
         }
-        let orchestration = self.orchestration.as_ref().ok_or_else(|| {
-            KuramaError::Configuration("delegation runtime is not configured".into())
-        })?;
+        let (orchestration_context, child_runner) = self
+            .orchestration
+            .as_ref()
+            .map(|orchestration| (orchestration.context.clone(), orchestration.runner.clone()))
+            .ok_or_else(|| {
+                KuramaError::Configuration("delegation runtime is not configured".into())
+            })?;
         let manager =
             self.agent_manager.as_ref().cloned().ok_or_else(|| {
                 KuramaError::Configuration("agent manager is not configured".into())
             })?;
-        let plan = self.orchestrator.resolve(request, &orchestration.context)?;
-        let execution = manager.execute(
-            plan,
-            self.context.project_summary(),
-            orchestration.runner.clone(),
-        );
+        let plan = self.orchestrator.resolve(request, &orchestration_context)?;
+        for spec in plan.ready.iter().chain(&plan.queued).chain(&plan.blocked) {
+            self.append(SessionEvent::AgentQueued {
+                snapshot: queued_agent_snapshot(spec),
+            })?;
+        }
+        let execution = manager.execute(plan, self.context.project_summary(), child_runner);
         tokio::pin!(execution);
         let results = loop {
             tokio::select! {
@@ -1571,6 +1578,20 @@ impl EngineActor {
                     None
                 }
             })
+    }
+}
+
+fn queued_agent_snapshot(spec: &ResolvedAgentSpec) -> AgentSnapshot {
+    AgentSnapshot {
+        id: spec.id.clone(),
+        role: spec.role.clone(),
+        objective: spec.objective.clone(),
+        profile: spec.profile.name.clone(),
+        state: AgentState::Queued,
+        phase: None,
+        active_operation: None,
+        changed_files: Vec::new(),
+        last_error: None,
     }
 }
 

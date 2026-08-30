@@ -169,6 +169,45 @@ fn replay_restores_terminal_agents_without_duplicating_startup_updates() {
 }
 
 #[test]
+fn replayed_terminal_agents_are_inspectable_without_a_live_manager() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    let session_id = SessionId::from("s_resume");
+    let events = [
+        SessionEvent::AgentCompleted {
+            snapshot: snapshot("a_completed", AgentState::Completed),
+            summary: "review complete".into(),
+        },
+        SessionEvent::AgentFailed {
+            snapshot: snapshot("a_failed", AgentState::Failed),
+            error: "provider disconnected".into(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(sequence, event)| {
+        EventEnvelope::new(
+            sequence as u64,
+            sequence as u64 + 1,
+            session_id.clone(),
+            None,
+            event,
+        )
+    })
+    .collect::<Vec<_>>();
+
+    state.hydrate_replay(&events);
+    state.open_agents();
+    state.inspect_selected_agent();
+
+    assert!(matches!(state.overlay(), Overlay::AgentInspect));
+    assert!(state.sent_commands().is_empty());
+    assert_eq!(
+        state.selected_agent().unwrap().transcript,
+        ["review complete"]
+    );
+}
+
+#[test]
 fn enter_inspects_message_and_confirmed_cancel() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.set_agents(vec![row("a_1", AgentState::Running)]);

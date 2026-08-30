@@ -27,6 +27,7 @@ impl AgentRow {
             changed_files: _,
             last_error,
         } = snapshot;
+        let transcript = last_error.clone().into_iter().collect();
         let activity = active_operation
             .or(phase)
             .or(last_error)
@@ -39,14 +40,16 @@ impl AgentRow {
             task: objective,
             state,
             activity,
-            transcript: Vec::new(),
+            transcript,
         }
     }
 
     pub fn update_from_snapshot(&mut self, snapshot: AgentSnapshot) {
         let transcript = std::mem::take(&mut self.transcript);
         *self = Self::from_snapshot(snapshot);
-        self.transcript = transcript;
+        if !transcript.is_empty() {
+            self.transcript = transcript;
+        }
     }
 }
 

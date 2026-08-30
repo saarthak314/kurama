@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use kurama_protocol::{
     agent::{AgentSnapshot, AgentState},
-    id::CallId,
+    id::{AgentId, CallId},
     policy::{ApprovalRequest, ApprovalResponse, ExecutionMode},
     runtime::{AgentCommand, EngineCommand, RuntimeEvent},
     session::{EventEnvelope, SessionEvent},
@@ -102,6 +102,7 @@ pub struct TuiState {
     active_assistant_entry: Option<usize>,
     active_tool_entries: HashMap<CallId, usize>,
     active_tool_streams: HashMap<CallId, String>,
+    replayed_agent_ids: HashSet<AgentId>,
     committed_transcript_entries: usize,
     sent_commands: Vec<EngineCommand>,
 }
@@ -135,6 +136,7 @@ impl TuiState {
             active_assistant_entry: None,
             active_tool_entries: HashMap::new(),
             active_tool_streams: HashMap::new(),
+            replayed_agent_ids: HashSet::new(),
             committed_transcript_entries: 0,
             sent_commands: Vec::new(),
         }
@@ -273,6 +275,7 @@ impl TuiState {
         self.active_assistant_entry = None;
         self.active_tool_entries.clear();
         self.active_tool_streams.clear();
+        self.replayed_agent_ids.clear();
         self.committed_transcript_entries = 0;
         self.transcript.clear();
         self.agents.clear();
@@ -296,10 +299,28 @@ impl TuiState {
                 ),
                 SessionEvent::AgentQueued { snapshot }
                 | SessionEvent::AgentStarted { snapshot }
-                | SessionEvent::AgentProgress { snapshot }
-                | SessionEvent::AgentCompleted { snapshot, .. }
-                | SessionEvent::AgentFailed { snapshot, .. }
-                | SessionEvent::AgentCancelled { snapshot } => self.upsert_agent(snapshot.clone()),
+                | SessionEvent::AgentProgress { snapshot } => {
+                    self.replayed_agent_ids.insert(snapshot.id.clone());
+                    self.upsert_agent(snapshot.clone());
+                }
+                SessionEvent::AgentCompleted { snapshot, summary } => {
+                    self.replayed_agent_ids.insert(snapshot.id.clone());
+                    self.upsert_agent_with_transcript(snapshot.clone(), summary.clone());
+                }
+                SessionEvent::AgentFailed { snapshot, error } => {
+                    self.replayed_agent_ids.insert(snapshot.id.clone());
+                    self.upsert_agent_with_transcript(snapshot.clone(), error.clone());
+                }
+                SessionEvent::AgentCancelled { snapshot } => {
+                    self.replayed_agent_ids.insert(snapshot.id.clone());
+                    self.upsert_agent_with_transcript(
+                        snapshot.clone(),
+                        snapshot
+                            .last_error
+                            .clone()
+                            .unwrap_or_else(|| "cancelled".into()),
+                    );
+                }
                 _ => {}
             }
         }
@@ -311,6 +332,7 @@ impl TuiState {
     }
 
     pub fn set_agents(&mut self, mut agents: Vec<AgentRow>) {
+        self.replayed_agent_ids.clear();
         let selected_id = self.selected_agent().map(|agent| agent.id.clone());
         sort_agents(&mut agents);
         self.agents = agents;
@@ -328,6 +350,14 @@ impl TuiState {
         sort_agents(&mut self.agents);
         self.restore_agent_selection(selected_id.as_ref());
         self.refresh_agent_counts();
+    }
+
+    fn upsert_agent_with_transcript(&mut self, snapshot: AgentSnapshot, line: String) {
+        let agent_id = snapshot.id.clone();
+        self.upsert_agent(snapshot);
+        if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == agent_id) {
+            agent.transcript = vec![line];
+        }
     }
 
     fn restore_agent_selection(&mut self, selected_id: Option<&kurama_protocol::id::AgentId>) {
@@ -378,9 +408,16 @@ impl TuiState {
     }
 
     pub fn inspect_selected_agent(&mut self) {
-        if let Some(agent_id) = self.selected_agent().map(|agent| agent.id.clone()) {
-            self.sent_commands
-                .push(EngineCommand::Agent(AgentCommand::Inspect { agent_id }));
+        if let Some((agent_id, needs_refresh)) = self.selected_agent().map(|agent| {
+            (
+                agent.id.clone(),
+                !self.replayed_agent_ids.contains(&agent.id),
+            )
+        }) {
+            if needs_refresh {
+                self.sent_commands
+                    .push(EngineCommand::Agent(AgentCommand::Inspect { agent_id }));
+            }
             self.overlay = Overlay::AgentInspect;
         }
     }

@@ -94,6 +94,37 @@ async fn runtime_launches_explicit_depth_one_children() {
 }
 
 #[tokio::test]
+async fn parent_log_records_child_plan_before_the_terminal_result() {
+    let backend = Arc::new(RecordingBackend::new(vec![
+        vec![
+            delegation(child_budget(16_000, 2_000)),
+            completed(FinishReason::ToolCalls),
+        ],
+        vec![text("child complete"), completed(FinishReason::Stop)],
+        vec![text("parent complete"), completed(FinishReason::Stop)],
+    ]));
+    let store = Arc::new(MemoryStore::default());
+    let runtime = orchestrated_runtime(backend, Arc::new(AllowAllPolicy), store.clone(), None);
+    let (handle, mut events) = runtime
+        .start(session("durable-child"), Vec::new())
+        .expect("start");
+
+    handle.submit("use sub-agents", true).await.expect("submit");
+    wait_for_turn(&mut events).await;
+
+    let replay = store.replay(&"durable-child".into()).expect("replay");
+    let queued = replay
+        .iter()
+        .position(|event| matches!(event.event, SessionEvent::AgentQueued { .. }))
+        .expect("durable queued child");
+    let completed = replay
+        .iter()
+        .position(|event| matches!(event.event, SessionEvent::AgentCompleted { .. }))
+        .expect("durable completed child");
+    assert!(queued < completed);
+}
+
+#[tokio::test]
 async fn second_child_turn_routes_parent_approval() {
     let mut budget = child_budget(16_000, 2_000);
     budget.max_turns = 2;

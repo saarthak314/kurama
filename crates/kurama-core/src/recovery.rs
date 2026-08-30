@@ -333,7 +333,8 @@ impl RecoveryPlanner {
                     turn_terminal = true;
                 }
                 SessionEvent::UserMessage { .. } => turn_terminal = false,
-                SessionEvent::AgentStarted { snapshot }
+                SessionEvent::AgentQueued { snapshot }
+                | SessionEvent::AgentStarted { snapshot }
                 | SessionEvent::AgentProgress { snapshot } => {
                     agents.insert(snapshot.id.clone(), snapshot.clone());
                 }

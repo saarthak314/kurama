@@ -1,11 +1,26 @@
 use kurama_core::recovery::{NoopRecoveryProbe, RecoveryAction, RecoveryPlanner, StreamRecovery};
 use kurama_protocol::{
+    agent::{AgentSnapshot, AgentState},
     id::{OperationId, SessionId},
     model::{BackendCapabilities, BackendCursor},
     policy::ApprovalResponse,
     session::{EventEnvelope, SessionEvent},
     tool::{CommandClass, Operation},
 };
+
+fn queued_agent() -> AgentSnapshot {
+    AgentSnapshot {
+        id: "child".into(),
+        role: "worker".into(),
+        objective: "inspect".into(),
+        profile: "test".into(),
+        state: AgentState::Queued,
+        phase: None,
+        active_operation: None,
+        changed_files: Vec::new(),
+        last_error: None,
+    }
+}
 
 fn event(sequence: u64, event: SessionEvent) -> EventEnvelope {
     EventEnvelope::new(sequence, sequence, SessionId::from("session"), None, event)
@@ -46,6 +61,29 @@ fn recovery_never_blindly_reexecutes_unknown_bash() {
         plan.operations.get(&operation_id),
         Some(RecoveryAction::RequireDecision { .. })
     ));
+}
+
+#[test]
+fn recovery_marks_a_durable_queued_child_as_interrupted() {
+    let plan = RecoveryPlanner::new()
+        .plan(
+            &[event(
+                0,
+                SessionEvent::AgentQueued {
+                    snapshot: queued_agent(),
+                },
+            )],
+            &NoopRecoveryProbe,
+            BackendCapabilities::remote_default(),
+        )
+        .expect("plan");
+
+    assert_eq!(plan.interrupted_agents.len(), 1);
+    assert_eq!(plan.interrupted_agents[0].state, AgentState::Failed);
+    assert_eq!(
+        plan.interrupted_agents[0].last_error.as_deref(),
+        Some("interrupted during previous process")
+    );
 }
 
 #[test]
