@@ -1316,8 +1316,14 @@ pub(crate) fn hard_wrap(value: &str, width: usize) -> Vec<String> {
         for grapheme in source_line.graphemes(true) {
             let grapheme_width = display_width(grapheme);
             if line_width > 0 && line_width.saturating_add(grapheme_width) > width {
-                wrapped.push(std::mem::take(&mut line));
-                line_width = 0;
+                if let Some(previous) =
+                    split_before_trailing_punctuation(&mut line, &mut line_width, grapheme, width)
+                {
+                    wrapped.push(previous);
+                } else {
+                    wrapped.push(std::mem::take(&mut line));
+                    line_width = 0;
+                }
             }
             line.push_str(grapheme);
             line_width = line_width.saturating_add(grapheme_width);
@@ -1325,6 +1331,42 @@ pub(crate) fn hard_wrap(value: &str, width: usize) -> Vec<String> {
         wrapped.push(line);
     }
     wrapped
+}
+
+fn split_before_trailing_punctuation(
+    line: &mut String,
+    line_width: &mut usize,
+    grapheme: &str,
+    width: usize,
+) -> Option<String> {
+    if !matches!(grapheme, "," | "." | ";" | ":" | "!" | "?") {
+        return None;
+    }
+
+    let punctuation_width = display_width(grapheme);
+    let split_at = line
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace())
+        .map(|(index, character)| index + character.len_utf8())
+        .or_else(|| {
+            line.grapheme_indices(true)
+                .next_back()
+                .map(|(index, _)| index)
+                .filter(|index| *index > 0)
+        })?;
+    let previous = line[..split_at].trim_end().to_owned();
+    let continuation = line[split_at..].trim_start();
+    if previous.is_empty()
+        || continuation.is_empty()
+        || display_width(continuation).saturating_add(punctuation_width) > width
+    {
+        return None;
+    }
+
+    *line = continuation.to_owned();
+    *line_width = display_width(line);
+    Some(previous)
 }
 
 pub(crate) fn word_wrap(value: &str, width: usize) -> Vec<String> {

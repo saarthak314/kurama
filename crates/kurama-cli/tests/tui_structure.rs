@@ -1004,6 +1004,30 @@ fn narrow_approval_edit_cursor_follows_wrapped_context() {
 }
 
 #[test]
+fn approval_editor_keeps_trailing_json_punctuation_attached() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.begin_approval(ApprovalRequest {
+        operation_id: OperationId::from("o_json"),
+        operation: Operation::Write {
+            paths: vec!["crates/kurama-cli/src/tui/composer.rs".into()],
+            destructive: false,
+            external: false,
+        },
+        summary: "Write the responsive composer changes after reviewing the diff".into(),
+        arguments: serde_json::json!({
+            "path": "crates/kurama-cli/src/tui/composer.rs",
+            "content": "responsive approval content"
+        }),
+    });
+    state.begin_approval_edit();
+
+    let text = buffer_text(&rendered(&state, 48, 16));
+    let rows = text.lines().map(str::trim).collect::<Vec<_>>();
+
+    assert!(!rows.contains(&","), "{rows:#?}");
+}
+
+#[test]
 fn every_tui_view_preserves_the_terminal_default_background() {
     let main = TuiState::new("work", "model", ".", ExecutionMode::Yolo);
 
