@@ -15,7 +15,7 @@ use kurama_core::{
     },
 };
 use kurama_protocol::{
-    agent::{AgentSnapshot, AgentState, WriteScope},
+    agent::{AgentSnapshot, AgentState, DelegationRequest, WriteScope},
     id::{CallId, OperationId, SessionId},
     model::{BackendCapabilities, FinishReason, ModelEvent, ModelProfile, ModelRequest},
     policy::{ApprovalResponse, AutoBoundaries, ExecutionMode, PolicyContext, PolicyDecision},
@@ -712,6 +712,101 @@ async fn tool_calls_finish_without_work_fails_before_another_round() {
 }
 
 #[tokio::test]
+async fn length_finish_rejects_tool_calls_before_execution() {
+    let backend: Arc<dyn ModelBackend> = Arc::new(ScriptedBackend::new(vec![
+        vec![
+            Ok(ModelEvent::ToolCall {
+                call_id: "terminal_call".into(),
+                name: "count".into(),
+                arguments: serde_json::json!({}),
+            }),
+            Ok(ModelEvent::ResponseCompleted {
+                cursor: None,
+                finish_reason: FinishReason::Length,
+            }),
+        ],
+        vec![Ok(ModelEvent::ResponseCompleted {
+            cursor: None,
+            finish_reason: FinishReason::Stop,
+        })],
+    ]));
+    let tool = Arc::new(CountingTool::default());
+    let executions = tool.executions.clone();
+    let (handle, mut events) = Engine::spawn(
+        counting_config(
+            "length-with-tool-call",
+            backend,
+            tool,
+            Arc::new(MemoryStore::default()),
+        ),
+        Vec::new(),
+    )
+    .expect("spawn engine");
+
+    handle.submit("inspect", false).await.expect("submit");
+    let message = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match events.recv().await.expect("runtime event") {
+                RuntimeEvent::Error { message } => break message,
+                RuntimeEvent::TurnCompleted => panic!("length finish completed the turn"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("length finish failure timed out");
+
+    assert!(message.contains("output limit"));
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cancelled_finish_rejects_delegation_before_execution() {
+    let backend: Arc<dyn ModelBackend> = Arc::new(ScriptedBackend::new(vec![
+        vec![
+            Ok(ModelEvent::Delegation {
+                request: DelegationRequest { agents: Vec::new() },
+            }),
+            Ok(ModelEvent::ResponseCompleted {
+                cursor: None,
+                finish_reason: FinishReason::Cancelled,
+            }),
+        ],
+        vec![Ok(ModelEvent::ResponseCompleted {
+            cursor: None,
+            finish_reason: FinishReason::Stop,
+        })],
+    ]));
+    let (handle, mut events) = Engine::spawn(
+        partial_stream_config(
+            "cancelled-with-delegation",
+            backend,
+            Arc::new(MemoryStore::default()),
+        ),
+        Vec::new(),
+    )
+    .expect("spawn engine");
+
+    handle.submit("delegate", true).await.expect("submit");
+    let message = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match events.recv().await.expect("runtime event") {
+                RuntimeEvent::Error { message } => break message,
+                RuntimeEvent::AgentUpdated { .. } => {
+                    panic!("cancelled finish started delegation")
+                }
+                RuntimeEvent::TurnCompleted => panic!("cancelled finish completed the turn"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("cancelled finish failure timed out");
+
+    assert_eq!(message, "cancelled");
+}
+
+#[tokio::test]
 async fn stream_failure_flushes_and_persists_sub_threshold_assistant_text() {
     let store = Arc::new(MemoryStore::default());
     let backend = Arc::new(ScriptedBackend::new(vec![vec![
@@ -835,6 +930,42 @@ impl ApprovalPolicy for AskPolicy {
     }
 }
 
+fn approval_config(
+    session_id: &str,
+    backend: Arc<dyn ModelBackend>,
+    tool: Arc<dyn Tool>,
+    policy: Arc<dyn ApprovalPolicy>,
+    store: Arc<MemoryStore>,
+) -> EngineConfig {
+    EngineConfig {
+        session: SessionMetadata {
+            id: session_id.into(),
+            created_at_ms: 0,
+            project_root: ".".into(),
+            profile: "test".into(),
+            mode: ExecutionMode::Supervised,
+            redaction_best_effort: false,
+        },
+        profile: ModelProfile::new("test", "frontier", 4_000, 500),
+        backend,
+        tools: vec![tool],
+        policy,
+        store,
+        sink: Arc::new(CollectingSink::default()),
+        orchestrator: Arc::new(NoDelegation),
+        ids: Arc::new(SequenceIds::new(1)),
+        context_policy: ContextPolicy::default(),
+        workspace_root: PathBuf::from("."),
+        write_scope: WriteScope::default(),
+        auto: AutoBoundaries::default(),
+        agent_id: None,
+        orchestration: None,
+        provider_retry_delays_ms: Vec::new(),
+        command_capacity: 32,
+        event_capacity: 128,
+    }
+}
+
 #[derive(Clone, Default)]
 struct ArgumentTool {
     executed: Arc<Mutex<Vec<serde_json::Value>>>,
@@ -879,6 +1010,54 @@ impl Tool for ArgumentTool {
     }
 }
 
+#[derive(Clone, Default)]
+struct ReadArgumentTool {
+    executed: Arc<Mutex<Vec<serde_json::Value>>>,
+    blocked: Option<Arc<Notify>>,
+}
+
+impl Tool for ReadArgumentTool {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "edit".into(),
+            description: "record read arguments".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }
+    }
+
+    fn classify(
+        &self,
+        _context: &ToolContext,
+        invocation: &ToolInvocation,
+    ) -> Result<Operation, kurama_protocol::KuramaError> {
+        Ok(Operation::Read {
+            path: PathBuf::from(invocation.arguments["path"].as_str().unwrap_or("missing")),
+            external: false,
+        })
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _context: ToolContext,
+        invocation: ToolInvocation,
+        _cancel: &'a dyn CancelSignal,
+    ) -> BoxFuture<'a, Result<ToolResult, kurama_protocol::KuramaError>> {
+        Box::pin(async move {
+            let call_id = invocation.call_id;
+            self.executed
+                .lock()
+                .expect("executed lock")
+                .push(invocation.arguments);
+            if let Some(blocked) = &self.blocked {
+                blocked.notify_one();
+                pending().await
+            } else {
+                Ok(ToolResult::success(call_id, "ok"))
+            }
+        })
+    }
+}
+
 #[tokio::test]
 async fn approval_edit_is_reclassified_before_execution() {
     let backend: Arc<dyn ModelBackend> = Arc::new(ScriptedBackend::new(vec![
@@ -900,33 +1079,13 @@ async fn approval_edit_is_reclassified_before_execution() {
     ]));
     let tool = ArgumentTool::default();
     let executed = tool.executed.clone();
-    let config = EngineConfig {
-        session: SessionMetadata {
-            id: "approval".into(),
-            created_at_ms: 0,
-            project_root: ".".into(),
-            profile: "test".into(),
-            mode: ExecutionMode::Supervised,
-            redaction_best_effort: false,
-        },
-        profile: ModelProfile::new("test", "frontier", 4_000, 500),
+    let config = approval_config(
+        "approval",
         backend,
-        tools: vec![Arc::new(tool)],
-        policy: Arc::new(AskPolicy),
-        store: Arc::new(MemoryStore::default()),
-        sink: Arc::new(CollectingSink::default()),
-        orchestrator: Arc::new(NoDelegation),
-        ids: Arc::new(SequenceIds::new(1)),
-        context_policy: ContextPolicy::default(),
-        workspace_root: PathBuf::from("."),
-        write_scope: WriteScope::default(),
-        auto: AutoBoundaries::default(),
-        agent_id: None,
-        orchestration: None,
-        provider_retry_delays_ms: Vec::new(),
-        command_capacity: 32,
-        event_capacity: 128,
-    };
+        Arc::new(tool),
+        Arc::new(AskPolicy),
+        Arc::new(MemoryStore::default()),
+    );
     let (handle, mut events) = Engine::spawn(config, Vec::new()).expect("spawn");
     handle.submit("edit", false).await.expect("submit");
     let mut approvals = 0;
@@ -975,6 +1134,124 @@ async fn approval_edit_is_reclassified_before_execution() {
         executed.lock().expect("executed lock").as_slice(),
         &[serde_json::json!({"path":"safe.txt"})]
     );
+}
+
+#[tokio::test]
+async fn approval_edit_remains_resumable_after_a_crash() {
+    let backend: Arc<dyn ModelBackend> = Arc::new(ScriptedBackend::new(vec![vec![
+        Ok(ModelEvent::ToolCall {
+            call_id: "edited_call".into(),
+            name: "edit".into(),
+            arguments: serde_json::json!({"path":"unsafe.txt"}),
+        }),
+        Ok(ModelEvent::ResponseCompleted {
+            cursor: None,
+            finish_reason: FinishReason::ToolCalls,
+        }),
+    ]]));
+    let store = Arc::new(MemoryStore::default());
+    let started = Arc::new(Notify::new());
+    let config = approval_config(
+        "approval-crash",
+        backend,
+        Arc::new(ReadArgumentTool {
+            executed: Arc::default(),
+            blocked: Some(started.clone()),
+        }),
+        Arc::new(AskPolicy),
+        store.clone(),
+    );
+    let (handle, mut events) = Engine::spawn(config, Vec::new()).expect("spawn engine");
+    handle.submit("edit", false).await.expect("submit");
+
+    let mut approvals = 0;
+    while approvals < 2 {
+        match events.recv().await.expect("runtime event") {
+            RuntimeEvent::ApprovalRequired { request } if approvals == 0 => {
+                approvals += 1;
+                handle
+                    .resolve_approval(
+                        request.operation_id,
+                        ApprovalResponse::Edit {
+                            arguments: serde_json::json!({"path":"safe.txt"}),
+                        },
+                    )
+                    .await
+                    .expect("edit approval");
+            }
+            RuntimeEvent::ApprovalRequired { request } => {
+                approvals += 1;
+                assert_eq!(request.arguments, serde_json::json!({"path":"safe.txt"}));
+                handle
+                    .resolve_approval(request.operation_id, ApprovalResponse::ApproveOnce)
+                    .await
+                    .expect("approve edited invocation");
+            }
+            RuntimeEvent::Error { message } => panic!("engine error: {message}"),
+            _ => {}
+        }
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+        .await
+        .expect("edited tool did not start");
+
+    let replay = store.events("approval-crash");
+    let recorded: Vec<_> = replay
+        .iter()
+        .filter_map(|event| match &event.event {
+            SessionEvent::ToolInvocationRecorded { invocation, .. }
+                if invocation.call_id == CallId::from("edited_call") =>
+            {
+                Some(invocation.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(recorded.len(), 1, "edited call was recorded more than once");
+
+    drop(handle);
+    drop(events);
+
+    let resume_store = Arc::new(MemoryStore::default());
+    seed_replay(&resume_store, &replay);
+    let resume_tool = ReadArgumentTool::default();
+    let resumed_arguments = resume_tool.executed.clone();
+    let (resume_handle, mut resume_events) = Engine::spawn(
+        approval_config(
+            "approval-crash",
+            Arc::new(ScriptedBackend::new(vec![vec![Ok(
+                ModelEvent::ResponseCompleted {
+                    cursor: None,
+                    finish_reason: FinishReason::Stop,
+                },
+            )]])),
+            Arc::new(resume_tool),
+            Arc::new(AllowAllPolicy),
+            resume_store,
+        ),
+        replay,
+    )
+    .expect("resume edited approval");
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match resume_events.recv().await.expect("resume event") {
+                RuntimeEvent::TurnCompleted => break,
+                RuntimeEvent::Error { message } => panic!("resume error: {message}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("resumed turn timed out");
+    assert_eq!(
+        resumed_arguments
+            .lock()
+            .expect("resumed arguments lock")
+            .as_slice(),
+        &[serde_json::json!({"path":"safe.txt"})]
+    );
+    drop(resume_handle);
 }
 
 #[derive(Clone, Default)]

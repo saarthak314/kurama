@@ -158,8 +158,9 @@ impl Engine {
         }
 
         let recovery_probe = SessionRecoveryProbe::new(&replay, config.store.as_ref());
+        let recovery_replay = recovery_replay_with_effective_tool_invocations(&replay)?;
         let recovery = RecoveryPlanner::new().plan_for_backend(
-            &replay,
+            &recovery_replay,
             &recovery_probe,
             config.backend.backend_name(),
             config.backend.capabilities(),
@@ -852,6 +853,18 @@ impl EngineActor {
             if !round.text.is_empty() {
                 self.append(SessionEvent::AssistantMessage { text: round.text })?;
             }
+            let finish_reason = round.finish_reason.ok_or_else(|| {
+                KuramaError::Model("model round ended without a finish reason".into())
+            })?;
+            match finish_reason {
+                FinishReason::Length => {
+                    return Err(KuramaError::Model(
+                        "model stopped at its output limit".into(),
+                    ));
+                }
+                FinishReason::Cancelled => return Err(KuramaError::Cancelled),
+                FinishReason::Stop | FinishReason::ToolCalls => {}
+            }
             for invocation in round.tool_calls {
                 self.execute_tool(invocation, cancel).await?;
             }
@@ -865,21 +878,14 @@ impl EngineActor {
             if !round.tool_calls_empty || !round.delegations_empty {
                 continue;
             }
-            match round.finish_reason.ok_or_else(|| {
-                KuramaError::Model("model round ended without a finish reason".into())
-            })? {
+            match finish_reason {
                 FinishReason::Stop => return Ok(()),
                 FinishReason::ToolCalls => {
                     return Err(KuramaError::Model(
                         "model reported tool calls without producing work".into(),
                     ));
                 }
-                FinishReason::Length => {
-                    return Err(KuramaError::Model(
-                        "model stopped at its output limit".into(),
-                    ));
-                }
-                FinishReason::Cancelled => return Err(KuramaError::Cancelled),
+                FinishReason::Length | FinishReason::Cancelled => unreachable!(),
             }
         }
     }
@@ -991,14 +997,14 @@ impl EngineActor {
         invocation: ToolInvocation,
         cancel: &CancelToken,
     ) -> Result<ToolResult, KuramaError> {
-        match self.seen_tool_calls.get(&invocation.call_id) {
+        let mut record_invocation = match self.seen_tool_calls.get(&invocation.call_id) {
             Some(previous) if previous != &invocation => {
                 return Err(KuramaError::Model(format!(
                     "model reused tool call id {} for a different invocation",
                     invocation.call_id
                 )));
             }
-            Some(_) => {}
+            Some(_) => false,
             None if self.completed_tool_calls.contains_key(&invocation.call_id) => {
                 return Err(KuramaError::Model(format!(
                     "model reused tool call id {} without a durable invocation",
@@ -1008,8 +1014,9 @@ impl EngineActor {
             None => {
                 self.seen_tool_calls
                     .insert(invocation.call_id.clone(), invocation.clone());
+                true
             }
-        }
+        };
         if let Some((operation_id, result)) =
             self.completed_tool_calls.get(&invocation.call_id).cloned()
         {
@@ -1055,10 +1062,13 @@ impl EngineActor {
                 call_id: invocation.call_id.clone(),
                 operation: operation.clone(),
             })?;
-            self.append(SessionEvent::ToolInvocationRecorded {
-                operation_id: operation_id.clone(),
-                invocation: invocation.clone(),
-            })?;
+            if record_invocation {
+                self.append(SessionEvent::ToolInvocationRecorded {
+                    operation_id: operation_id.clone(),
+                    invocation: invocation.clone(),
+                })?;
+                record_invocation = false;
+            }
 
             let policy_context = PolicyContext {
                 mode: self.mode,
@@ -1758,22 +1768,102 @@ fn tool_invocations_for_active_turn(
     replay: &[EventEnvelope],
 ) -> Result<BTreeMap<kurama_protocol::id::CallId, ToolInvocation>, KuramaError> {
     let mut invocations = BTreeMap::new();
+    let mut operations = BTreeMap::new();
     for event in &replay[active_turn_start(replay)..] {
-        let SessionEvent::ToolInvocationRecorded { invocation, .. } = &event.event else {
-            continue;
-        };
-        if invocations
-            .get(&invocation.call_id)
-            .is_some_and(|existing| existing != invocation)
-        {
-            return Err(KuramaError::Session(format!(
-                "active turn reuses tool call id {} for different invocations",
-                invocation.call_id
-            )));
+        match &event.event {
+            SessionEvent::ToolProposed {
+                operation_id,
+                call_id,
+                ..
+            } => {
+                operations.insert(operation_id.clone(), call_id.clone());
+            }
+            SessionEvent::ToolInvocationRecorded { invocation, .. } => {
+                if invocations
+                    .get(&invocation.call_id)
+                    .is_some_and(|existing| existing != invocation)
+                {
+                    return Err(KuramaError::Session(format!(
+                        "active turn reuses tool call id {} for different invocations",
+                        invocation.call_id
+                    )));
+                }
+                invocations.insert(invocation.call_id.clone(), invocation.clone());
+            }
+            SessionEvent::ApprovalResolved {
+                operation_id,
+                response: ApprovalResponse::Edit { arguments },
+            } => {
+                let Some(call_id) = operations.get(operation_id) else {
+                    continue;
+                };
+                if let Some(invocation) = invocations.get_mut(call_id) {
+                    invocation.arguments = arguments.clone();
+                }
+            }
+            _ => {}
         }
-        invocations.insert(invocation.call_id.clone(), invocation.clone());
     }
     Ok(invocations)
+}
+
+fn recovery_replay_with_effective_tool_invocations(
+    replay: &[EventEnvelope],
+) -> Result<Vec<EventEnvelope>, KuramaError> {
+    let mut effective = BTreeMap::new();
+    let mut operations = BTreeMap::new();
+    let mut normalized = Vec::with_capacity(replay.len());
+
+    for event in replay {
+        normalized.push(event.clone());
+        match &event.event {
+            SessionEvent::ToolProposed {
+                operation_id,
+                call_id,
+                ..
+            } => {
+                operations.insert(operation_id.clone(), call_id.clone());
+                if let Some(invocation) = effective.get(call_id).cloned() {
+                    let mut synthetic = event.clone();
+                    synthetic.event = SessionEvent::ToolInvocationRecorded {
+                        operation_id: operation_id.clone(),
+                        invocation,
+                    };
+                    normalized.push(synthetic);
+                }
+            }
+            SessionEvent::ToolInvocationRecorded { invocation, .. } => {
+                if effective
+                    .get(&invocation.call_id)
+                    .is_some_and(|existing| existing != invocation)
+                {
+                    return Err(KuramaError::Session(format!(
+                        "active turn reuses tool call id {} for different invocations",
+                        invocation.call_id
+                    )));
+                }
+                effective.insert(invocation.call_id.clone(), invocation.clone());
+            }
+            SessionEvent::ApprovalResolved {
+                operation_id,
+                response: ApprovalResponse::Edit { arguments },
+            } => {
+                let Some(call_id) = operations.get(operation_id) else {
+                    continue;
+                };
+                if let Some(invocation) = effective.get_mut(call_id) {
+                    invocation.arguments = arguments.clone();
+                }
+            }
+            SessionEvent::TurnCompleted | SessionEvent::TurnFailed { .. } => {
+                effective.clear();
+                operations.clear();
+            }
+            _ => {}
+        }
+    }
+
+    Ok(normalized)
 }
 
 fn active_turn_start(replay: &[EventEnvelope]) -> usize {
