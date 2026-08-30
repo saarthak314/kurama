@@ -698,15 +698,18 @@ impl TuiState {
     }
 
     pub fn apply_runtime_event(&mut self, event: RuntimeEvent) {
-        let advances_pending_turn = matches!(
+        let terminal_turn_event = match &event {
+            RuntimeEvent::TurnCompleted => true,
+            RuntimeEvent::Error { message } => !is_non_terminal_runtime_error(message),
+            _ => false,
+        };
+        let completes_active_streams =
+            matches!(&event, RuntimeEvent::TurnCompleted | RuntimeEvent::Shutdown);
+        let preserves_active_streams = matches!(
             &event,
-            RuntimeEvent::TurnCompleted | RuntimeEvent::Error { .. }
+            RuntimeEvent::Error { message } if is_non_terminal_runtime_error(message)
         );
-        let completes_active_streams = matches!(
-            &event,
-            RuntimeEvent::TurnCompleted | RuntimeEvent::Error { .. } | RuntimeEvent::Shutdown
-        );
-        if !matches!(&event, RuntimeEvent::AssistantDelta { .. }) {
+        if !matches!(&event, RuntimeEvent::AssistantDelta { .. }) && !preserves_active_streams {
             self.active_assistant_entry = None;
         }
         match event {
@@ -766,18 +769,22 @@ impl TuiState {
             }
             RuntimeEvent::TurnCompleted => self.activity = ActivityState::Idle,
             RuntimeEvent::Error { message } => {
-                self.push_error(message);
-                self.activity = ActivityState::Idle;
+                if terminal_turn_event {
+                    self.push_error(message);
+                    self.activity = ActivityState::Idle;
+                } else {
+                    self.push_transcript_entry(TranscriptEntry::Error { body: message });
+                }
             }
             RuntimeEvent::Shutdown => self.activity = ActivityState::Idle,
         }
-        if completes_active_streams {
+        if completes_active_streams || terminal_turn_event {
             self.active_tool_entries.clear();
             self.active_tool_streams.clear();
             self.active_tool_contexts.clear();
             self.pending_tool_context = None;
         }
-        if advances_pending_turn {
+        if terminal_turn_event {
             self.start_next_pending_turn();
         }
     }
@@ -897,6 +904,17 @@ impl TuiState {
             lifecycle,
         }));
     }
+}
+
+fn is_non_terminal_runtime_error(message: &str) -> bool {
+    matches!(
+        message,
+        "another command cannot start during an active turn"
+            | "command is unavailable while approval is pending"
+            | "command is unavailable while agents are running"
+            | "there is no pending approval"
+            | "approval request is no longer pending"
+    )
 }
 
 fn append_live_tool_output(output: &mut String, chunk: &str) {

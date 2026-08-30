@@ -95,6 +95,87 @@ fn runtime_completion_error_and_shutdown_return_to_idle() {
 }
 
 #[test]
+fn non_terminal_command_error_preserves_the_active_turn_and_tool_stream() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.set_thinking();
+    state.apply_runtime_event(RuntimeEvent::ToolStarted {
+        operation_id: OperationId::from("operation_1"),
+        name: "bash".into(),
+        context: "cargo test".into(),
+    });
+    state.apply_runtime_event(tool_delta("call_1", "stdout", "before"));
+    state.submit_turn("queued follow-up", false);
+
+    state.apply_runtime_event(RuntimeEvent::Error {
+        message: "another command cannot start during an active turn".into(),
+    });
+    state.apply_runtime_event(tool_delta("call_1", "stdout", " after"));
+
+    assert!(matches!(
+        state.activity(),
+        ActivityState::RunningTool { name, .. } if name == "bash"
+    ));
+    assert_eq!(state.pending_turn_count(), 1);
+    assert!(state.sent_commands().is_empty());
+    assert!(matches!(
+        &state.transcript[..],
+        [TranscriptEntry::ToolCall(tool), TranscriptEntry::Error { body }]
+            if tool.output == "before after"
+                && body == "another command cannot start during an active turn"
+    ));
+}
+
+#[test]
+fn non_terminal_command_error_preserves_the_active_assistant_stream() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.set_thinking();
+    state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+        text: "before".into(),
+    });
+
+    state.apply_runtime_event(RuntimeEvent::Error {
+        message: "another command cannot start during an active turn".into(),
+    });
+    state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+        text: " after".into(),
+    });
+
+    assert!(matches!(
+        &state.transcript[..],
+        [TranscriptEntry::AssistantMessage { body }, TranscriptEntry::Error { .. }]
+            if body == "before after"
+    ));
+}
+
+#[test]
+fn terminal_turn_error_advances_the_queue_once() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.set_thinking();
+    state.submit_turn("second turn", false);
+    state.submit_turn("third turn", false);
+
+    state.apply_runtime_event(RuntimeEvent::Error {
+        message: "model stream failed".into(),
+    });
+
+    assert_eq!(state.pending_turn_count(), 1);
+    assert!(matches!(
+        state.sent_commands(),
+        [EngineCommand::SubmitTurn { text, .. }] if text == "second turn"
+    ));
+
+    state.apply_runtime_event(RuntimeEvent::Error {
+        message: "another command cannot start during an active turn".into(),
+    });
+
+    assert_eq!(state.pending_turn_count(), 1);
+    assert!(matches!(
+        state.sent_commands(),
+        [EngineCommand::SubmitTurn { text, .. }] if text == "second turn"
+    ));
+}
+
+#[test]
 fn status_updates_append_notices_without_starting_activity() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.apply_runtime_event(RuntimeEvent::Status {
