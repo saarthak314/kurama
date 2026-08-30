@@ -899,6 +899,9 @@ impl App {
             (Overlay::Approval, KeyCode::Char('a')) => {
                 self.state.resolve_approval(ApprovalResponse::ApproveOnce)
             }
+            (Overlay::Approval, KeyCode::Char('s')) => self
+                .state
+                .resolve_approval(ApprovalResponse::ApproveSession),
             (Overlay::Approval, KeyCode::Char('d')) => {
                 self.state.resolve_approval(ApprovalResponse::Deny)
             }
@@ -1654,7 +1657,8 @@ mod tests {
     use crossterm::event::{MouseEvent, MouseEventKind};
     use kurama_protocol::{
         id::{CallId, OperationId},
-        tool::ToolResult,
+        policy::ApprovalRequest,
+        tool::{CommandClass, Operation, ToolResult},
     };
     use ratatui::{
         TerminalOptions, Viewport,
@@ -1724,6 +1728,36 @@ Session ID: s_exit"
 To continue this session, run kurama resume s_cached\n\
 Session ID: s_cached"
         );
+    }
+
+    #[test]
+    fn approval_session_shortcut_queues_session_scoped_approval() {
+        let mut app = test_app();
+        app.state.begin_approval(ApprovalRequest {
+            operation_id: OperationId::from("o_session"),
+            operation: Operation::Bash {
+                command: "cargo test".into(),
+                cwd: ".".into(),
+                class: CommandClass::ReadOnly,
+                timeout_ms: 30_000,
+            },
+            summary: "Run tests".into(),
+            arguments: serde_json::json!({"command":"cargo test"}),
+        });
+
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('s'),
+            KeyModifiers::NONE,
+        )))
+        .expect("approve for session");
+
+        assert!(matches!(
+            app.state.sent_commands().last(),
+            Some(EngineCommand::ResolveApproval {
+                operation_id,
+                response: ApprovalResponse::ApproveSession,
+            }) if operation_id.as_ref() == "o_session"
+        ));
     }
 
     #[test]

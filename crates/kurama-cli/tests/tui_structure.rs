@@ -1037,7 +1037,7 @@ fn approvals_render_inline_without_hiding_the_main_screen() {
     assert!(pending.contains("› Run the CLI tests."));
     assert!(pending.contains("Action required"));
     assert!(pending.contains("Run the focused CLI tests"));
-    assert!(pending.contains("a approve once  d deny  e edit"));
+    assert!(pending.contains("a approve once  s approve session  d deny  e edit"));
     assert!(!pending.contains("Message Kurama or type / for commands"));
     assert!(!pending.contains("approval pending"));
     let pending_lines = pending.lines().collect::<Vec<_>>();
@@ -1070,6 +1070,7 @@ fn narrow_pending_approval_keeps_all_controls_visible() {
 
     assert!(text.contains("Action required"));
     assert!(text.contains("a approve once"));
+    assert!(text.contains("s approve session"));
     assert!(text.contains("d deny"));
     assert!(text.contains("e edit"));
     assert!(lines.contains(&"Run the focused CLI tests before"));
@@ -1090,6 +1091,7 @@ fn narrow_layout_preserves_action_and_stacks_approval_choices() {
     assert!(text.contains("Action required"));
     assert!(text.contains("$ cargo test -p kurama-cli"));
     assert!(lines.contains(&"a approve once"));
+    assert!(lines.contains(&"s approve session"));
     assert!(lines.contains(&"d deny"));
     assert!(lines.contains(&"e edit"));
     assert!(!text.contains("Esc to interrupt"));
@@ -1103,9 +1105,7 @@ fn short_narrow_approval_compacts_controls_before_losing_action() {
     let text = buffer_text(&rendered(&state, 32, 2));
 
     assert!(text.contains("$ cargo test -p kurama-cli"));
-    assert!(text.contains("a approve"));
-    assert!(text.contains("d deny"));
-    assert!(text.contains("e edit"));
+    assert!(text.contains("a/s/d/e"));
 }
 
 #[test]
@@ -1117,7 +1117,7 @@ fn very_narrow_short_approval_keeps_every_decision_shortcut() {
     let lines = text.lines().map(str::trim).collect::<Vec<_>>();
 
     assert!(text.contains("$ cargo test"));
-    assert!(lines.contains(&"a/d/e"));
+    assert!(lines.contains(&"a/s/d/e"));
 }
 
 #[test]

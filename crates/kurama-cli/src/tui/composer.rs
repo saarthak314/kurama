@@ -332,7 +332,7 @@ fn approval_controls(editing: bool, width: usize, max_lines: usize) -> Vec<Line<
     let full_labels = if editing {
         ["Enter submit", "Esc return"].as_slice()
     } else {
-        ["a approve once", "d deny", "e edit"].as_slice()
+        ["a approve once", "s approve session", "d deny", "e edit"].as_slice()
     };
     let style = if editing {
         Style::default().add_modifier(Modifier::DIM)
@@ -361,7 +361,7 @@ fn approval_controls(editing: bool, width: usize, max_lines: usize) -> Vec<Line<
     let compact_labels = if editing {
         ["Enter", "Esc"].as_slice()
     } else {
-        ["a approve", "d deny", "e edit"].as_slice()
+        ["a approve", "s session", "d deny", "e edit"].as_slice()
     };
     let compact_combined = compact_labels.join(if editing { "/" } else { "  " });
     if Line::from(compact_combined.as_str()).width() <= width {
@@ -381,10 +381,12 @@ fn approval_controls(editing: bool, width: usize, max_lines: usize) -> Vec<Line<
 
     let shortest = if editing {
         "↵⎋"
-    } else if width >= Line::from("a/d/e").width() {
-        "a/d/e"
+    } else if width >= Line::from("a/s/d/e").width() {
+        "a/s/d/e"
+    } else if width >= Line::from("asde").width() {
+        "asde"
     } else {
-        "ade"
+        "asd"
     };
     vec![Line::from(Span::styled(
         truncate_display(shortest, width),
@@ -502,18 +504,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn single_line_approval_uses_slash_shortcuts_at_width_five() {
-        assert_eq!(single_line_controls(false, 5), "a/d/e");
+    fn single_line_approval_uses_key_only_controls_at_width_five() {
+        assert_eq!(single_line_controls(false, 5), "asde");
     }
 
     #[test]
     fn single_line_approval_uses_key_only_controls_at_width_four() {
-        assert_eq!(single_line_controls(false, 4), "ade");
+        assert_eq!(single_line_controls(false, 4), "asde");
     }
 
     #[test]
     fn single_line_approval_uses_key_only_controls_at_width_three() {
-        assert_eq!(single_line_controls(false, 3), "ade");
+        assert_eq!(single_line_controls(false, 3), "asd");
     }
 
     #[test]
