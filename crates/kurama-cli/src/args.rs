@@ -14,7 +14,7 @@ pub struct Args {
     pub internal_print_prompt_bundle: bool,
 }
 
-pub const HELP: &str = "Kurama — minimal coding agent\n\nUsage: kurama [OPTIONS]\n\nOptions:\n  --profile <NAME>  Use a configured profile\n  --resume <ID>     Resume a session\n  --continue        Resume this project's latest session\n  --yolo            Disable approvals and boundaries for this launch\n  -h, --help        Print help\n  -V, --version     Print version\n";
+pub const HELP: &str = "Kurama — minimal coding agent\n\nUsage:\n  kurama [OPTIONS]\n  kurama resume <ID>\n\nOptions:\n  --profile <NAME>  Use a configured profile\n  --resume <ID>     Resume a session\n  --continue        Resume this project's latest session\n  --yolo            Disable approvals and boundaries for this launch\n  -h, --help        Print help\n  -V, --version     Print version\n";
 
 pub fn parse_from<I, S>(args: I) -> Result<Args, String>
 where
@@ -37,6 +37,15 @@ where
                 );
             }
             Long("resume") => {
+                parsed.resume = Some(ResumeChoice::Id(
+                    parser
+                        .value()
+                        .map_err(|error| error.to_string())?
+                        .string()
+                        .map_err(|error| error.to_string())?,
+                ));
+            }
+            Value(command) if command == std::ffi::OsStr::new("resume") => {
                 parsed.resume = Some(ResumeChoice::Id(
                     parser
                         .value()

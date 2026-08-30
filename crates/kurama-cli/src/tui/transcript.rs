@@ -82,15 +82,30 @@ fn parse_markdown_blocks<'a>(
     while *index < events.len() {
         let event = events[*index].clone();
         *index += 1;
+        if is_implicit_inline_event(&event) {
+            *index -= 1;
+            blocks.push(MarkdownBlock::Paragraph(parse_inline_fragments(
+                events,
+                index,
+                None,
+                text_style(),
+            )));
+            continue;
+        }
         match event {
             Event::End(tag) if Some(tag) == end => break,
             Event::Start(Tag::Paragraph) => blocks.push(MarkdownBlock::Paragraph(
-                parse_inline_fragments(events, index, TagEnd::Paragraph, text_style()),
+                parse_inline_fragments(events, index, Some(TagEnd::Paragraph), text_style()),
             )),
             Event::Start(Tag::Heading { level, .. }) => {
                 blocks.push(MarkdownBlock::Heading(
                     level,
-                    parse_inline_fragments(events, index, TagEnd::Heading(level), text_style()),
+                    parse_inline_fragments(
+                        events,
+                        index,
+                        Some(TagEnd::Heading(level)),
+                        text_style(),
+                    ),
                 ));
             }
             Event::Start(Tag::BlockQuote(kind)) => blocks.push(MarkdownBlock::Quote(
@@ -127,21 +142,14 @@ fn parse_markdown_blocks<'a>(
                 }]))
             }
             Event::Rule => blocks.push(MarkdownBlock::Rule),
-            Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
-                blocks.push(MarkdownBlock::Paragraph(vec![StyledFragment {
-                    content: text.into_string(),
-                    style: text_style(),
-                }]));
-            }
-            Event::Code(code) => blocks.push(MarkdownBlock::Paragraph(vec![StyledFragment {
-                content: code.into_string(),
-                style: inline_code_style(),
-            }])),
-            Event::SoftBreak | Event::HardBreak => {
-                blocks.push(MarkdownBlock::Paragraph(Vec::new()));
-            }
             Event::Start(_)
             | Event::End(_)
+            | Event::Text(_)
+            | Event::Code(_)
+            | Event::Html(_)
+            | Event::InlineHtml(_)
+            | Event::SoftBreak
+            | Event::HardBreak
             | Event::InlineMath(_)
             | Event::DisplayMath(_)
             | Event::FootnoteReference(_)
@@ -151,10 +159,31 @@ fn parse_markdown_blocks<'a>(
     blocks
 }
 
+fn is_implicit_inline_event(event: &Event<'_>) -> bool {
+    matches!(
+        event,
+        Event::Text(_)
+            | Event::Code(_)
+            | Event::Html(_)
+            | Event::InlineHtml(_)
+            | Event::SoftBreak
+            | Event::HardBreak
+            | Event::InlineMath(_)
+            | Event::DisplayMath(_)
+            | Event::FootnoteReference(_)
+            | Event::TaskListMarker(_)
+            | Event::Start(Tag::Emphasis)
+            | Event::Start(Tag::Strong)
+            | Event::Start(Tag::Strikethrough)
+            | Event::Start(Tag::Link { .. })
+            | Event::Start(Tag::Image { .. })
+    )
+}
+
 fn parse_inline_fragments<'a>(
     events: &[Event<'a>],
     index: &mut usize,
-    end: TagEnd,
+    end: Option<TagEnd>,
     style: Style,
 ) -> Vec<StyledFragment> {
     let mut fragments = Vec::new();
@@ -162,7 +191,7 @@ fn parse_inline_fragments<'a>(
         let event = events[*index].clone();
         *index += 1;
         match event {
-            Event::End(tag) if tag == end => break,
+            Event::End(tag) if Some(tag) == end => break,
             Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
                 push_fragment(&mut fragments, text.into_string(), style);
             }
@@ -178,19 +207,19 @@ fn parse_inline_fragments<'a>(
             Event::Start(Tag::Emphasis) => fragments.extend(parse_inline_fragments(
                 events,
                 index,
-                TagEnd::Emphasis,
+                Some(TagEnd::Emphasis),
                 style.add_modifier(Modifier::ITALIC),
             )),
             Event::Start(Tag::Strong) => fragments.extend(parse_inline_fragments(
                 events,
                 index,
-                TagEnd::Strong,
+                Some(TagEnd::Strong),
                 style.add_modifier(Modifier::BOLD),
             )),
             Event::Start(Tag::Strikethrough) => fragments.extend(parse_inline_fragments(
                 events,
                 index,
-                TagEnd::Strikethrough,
+                Some(TagEnd::Strikethrough),
                 style.add_modifier(Modifier::CROSSED_OUT),
             )),
             Event::Start(Tag::Link { dest_url, .. }) => {
@@ -198,7 +227,7 @@ fn parse_inline_fragments<'a>(
                 let linked = parse_inline_fragments(
                     events,
                     index,
-                    TagEnd::Link,
+                    Some(TagEnd::Link),
                     style.fg(BLUE).add_modifier(Modifier::UNDERLINED),
                 );
                 let label = fragments_text(&linked);
@@ -216,7 +245,7 @@ fn parse_inline_fragments<'a>(
                 let alternate = parse_inline_fragments(
                     events,
                     index,
-                    TagEnd::Image,
+                    Some(TagEnd::Image),
                     style.add_modifier(Modifier::ITALIC),
                 );
                 fragments.extend(alternate);
@@ -238,10 +267,18 @@ fn parse_inline_fragments<'a>(
             | Event::FootnoteReference(value) => {
                 push_fragment(&mut fragments, value.into_string(), style);
             }
-            Event::Start(tag) => {
-                fragments.extend(parse_inline_fragments(events, index, tag.to_end(), style));
+            Event::Start(tag) if end.is_some() => {
+                fragments.extend(parse_inline_fragments(
+                    events,
+                    index,
+                    Some(tag.to_end()),
+                    style,
+                ));
             }
-            Event::Rule | Event::End(_) => {}
+            Event::Start(_) | Event::Rule | Event::End(_) => {
+                *index -= 1;
+                break;
+            }
         }
     }
     fragments
@@ -343,7 +380,7 @@ fn parse_table_cells<'a>(
             Event::Start(Tag::TableCell) => cells.push(parse_inline_fragments(
                 events,
                 index,
-                TagEnd::TableCell,
+                Some(TagEnd::TableCell),
                 text_style(),
             )),
             Event::End(tag) if tag == end => break,
@@ -1134,7 +1171,7 @@ fn inline_code_style() -> Style {
 pub fn transcript_lines(
     entries: &[TranscriptEntry],
     width: usize,
-    detail: TranscriptDetail,
+    _detail: TranscriptDetail,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for entry in entries {
@@ -1163,35 +1200,45 @@ pub fn transcript_lines(
                     ToolLifecycle::Completed => format!("Ran {name}"),
                     ToolLifecycle::Failed => format!("{name} failed"),
                 };
-                let summary_style = if tool.lifecycle == ToolLifecycle::Failed {
-                    Style::default().fg(RED)
-                } else {
-                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
-                };
+                let failed = tool.lifecycle == ToolLifecycle::Failed;
                 push_prefixed_lines(
                     &mut lines,
                     &summary,
-                    "└ ",
+                    if failed { "× " } else { "• " },
                     "  ",
-                    Style::default().fg(DIM),
-                    summary_style,
+                    Style::default().fg(if failed { RED } else { DIM }),
+                    Style::default()
+                        .fg(if failed { RED } else { TEXT })
+                        .add_modifier(Modifier::BOLD),
                     width,
                 );
-                if detail == TranscriptDetail::Expanded && !tool.output.is_empty() {
-                    let output_width = width.saturating_sub(2).max(1);
-                    for line in hard_wrap(&tool.output, output_width) {
-                        lines.push(Line::from(vec![
-                            Span::styled("  ", Style::default().fg(DIM)),
-                            Span::styled(line, Style::default().fg(DIM)),
-                        ]));
-                    }
+                let output_width = width.saturating_sub(4).max(1);
+                let output = tool.output.trim_end_matches(['\r', '\n']);
+                let output = if output.is_empty() {
+                    vec!["(no output)".to_owned()]
+                } else {
+                    word_wrap(output, output_width)
+                };
+                let output_len = output.len();
+                for (index, line) in output.into_iter().enumerate() {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            if index + 1 == output_len {
+                                "  └ "
+                            } else {
+                                "  │ "
+                            },
+                            Style::default().fg(DIM),
+                        ),
+                        Span::styled(line, Style::default().fg(DIM)),
+                    ]));
                 }
             }
             TranscriptEntry::Error { body } => push_prefixed_lines(
                 &mut lines,
-                &format!("Error: {body}"),
-                "",
-                "",
+                &format!("Error · {body}"),
+                "× ",
+                "  ",
                 Style::default().fg(RED),
                 Style::default().fg(RED),
                 width,
@@ -1262,6 +1309,10 @@ fn push_markdown_lines(lines: &mut Vec<Line<'static>>, body: &str, width: usize)
     if markdown.is_empty() {
         markdown.push(Line::default());
     }
+    if markdown.first().is_some_and(line_starts_with_list_marker) {
+        lines.extend(markdown);
+        return;
+    }
     for (index, mut line) in markdown.into_iter().enumerate() {
         line.spans.insert(
             0,
@@ -1272,6 +1323,19 @@ fn push_markdown_lines(lines: &mut Vec<Line<'static>>, body: &str, width: usize)
         );
         lines.push(line);
     }
+}
+
+fn line_starts_with_list_marker(line: &Line<'_>) -> bool {
+    let text = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    let text = text.trim_start();
+    text.starts_with("• ")
+        || text.split_once(". ").is_some_and(|(number, _)| {
+            !number.is_empty() && number.chars().all(|character| character.is_ascii_digit())
+        })
 }
 
 fn push_prefixed_lines(

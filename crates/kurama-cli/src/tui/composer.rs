@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use kurama_protocol::{policy::ExecutionMode, tool::Operation};
 use ratatui::{
     Frame,
@@ -46,7 +48,7 @@ pub(crate) fn render_composer(
     }
 
     if state.composer.is_empty() {
-        let placeholder = "Message Kurama or type / for commands";
+        let placeholder = "Ask Kurama to do anything";
         let available = area.width.saturating_sub(PROMPT_WIDTH as u16) as usize;
         let placeholder = if Line::from(placeholder).width() <= available {
             placeholder
@@ -125,40 +127,20 @@ pub(crate) fn render_approval(
     })
 }
 
-pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, show_help: bool) {
+pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, _show_help: bool) {
     if area.is_empty() {
         return;
     }
 
-    let mut items = vec![FooterItem::new(
-        mode_label(state.mode),
-        mode_style(state.mode),
-    )];
-    let candidates = [
-        FooterItem::dim(format!("{}/{}", state.profile, state.model)),
-        FooterItem::dim(state.project.clone()),
-        FooterItem::new(
-            format!(
-                "agents {} running · {} queued",
-                state.running_agents, state.queued_agents
-            ),
-            if state.running_agents > 0 {
-                Style::default().fg(Color::Cyan)
-            } else {
-                Style::default().add_modifier(Modifier::DIM)
-            },
-        ),
-        FooterItem::dim("Ctrl+O details · / commands"),
-    ];
-    for (index, candidate) in candidates.into_iter().enumerate() {
-        if index == 3 && !show_help {
-            break;
-        }
-        if footer_width(&items).saturating_add(2 + candidate.width()) <= area.width as usize {
-            items.insert(0, candidate);
-        } else {
-            break;
-        }
+    let profile = FooterItem::dim(format!("{}/{}", state.profile, state.model));
+    let project = FooterItem::dim(project_label(&state.project));
+    let mode = FooterItem::new(mode_label(state.mode), mode_style(state.mode));
+    let mut items = vec![profile, project, mode];
+    if footer_width(&items) > area.width as usize {
+        items.remove(1);
+    }
+    if footer_width(&items) > area.width as usize {
+        items.remove(0);
     }
 
     if footer_width(&items) > area.width as usize {
@@ -488,11 +470,20 @@ fn footer_width(items: &[FooterItem]) -> usize {
         .saturating_add(items.len().saturating_sub(1) * 2)
 }
 
+fn project_label(project: &str) -> String {
+    Path::new(project)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(project)
+        .to_owned()
+}
+
 fn mode_label(mode: ExecutionMode) -> &'static str {
     match mode {
-        ExecutionMode::Supervised => "SUPERVISED",
-        ExecutionMode::Auto => "AUTO",
-        ExecutionMode::Yolo => "YOLO",
+        ExecutionMode::Supervised => "supervised",
+        ExecutionMode::Auto => "auto",
+        ExecutionMode::Yolo => "yolo",
     }
 }
 

@@ -11,6 +11,10 @@ fn help_exposes_profiles_resume_and_yolo_without_provider_flags() {
     for flag in ["--profile", "--resume", "--continue", "--yolo"] {
         assert!(stdout.contains(flag), "missing {flag}: {stdout}");
     }
+    assert!(
+        stdout.contains("kurama resume <ID>"),
+        "missing resume alias: {stdout}"
+    );
     assert!(!stdout.contains("--provider"));
 }
 

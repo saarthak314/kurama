@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
-    io,
+    fmt,
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -24,7 +25,7 @@ use kurama_protocol::{
         AuthRef, KuramaConfig, OrchestrationConfig, ProfileConfig, ProfileKind, SearchConfig,
     },
     id::SessionId,
-    model::ModelProfile,
+    model::{ModelProfile, Usage},
     policy::{ApprovalResponse, AutoBoundaries, ExecutionMode},
     runtime::{EngineCommand, RuntimeEvent},
     session::{BlobRef, EventEnvelope, SessionEvent, SessionMetadata},
@@ -34,7 +35,7 @@ use kurama_sdk::AgentBuilder;
 use ratatui::{
     Terminal, TerminalOptions, Viewport,
     backend::{Backend, ClearType, CrosstermBackend},
-    layout::Position,
+    layout::{Position, Rect},
     style::Style,
     widgets::{Block, Padding, Paragraph, Widget},
 };
@@ -52,7 +53,8 @@ use crate::{
 
 const TRANSCRIPT_HORIZONTAL_PADDING: usize = 2;
 const MAX_TRANSCRIPT_INSERT_HEIGHT: usize = 1_024;
-const ACTIVITY_FRAME_INTERVAL: Duration = Duration::from_millis(32);
+const INLINE_VIEWPORT_MAX_HEIGHT: u16 = 12;
+const ACTIVITY_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct App {
     pub state: TuiState,
@@ -62,7 +64,37 @@ pub struct App {
     orchestrator: Option<Arc<dyn Orchestrator>>,
     session_id: Option<SessionId>,
     restart_args: Option<Args>,
+    exit_requested: bool,
     control: Option<AppControl>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExitSummary {
+    session_id: SessionId,
+    usage: Usage,
+}
+
+impl fmt::Display for ExitSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let total = self
+            .usage
+            .input_tokens
+            .saturating_add(self.usage.output_tokens);
+        write!(
+            formatter,
+            "Token usage: total={total} input={}",
+            self.usage.input_tokens
+        )?;
+        if self.usage.cached_input_tokens > 0 {
+            write!(formatter, " (+ {} cached)", self.usage.cached_input_tokens)?;
+        }
+        write!(formatter, " output={}", self.usage.output_tokens)?;
+        write!(
+            formatter,
+            "\nTo continue this session, run kurama resume {}\nSession ID: {}",
+            self.session_id, self.session_id
+        )
+    }
 }
 
 struct AppControl {
@@ -366,6 +398,7 @@ impl App {
             orchestrator: Some(orchestrator),
             session_id: Some(session_id),
             restart_args: None,
+            exit_requested: false,
             control: Some(AppControl {
                 project,
                 paths,
@@ -393,6 +426,7 @@ impl App {
             orchestrator: Some(orchestrator),
             session_id: Some(session_id),
             restart_args: None,
+            exit_requested: false,
             control: None,
         }
     }
@@ -406,6 +440,7 @@ impl App {
             orchestrator: None,
             session_id: None,
             restart_args: None,
+            exit_requested: false,
             control: Some(control),
         }
     }
@@ -434,7 +469,7 @@ impl App {
         ["bash", "read", "web-search", "write"]
     }
 
-    pub async fn run(mut self) -> Result<(), String> {
+    pub async fn run(mut self) -> Result<Option<ExitSummary>, String> {
         let _guard = TerminalGuard::enter().map_err(|error| error.to_string())?;
         let backend = CursorTrackingBackend::new(CrosstermBackend::new(io::stdout()));
         let mut terminal =
@@ -453,7 +488,8 @@ impl App {
             )
             .await?;
             let Some(args) = self.restart_args.take() else {
-                return Ok(());
+                clear_inline_terminal(&mut terminal).map_err(|error| error.to_string())?;
+                return Ok(self.exit_requested.then(|| self.exit_summary()).flatten());
             };
             let control = self
                 .control
@@ -473,6 +509,7 @@ impl App {
             return Ok(false);
         };
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.exit_requested = true;
             self.state.queue_command(EngineCommand::Shutdown);
             return Ok(true);
         }
@@ -491,20 +528,6 @@ impl App {
             }
             return Ok(false);
         }
-        if self.transcript_is_visible() {
-            match key.code {
-                KeyCode::PageUp => {
-                    self.state.scroll = self.state.scroll.saturating_add(5);
-                    return Ok(false);
-                }
-                KeyCode::PageDown => {
-                    self.state.scroll = self.state.scroll.saturating_sub(5);
-                    return Ok(false);
-                }
-                _ => {}
-            }
-        }
-
         match self.state.overlay {
             Overlay::Onboarding => self.handle_onboarding_key(key),
             Overlay::Approval | Overlay::ApprovalEdit => self.handle_approval_key(key),
@@ -514,7 +537,7 @@ impl App {
             | Overlay::ConfirmAgentCancel => self.handle_agents_key(key),
             Overlay::None => self.handle_main_key(key)?,
         }
-        Ok(self.restart_args.is_some() && self.engine.is_none())
+        Ok(self.exit_requested || (self.restart_args.is_some() && self.engine.is_none()))
     }
 
     fn handle_main_key(&mut self, key: KeyEvent) -> Result<(), String> {
@@ -566,13 +589,6 @@ impl App {
             _ => {}
         }
         Ok(())
-    }
-
-    fn transcript_is_visible(&self) -> bool {
-        matches!(
-            self.state.overlay,
-            Overlay::None | Overlay::Approval | Overlay::ApprovalEdit
-        )
     }
 
     fn submit_composer(&mut self) -> Result<(), String> {
@@ -680,6 +696,10 @@ impl App {
                         format!("mode {}", execution_mode_label(mode)),
                     );
                 }
+                Command::Exit => {
+                    self.exit_requested = true;
+                    self.state.queue_command(EngineCommand::Shutdown);
+                }
             }
         } else if self.engine.is_none() {
             self.state
@@ -725,6 +745,32 @@ impl App {
         };
         self.state.push_notice(Some("SESSIONS".into()), body);
         Ok(())
+    }
+
+    fn exit_summary(&self) -> Option<ExitSummary> {
+        let session_id = self.session_id.clone()?;
+        let usage = self
+            .control
+            .as_ref()
+            .and_then(|control| control.store.replay(&session_id).ok())
+            .map(|events| {
+                events
+                    .into_iter()
+                    .fold(Usage::default(), |mut total, event| {
+                        if let SessionEvent::ModelUsage { usage } = event.event {
+                            total.input_tokens =
+                                total.input_tokens.saturating_add(usage.input_tokens);
+                            total.output_tokens =
+                                total.output_tokens.saturating_add(usage.output_tokens);
+                            total.cached_input_tokens = total
+                                .cached_input_tokens
+                                .saturating_add(usage.cached_input_tokens);
+                        }
+                        total
+                    })
+            })
+            .unwrap_or_default();
+        Some(ExitSummary { session_id, usage })
     }
 
     fn handle_onboarding_key(&mut self, key: KeyEvent) {
@@ -991,17 +1037,57 @@ where
     B: Backend,
 {
     let rows = backend.size()?.height;
-    backend.clear_region(ClearType::All)?;
-    backend.set_cursor_position(Position::ORIGIN)?;
+    let viewport_height = rows.min(INLINE_VIEWPORT_MAX_HEIGHT);
+    let viewport_top = rows.saturating_sub(viewport_height);
+    backend.set_cursor_position(Position::new(0, viewport_top))?;
+    backend.clear_region(ClearType::AfterCursor)?;
     Terminal::with_options(
         backend,
         TerminalOptions {
-            viewport: Viewport::Inline(rows),
+            viewport: Viewport::Inline(viewport_height),
         },
     )
 }
 
-pub async fn run(args: Args) -> Result<(), String> {
+fn resize_inline_terminal<B>(
+    terminal: &mut Terminal<B>,
+    width: u16,
+    height: u16,
+) -> Result<(), B::Error>
+where
+    B: Backend,
+{
+    let previous_viewport_top = terminal.get_frame().area().top();
+    let viewport_height = height.min(INLINE_VIEWPORT_MAX_HEIGHT);
+    let viewport_top = height.saturating_sub(viewport_height);
+    terminal.set_cursor_position(Position::new(
+        0,
+        previous_viewport_top.min(height.saturating_sub(1)),
+    ))?;
+    terminal.backend_mut().clear_region(ClearType::All)?;
+    terminal
+        .backend_mut()
+        .set_cursor_position(Position::new(0, viewport_top))?;
+    terminal.resize(Rect::new(0, 0, width, height))
+}
+
+fn clear_inline_terminal<B>(terminal: &mut Terminal<B>) -> Result<(), B::Error>
+where
+    B: Backend,
+{
+    let viewport_top = terminal.get_frame().area().as_position();
+    terminal.clear()?;
+    terminal.set_cursor_position(viewport_top)?;
+    terminal.backend_mut().flush()
+}
+
+fn purge_terminal_history() -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(b"\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H")?;
+    stdout.flush()
+}
+
+pub async fn run(args: Args) -> Result<Option<ExitSummary>, String> {
     App::bootstrap(
         &args,
         std::env::current_dir().map_err(|error| error.to_string())?,
@@ -1123,6 +1209,13 @@ where
             _ = &mut animation => animation_tick = true,
             event = input.recv(), if input_open => {
                 match event {
+                    Some(Event::Resize(width, height)) if commit_to_scrollback => {
+                        purge_terminal_history().map_err(|error| error.to_string())?;
+                        app.state.reset_transcript_commit();
+                        resize_inline_terminal(terminal, width, height)
+                            .map_err(|error| error.to_string())?;
+                        commit_stable_transcript(&mut app.state, terminal)?;
+                    }
                     Some(event) => {
                         exit = app.handle_event(event)?;
                         app.flush_commands().await?;
@@ -1450,8 +1543,55 @@ mod tests {
             orchestrator: None,
             session_id: None,
             restart_args: None,
+            exit_requested: false,
             control: None,
         }
+    }
+
+    #[test]
+    fn exit_command_requests_shutdown_and_returns_resume_details() {
+        let mut app = test_app();
+        app.session_id = Some(SessionId::from("s_exit"));
+        app.state.composer = "/exit".into();
+        app.state.cursor = app.state.composer.len();
+
+        let exit = app
+            .handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("submit exit command");
+
+        assert!(exit);
+        assert!(matches!(
+            app.state.sent_commands().last(),
+            Some(EngineCommand::Shutdown)
+        ));
+        assert_eq!(
+            app.exit_summary().expect("exit summary").to_string(),
+            "Token usage: total=0 input=0 output=0\n\
+To continue this session, run kurama resume s_exit\n\
+Session ID: s_exit"
+        );
+    }
+
+    #[test]
+    fn exit_summary_includes_cached_usage() {
+        let summary = ExitSummary {
+            session_id: SessionId::from("s_cached"),
+            usage: Usage {
+                input_tokens: 120,
+                output_tokens: 30,
+                cached_input_tokens: 80,
+            },
+        };
+
+        assert_eq!(
+            summary.to_string(),
+            "Token usage: total=150 input=120 (+ 80 cached) output=30\n\
+To continue this session, run kurama resume s_cached\n\
+Session ID: s_cached"
+        );
     }
 
     #[test]
@@ -1547,7 +1687,7 @@ mod tests {
     #[test]
     fn animation_wakes_only_for_visible_active_work() {
         let mut app = test_app();
-        assert_eq!(ACTIVITY_FRAME_INTERVAL, Duration::from_millis(32));
+        assert_eq!(ACTIVITY_FRAME_INTERVAL, Duration::from_millis(100));
         let normal_area = Rect::new(0, 0, 80, 24);
         assert!(visible_activity_rect(normal_area, &app.state).is_empty());
 
@@ -1632,7 +1772,7 @@ mod tests {
     }
 
     #[test]
-    fn page_up_scrolls_past_the_u16_line_limit() {
+    fn normal_view_leaves_page_keys_to_native_scrollback() {
         let mut app = App {
             state: TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised),
             engine: None,
@@ -1641,6 +1781,7 @@ mod tests {
             orchestrator: None,
             session_id: None,
             restart_args: None,
+            exit_requested: false,
             control: None,
         };
         app.state.scroll = usize::from(u16::MAX);
@@ -1651,7 +1792,7 @@ mod tests {
         )))
         .expect("page up");
 
-        assert!(app.state.scroll > usize::from(u16::MAX));
+        assert_eq!(app.state.scroll, usize::from(u16::MAX));
     }
 
     #[test]
@@ -1664,6 +1805,7 @@ mod tests {
             orchestrator: None,
             session_id: None,
             restart_args: None,
+            exit_requested: false,
             control: None,
         };
 
@@ -1687,7 +1829,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_terminal_initialization_clears_the_screen_and_uses_full_height() {
+    fn inline_terminal_initialization_anchors_at_bottom_without_erasing_history() {
         let mut lines = vec![" ".repeat(80); 40];
         lines[0] = "stale shell prompt".into();
         lines[4] = "stale viewport content".into();
@@ -1706,10 +1848,73 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert_eq!(terminal.get_frame().area(), Rect::new(0, 0, 80, 40));
-        assert!(!visible.contains("stale shell prompt"));
-        assert!(!visible.contains("stale viewport content"));
+        assert_eq!(terminal.get_frame().area(), Rect::new(0, 28, 80, 12));
+        assert!(visible.contains("stale shell prompt"));
+        assert!(visible.contains("stale viewport content"));
         assert!(!visible.contains("stale lower content"));
+    }
+
+    #[test]
+    fn inline_resize_does_not_commit_live_viewport_to_scrollback() {
+        let state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24))
+            .expect("initialize inline terminal");
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("draw initial viewport");
+
+        terminal.backend_mut().resize(52, 12);
+        resize_inline_terminal(&mut terminal, 52, 12).expect("shrink inline terminal");
+        assert_eq!(terminal.get_frame().area(), Rect::new(0, 0, 52, 12));
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("draw narrow viewport");
+
+        terminal.backend_mut().resize(100, 30);
+        resize_inline_terminal(&mut terminal, 100, 30).expect("grow inline terminal");
+        assert_eq!(terminal.get_frame().area(), Rect::new(0, 18, 100, 12));
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("draw wide viewport");
+
+        let text = terminal
+            .backend()
+            .scrollback()
+            .content()
+            .iter()
+            .chain(terminal.backend().buffer().content().iter())
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert_eq!(text.matches("Ask Kurama").count(), 1, "{text}");
+        assert_eq!(text.matches("work/model").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn clearing_inline_terminal_removes_the_live_ui_before_exit_output() {
+        let state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24))
+            .expect("initialize inline terminal");
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("draw live viewport");
+
+        clear_inline_terminal(&mut terminal).expect("clear live viewport");
+
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!text.contains("Ask Kurama"), "{text}");
+        assert_eq!(
+            terminal
+                .backend_mut()
+                .get_cursor_position()
+                .expect("exit cursor"),
+            Position::new(0, 12)
+        );
     }
 
     #[tokio::test]
@@ -1722,6 +1927,7 @@ mod tests {
             orchestrator: None,
             session_id: None,
             restart_args: None,
+            exit_requested: false,
             control: None,
         };
         app.state.push_user("committed question");
@@ -1786,6 +1992,7 @@ mod tests {
             orchestrator: None,
             session_id: None,
             restart_args: None,
+            exit_requested: false,
             control: None,
         };
         app.state.push_user("visible fullscreen question");

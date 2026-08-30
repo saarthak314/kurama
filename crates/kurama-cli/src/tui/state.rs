@@ -256,6 +256,11 @@ impl TuiState {
         self.scroll = 0;
     }
 
+    pub fn reset_transcript_commit(&mut self) {
+        self.committed_transcript_entries = 0;
+        self.scroll = 0;
+    }
+
     pub fn live_transcript(&self) -> &[TranscriptEntry] {
         &self.transcript[self.committed_transcript_entries..]
     }
@@ -448,7 +453,6 @@ impl TuiState {
             response,
         });
         self.overlay = Overlay::None;
-        self.push_notice(None, "approval submitted");
         self.set_thinking();
     }
 

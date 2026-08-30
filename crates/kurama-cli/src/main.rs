@@ -26,8 +26,12 @@ async fn main() {
         return;
     }
 
-    if let Err(error) = app::run(args).await {
-        eprintln!("kurama: {error}");
-        std::process::exit(2);
+    match app::run(args).await {
+        Ok(Some(summary)) => println!("{summary}"),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("kurama: {error}");
+            std::process::exit(2);
+        }
     }
 }

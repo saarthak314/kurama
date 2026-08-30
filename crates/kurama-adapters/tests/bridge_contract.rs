@@ -17,6 +17,7 @@ use kurama_protocol::{
     KuramaError,
     id::SessionId,
     model::{BackendCursor, ModelEvent, ModelItem, ModelProfile, ModelRequest},
+    tool::ToolDescriptor,
     traits::{BoxFuture, CancelSignal, ModelBackend},
 };
 
@@ -30,7 +31,14 @@ fn request() -> ModelRequest {
         items: vec![ModelItem::User {
             text: "Inspect it".into(),
         }],
-        tools: Vec::new(),
+        tools: vec![ToolDescriptor {
+            name: "bash".into(),
+            description: "Run one bounded Bash command in the workspace.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "required": ["command", "cwd", "timeout_ms"]
+            }),
+        }],
         delegation: None,
         continuation: None,
     }
@@ -86,7 +94,10 @@ fn bridge_prompt_does_not_invent_tool_unavailability() {
     let prompt = bridge_prompt(&request());
 
     assert!(prompt.contains("listed Kurama tool is available through this control protocol"));
-    assert!(prompt.contains("disabled CLI tool list applies only to the bridge process"));
+    assert!(prompt.contains("CLI tools are deliberately disabled and irrelevant"));
+    assert!(prompt.contains("Kurama protocol operations, not CLI tools"));
+    assert!(prompt.contains("Kurama executes it after this response"));
+    assert!(prompt.contains("Do not claim any operation ran, failed, or was unavailable"));
     assert!(prompt.contains("return kind=tool_calls instead of kind=final"));
     assert!(prompt.contains("nonzero exit status"));
     assert!(prompt.contains("is_error=true"));
@@ -136,7 +147,7 @@ fn codex_resume_command_preserves_thread_cursor() {
 }
 
 #[test]
-fn claude_command_disables_builtin_tools_and_customization() {
+fn claude_command_uses_single_result_json_and_disables_builtin_tools() {
     let command = ClaudeBridge::command_for(&request(), None, Path::new("/tmp/control.json"));
 
     assert_eq!(command.program, "claude");
@@ -150,8 +161,15 @@ fn claude_command_disables_builtin_tools_and_customization() {
     assert!(
         command
             .args
+            .windows(2)
+            .any(|pair| pair == ["--output-format", "json"])
+    );
+    assert!(!command.args.iter().any(|argument| argument == "--verbose"));
+    assert!(
+        !command
+            .args
             .iter()
-            .any(|argument| argument == "stream-json")
+            .any(|argument| argument == "--include-partial-messages")
     );
     assert!(
         command
@@ -159,11 +177,38 @@ fn claude_command_disables_builtin_tools_and_customization() {
             .iter()
             .any(|argument| argument == "--strict-mcp-config")
     );
-    assert_eq!(command.stdin, request_prompt_marker());
+    let system_prompt = command
+        .args
+        .windows(2)
+        .find(|pair| pair[0] == "--system-prompt")
+        .map(|pair| pair[1].as_str())
+        .expect("Claude bridge system prompt");
+    assert!(system_prompt.contains("You are a model bridge"));
+    assert!(system_prompt.contains("Every listed Kurama tool is available"));
+    assert!(system_prompt.contains("Kurama executes it after this response"));
+    assert!(command.stdin.starts_with("Active context:\n"));
+    assert!(!command.stdin.contains("You are a model bridge"));
 }
 
-fn request_prompt_marker() -> String {
-    bridges::control::bridge_prompt(&request())
+#[test]
+fn claude_single_result_json_normalizes_tool_calls() {
+    let events = ClaudeBridge::parse_fixture(
+        r#"{"type":"result","subtype":"success","session_id":"session-1","structured_output":{"kind":"tool_calls","text":"","calls":[{"call_id":"c1","name":"bash","arguments":"{\"command\":\"pwd\",\"cwd\":\"/workspace/project\",\"timeout_ms\":10000}"}],"agents":[]},"usage":{"input_tokens":90,"output_tokens":16,"cache_read_input_tokens":70}}"#,
+    )
+    .expect("Claude result JSON");
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ModelEvent::ToolCall { name, .. } if name == "bash"))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ModelEvent::ResponseCompleted {
+            finish_reason: kurama_protocol::model::FinishReason::ToolCalls,
+            ..
+        }
+    )));
 }
 
 #[test]

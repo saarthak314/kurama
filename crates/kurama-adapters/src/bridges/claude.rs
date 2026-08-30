@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use super::{
     BridgeCommand,
-    control::{bridge_prompt, control_schema, parse_control},
+    control::{bridge_context_prompt, bridge_system_prompt, control_schema, parse_control},
 };
 
 const BACKEND: &str = "claude_cli";
@@ -57,15 +57,15 @@ impl ClaudeBridge {
         let mut args = vec![
             "-p".into(),
             "--output-format".into(),
-            "stream-json".into(),
-            "--include-partial-messages".into(),
-            "--verbose".into(),
+            "json".into(),
             "--safe-mode".into(),
             "--tools".into(),
             "".into(),
             "--strict-mcp-config".into(),
             "--permission-mode".into(),
             "manual".into(),
+            "--system-prompt".into(),
+            bridge_system_prompt(request),
             "--model".into(),
             request.profile.model.clone(),
             "--json-schema".into(),
@@ -78,7 +78,7 @@ impl ClaudeBridge {
         BridgeCommand {
             program: program.into(),
             args,
-            stdin: bridge_prompt(request),
+            stdin: bridge_context_prompt(request),
             cwd: None,
         }
     }

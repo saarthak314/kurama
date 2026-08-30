@@ -101,6 +101,7 @@ fn parses_all_product_commands_without_restart() {
         parse_command("/mode auto").unwrap(),
         Command::Mode(ExecutionMode::Auto)
     );
+    assert_eq!(parse_command("/exit").unwrap(), Command::Exit);
     assert!(parse_command("/restart").is_err());
     assert!(parse_command("/mode yolo").is_err());
 }
@@ -134,14 +135,16 @@ fn main_screen_is_transcript_first_without_tool_statistics() {
         terminal.draw(|frame| render(frame, &state)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
         assert!(!text.contains("KURAMA"));
-        assert!(text.contains("SUPERVISED"));
+        assert!(text.contains("supervised"));
         assert!(!text.contains("tool calls"));
         assert!(!text.contains("tokens/sec"));
     }
 
     let wide = buffer_text(&rendered(&state, 160, 30));
-    assert!(wide.contains("agents 1 running · 1 queued"));
-    assert!(wide.contains("Ctrl+O details"));
+    assert!(wide.contains("openai-main/gpt-5.6"));
+    assert!(wide.contains("kurama"));
+    assert!(!wide.contains("agents 1 running · 1 queued"));
+    assert!(!wide.contains("Ctrl+O details"));
 }
 
 #[test]
@@ -218,11 +221,13 @@ fn activity_line_formats_elapsed_time_and_measures_the_interrupt_hint() {
         activity_line(&hours_state(now), 24, now).expect("narrow activity line"),
     ]);
 
-    assert!(seconds.contains("Thinking · 59s"));
-    assert!(minutes.contains("Working tests · 1m 00s"));
-    assert!(hours.contains("Running cargo test · 1h 00m 00s"));
-    assert!(hours.contains("Esc to interrupt"));
-    assert!(!narrow.contains("Esc to interrupt"));
+    assert_eq!(seconds, "• Thinking (59s • esc to interrupt)");
+    assert_eq!(minutes, "• Working tests (1m 00s • esc to interrupt)");
+    assert_eq!(
+        hours,
+        "• Running cargo test (1h 00m 00s • esc to interrupt)"
+    );
+    assert!(!narrow.contains("esc to interrupt"));
     assert!(activity_line(&ActivityState::Idle, 80, now).is_none());
     assert!(activity_line(&ActivityState::AwaitingApproval, 80, now).is_none());
 }
@@ -252,29 +257,36 @@ fn hours_state(now: Instant) -> ActivityState {
 
 #[test]
 fn measured_footer_collapses_low_priority_context_before_mode() {
-    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Yolo);
+    let mut state = TuiState::new(
+        "work",
+        "model",
+        "/Users/sarthak/src/kurama",
+        ExecutionMode::Yolo,
+    );
     state.set_agent_counts(2, 1);
 
     let wide = buffer_text(&rendered(&state, 120, 32));
-    assert!(wide.contains("Ctrl+O details"));
-    assert!(wide.contains("agents 2 running · 1 queued"));
-    assert!(wide.contains("."));
+    assert!(!wide.contains("Ctrl+O details"));
+    assert!(!wide.contains("agents 2 running · 1 queued"));
+    assert!(wide.contains("kurama"));
+    assert!(!wide.contains("/Users/sarthak/src/kurama"));
     assert!(wide.contains("work/model"));
-    assert!(wide.contains("YOLO"));
+    assert!(wide.contains("yolo"));
 
     let medium = buffer_text(&rendered(&state, 48, 16));
     assert!(!medium.contains("Ctrl+O details"));
     assert!(!medium.contains("agents 2 running · 1 queued"));
+    assert!(medium.contains("kurama"));
     assert!(medium.contains("work/model"));
-    assert!(medium.contains("YOLO"));
+    assert!(medium.contains("yolo"));
 
     let narrow = buffer_text(&rendered(&state, 32, 10));
     assert!(!narrow.contains("Ctrl+O details"));
     assert!(!narrow.contains("agents 2 running · 1 queued"));
-    assert!(narrow.contains("YOLO"));
+    assert!(narrow.contains("yolo"));
 
     let tiny = buffer_text(&rendered(&state, 12, 6));
-    assert!(tiny.contains("YOLO"));
+    assert!(tiny.contains("yolo"));
     assert!(!tiny.contains("work/model"));
 }
 
@@ -291,7 +303,8 @@ fn footer_priority_stops_after_the_first_ambient_item_does_not_fit() {
     let text = buffer_text(&rendered(&state, 52, 6));
 
     assert!(text.contains("work/model"));
-    assert!(text.contains("YOLO"));
+    assert!(text.contains("yolo"));
+    assert!(!text.contains("a-project-name-that-cannot-fit-in-this-footer"));
     assert!(!text.contains("agents 2 running · 1 queued"));
     assert!(!text.contains("Ctrl+O details"));
 }
@@ -319,8 +332,8 @@ fn transcript_uses_compact_codex_style_hierarchy() {
     );
     assert!(text.contains("I’ll inspect the parser and its focused tests."));
     assert!(text.contains("• I’ll inspect the parser and its focused tests."));
-    assert!(text.contains("└ Ran bash"));
-    assert!(!text.contains("cargo test -p kurama-cli"));
+    assert!(text.contains("• Ran bash"));
+    assert!(text.contains("└ cargo test -p kurama-cli"));
     assert!(text.contains("• MODE · supervised"));
     assert!(!text.contains("│ YOU"));
     assert!(!text.contains("│ KURAMA"));
@@ -328,7 +341,7 @@ fn transcript_uses_compact_codex_style_hierarchy() {
 }
 
 #[test]
-fn transcript_groups_turns_and_expands_complete_tool_output() {
+fn transcript_groups_turns_and_shows_complete_tool_output() {
     let entries = vec![
         TranscriptEntry::UserTurn {
             body: "inspect".into(),
@@ -345,9 +358,9 @@ fn transcript_groups_turns_and_expands_complete_tool_output() {
     let expanded = plain(transcript_lines(&entries, 80, TranscriptDetail::Expanded));
 
     assert!(compact.contains("› inspect"));
-    assert!(compact.contains("└ Ran bash"));
-    assert!(!compact.contains("line one"));
-    assert!(!compact.contains("line two"));
+    assert!(compact.contains("• Ran bash"));
+    assert!(compact.contains("line one"));
+    assert!(compact.contains("line two"));
     assert!(expanded.contains("line one"));
     assert!(expanded.contains("line two"));
 }
@@ -380,10 +393,11 @@ fn transcript_uses_codex_gutters_and_separates_user_turns() {
 
     assert_eq!(lines[0], "› first");
     assert_eq!(lines[1], "• answer");
-    assert_eq!(lines[2], "└ Running read");
-    assert_eq!(lines[3], "Error: broken");
-    assert_eq!(lines[4], "");
-    assert_eq!(lines[5], "› second");
+    assert_eq!(lines[2], "• Running read");
+    assert_eq!(lines[3], "  └ hidden");
+    assert_eq!(lines[4], "× Error · broken");
+    assert_eq!(lines[5], "");
+    assert_eq!(lines[6], "› second");
 }
 
 #[test]
@@ -429,15 +443,51 @@ fn transcript_tool_summaries_follow_lifecycle_without_truncating_expanded_output
     let compact = plain(transcript_lines(&entries, 20, TranscriptDetail::Compact));
     let expanded = plain(transcript_lines(&entries, 20, TranscriptDetail::Expanded));
 
-    assert!(compact.contains("└ Ran bash"));
-    assert!(compact.contains("└ write failed"));
-    assert!(!compact.contains("permission denied"));
-    assert!(expanded.contains("abcdefghijklmnopqr"));
-    assert!(expanded.contains("stuvwxyz0123456789"));
-    assert!(expanded.contains("ABCDEFGHIJ"));
+    assert!(compact.contains("• Ran bash"));
+    assert!(compact.contains("× write failed"));
+    assert!(compact.contains("  │ abcdefghijklmnop"));
+    assert!(compact.contains("  └ line two"));
+    assert!(compact.contains("  │ permission"));
+    assert!(compact.contains("  └ denied"));
+    assert!(expanded.contains("  │ abcdefghijklmnop"));
+    assert!(expanded.contains("  │ qrstuvwxyz012345"));
+    assert!(expanded.contains("  │ 6789ABCDEFGHIJ"));
     assert!(expanded.contains("line two"));
-    assert!(expanded.contains("permission denied"));
+    assert!(expanded.contains("  │ permission"));
+    assert!(expanded.contains("  └ denied"));
     assert!(!expanded.contains('…'));
+}
+
+#[test]
+fn tool_output_drops_terminal_trailing_line_breaks() {
+    let entries = vec![TranscriptEntry::ToolCall(ToolTranscript {
+        call_id: None,
+        name: "bash".into(),
+        output: "line one\nline two\n".into(),
+        lifecycle: ToolLifecycle::Completed,
+    })];
+
+    let text = plain(transcript_lines(&entries, 80, TranscriptDetail::Compact));
+
+    assert!(text.contains("  │ line one"));
+    assert!(text.contains("  └ line two"));
+    assert!(!text.lines().any(|line| line == "  └ "));
+}
+
+#[test]
+fn tool_output_wraps_prose_at_word_boundaries() {
+    let entries = vec![TranscriptEntry::ToolCall(ToolTranscript {
+        call_id: None,
+        name: "read".into(),
+        output: "bounded context keeps terminal output readable".into(),
+        lifecycle: ToolLifecycle::Completed,
+    })];
+
+    let text = plain(transcript_lines(&entries, 24, TranscriptDetail::Compact));
+
+    assert!(text.contains("  │ bounded context"), "{text}");
+    assert!(text.contains("  │ keeps terminal"), "{text}");
+    assert!(!text.contains("bounded context kee"), "{text}");
 }
 
 #[test]
@@ -509,7 +559,7 @@ fn expanded_transcript_view_renders_committed_canonical_history() {
 
     let compact = buffer_text(&rendered(&state, 80, 20));
     assert!(!compact.contains("committed question"));
-    assert!(!compact.contains("complete output"));
+    assert!(compact.contains("complete output"));
 
     state.toggle_transcript_view();
     let expanded = buffer_text(&rendered(&state, 80, 20));
@@ -527,7 +577,7 @@ fn runtime_errors_render_in_the_transcript_instead_of_the_status_line() {
     let buffer = rendered(&state, 100, 20);
     let text = buffer_text(&buffer);
 
-    assert!(text.contains("Error: protocol error: malformed bridge output"));
+    assert!(text.contains("× Error · protocol error: malformed bridge output"));
     assert!(text.lines().any(|line| line.contains("work/model")));
     assert!(!text.contains("ready"));
     assert_eq!(cell_at_text(&buffer, "Error").fg, Color::Rgb(255, 92, 82));
@@ -582,6 +632,36 @@ fn assistant_markdown_renders_inline_styles_and_links() {
     let link = cell_at_text(&buffer, "docs");
     assert_eq!(link.fg, Color::Rgb(116, 177, 255));
     assert!(link.modifier.contains(Modifier::UNDERLINED));
+}
+
+#[test]
+fn wide_markdown_lists_keep_inline_code_and_punctuation_together() {
+    let lines = transcript_lines(
+        &[TranscriptEntry::AssistantMessage {
+            body: concat!(
+                "- Path `/Users/sarthak/src/harness-eng/coding-agent-with-subagents`, ",
+                "git repo, branch `main`, clean tree.\n",
+                "1. Re-enable `read`/`bash` for this session and inspect the repository."
+            )
+            .into(),
+        }],
+        120,
+        TranscriptDetail::Compact,
+    );
+    let text = plain(lines);
+
+    assert!(
+        text.lines().any(|line| {
+            line == "• Path /Users/sarthak/src/harness-eng/coding-agent-with-subagents, git repo, branch main, clean tree."
+        }),
+        "{text}"
+    );
+    assert!(
+        text.lines().any(|line| {
+            line == "1. Re-enable read/bash for this session and inspect the repository."
+        }),
+        "{text}"
+    );
 }
 
 #[test]
@@ -800,8 +880,9 @@ fn tool_output_wraps_on_unicode_grapheme_clusters() {
     let text = buffer_text(&rendered(&state, 10, 16));
     let rows = text.lines().map(str::trim_end).collect::<Vec<_>>();
 
-    assert!(rows.contains(&"    AB👨‍👩‍👧‍👦"), "{rows:#?}");
-    assert!(rows.contains(&"    CD"), "{rows:#?}");
+    assert!(rows.contains(&"    │ AB"), "{rows:#?}");
+    assert!(rows.contains(&"    │ 👨‍👩‍👧‍👦"), "{rows:#?}");
+    assert!(rows.contains(&"    └ CD"), "{rows:#?}");
 }
 
 #[test]
@@ -871,8 +952,8 @@ fn tool_output_preserves_every_wrapped_line() {
 
     let text = buffer_text(&rendered(&state, 40, 30));
 
-    assert!(text.contains("  abcdefghijklmnopqrstuvwxyz01234567"));
-    assert!(text.contains("  89ABCDEFGHIJ"));
+    assert!(text.contains("    │ abcdefghijklmnopqrstuvwxyz012345"));
+    assert!(text.contains("    │ 6789ABCDEFGHIJ"));
     assert!(text.contains("head-two"));
     assert!(text.contains("middle-four"));
     assert!(text.contains("middle-five"));

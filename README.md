@@ -35,7 +35,7 @@ Common launches:
 ```bash
 kurama
 kurama --profile work
-kurama --resume s_1234
+kurama resume s_1234
 kurama --continue
 kurama --yolo
 ```
@@ -58,6 +58,7 @@ YOLO is unrestricted. It remains logged, but redaction is best-effort and the mo
 - `/model` selects a model; `/connect` manages provider connections.
 - `/sessions`, `/resume <id>`, and `/new` manage sessions.
 - `/context` explains active context; `/compact` forces compaction.
+- `/exit` closes the TUI and prints token usage, the session ID, and the resume command.
 
 Startup also supports `--resume <id>` and `--continue`. There is no ambiguous `/restart` command.
 

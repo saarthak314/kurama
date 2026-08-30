@@ -11,6 +11,7 @@ pub enum Command {
     Context,
     Compact,
     Mode(ExecutionMode),
+    Exit,
 }
 
 pub fn parse_command(input: &str) -> Result<Command, String> {
@@ -30,6 +31,7 @@ pub fn parse_command(input: &str) -> Result<Command, String> {
         ("/compact", []) => Ok(Command::Compact),
         ("/mode", ["supervised"]) => Ok(Command::Mode(ExecutionMode::Supervised)),
         ("/mode", ["auto"]) => Ok(Command::Mode(ExecutionMode::Auto)),
+        ("/exit", []) => Ok(Command::Exit),
         ("/mode", ["yolo"]) => Err("YOLO is launch-only; restart with --yolo".into()),
         ("/restart", _) => Err("/restart is intentionally unsupported; use /new or /resume".into()),
         _ => Err(format!("unknown or invalid command: {input}")),

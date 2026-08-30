@@ -217,6 +217,27 @@ fn approval_overlay_supports_approve_deny_and_edited_arguments() {
 }
 
 #[test]
+fn approval_submission_does_not_add_transcript_noise() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.begin_approval(ApprovalRequest {
+        operation_id: OperationId::from("o_1"),
+        operation: Operation::Bash {
+            command: "pwd".into(),
+            cwd: ".".into(),
+            class: kurama_protocol::tool::CommandClass::ReadOnly,
+            timeout_ms: 30_000,
+        },
+        summary: "Run pwd".into(),
+        arguments: serde_json::json!({"command":"pwd"}),
+    });
+
+    state.resolve_approval(ApprovalResponse::ApproveOnce);
+
+    assert!(state.transcript.is_empty());
+    assert!(matches!(state.activity(), ActivityState::Thinking { .. }));
+}
+
+#[test]
 fn runtime_approval_hydrates_editor_from_request_arguments() {
     let arguments = serde_json::json!({"path":"safe.txt","content":"safe"});
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
@@ -520,6 +541,20 @@ fn committed_transcript_marker_never_moves_backwards() {
     state.mark_transcript_committed(1);
 
     assert!(state.live_transcript().is_empty());
+}
+
+#[test]
+fn resize_reflow_can_replay_the_committed_transcript_from_source() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_user("retained prompt");
+    state.mark_transcript_committed(1);
+    assert!(state.stable_transcript().is_empty());
+    assert!(state.live_transcript().is_empty());
+
+    state.reset_transcript_commit();
+
+    assert_eq!(state.stable_transcript().len(), 1);
+    assert_eq!(state.live_transcript().len(), 1);
 }
 
 #[test]

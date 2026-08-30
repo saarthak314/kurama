@@ -7,8 +7,7 @@ use ratatui::{
 
 use super::{ActivityState, transcript::truncate_display};
 
-const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const INTERRUPT_HINT: &str = "Esc to interrupt";
+const INTERRUPT_HINT: &str = "esc to interrupt";
 
 pub fn activity_line(
     activity: &ActivityState,
@@ -32,67 +31,36 @@ pub fn activity_line(
         }
     };
 
-    let elapsed = now.saturating_duration_since(started_at);
-    let spinner =
-        SPINNER_FRAMES[(elapsed.as_millis() / 32 % SPINNER_FRAMES.len() as u128) as usize];
-    let elapsed = compact_elapsed(elapsed.as_secs());
-    let suffix = format!(" · {elapsed}");
-    let prefix = format!("{spinner} {verb}");
-    let full_action = detail.map_or_else(|| prefix.clone(), |detail| format!("{prefix} {detail}"));
-    let full_action_width = Line::from(full_action.as_str()).width();
-    let elapsed_width = Line::from(suffix.as_str()).width();
-    let hint = format!("  {INTERRUPT_HINT}");
-    let hint_width = Line::from(hint.as_str()).width();
-
-    if full_action_width.saturating_add(elapsed_width) <= width {
-        let mut spans = action_spans(spinner, full_action);
-        spans.push(Span::styled(
-            suffix,
-            Style::default().add_modifier(Modifier::DIM),
-        ));
-        if full_action_width
-            .saturating_add(elapsed_width)
-            .saturating_add(hint_width)
-            <= width
-        {
-            spans.push(Span::styled(
-                hint,
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-        }
-        return Some(Line::from(spans));
+    let elapsed = compact_elapsed(now.saturating_duration_since(started_at).as_secs());
+    let action = detail.map_or_else(|| verb.to_owned(), |detail| format!("{verb} {detail}"));
+    let full_suffix = format!(" ({elapsed} • {INTERRUPT_HINT})");
+    if display_width(&action).saturating_add(display_width(&full_suffix)) + 2 <= width {
+        return Some(styled_activity(action, full_suffix));
     }
 
-    if full_action_width <= width {
-        return Some(Line::from(action_spans(spinner, full_action)));
+    let elapsed_suffix = format!(" ({elapsed})");
+    if display_width(&action).saturating_add(display_width(&elapsed_suffix)) + 2 <= width {
+        return Some(styled_activity(action, elapsed_suffix));
     }
 
-    let action = if let Some(detail) = detail {
-        let available = width.saturating_sub(Line::from(format!("{prefix} ")).width());
-        let detail = truncate_display(detail, available);
-        if detail.is_empty() {
-            prefix
-        } else {
-            format!("{prefix} {detail}")
-        }
-    } else {
-        prefix
-    };
-    if Line::from(action.as_str()).width() > width {
-        return Some(Line::from(Span::styled(
-            truncate_display(&action, width),
-            Style::default().fg(Color::Cyan),
-        )));
-    }
-
-    Some(Line::from(action_spans(spinner, action)))
+    let available = width.saturating_sub(2);
+    let action = truncate_display(&action, available);
+    Some(Line::from(vec![
+        Span::styled("• ", Style::default().fg(Color::Cyan)),
+        Span::raw(action),
+    ]))
 }
 
-fn action_spans(spinner: &str, action: String) -> Vec<Span<'static>> {
-    vec![
-        Span::styled(format!("{spinner} "), Style::default().fg(Color::Cyan)),
-        Span::raw(action.trim_start_matches(spinner).trim_start().to_owned()),
-    ]
+fn styled_activity(action: String, suffix: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("• ", Style::default().fg(Color::Cyan)),
+        Span::raw(action),
+        Span::styled(suffix, Style::default().add_modifier(Modifier::DIM)),
+    ])
+}
+
+fn display_width(value: &str) -> usize {
+    Line::from(value).width()
 }
 
 fn compact_elapsed(seconds: u64) -> String {
