@@ -11,7 +11,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use kurama_protocol::{agent::AgentState, policy::ExecutionMode, tool::Operation};
 
-use super::{Overlay, TranscriptKind, TuiState};
+use super::{Overlay, TranscriptEntry, TuiState};
 
 const BORDER: Color = Color::Rgb(48, 53, 64);
 const DIM: Color = Color::Rgb(126, 132, 146);
@@ -1741,29 +1741,26 @@ fn inline_code_style() -> Style {
     text_style().add_modifier(Modifier::BOLD)
 }
 
-pub(crate) fn transcript_lines(
-    entries: &[super::TranscriptEntry],
-    width: usize,
-) -> Vec<Line<'static>> {
+pub(crate) fn transcript_lines(entries: &[TranscriptEntry], width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for entry in entries {
-        match entry.kind {
-            TranscriptKind::User => push_prefixed_lines(
+        match entry {
+            TranscriptEntry::UserTurn { body } => push_prefixed_lines(
                 &mut lines,
-                &entry.body,
+                body,
                 "› ",
                 "  ",
                 Style::default().fg(RED).add_modifier(Modifier::BOLD),
                 Style::default().fg(TEXT),
                 width,
             ),
-            TranscriptKind::Assistant => {
-                lines.extend(markdown_lines(&entry.body, width));
+            TranscriptEntry::AssistantMessage { body } => {
+                lines.extend(markdown_lines(body, width));
             }
-            TranscriptKind::Tool => {
+            TranscriptEntry::ToolCall(tool) => {
                 push_prefixed_lines(
                     &mut lines,
-                    &format!("Ran {}", tool_name(&entry.label)),
+                    &format!("Ran {}", tool.name),
                     "• ",
                     "  ",
                     Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
@@ -1771,7 +1768,10 @@ pub(crate) fn transcript_lines(
                     width,
                 );
                 let output_width = width.saturating_sub(4).max(1);
-                for (index, line) in hard_wrap(&entry.body, output_width).into_iter().enumerate() {
+                for (index, line) in hard_wrap(&tool.output, output_width)
+                    .into_iter()
+                    .enumerate()
+                {
                     lines.push(Line::from(vec![
                         Span::styled(
                             if index == 0 { "  └ " } else { "    " },
@@ -1781,24 +1781,38 @@ pub(crate) fn transcript_lines(
                     ]));
                 }
             }
-            TranscriptKind::System if entry.label == "ERROR" => push_prefixed_lines(
+            TranscriptEntry::Error { body } => push_prefixed_lines(
                 &mut lines,
-                &format!("{} · {}", entry.label, entry.body),
+                &format!("ERROR · {body}"),
                 "× ",
                 "  ",
                 Style::default().fg(RED).add_modifier(Modifier::BOLD),
                 Style::default().fg(RED),
                 width,
             ),
-            TranscriptKind::System => push_prefixed_lines(
-                &mut lines,
-                &format!("{} · {}", entry.label, entry.body),
-                "• ",
-                "  ",
-                Style::default().fg(DIM),
-                Style::default().fg(DIM),
-                width,
-            ),
+            TranscriptEntry::Notice { label, body } => {
+                if let Some(label) = label {
+                    push_prefixed_lines(
+                        &mut lines,
+                        &format!("{label} · {body}"),
+                        "• ",
+                        "  ",
+                        Style::default().fg(DIM),
+                        Style::default().fg(DIM),
+                        width,
+                    );
+                } else {
+                    push_prefixed_lines(
+                        &mut lines,
+                        body,
+                        "• ",
+                        "  ",
+                        Style::default().fg(DIM),
+                        Style::default().fg(DIM),
+                        width,
+                    );
+                }
+            }
         }
         lines.push(Line::from(""));
     }
@@ -1917,17 +1931,6 @@ fn editor_preview(editor: &str, width: usize, max_lines: usize) -> Vec<String> {
             .take(max_lines.saturating_sub(1)),
     );
     visible
-}
-
-fn tool_name(label: &str) -> String {
-    let mut parts = label.split('/').map(str::trim);
-    let first = parts.next().unwrap_or("tool");
-    let name = if first.eq_ignore_ascii_case("tool") {
-        parts.next().unwrap_or(first)
-    } else {
-        first
-    };
-    name.to_ascii_lowercase()
 }
 
 fn approval_height(state: &TuiState, terminal_width: u16) -> u16 {

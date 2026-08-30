@@ -1349,6 +1349,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::tui::TranscriptEntry;
 
     #[test]
     fn queued_tool_delta_is_applied_before_completion() {
@@ -1378,7 +1379,10 @@ mod tests {
         }
 
         assert_eq!(state.transcript.len(), 1);
-        assert_eq!(state.transcript[0].body, "final output");
+        assert!(matches!(
+            &state.transcript[0],
+            TranscriptEntry::ToolCall(tool) if tool.output == "final output"
+        ));
     }
 
     #[test]
@@ -1403,9 +1407,11 @@ mod tests {
 
         assert!(tool_receiver.try_recv().is_err());
         assert_eq!(state.transcript.len(), 2);
-        assert_eq!(state.transcript[0].kind, crate::tui::TranscriptKind::Tool);
-        assert_eq!(state.transcript[0].body, "partial output");
-        assert_eq!(state.transcript[1].label, "ERROR");
+        assert!(matches!(
+            &state.transcript[..],
+            [TranscriptEntry::ToolCall(tool), TranscriptEntry::Error { body }]
+                if tool.output == "partial output" && body == "cancelled"
+        ));
         assert_eq!(state.stable_transcript_end(), 2);
     }
 

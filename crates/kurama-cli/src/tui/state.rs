@@ -575,7 +575,7 @@ impl TuiState {
             }
             RuntimeEvent::Shutdown => {
                 self.status = "shutdown".into();
-                self.activity = ActivityState::Interrupted;
+                self.activity = ActivityState::Idle;
             }
         }
         if completes_active_streams {

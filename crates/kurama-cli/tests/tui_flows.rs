@@ -75,7 +75,7 @@ fn runtime_events_drive_typed_activity_without_duplicate_errors() {
 }
 
 #[test]
-fn runtime_status_and_shutdown_use_explicit_activity_states() {
+fn runtime_status_and_shutdown_return_to_idle() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
 
     state.apply_runtime_event(RuntimeEvent::Status {
@@ -87,7 +87,7 @@ fn runtime_status_and_shutdown_use_explicit_activity_states() {
     ));
 
     state.apply_runtime_event(RuntimeEvent::Shutdown);
-    assert_eq!(state.activity(), &ActivityState::Interrupted);
+    assert_eq!(state.activity(), &ActivityState::Idle);
 }
 
 #[test]
@@ -248,6 +248,7 @@ fn invalid_approval_json_stays_open_and_reports_the_error() {
 
     assert!(error.contains("invalid approval arguments"));
     assert_eq!(state.overlay(), Overlay::ApprovalEdit);
+    assert_eq!(state.activity(), &ActivityState::AwaitingApproval);
     assert!(state.approval.is_some());
     assert!(state.status.contains("invalid approval arguments"));
     assert!(state.sent_commands().is_empty());
