@@ -11,7 +11,7 @@ use kurama_protocol::{
 use serde_json::Value;
 
 use super::{
-    BridgeCommand,
+    BridgeCommand, BridgeDecoder,
     control::{bridge_prompt, parse_control, write_control_schema},
 };
 
@@ -157,13 +157,13 @@ impl ModelBackend for CodexBridge {
                 &self.bridge_dir,
                 &self.schema_path,
             );
-            let lines = command.run(cancel, &self.secrets).await?;
-            let events = parse_lines(
-                lines.iter().map(String::as_str),
-                request.delegation.is_some(),
+            super::event_stream(
+                command,
+                CodexDecoder::new(request.delegation.is_some()),
+                cancel,
+                self.secrets.clone(),
             )
-            .map_err(|error| super::control::bounded_kurama_error(error, &self.secrets))?;
-            Ok(super::event_stream(events.into_iter().map(Ok).collect()))
+            .await
         })
     }
 }
@@ -172,11 +172,36 @@ fn parse_lines<'a>(
     lines: impl IntoIterator<Item = &'a str>,
     delegation_enabled: bool,
 ) -> Result<Vec<ModelEvent>, KuramaError> {
+    let mut decoder = CodexDecoder::new(delegation_enabled);
     let mut events = Vec::new();
-    let mut thread_id = None;
-    let mut control = None;
-    let mut completed = false;
     for line in lines {
+        events.extend(decoder.push_line(line)?);
+    }
+    decoder.finish()?;
+    Ok(events)
+}
+
+struct CodexDecoder {
+    delegation_enabled: bool,
+    thread_id: Option<String>,
+    control: Option<String>,
+    completed: bool,
+}
+
+impl CodexDecoder {
+    fn new(delegation_enabled: bool) -> Self {
+        Self {
+            delegation_enabled,
+            thread_id: None,
+            control: None,
+            completed: false,
+        }
+    }
+}
+
+impl BridgeDecoder for CodexDecoder {
+    fn push_line(&mut self, line: &str) -> Result<Vec<ModelEvent>, KuramaError> {
+        let mut events = Vec::new();
         let value: Value = serde_json::from_str(line)
             .map_err(|error| KuramaError::Protocol(format!("invalid Codex JSONL: {error}")))?;
         match value
@@ -191,14 +216,14 @@ fn parse_lines<'a>(
                     .ok_or_else(|| {
                         KuramaError::Protocol("Codex thread.started omitted thread_id".into())
                     })?;
-                thread_id = Some(id.to_owned());
+                self.thread_id = Some(id.to_owned());
                 events.push(ModelEvent::ResponseStarted {
                     provider_id: id.to_owned(),
                 });
             }
             "item.completed" => match value.pointer("/item/type").and_then(Value::as_str) {
                 Some("agent_message") => {
-                    control = value
+                    self.control = value
                         .pointer("/item/text")
                         .and_then(Value::as_str)
                         .map(str::to_owned);
@@ -232,10 +257,10 @@ fn parse_lines<'a>(
                         },
                     });
                 }
-                let control = control.take().ok_or_else(|| {
+                let control = self.control.take().ok_or_else(|| {
                     KuramaError::Protocol("Codex completed without a control object".into())
                 })?;
-                let normalized = parse_control(&control, delegation_enabled)?;
+                let normalized = parse_control(&control, self.delegation_enabled)?;
                 let tool_calls = normalized.iter().any(|event| {
                     matches!(
                         event,
@@ -244,7 +269,7 @@ fn parse_lines<'a>(
                 });
                 events.extend(normalized);
                 events.push(ModelEvent::ResponseCompleted {
-                    cursor: thread_id.clone().map(|value| BackendCursor {
+                    cursor: self.thread_id.clone().map(|value| BackendCursor {
                         backend: BACKEND.into(),
                         value,
                     }),
@@ -254,7 +279,7 @@ fn parse_lines<'a>(
                         FinishReason::Stop
                     },
                 });
-                completed = true;
+                self.completed = true;
             }
             "turn.failed" | "error" => {
                 let message = value
@@ -266,11 +291,16 @@ fn parse_lines<'a>(
             }
             _ => {}
         }
+        Ok(events)
     }
-    if !completed {
-        return Err(KuramaError::Protocol(
-            "Codex JSONL ended before turn.completed".into(),
-        ));
+
+    fn finish(&self) -> Result<(), KuramaError> {
+        if self.completed {
+            Ok(())
+        } else {
+            Err(KuramaError::Protocol(
+                "Codex JSONL ended before turn.completed".into(),
+            ))
+        }
     }
-    Ok(events)
 }

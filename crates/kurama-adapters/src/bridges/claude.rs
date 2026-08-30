@@ -8,7 +8,7 @@ use kurama_protocol::{
 use serde_json::{Value, json};
 
 use super::{
-    BridgeCommand,
+    BridgeCommand, BridgeDecoder, MAX_JSONL_LINE_BYTES,
     control::{bridge_context_prompt, bridge_system_prompt, control_schema, parse_control},
 };
 
@@ -128,13 +128,13 @@ impl ModelBackend for ClaudeBridge {
                 request.continuation.as_ref(),
                 &self.schema_path,
             );
-            let lines = command.run(cancel, &self.secrets).await?;
-            let events = parse_lines(
-                lines.iter().map(String::as_str),
-                request.delegation.is_some(),
+            super::event_stream(
+                command,
+                ClaudeDecoder::new(request.delegation.is_some()),
+                cancel,
+                self.secrets.clone(),
             )
-            .map_err(|error| super::control::bounded_kurama_error(error, &self.secrets))?;
-            Ok(super::event_stream(events.into_iter().map(Ok).collect()))
+            .await
         })
     }
 }
@@ -143,13 +143,40 @@ fn parse_lines<'a>(
     lines: impl IntoIterator<Item = &'a str>,
     delegation_enabled: bool,
 ) -> Result<Vec<ModelEvent>, KuramaError> {
+    let mut decoder = ClaudeDecoder::new(delegation_enabled);
     let mut events = Vec::new();
-    let mut session_id = None;
-    let mut control = None;
-    let mut protocol_calls = Vec::new();
-    let mut partial = String::new();
-    let mut completed = false;
     for line in lines {
+        events.extend(decoder.push_line(line)?);
+    }
+    decoder.finish()?;
+    Ok(events)
+}
+
+struct ClaudeDecoder {
+    delegation_enabled: bool,
+    session_id: Option<String>,
+    control: Option<String>,
+    protocol_calls: Vec<ModelEvent>,
+    partial: String,
+    completed: bool,
+}
+
+impl ClaudeDecoder {
+    fn new(delegation_enabled: bool) -> Self {
+        Self {
+            delegation_enabled,
+            session_id: None,
+            control: None,
+            protocol_calls: Vec::new(),
+            partial: String::new(),
+            completed: false,
+        }
+    }
+}
+
+impl BridgeDecoder for ClaudeDecoder {
+    fn push_line(&mut self, line: &str) -> Result<Vec<ModelEvent>, KuramaError> {
+        let mut events = Vec::new();
         let value: Value = serde_json::from_str(line)
             .map_err(|error| KuramaError::Protocol(format!("invalid Claude JSONL: {error}")))?;
         match value
@@ -159,7 +186,7 @@ fn parse_lines<'a>(
         {
             "system" if value.get("subtype").and_then(Value::as_str) == Some("init") => {
                 if let Some(id) = value.get("session_id").and_then(Value::as_str) {
-                    session_id = Some(id.to_owned());
+                    self.session_id = Some(id.to_owned());
                     events.push(ModelEvent::ResponseStarted {
                         provider_id: id.to_owned(),
                     });
@@ -172,7 +199,12 @@ fn parse_lines<'a>(
                         == Some("text_delta")
                     && let Some(text) = value.pointer("/event/delta/text").and_then(Value::as_str)
                 {
-                    partial.push_str(text);
+                    if self.partial.len().saturating_add(text.len()) > MAX_JSONL_LINE_BYTES {
+                        return Err(KuramaError::Protocol(
+                            "Claude streamed an oversized control response".into(),
+                        ));
+                    }
+                    self.partial.push_str(text);
                 }
             }
             "assistant" => {
@@ -183,7 +215,7 @@ fn parse_lines<'a>(
                         .filter_map(|block| block.get("text").and_then(Value::as_str))
                         .collect::<String>();
                     if !text.is_empty() {
-                        control = Some(text);
+                        self.control = Some(text);
                     }
                     for block in content {
                         let Some(name) = block.get("name").and_then(Value::as_str) else {
@@ -217,7 +249,13 @@ fn parse_lines<'a>(
                             "agents": []
                         })
                         .to_string();
-                        protocol_calls.extend(parse_control(&encoded, delegation_enabled)?);
+                        if self.protocol_calls.len() >= 8 {
+                            return Err(KuramaError::Protocol(
+                                "Claude emitted too many protocol tool calls".into(),
+                            ));
+                        }
+                        self.protocol_calls
+                            .extend(parse_control(&encoded, self.delegation_enabled)?);
                     }
                 }
             }
@@ -252,7 +290,7 @@ fn parse_lines<'a>(
                     });
                 }
                 if let Some(id) = value.get("session_id").and_then(Value::as_str) {
-                    session_id = Some(id.to_owned());
+                    self.session_id = Some(id.to_owned());
                 }
                 let control_value = value
                     .get("structured_output")
@@ -263,13 +301,13 @@ fn parse_lines<'a>(
                             .and_then(Value::as_str)
                             .map(str::to_owned)
                     })
-                    .or_else(|| control.take())
+                    .or_else(|| self.control.take())
                     .filter(|text| !text.is_empty())
-                    .unwrap_or(partial.clone());
-                let normalized = if protocol_calls.is_empty() {
-                    parse_control(&control_value, delegation_enabled)?
+                    .unwrap_or_else(|| self.partial.clone());
+                let normalized = if self.protocol_calls.is_empty() {
+                    parse_control(&control_value, self.delegation_enabled)?
                 } else {
-                    std::mem::take(&mut protocol_calls)
+                    std::mem::take(&mut self.protocol_calls)
                 };
                 let tool_calls = normalized.iter().any(|event| {
                     matches!(
@@ -279,7 +317,7 @@ fn parse_lines<'a>(
                 });
                 events.extend(normalized);
                 events.push(ModelEvent::ResponseCompleted {
-                    cursor: session_id.clone().map(|value| BackendCursor {
+                    cursor: self.session_id.clone().map(|value| BackendCursor {
                         backend: BACKEND.into(),
                         value,
                     }),
@@ -289,7 +327,7 @@ fn parse_lines<'a>(
                         FinishReason::Stop
                     },
                 });
-                completed = true;
+                self.completed = true;
             }
             "error" => {
                 let message = value
@@ -301,11 +339,16 @@ fn parse_lines<'a>(
             }
             _ => {}
         }
+        Ok(events)
     }
-    if !completed {
-        return Err(KuramaError::Protocol(
-            "Claude JSONL ended before result".into(),
-        ));
+
+    fn finish(&self) -> Result<(), KuramaError> {
+        if self.completed {
+            Ok(())
+        } else {
+            Err(KuramaError::Protocol(
+                "Claude JSONL ended before result".into(),
+            ))
+        }
     }
-    Ok(events)
 }

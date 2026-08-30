@@ -245,9 +245,9 @@ fn claude_single_result_json_normalizes_tool_calls() {
     assert!(events.iter().any(|event| matches!(
         event,
         ModelEvent::ResponseCompleted {
+            cursor: Some(BackendCursor { backend, value }),
             finish_reason: kurama_protocol::model::FinishReason::ToolCalls,
-            ..
-        }
+        } if backend == "claude_cli" && value == "session-1"
     )));
 }
 
@@ -425,8 +425,157 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":4,"output_tokens
     );
     assert!(matches!(
         events.last(),
-        Some(ModelEvent::ResponseCompleted { .. })
+        Some(ModelEvent::ResponseCompleted {
+            cursor: Some(BackendCursor { backend, value }),
+            ..
+        }) if backend == "codex_cli" && value == "thread-live"
     ));
+}
+
+#[tokio::test]
+async fn codex_stream_yields_before_process_exit() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let executable = temporary.path().join("codex");
+    let completed = temporary.path().join("completed");
+    write_executable(
+        &executable,
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' '{{"type":"thread.started","thread_id":"thread-live"}}'
+sleep 1
+: > '{}'
+printf '%s\n' '{{"type":"item.completed","item":{{"type":"agent_message","text":"{{\"kind\":\"final\",\"text\":\"done\"}}"}}}}'
+printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":4,"output_tokens":2,"cached_input_tokens":1}}}}'
+"#,
+            completed.display()
+        ),
+    );
+    let bridge = CodexBridge::new(
+        temporary.path().join("work"),
+        temporary.path().join("control.json"),
+    )
+    .with_program(executable.display().to_string());
+
+    let mut stream = bridge
+        .stream(request(), &NeverCancel)
+        .await
+        .expect("bridge stream");
+    let first = tokio::time::timeout(std::time::Duration::from_millis(500), stream.next())
+        .await
+        .expect("first event before process exit")
+        .expect("first event")
+        .expect("valid event");
+
+    assert!(matches!(first, ModelEvent::ResponseStarted { .. }));
+    assert!(
+        !completed.exists(),
+        "process exited before the event was yielded"
+    );
+}
+
+#[tokio::test]
+async fn claude_stream_yields_before_process_exit() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let executable = temporary.path().join("claude");
+    let completed = temporary.path().join("completed");
+    write_executable(
+        &executable,
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' '{{"type":"system","subtype":"init","session_id":"session-live"}}'
+sleep 1
+: > '{}'
+printf '%s\n' '{{"type":"result","subtype":"success","session_id":"session-live","structured_output":{{"kind":"final","text":"done","calls":[],"agents":[]}},"usage":{{"input_tokens":4,"output_tokens":2,"cache_read_input_tokens":1}}}}'
+"#,
+            completed.display()
+        ),
+    );
+    let bridge = ClaudeBridge::new(temporary.path().join("control.json"))
+        .with_program(executable.display().to_string());
+
+    let mut stream = bridge
+        .stream(request(), &NeverCancel)
+        .await
+        .expect("bridge stream");
+    let first = tokio::time::timeout(std::time::Duration::from_millis(500), stream.next())
+        .await
+        .expect("first event before process exit")
+        .expect("first event")
+        .expect("valid event");
+
+    assert!(matches!(first, ModelEvent::ResponseStarted { .. }));
+    assert!(
+        !completed.exists(),
+        "process exited before the event was yielded"
+    );
+}
+
+#[tokio::test]
+async fn bridge_rejects_oversized_unterminated_record_promptly() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let executable = temporary.path().join("codex");
+    write_executable(
+        &executable,
+        r#"#!/bin/sh
+dd if=/dev/zero bs=1048576 count=16 2>/dev/null
+sleep 10
+"#,
+    );
+    let bridge = CodexBridge::new(
+        temporary.path().join("work"),
+        temporary.path().join("control.json"),
+    )
+    .with_program(executable.display().to_string());
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        bridge.stream(request(), &NeverCancel),
+    )
+    .await
+    .expect("oversized record rejection timed out");
+
+    assert!(
+        matches!(result, Err(KuramaError::Protocol(message)) if message.contains("oversized JSONL record"))
+    );
+}
+
+#[tokio::test]
+async fn bridge_drains_stderr_after_diagnostic_cap() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let executable = temporary.path().join("codex");
+    write_executable(
+        &executable,
+        r#"#!/bin/sh
+set -e
+i=0
+while [ "$i" -lt 6000 ]; do
+  printf '%080d\n' "$i" >&2
+  i=$((i + 1))
+done
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-live"}'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"kind\":\"final\",\"text\":\"done\"}"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":4,"output_tokens":2,"cached_input_tokens":1}}'
+"#,
+    );
+    let bridge = CodexBridge::new(
+        temporary.path().join("work"),
+        temporary.path().join("control.json"),
+    )
+    .with_program(executable.display().to_string());
+
+    let mut stream = bridge
+        .stream(request(), &NeverCancel)
+        .await
+        .expect("bridge stream");
+    let mut completed = false;
+    while let Some(event) = stream.next().await {
+        completed |= matches!(
+            event.expect("valid event"),
+            ModelEvent::ResponseCompleted { .. }
+        );
+    }
+
+    assert!(completed);
 }
 
 #[tokio::test]
@@ -442,6 +591,60 @@ async fn bridge_cancellation_terminates_without_waiting_for_child() {
 
     assert!(matches!(result, Err(KuramaError::Cancelled)));
     assert!(started.elapsed().as_secs() < 2);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropping_bridge_stream_kills_term_resistant_process_group() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let executable = temporary.path().join("claude");
+    let pids = temporary.path().join("pids");
+    write_executable(
+        &executable,
+        &format!(
+            r#"#!/bin/sh
+trap '' TERM
+sh -c 'trap "" TERM; while :; do sleep 1; done' &
+descendant=$!
+printf '%s %s\n' "$$" "$descendant" > '{}'
+printf '%s\n' '{{"type":"system","subtype":"init","session_id":"session-live"}}'
+while :; do sleep 1; done
+"#,
+            pids.display()
+        ),
+    );
+    let bridge = ClaudeBridge::new(temporary.path().join("control.json"))
+        .with_program(executable.display().to_string());
+
+    let mut stream = bridge
+        .stream(request(), &NeverCancel)
+        .await
+        .expect("bridge stream");
+    let first = stream
+        .next()
+        .await
+        .expect("first event")
+        .expect("valid event");
+    assert!(matches!(first, ModelEvent::ResponseStarted { .. }));
+    drop(stream);
+
+    let contents = fs::read_to_string(&pids).expect("process IDs");
+    let mut process_ids = contents
+        .split_whitespace()
+        .map(|value| value.parse::<i32>().expect("numeric process ID"));
+    let leader = process_ids.next().expect("leader process ID");
+    let descendant = process_ids.next().expect("descendant process ID");
+    let descendant_gone = wait_for_process_exit(descendant).await;
+    if !descendant_gone {
+        unsafe {
+            libc::kill(-leader, libc::SIGKILL);
+        }
+    }
+
+    assert!(
+        descendant_gone,
+        "TERM-resistant descendant survived stream cancellation"
+    );
 }
 
 #[tokio::test]
@@ -523,4 +726,17 @@ impl CancelSignal for DelayedCancel {
     fn cancelled(&self) -> BoxFuture<'_, ()> {
         Box::pin(tokio::time::sleep(std::time::Duration::from_millis(50)))
     }
+}
+
+#[cfg(unix)]
+async fn wait_for_process_exit(process_id: i32) -> bool {
+    for _ in 0..50 {
+        if unsafe { libc::kill(process_id, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    false
 }
