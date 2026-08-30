@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Instant;
 
 use kurama_protocol::{
     agent::{AgentSnapshot, AgentState},
@@ -24,19 +25,56 @@ pub enum Overlay {
     ConfirmAgentCancel,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ActivityState {
+    #[default]
+    Idle,
+    Thinking {
+        started_at: Instant,
+    },
+    Working {
+        label: String,
+        started_at: Instant,
+    },
+    RunningTool {
+        name: String,
+        started_at: Instant,
+    },
+    AwaitingApproval,
+    Interrupted,
+}
+
+impl ActivityState {
+    pub const fn is_animated(&self) -> bool {
+        matches!(
+            self,
+            Self::Thinking { .. } | Self::Working { .. } | Self::RunningTool { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TranscriptKind {
-    User,
-    Assistant,
-    Tool,
-    System,
+pub enum ToolLifecycle {
+    Running,
+    Completed,
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TranscriptEntry {
-    pub kind: TranscriptKind,
-    pub label: String,
-    pub body: String,
+pub struct ToolTranscript {
+    pub call_id: Option<CallId>,
+    pub name: String,
+    pub output: String,
+    pub lifecycle: ToolLifecycle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptEntry {
+    UserTurn { body: String },
+    AssistantMessage { body: String },
+    ToolCall(ToolTranscript),
+    Error { body: String },
+    Notice { label: Option<String>, body: String },
 }
 
 pub struct TuiState {
@@ -57,6 +95,8 @@ pub struct TuiState {
     pub agents: Vec<AgentRow>,
     pub selected_agent: usize,
     pub agent_message: String,
+    activity: ActivityState,
+    transcript_view_expanded: bool,
     active_assistant_entry: Option<usize>,
     active_tool_entries: HashMap<CallId, usize>,
     active_tool_streams: HashMap<CallId, String>,
@@ -89,6 +129,8 @@ impl TuiState {
             agents: Vec::new(),
             selected_agent: 0,
             agent_message: String::new(),
+            activity: ActivityState::Idle,
+            transcript_view_expanded: false,
             active_assistant_entry: None,
             active_tool_entries: HashMap::new(),
             active_tool_streams: HashMap::new(),
@@ -122,40 +164,71 @@ impl TuiState {
         state
     }
 
+    pub const fn activity(&self) -> &ActivityState {
+        &self.activity
+    }
+
+    pub fn set_thinking(&mut self) {
+        self.activity = ActivityState::Thinking {
+            started_at: Instant::now(),
+        };
+    }
+
+    pub fn toggle_transcript_view(&mut self) {
+        self.transcript_view_expanded = !self.transcript_view_expanded;
+        self.scroll = 0;
+    }
+
+    pub const fn transcript_view_expanded(&self) -> bool {
+        self.transcript_view_expanded
+    }
+
     pub fn push_user(&mut self, body: impl Into<String>) {
         self.active_assistant_entry = None;
-        self.transcript.push(TranscriptEntry {
-            kind: TranscriptKind::User,
-            label: "YOU".into(),
-            body: body.into(),
-        });
+        self.push_transcript_entry(TranscriptEntry::UserTurn { body: body.into() });
     }
 
     pub fn push_assistant(&mut self, body: impl Into<String>) {
         self.active_assistant_entry = None;
-        self.transcript.push(TranscriptEntry {
-            kind: TranscriptKind::Assistant,
-            label: "KURAMA".into(),
-            body: body.into(),
-        });
+        self.push_transcript_entry(TranscriptEntry::AssistantMessage { body: body.into() });
     }
 
     pub fn push_tool(&mut self, label: impl Into<String>, body: impl Into<String>) {
         self.active_assistant_entry = None;
-        self.transcript.push(TranscriptEntry {
-            kind: TranscriptKind::Tool,
-            label: label.into(),
+        let label = label.into();
+        self.push_transcript_entry(TranscriptEntry::ToolCall(ToolTranscript {
+            call_id: None,
+            name: transcript_tool_name(&label).to_owned(),
+            output: body.into(),
+            lifecycle: ToolLifecycle::Completed,
+        }));
+    }
+
+    pub fn push_system(&mut self, label: impl Into<String>, body: impl Into<String>) {
+        let label = label.into();
+        if label == "ERROR" {
+            self.push_error(body);
+        } else {
+            self.push_notice(Some(label), body);
+        }
+    }
+
+    pub fn push_notice(&mut self, label: Option<String>, body: impl Into<String>) {
+        self.active_assistant_entry = None;
+        self.push_transcript_entry(TranscriptEntry::Notice {
+            label,
             body: body.into(),
         });
     }
 
-    pub fn push_system(&mut self, label: impl Into<String>, body: impl Into<String>) {
+    pub fn push_error(&mut self, body: impl Into<String>) {
         self.active_assistant_entry = None;
-        self.transcript.push(TranscriptEntry {
-            kind: TranscriptKind::System,
-            label: label.into(),
-            body: body.into(),
-        });
+        self.activity = ActivityState::Idle;
+        self.push_transcript_entry(TranscriptEntry::Error { body: body.into() });
+    }
+
+    fn push_transcript_entry(&mut self, entry: TranscriptEntry) {
+        self.transcript.push(entry);
     }
 
     pub fn stable_transcript_end(&self) -> usize {
@@ -183,6 +256,7 @@ impl TuiState {
     }
 
     pub fn hydrate_replay(&mut self, replay: &[EventEnvelope]) {
+        self.activity = ActivityState::Idle;
         self.active_assistant_entry = None;
         self.active_tool_entries.clear();
         self.active_tool_streams.clear();
@@ -194,17 +268,17 @@ impl TuiState {
                 SessionEvent::UserMessage { text } => self.push_user(text.clone()),
                 SessionEvent::AssistantMessage { text } => self.push_assistant(text.clone()),
                 SessionEvent::ToolCompleted { result, .. } => {
-                    self.push_tool(tool_label(result), tool_display_output(result).to_owned());
+                    self.push_transcript_entry(TranscriptEntry::ToolCall(tool_transcript(result)));
                 }
                 SessionEvent::ToolUnknown { reason, .. } => {
-                    self.push_system("TOOL", reason.clone());
+                    self.push_notice(Some("TOOL".into()), reason.clone());
                 }
                 SessionEvent::ModeSelected { mode } => {
-                    self.push_system("MODE", mode_label(*mode).to_owned());
+                    self.push_notice(Some("MODE".into()), mode_label(*mode).to_owned());
                 }
-                SessionEvent::TurnFailed { error } => self.push_system("ERROR", error.clone()),
-                SessionEvent::RecoveryRepair { removed_bytes } => self.push_system(
-                    "RECOVERY",
+                SessionEvent::TurnFailed { error } => self.push_error(error.clone()),
+                SessionEvent::RecoveryRepair { removed_bytes } => self.push_notice(
+                    Some("RECOVERY".into()),
                     format!("removed {removed_bytes} incomplete transcript bytes"),
                 ),
                 SessionEvent::AgentQueued { snapshot }
@@ -357,6 +431,7 @@ impl TuiState {
     pub fn begin_approval(&mut self, request: ApprovalRequest) {
         self.approval = Some(ApprovalState::new(request));
         self.overlay = Overlay::Approval;
+        self.activity = ActivityState::AwaitingApproval;
         self.status = "approval pending".into();
     }
 
@@ -371,6 +446,7 @@ impl TuiState {
         });
         self.overlay = Overlay::None;
         self.status = "approval submitted".into();
+        self.set_thinking();
     }
 
     pub fn begin_approval_edit(&mut self) {
@@ -441,12 +517,32 @@ impl TuiState {
             self.active_assistant_entry = None;
         }
         match event {
-            RuntimeEvent::Status { message } => self.status = message,
-            RuntimeEvent::AssistantDelta { text } => self.append_assistant_delta(text),
+            RuntimeEvent::Status { message } => {
+                self.status = message.clone();
+                self.activity = ActivityState::Working {
+                    label: message,
+                    started_at: Instant::now(),
+                };
+            }
+            RuntimeEvent::AssistantDelta { text } => {
+                if matches!(
+                    self.activity,
+                    ActivityState::Idle | ActivityState::Interrupted
+                ) {
+                    self.set_thinking();
+                }
+                self.append_assistant_delta(text);
+            }
             RuntimeEvent::ApprovalRequired { request } => {
                 self.begin_approval(request);
             }
-            RuntimeEvent::ToolStarted { name, .. } => self.status = format!("running {name}"),
+            RuntimeEvent::ToolStarted { name, .. } => {
+                self.status = format!("running {name}");
+                self.activity = ActivityState::RunningTool {
+                    name,
+                    started_at: Instant::now(),
+                };
+            }
             RuntimeEvent::ToolOutputDelta {
                 call_id,
                 chunk,
@@ -456,6 +552,7 @@ impl TuiState {
             }
             RuntimeEvent::ToolCompleted { result, .. } => {
                 self.complete_tool(result);
+                self.activity = ActivityState::Idle;
             }
             RuntimeEvent::AgentUpdated { snapshot } => self.upsert_agent(snapshot),
             RuntimeEvent::AgentInspection {
@@ -468,12 +565,18 @@ impl TuiState {
                     agent.transcript = transcript;
                 }
             }
-            RuntimeEvent::TurnCompleted => self.status = "ready".into(),
+            RuntimeEvent::TurnCompleted => {
+                self.status = "ready".into();
+                self.activity = ActivityState::Idle;
+            }
             RuntimeEvent::Error { message } => {
-                self.push_system("ERROR", message);
+                self.push_error(message);
                 self.status = "ready".into();
             }
-            RuntimeEvent::Shutdown => self.status = "shutdown".into(),
+            RuntimeEvent::Shutdown => {
+                self.status = "shutdown".into();
+                self.activity = ActivityState::Interrupted;
+            }
         }
         if completes_active_streams {
             self.active_tool_entries.clear();
@@ -482,11 +585,10 @@ impl TuiState {
     }
 
     fn append_assistant_delta(&mut self, text: String) {
-        if let Some(entry) = self
-            .active_assistant_entry
-            .and_then(|index| self.transcript.get_mut(index))
+        if let Some(index) = self.active_assistant_entry
+            && let Some(TranscriptEntry::AssistantMessage { body }) = self.transcript.get_mut(index)
         {
-            entry.body.push_str(&text);
+            body.push_str(&text);
             return;
         }
 
@@ -500,17 +602,32 @@ impl TuiState {
                 .active_tool_streams
                 .get(&call_id)
                 .is_some_and(|active| active != &stream);
-            if let Some(entry) = self.transcript.get_mut(index) {
+            if let Some(TranscriptEntry::ToolCall(tool)) = self.transcript.get_mut(index) {
                 if stream_changed {
-                    append_stream_boundary(&mut entry.body, &stream);
+                    append_stream_boundary(&mut tool.output, &stream);
                 }
-                entry.body.push_str(&chunk);
+                tool.output.push_str(&chunk);
             }
             self.active_tool_streams.insert(call_id, stream);
             return;
         }
 
-        self.push_tool(format!("BASH / {stream}"), chunk);
+        let name = match &self.activity {
+            ActivityState::RunningTool { name, .. } => name.clone(),
+            _ => stream.clone(),
+        };
+        if !matches!(self.activity, ActivityState::RunningTool { .. }) {
+            self.activity = ActivityState::RunningTool {
+                name: name.clone(),
+                started_at: Instant::now(),
+            };
+        }
+        self.push_transcript_entry(TranscriptEntry::ToolCall(ToolTranscript {
+            call_id: Some(call_id.clone()),
+            name,
+            output: chunk,
+            lifecycle: ToolLifecycle::Running,
+        }));
         if let Some(index) = self.transcript.len().checked_sub(1) {
             self.active_tool_entries.insert(call_id.clone(), index);
             self.active_tool_streams.insert(call_id, stream);
@@ -518,40 +635,43 @@ impl TuiState {
     }
 
     fn complete_tool(&mut self, result: ToolResult) {
-        let label = tool_label(&result);
         let persisted_display_output = result
             .metadata
             .get("display_output")
             .and_then(serde_json::Value::as_str);
         let display_output = tool_display_output(&result).to_owned();
+        let lifecycle = tool_lifecycle(&result);
+        let name = tool_name(&result).to_owned();
 
         self.active_tool_streams.remove(&result.call_id);
         if let Some(index) = self.active_tool_entries.remove(&result.call_id)
-            && let Some(active_entry) = self.transcript.get_mut(index)
+            && let Some(TranscriptEntry::ToolCall(tool)) = self.transcript.get_mut(index)
         {
-            active_entry.label = label;
+            tool.name = name;
+            tool.lifecycle = lifecycle;
             if result
                 .metadata
                 .get("execution_error")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
-                && !active_entry.body.is_empty()
+                && !tool.output.is_empty()
             {
-                append_error_boundary(&mut active_entry.body, &display_output);
+                append_error_boundary(&mut tool.output, &display_output);
             } else if !result.truncated
                 || persisted_display_output.is_some()
-                || active_entry.body.is_empty()
+                || tool.output.is_empty()
             {
-                active_entry.body = display_output;
+                tool.output = display_output;
             }
             return;
         }
 
-        self.transcript.push(TranscriptEntry {
-            kind: TranscriptKind::Tool,
-            label,
-            body: display_output,
-        });
+        self.push_transcript_entry(TranscriptEntry::ToolCall(ToolTranscript {
+            call_id: Some(result.call_id),
+            name,
+            output: display_output,
+            lifecycle,
+        }));
     }
 }
 
@@ -580,12 +700,39 @@ fn tool_display_output(result: &ToolResult) -> &str {
         .unwrap_or(&result.output)
 }
 
-fn tool_label(result: &ToolResult) -> String {
+fn tool_name(result: &ToolResult) -> &str {
     result
         .metadata
         .get("tool_name")
         .and_then(serde_json::Value::as_str)
-        .map_or_else(|| "TOOL".into(), |name| format!("TOOL / {name}"))
+        .unwrap_or("tool")
+}
+
+fn tool_lifecycle(result: &ToolResult) -> ToolLifecycle {
+    if result.is_error
+        || result
+            .metadata
+            .get("execution_error")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    {
+        ToolLifecycle::Failed
+    } else {
+        ToolLifecycle::Completed
+    }
+}
+
+fn tool_transcript(result: &ToolResult) -> ToolTranscript {
+    ToolTranscript {
+        call_id: Some(result.call_id.clone()),
+        name: tool_name(result).to_owned(),
+        output: tool_display_output(result).to_owned(),
+        lifecycle: tool_lifecycle(result),
+    }
+}
+
+fn transcript_tool_name(label: &str) -> &str {
+    label.split_once('/').map_or(label, |(_, name)| name).trim()
 }
 
 fn mode_label(mode: ExecutionMode) -> &'static str {

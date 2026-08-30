@@ -1,4 +1,6 @@
-use kurama_cli::tui::{OnboardingState, Overlay, TranscriptKind, TuiState};
+use kurama_cli::tui::{
+    ActivityState, OnboardingState, Overlay, ToolLifecycle, TranscriptEntry, TuiState,
+};
 use kurama_protocol::{
     id::{CallId, OperationId, SessionId},
     policy::{ApprovalRequest, ApprovalResponse, ExecutionMode},
@@ -47,6 +49,129 @@ fn onboarding_masks_session_credentials_in_the_rendered_form() {
 }
 
 #[test]
+fn runtime_events_drive_typed_activity_without_duplicate_errors() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.set_thinking();
+    assert!(matches!(state.activity(), ActivityState::Thinking { .. }));
+
+    state.apply_runtime_event(RuntimeEvent::ToolStarted {
+        operation_id: OperationId::from("operation_1"),
+        name: "bash".into(),
+    });
+    assert!(matches!(state.activity(), ActivityState::RunningTool { name, .. } if name == "bash"));
+
+    state.apply_runtime_event(RuntimeEvent::Error {
+        message: "broken".into(),
+    });
+    assert_eq!(state.activity(), &ActivityState::Idle);
+    assert_eq!(
+        state
+            .transcript
+            .iter()
+            .filter(|entry| matches!(entry, TranscriptEntry::Error { body } if body == "broken"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn runtime_status_and_shutdown_use_explicit_activity_states() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+
+    state.apply_runtime_event(RuntimeEvent::Status {
+        message: "compacting context".into(),
+    });
+    assert!(matches!(
+        state.activity(),
+        ActivityState::Working { label, .. } if label == "compacting context"
+    ));
+
+    state.apply_runtime_event(RuntimeEvent::Shutdown);
+    assert_eq!(state.activity(), &ActivityState::Interrupted);
+}
+
+#[test]
+fn tool_events_preserve_complete_output_and_lifecycle() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.apply_runtime_event(RuntimeEvent::ToolStarted {
+        operation_id: OperationId::from("operation_1"),
+        name: "bash".into(),
+    });
+    state.apply_runtime_event(tool_delta(
+        "call_1",
+        "stdout",
+        "head\nfull middle output\ntail\n",
+    ));
+
+    assert!(matches!(
+        &state.transcript[0],
+        TranscriptEntry::ToolCall(tool)
+            if tool.call_id.as_ref().is_some_and(|call_id| call_id.as_ref() == "call_1")
+                && tool.name == "bash"
+                && tool.lifecycle == ToolLifecycle::Running
+    ));
+
+    let mut result = tool_result("call_1", "head\n[omitted]\ntail\n", "bash");
+    result.truncated = true;
+    state.apply_runtime_event(RuntimeEvent::ToolCompleted {
+        operation_id: OperationId::from("operation_1"),
+        result,
+    });
+
+    assert_eq!(state.activity(), &ActivityState::Idle);
+    assert!(matches!(
+        &state.transcript[0],
+        TranscriptEntry::ToolCall(tool)
+            if tool.output == "head\nfull middle output\ntail\n"
+                && tool.lifecycle == ToolLifecycle::Completed
+    ));
+}
+
+#[test]
+fn replay_hydrates_explicit_transcript_variants() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.hydrate_replay(&[
+        replay_event(SessionEvent::UserMessage {
+            text: "inspect".into(),
+        }),
+        replay_event(SessionEvent::AssistantMessage {
+            text: "checking".into(),
+        }),
+        replay_event(SessionEvent::ToolCompleted {
+            operation_id: OperationId::from("operation_1"),
+            result: tool_result("call_1", "done", "read"),
+        }),
+        replay_event(SessionEvent::ModeSelected {
+            mode: ExecutionMode::Auto,
+        }),
+        replay_event(SessionEvent::TurnFailed {
+            error: "broken".into(),
+        }),
+    ]);
+
+    assert!(matches!(
+        &state.transcript[..],
+        [
+            TranscriptEntry::UserTurn { body: user },
+            TranscriptEntry::AssistantMessage { body: assistant },
+            TranscriptEntry::ToolCall(tool),
+            TranscriptEntry::Notice {
+                label: Some(label),
+                body: mode,
+            },
+            TranscriptEntry::Error { body: error },
+        ] if user == "inspect"
+            && assistant == "checking"
+            && tool.name == "read"
+            && tool.output == "done"
+            && tool.lifecycle == ToolLifecycle::Completed
+            && label == "MODE"
+            && mode == "auto"
+            && error == "broken"
+    ));
+}
+
+#[test]
 fn approval_overlay_supports_approve_deny_and_edited_arguments() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.begin_approval(ApprovalRequest {
@@ -59,9 +184,11 @@ fn approval_overlay_supports_approve_deny_and_edited_arguments() {
         summary: "Write safe.txt".into(),
         arguments: serde_json::json!({"path":"unsafe.txt","content":"unsafe"}),
     });
+    assert_eq!(state.activity(), &ActivityState::AwaitingApproval);
     state.begin_approval_edit();
     state.set_approval_editor(r#"{"path":"safe.txt","content":"safe"}"#);
     state.submit_approval_edit().expect("submit edit");
+    assert!(matches!(state.activity(), ActivityState::Thinking { .. }));
     assert!(matches!(
         state.sent_commands().last(),
         Some(EngineCommand::ResolveApproval {
@@ -89,12 +216,24 @@ fn runtime_approval_hydrates_editor_from_request_arguments() {
         },
     });
 
+    assert_eq!(state.activity(), &ActivityState::AwaitingApproval);
     let approval = state.approval.as_ref().expect("approval");
     assert_eq!(approval.arguments, arguments);
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&approval.editor).expect("editor JSON"),
         arguments
     );
+}
+
+#[test]
+fn transcript_view_toggle_is_reversible() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+
+    assert!(!state.transcript_view_expanded());
+    state.toggle_transcript_view();
+    assert!(state.transcript_view_expanded());
+    state.toggle_transcript_view();
+    assert!(!state.transcript_view_expanded());
 }
 
 #[test]
@@ -145,8 +284,11 @@ fn tool_output_deltas_for_the_same_call_update_one_entry() {
     state.apply_runtime_event(tool_delta("call_1", "stdout", "second"));
 
     assert_eq!(state.transcript.len(), 1);
-    assert_eq!(state.transcript[0].kind, TranscriptKind::Tool);
-    assert_eq!(state.transcript[0].body, "first second");
+    assert!(matches!(
+        &state.transcript[0],
+        TranscriptEntry::ToolCall(tool)
+            if tool.output == "first second" && tool.lifecycle == ToolLifecycle::Running
+    ));
 }
 
 #[test]
@@ -160,8 +302,13 @@ fn tool_completion_finalizes_the_streamed_entry_by_result_call_id() {
     });
 
     assert_eq!(state.transcript.len(), 1);
-    assert_eq!(state.transcript[0].label, "TOOL / bash");
-    assert_eq!(state.transcript[0].body, "final output");
+    assert!(matches!(
+        &state.transcript[0],
+        TranscriptEntry::ToolCall(tool)
+            if tool.name == "bash"
+                && tool.output == "final output"
+                && tool.lifecycle == ToolLifecycle::Completed
+    ));
 }
 
 #[test]
@@ -181,7 +328,10 @@ fn truncated_tool_completion_preserves_full_streamed_output() {
     });
 
     assert_eq!(state.transcript.len(), 1);
-    assert_eq!(state.transcript[0].body, "head\nfull middle output\ntail\n");
+    assert!(matches!(
+        &state.transcript[0],
+        TranscriptEntry::ToolCall(tool) if tool.output == "head\nfull middle output\ntail\n"
+    ));
 }
 
 #[test]
@@ -198,10 +348,11 @@ fn truncated_mixed_streams_keep_explicit_stream_boundaries() {
         result,
     });
 
-    assert_eq!(
-        state.transcript[0].body,
-        "output\n[stderr]\nwarning\n[stdout]\ndone"
-    );
+    assert!(matches!(
+        &state.transcript[0],
+        TranscriptEntry::ToolCall(tool)
+            if tool.output == "output\n[stderr]\nwarning\n[stdout]\ndone"
+    ));
 }
 
 #[test]
@@ -217,10 +368,12 @@ fn execution_errors_append_after_streamed_diagnostics() {
         result,
     });
 
-    assert_eq!(
-        state.transcript[0].body,
-        "diagnostic\n\n[error]\ncommand timed out after 1000 ms"
-    );
+    assert!(matches!(
+        &state.transcript[0],
+        TranscriptEntry::ToolCall(tool)
+            if tool.output == "diagnostic\n\n[error]\ncommand timed out after 1000 ms"
+                && tool.lifecycle == ToolLifecycle::Failed
+    ));
 }
 
 #[test]
@@ -236,7 +389,10 @@ fn replay_uses_display_hydrated_tool_output() {
         result,
     })]);
 
-    assert_eq!(state.transcript[0].body, "head\nfull middle output\ntail\n");
+    assert!(matches!(
+        &state.transcript[0],
+        TranscriptEntry::ToolCall(tool) if tool.output == "head\nfull middle output\ntail\n"
+    ));
 }
 
 #[test]
@@ -248,8 +404,11 @@ fn tool_streams_with_different_call_ids_remain_separate() {
     state.apply_runtime_event(tool_delta("call_1", "stdout", " more"));
 
     assert_eq!(state.transcript.len(), 2);
-    assert_eq!(state.transcript[0].body, "one more");
-    assert_eq!(state.transcript[1].body, "two");
+    assert!(matches!(
+        &state.transcript[..],
+        [TranscriptEntry::ToolCall(first), TranscriptEntry::ToolCall(second)]
+            if first.output == "one more" && second.output == "two"
+    ));
 }
 
 #[test]
@@ -264,36 +423,41 @@ fn assistant_deltas_coalesce_only_while_adjacent() {
     });
 
     assert_eq!(state.transcript.len(), 1);
-    assert_eq!(state.transcript[0].kind, TranscriptKind::Assistant);
-    assert_eq!(state.transcript[0].body, "first second");
+    assert!(matches!(
+        &state.transcript[0],
+        TranscriptEntry::AssistantMessage { body } if body == "first second"
+    ));
     state.push_user("interrupt");
     state.apply_runtime_event(RuntimeEvent::AssistantDelta {
         text: "third".into(),
     });
 
     assert_eq!(state.transcript.len(), 3);
-    assert_eq!(state.transcript[1].kind, TranscriptKind::User);
-    assert_eq!(state.transcript[2].kind, TranscriptKind::Assistant);
-    assert_eq!(state.transcript[2].body, "third");
+    assert!(matches!(
+        &state.transcript[1..],
+        [
+            TranscriptEntry::UserTurn { body: user },
+            TranscriptEntry::AssistantMessage { body: assistant },
+        ] if user == "interrupt" && assistant == "third"
+    ));
 }
 
 #[test]
 fn runtime_errors_are_appended_to_the_transcript() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-    state.status = "running model".into();
+    state.set_thinking();
 
     state.apply_runtime_event(RuntimeEvent::Error {
         message: "protocol error: malformed bridge output".into(),
     });
 
-    assert_eq!(state.status, "ready");
+    assert_eq!(state.activity(), &ActivityState::Idle);
     assert_eq!(state.transcript.len(), 1);
-    assert_eq!(state.transcript[0].kind, TranscriptKind::System);
-    assert_eq!(state.transcript[0].label, "ERROR");
-    assert_eq!(
-        state.transcript[0].body,
-        "protocol error: malformed bridge output"
-    );
+    assert!(matches!(
+        &state.transcript[0],
+        TranscriptEntry::Error { body }
+            if body == "protocol error: malformed bridge output"
+    ));
 }
 
 #[test]
@@ -309,7 +473,10 @@ fn stable_transcript_prefix_excludes_mutable_assistant_and_tool_entries() {
 
     state.mark_transcript_committed(1);
     assert_eq!(state.live_transcript().len(), 1);
-    assert_eq!(state.live_transcript()[0].body, "working");
+    assert!(matches!(
+        &state.live_transcript()[0],
+        TranscriptEntry::AssistantMessage { body } if body == "working"
+    ));
 
     state.apply_runtime_event(RuntimeEvent::TurnCompleted);
     assert_eq!(state.stable_transcript_end(), 2);
@@ -349,10 +516,11 @@ fn replay_hydration_clears_active_tool_stream_tracking() {
     });
 
     assert_eq!(state.transcript.len(), 2);
-    assert_eq!(state.transcript[0].kind, TranscriptKind::Tool);
-    assert_eq!(state.transcript[0].body, "replayed");
-    assert_eq!(state.transcript[1].kind, TranscriptKind::Tool);
-    assert_eq!(state.transcript[1].body, "fresh");
+    assert!(matches!(
+        &state.transcript[..],
+        [TranscriptEntry::ToolCall(replayed), TranscriptEntry::ToolCall(fresh)]
+            if replayed.output == "replayed" && fresh.output == "fresh"
+    ));
 }
 
 fn approval_state() -> TuiState {
