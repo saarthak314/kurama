@@ -29,6 +29,36 @@ pub mod control;
 pub(crate) const MAX_JSONL_LINE_BYTES: usize = 1024 * 1024;
 const BRIDGE_RECORD_CAPACITY: usize = 4;
 const STDERR_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+const DEFAULT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const INACTIVITY_STDERR_JOIN_TIMEOUT: Duration = Duration::from_millis(250);
+
+pub(crate) struct InactivityWatchdog {
+    timeout: Duration,
+    sleep: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl InactivityWatchdog {
+    pub(crate) fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            sleep: Box::pin(tokio::time::sleep(timeout)),
+        }
+    }
+
+    pub(crate) fn observe_record(&mut self, record: &str) -> bool {
+        if record.trim().is_empty() {
+            return false;
+        }
+        self.sleep
+            .as_mut()
+            .reset(tokio::time::Instant::now() + self.timeout);
+        true
+    }
+
+    pub(crate) async fn wait(&mut self) {
+        self.sleep.as_mut().await;
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeCommand {
@@ -39,7 +69,11 @@ pub struct BridgeCommand {
 }
 
 impl BridgeCommand {
-    async fn spawn(self, secrets: Vec<String>) -> Result<BridgeLineStream, KuramaError> {
+    async fn spawn(
+        self,
+        secrets: Vec<String>,
+        inactivity_timeout: Duration,
+    ) -> Result<BridgeLineStream, KuramaError> {
         let mut command = Command::new(&self.program);
         command
             .args(&self.args)
@@ -79,6 +113,7 @@ impl BridgeCommand {
             sender,
             cancel_rx,
             secrets,
+            inactivity_timeout,
         ));
         Ok(BridgeLineStream {
             receiver,
@@ -95,14 +130,31 @@ pub(crate) trait BridgeDecoder: Send + 'static {
 
 pub(crate) async fn event_stream<D: BridgeDecoder>(
     command: BridgeCommand,
+    decoder: D,
+    cancel: &dyn CancelSignal,
+    secrets: Vec<String>,
+) -> Result<ModelStream, KuramaError> {
+    event_stream_with_inactivity(
+        command,
+        decoder,
+        cancel,
+        secrets,
+        DEFAULT_INACTIVITY_TIMEOUT,
+    )
+    .await
+}
+
+pub(crate) async fn event_stream_with_inactivity<D: BridgeDecoder>(
+    command: BridgeCommand,
     mut decoder: D,
     cancel: &dyn CancelSignal,
     secrets: Vec<String>,
+    inactivity_timeout: Duration,
 ) -> Result<ModelStream, KuramaError> {
     if cancel.is_cancelled() {
         return Err(KuramaError::Cancelled);
     }
-    let mut lines = command.spawn(secrets.clone()).await?;
+    let mut lines = command.spawn(secrets.clone(), inactivity_timeout).await?;
     loop {
         let line = tokio::select! {
             _ = cancel.cancelled() => {
@@ -113,9 +165,17 @@ pub(crate) async fn event_stream<D: BridgeDecoder>(
         };
         match line {
             Some(Ok(line)) => match decoder.push_line(&line) {
-                Ok(events) if events.is_empty() => {}
                 Ok(events) => {
-                    return Ok(decoded_event_stream(lines, decoder, events, secrets));
+                    let terminal = decoder.finish().is_ok();
+                    if terminal && events.is_empty() {
+                        lines.cancel_and_wait().await;
+                        return Ok(Box::pin(futures_util::stream::empty()));
+                    }
+                    if !events.is_empty() {
+                        return Ok(decoded_event_stream(
+                            lines, decoder, events, secrets, terminal,
+                        ));
+                    }
                 }
                 Err(error) => {
                     lines.cancel_and_wait().await;
@@ -141,12 +201,14 @@ fn decoded_event_stream<D: BridgeDecoder>(
     decoder: D,
     events: Vec<ModelEvent>,
     secrets: Vec<String>,
+    terminal: bool,
 ) -> ModelStream {
     let state = DecodedStreamState {
         lines,
         decoder,
         pending: events.into_iter().map(Ok).collect(),
         secrets,
+        terminal,
         ended: false,
     };
     Box::pin(futures_util::stream::unfold(
@@ -156,12 +218,19 @@ fn decoded_event_stream<D: BridgeDecoder>(
                 if let Some(event) = state.pending.pop_front() {
                     return Some((event, state));
                 }
+                if state.terminal {
+                    state.lines.cancel_and_wait().await;
+                    return None;
+                }
                 if state.ended {
                     return None;
                 }
                 match state.lines.next().await {
                     Some(Ok(line)) => match state.decoder.push_line(&line) {
-                        Ok(events) => state.pending.extend(events.into_iter().map(Ok)),
+                        Ok(events) => {
+                            state.pending.extend(events.into_iter().map(Ok));
+                            state.terminal = state.decoder.finish().is_ok();
+                        }
                         Err(error) => {
                             state.lines.cancel_and_wait().await;
                             state.ended = true;
@@ -197,6 +266,7 @@ struct DecodedStreamState<D> {
     decoder: D,
     pending: VecDeque<Result<ModelEvent, KuramaError>>,
     secrets: Vec<String>,
+    terminal: bool,
     ended: bool,
 }
 
@@ -246,12 +316,14 @@ async fn drive_process(
     sender: mpsc::Sender<Result<String, KuramaError>>,
     mut cancel: oneshot::Receiver<()>,
     secrets: Vec<String>,
+    inactivity_timeout: Duration,
 ) {
     let mut stdin_task = tokio::spawn(write_stdin(stdin, input));
     let mut stderr_task = tokio::spawn(drain_bounded(stderr, STDERR_DIAGNOSTIC_BYTES));
     let mut stdout = BoundedJsonlReader::new(stdout);
     let mut stdout_error = None;
     let mut last_stdout = None;
+    let mut inactivity = InactivityWatchdog::new(inactivity_timeout);
 
     loop {
         let record = tokio::select! {
@@ -262,6 +334,27 @@ async fn drive_process(
                 return;
             }
             record = stdout.next_record(&program) => record,
+            _ = inactivity.wait() => {
+                terminate_process_group(&mut child).await;
+                stdin_task.abort();
+                let diagnostic = bounded_stderr_diagnostic(
+                    &program,
+                    &mut stderr_task,
+                    INACTIVITY_STDERR_JOIN_TIMEOUT,
+                )
+                .await
+                .or(stdout_error)
+                .or(last_stdout)
+                .unwrap_or_else(|| "no diagnostic output".into());
+                let error = inactivity_error(
+                    &program,
+                    inactivity_timeout,
+                    &diagnostic,
+                    &secrets,
+                );
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
         };
         let line = match record {
             Ok(Some(line)) => line,
@@ -274,7 +367,7 @@ async fn drive_process(
                 return;
             }
         };
-        if line.trim().is_empty() {
+        if !inactivity.observe_record(&line) {
             continue;
         }
         last_stdout = Some(control::bounded_error(&line, &secrets));
@@ -372,6 +465,38 @@ async fn drive_process(
                 .await;
         }
     }
+}
+
+pub(crate) async fn bounded_stderr_diagnostic(
+    program: &str,
+    stderr_task: &mut JoinHandle<Result<String, KuramaError>>,
+    timeout: Duration,
+) -> Option<String> {
+    match tokio::time::timeout(timeout, &mut *stderr_task).await {
+        Ok(Ok(Ok(stderr))) if !stderr.trim().is_empty() => Some(stderr),
+        Ok(Ok(Ok(_))) => None,
+        Ok(Ok(Err(error))) => Some(error.to_string()),
+        Ok(Err(error)) => Some(format!("{program} stderr task: {error}")),
+        Err(_) => {
+            stderr_task.abort();
+            None
+        }
+    }
+}
+
+pub(crate) fn inactivity_error(
+    program: &str,
+    inactivity_timeout: Duration,
+    diagnostic: &str,
+    secrets: &[String],
+) -> KuramaError {
+    control::bounded_kurama_error(
+        KuramaError::Model(format!(
+            "{program} CLI inactive for {} ms: {diagnostic}",
+            inactivity_timeout.as_millis()
+        )),
+        secrets,
+    )
 }
 
 async fn write_stdin(mut stdin: ChildStdin, input: String) -> Result<(), KuramaError> {

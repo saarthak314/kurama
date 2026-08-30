@@ -5,12 +5,17 @@
 mod bridges;
 
 use std::path::Path;
-use std::{fs, time::Instant};
+use std::{
+    fs,
+    time::{Duration, Instant},
+};
 
 use bridges::{
+    BridgeDecoder, InactivityWatchdog, bounded_stderr_diagnostic,
     claude::ClaudeBridge,
     codex::CodexBridge,
     control::{bridge_prompt, control_schema, parse_control},
+    event_stream_with_inactivity, inactivity_error,
 };
 use futures_util::StreamExt;
 use kurama_protocol::{
@@ -565,6 +570,142 @@ exit 7
 }
 
 #[tokio::test]
+async fn codex_terminal_completion_ends_before_cli_eof() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let executable = temporary.path().join("codex");
+    write_executable(
+        &executable,
+        r#"#!/bin/sh
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-live"}'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"kind\":\"final\",\"text\":\"done\",\"calls\":[],\"agents\":[]}"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":4,"output_tokens":2,"cached_input_tokens":1}}'
+sleep 10
+"#,
+    );
+    let bridge = CodexBridge::new(
+        temporary.path().join("work"),
+        temporary.path().join("control.json"),
+    )
+    .with_program(executable.display().to_string());
+    let stream = bridge
+        .stream(request(), &NeverCancel)
+        .await
+        .expect("bridge stream");
+
+    let events = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        stream.collect::<Vec<_>>(),
+    )
+    .await
+    .expect("terminal stream waited for CLI EOF");
+
+    assert!(matches!(
+        events.last(),
+        Some(Ok(ModelEvent::ResponseCompleted { .. }))
+    ));
+}
+
+#[tokio::test]
+async fn silent_codex_bridge_times_out_after_inactivity() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let executable = temporary.path().join("codex");
+    write_executable(&executable, "#!/bin/sh\nsleep 10\n");
+    let mut command = CodexBridge::command_for(
+        &request(),
+        None,
+        &temporary.path().join("work"),
+        &temporary.path().join("control.json"),
+    );
+    command.program = executable.display().to_string();
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(750),
+        event_stream_with_inactivity(
+            command,
+            TestBridgeDecoder::default(),
+            &NeverCancel,
+            Vec::new(),
+            Duration::from_millis(100),
+        ),
+    )
+    .await
+    .expect("silent bridge watchdog timed out");
+    let error = match result {
+        Ok(_) => panic!("silent bridge unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+
+    assert!(message.contains("inactive"), "{message}");
+    assert!(message.contains("no diagnostic output"), "{message}");
+    assert!(message.len() <= 16 * 1024 + 128, "{message}");
+}
+
+#[test]
+fn bridge_inactivity_diagnostics_are_bounded_and_redacted() {
+    let secret = "secret-value";
+    let diagnostic = format!("{secret} {}", "x".repeat(20_000));
+    let error = inactivity_error(
+        "codex",
+        Duration::from_secs(2),
+        &diagnostic,
+        &[secret.into()],
+    );
+    let message = error.to_string();
+
+    assert!(message.contains("inactive"), "{message}");
+    assert!(message.contains("[REDACTED]"), "{message}");
+    assert!(!message.contains("secret-value"), "{message}");
+    assert!(message.len() <= 16 * 1024 + 128, "{message}");
+}
+
+#[tokio::test]
+async fn bridge_inactivity_watchdog_resets_on_each_nonempty_record() {
+    let inactivity = Duration::from_millis(200);
+    let mut watchdog = InactivityWatchdog::new(inactivity);
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            sender
+                .send(r#"{"type":"heartbeat"}"#)
+                .expect("watchdog receiver");
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        for _ in 0..4 {
+            tokio::select! {
+                _ = watchdog.wait() => panic!("active JSONL stream timed out"),
+                record = receiver.recv() => {
+                    assert!(watchdog.observe_record(record.expect("heartbeat record")));
+                }
+            }
+        }
+    })
+    .await
+    .expect("watchdog reset test timed out");
+    assert!(!watchdog.observe_record(" \n"));
+}
+
+#[tokio::test]
+async fn bridge_inactivity_does_not_wait_forever_for_stderr() {
+    let mut stderr_task = tokio::spawn(std::future::pending::<Result<String, KuramaError>>());
+    let started = Instant::now();
+
+    let diagnostic =
+        bounded_stderr_diagnostic("codex", &mut stderr_task, Duration::from_millis(25)).await;
+
+    assert_eq!(diagnostic, None);
+    assert!(started.elapsed() < Duration::from_millis(250));
+    let join_error = tokio::time::timeout(Duration::from_millis(100), &mut stderr_task)
+        .await
+        .expect("aborted stderr task remained pending")
+        .expect_err("stderr task unexpectedly completed");
+    assert!(join_error.is_cancelled());
+}
+
+#[tokio::test]
 async fn codex_stream_yields_before_process_exit() {
     let temporary = tempfile::tempdir().expect("tempdir");
     let executable = temporary.path().join("codex");
@@ -845,6 +986,36 @@ impl CancelSignal for NeverCancel {
 
     fn cancelled(&self) -> BoxFuture<'_, ()> {
         Box::pin(std::future::pending())
+    }
+}
+
+#[derive(Default)]
+struct TestBridgeDecoder {
+    completed: bool,
+}
+
+impl BridgeDecoder for TestBridgeDecoder {
+    fn push_line(&mut self, line: &str) -> Result<Vec<ModelEvent>, KuramaError> {
+        let value: serde_json::Value = serde_json::from_str(line)
+            .map_err(|error| KuramaError::Protocol(format!("invalid test JSONL: {error}")))?;
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("complete") {
+            return Ok(Vec::new());
+        }
+        self.completed = true;
+        Ok(vec![ModelEvent::ResponseCompleted {
+            cursor: None,
+            finish_reason: kurama_protocol::model::FinishReason::Stop,
+        }])
+    }
+
+    fn finish(&self) -> Result<(), KuramaError> {
+        if self.completed {
+            Ok(())
+        } else {
+            Err(KuramaError::Protocol(
+                "test JSONL ended before completion".into(),
+            ))
+        }
     }
 }
 
