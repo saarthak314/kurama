@@ -1149,7 +1149,7 @@ pub fn transcript_lines(
                     body,
                     "› ",
                     "  ",
-                    Style::default().fg(RED).add_modifier(Modifier::BOLD),
+                    Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
                     Style::default().fg(TEXT),
                     width,
                 );
@@ -1197,17 +1197,27 @@ pub fn transcript_lines(
                 Style::default().fg(RED),
                 width,
             ),
-            TranscriptEntry::Notice { label, body } => {
-                push_prefixed_lines(
-                    &mut lines,
-                    &format!("{} · {body}", label.as_deref().unwrap_or("NOTICE")),
-                    "• ",
-                    "  ",
-                    Style::default().fg(DIM),
-                    Style::default().fg(DIM),
-                    width,
-                );
-            }
+            TranscriptEntry::Notice {
+                label: Some(label),
+                body,
+            } => push_prefixed_lines(
+                &mut lines,
+                &format!("{label} · {body}"),
+                "• ",
+                "  ",
+                Style::default().fg(DIM),
+                Style::default().fg(DIM),
+                width,
+            ),
+            TranscriptEntry::Notice { label: None, body } => push_prefixed_lines(
+                &mut lines,
+                body,
+                "",
+                "",
+                Style::default().fg(DIM),
+                Style::default().fg(DIM),
+                width,
+            ),
         }
     }
     lines

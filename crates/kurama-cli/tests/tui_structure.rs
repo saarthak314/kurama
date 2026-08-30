@@ -140,9 +140,14 @@ fn transcript_uses_compact_codex_style_hierarchy() {
     state.push_tool("TOOL / bash", "cargo test -p kurama-cli");
     state.push_system("MODE", "supervised");
 
-    let text = buffer_text(&rendered(&state, 100, 30));
+    let buffer = rendered(&state, 100, 30);
+    let text = buffer_text(&buffer);
 
     assert!(text.contains("› Review the parser."));
+    assert_eq!(
+        cell_at_text(&buffer, "› Review the parser.").fg,
+        Color::Rgb(116, 177, 255)
+    );
     assert!(text.contains("I’ll inspect the parser and its focused tests."));
     assert!(text.contains("• I’ll inspect the parser and its focused tests."));
     assert!(text.contains("└ Ran bash"));
@@ -256,13 +261,39 @@ fn typed_tool_transcript_preserves_normalized_tool_name() {
 }
 
 #[test]
-fn unlabeled_notice_preserves_notice_fallback_label() {
-    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-    state.push_notice(None, "runtime resumed");
+fn unlabeled_notice_renders_body_only_in_dim_text() {
+    let entries = vec![TranscriptEntry::Notice {
+        label: None,
+        body: "runtime resumed".into(),
+    }];
 
-    let text = buffer_text(&rendered(&state, 80, 20));
+    let lines = transcript_lines(&entries, 80, TranscriptDetail::Compact);
 
-    assert!(text.contains("NOTICE · runtime resumed"));
+    assert_eq!(plain(lines.clone()), "runtime resumed");
+    assert!(
+        lines[0]
+            .spans
+            .iter()
+            .all(|span| span.style.fg == Some(Color::Rgb(126, 132, 146)))
+    );
+}
+
+#[test]
+fn labeled_notice_keeps_its_label_in_dim_text() {
+    let entries = vec![TranscriptEntry::Notice {
+        label: Some("MODE".into()),
+        body: "supervised".into(),
+    }];
+
+    let lines = transcript_lines(&entries, 80, TranscriptDetail::Compact);
+
+    assert_eq!(plain(lines.clone()), "• MODE · supervised");
+    assert!(
+        lines[0]
+            .spans
+            .iter()
+            .all(|span| span.style.fg == Some(Color::Rgb(126, 132, 146)))
+    );
 }
 
 #[test]
@@ -433,11 +464,13 @@ fn assistant_markdown_preserves_viewport_wrapping_and_style() {
     let buffer = rendered(&state, 40, 20);
     let text = buffer_text(&buffer);
 
-    let compact = text
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>();
-    assert!(compact.contains("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ"));
+    let rows = text.lines().map(str::trim_end).collect::<Vec<_>>();
+    assert!(
+        rows.contains(&"  • abcdefghijklmnopqrstuvwxyz01234567"),
+        "{rows:#?}"
+    );
+    assert!(rows.contains(&"    89ABCDEFGHIJ"), "{rows:#?}");
+    assert!(!rows.iter().any(|row| row.contains("• 89ABCDEFGHIJ")));
     assert!(!text.contains("**"));
     assert!(
         cell_at_text(&buffer, "abcdefghijklmnopqrstuvwxyz")
@@ -574,12 +607,14 @@ fn transcript_follows_the_latest_answer_after_long_tool_output() {
 #[test]
 fn tool_output_wraps_on_unicode_grapheme_clusters() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-    state.push_tool("TOOL / bash", "A👨‍👩‍👧‍👦B");
+    state.push_tool("TOOL / bash", "AB👨‍👩‍👧‍👦CD");
     state.toggle_transcript_view();
 
     let text = buffer_text(&rendered(&state, 10, 16));
+    let rows = text.lines().map(str::trim_end).collect::<Vec<_>>();
 
-    assert!(text.lines().any(|line| line.contains("👨‍👩‍👧‍👦")));
+    assert!(rows.contains(&"    AB👨‍👩‍👧‍👦"), "{rows:#?}");
+    assert!(rows.contains(&"    CD"), "{rows:#?}");
 }
 
 #[test]

@@ -4,7 +4,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use kurama_adapters::{BashTool, HttpClient, ReadTool, WebSearchTool, WriteTool};
 use kurama_cli::{
     app::{App, run_with},
-    tui::TuiState,
+    tui::{TranscriptEntry, TuiState},
 };
 use kurama_core::{
     orchestrator::SmartOrchestrator,
@@ -190,7 +190,7 @@ async fn fake_provider_runs_tools_approval_child_panel_and_exact_once_resume() {
         app.state
             .transcript
             .iter()
-            .any(|entry| entry.body.contains("updated"))
+            .any(|entry| transcript_entry_contains(entry, "updated"))
     );
     assert!(
         store
@@ -232,7 +232,7 @@ async fn fake_provider_runs_tools_approval_child_panel_and_exact_once_resume() {
         app.state
             .transcript
             .iter()
-            .any(|entry| entry.body.contains("resumed without repeating"))
+            .any(|entry| transcript_entry_contains(entry, "resumed without repeating"))
     );
     let write_completions = store
         .events("session")
@@ -243,6 +243,16 @@ async fn fake_provider_runs_tools_approval_child_panel_and_exact_once_resume() {
         ))
         .count();
     assert_eq!(write_completions, 1);
+}
+
+fn transcript_entry_contains(entry: &TranscriptEntry, needle: &str) -> bool {
+    match entry {
+        TranscriptEntry::UserTurn { body }
+        | TranscriptEntry::AssistantMessage { body }
+        | TranscriptEntry::Error { body }
+        | TranscriptEntry::Notice { body, .. } => body.contains(needle),
+        TranscriptEntry::ToolCall(tool) => tool.output.contains(needle),
+    }
 }
 
 fn tool_round(

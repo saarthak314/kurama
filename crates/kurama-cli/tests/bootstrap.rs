@@ -5,7 +5,7 @@ use kurama_adapters::{AppPaths, ConfigRepository, FsSessionStore, SessionSecrets
 use kurama_cli::{
     app::App,
     args::{Args, ResumeChoice},
-    tui::Overlay,
+    tui::{Overlay, ToolLifecycle, TranscriptEntry},
 };
 use kurama_protocol::{
     config::{AuthRef, KuramaConfig, OrchestrationConfig, ProfileConfig, ProfileKind},
@@ -307,22 +307,20 @@ async fn resume_hydrates_the_visible_transcript_once() {
             .contains("full middle output")
     );
 
-    assert_eq!(
-        app.state
-            .transcript
-            .iter()
-            .map(|entry| (entry.label.as_str(), entry.body.as_str()))
-            .collect::<Vec<_>>(),
+    assert!(matches!(
+        &app.state.transcript[..],
         [
-            ("YOU", "inspect the parser"),
-            ("KURAMA", "checking it"),
-            (
-                "TOOL / bash",
-                "head\nfull middle output\ntail\n\n[stderr]\nwarning\n"
-            ),
-            ("ERROR", "provider disconnected"),
-        ]
-    );
+            TranscriptEntry::UserTurn { body: user },
+            TranscriptEntry::AssistantMessage { body: assistant },
+            TranscriptEntry::ToolCall(tool),
+            TranscriptEntry::Error { body: error },
+        ] if user == "inspect the parser"
+            && assistant == "checking it"
+            && tool.name == "bash"
+            && tool.output == "head\nfull middle output\ntail\n\n[stderr]\nwarning\n"
+            && tool.lifecycle == ToolLifecycle::Completed
+            && error == "provider disconnected"
+    ));
 
     app.state.apply_runtime_event(RuntimeEvent::AssistantDelta {
         text: "retrying now".into(),
@@ -331,14 +329,17 @@ async fn resume_hydrates_the_visible_transcript_once() {
         app.state
             .transcript
             .iter()
-            .filter(|entry| entry.body == "checking it")
+            .filter(|entry| matches!(
+                entry,
+                TranscriptEntry::AssistantMessage { body } if body == "checking it"
+            ))
             .count(),
         1
     );
-    assert_eq!(
-        app.state.transcript.last().map(|entry| entry.body.as_str()),
-        Some("retrying now")
-    );
+    assert!(matches!(
+        app.state.transcript.last(),
+        Some(TranscriptEntry::AssistantMessage { body }) if body == "retrying now"
+    ));
 }
 
 #[tokio::test]
