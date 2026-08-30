@@ -16,6 +16,16 @@ use super::{
 };
 
 const BACKEND: &str = "codex_cli";
+const DISABLED_NATIVE_FEATURES: [&str; 8] = [
+    "apps",
+    "browser_use",
+    "computer_use",
+    "image_generation",
+    "multi_agent",
+    "shell_tool",
+    "unified_exec",
+    "view_image",
+];
 
 #[derive(Clone)]
 pub struct CodexBridge {
@@ -61,7 +71,8 @@ impl CodexBridge {
         bridge_dir: &Path,
         schema_path: &Path,
     ) -> BridgeCommand {
-        let mut args = if let Some(cursor) = cursor.filter(|cursor| cursor.backend == BACKEND) {
+        let cursor = cursor.filter(|cursor| cursor.backend == BACKEND);
+        let mut args = if cursor.is_some() {
             vec![
                 "exec".into(),
                 "resume".into(),
@@ -73,8 +84,6 @@ impl CodexBridge {
                 schema_path.display().to_string(),
                 "-m".into(),
                 request.profile.model.clone(),
-                cursor.value.clone(),
-                "-".into(),
             ]
         } else {
             vec![
@@ -95,9 +104,16 @@ impl CodexBridge {
                 schema_path.display().to_string(),
                 "-m".into(),
                 request.profile.model.clone(),
-                "-".into(),
             ]
         };
+        for feature in DISABLED_NATIVE_FEATURES {
+            args.push("--disable".into());
+            args.push(feature.into());
+        }
+        if let Some(cursor) = cursor {
+            args.push(cursor.value.clone());
+        }
+        args.push("-".into());
         args.shrink_to_fit();
         BridgeCommand {
             program: program.into(),
@@ -180,14 +196,23 @@ fn parse_lines<'a>(
                     provider_id: id.to_owned(),
                 });
             }
-            "item.completed" => {
-                if value.pointer("/item/type").and_then(Value::as_str) == Some("agent_message") {
+            "item.completed" => match value.pointer("/item/type").and_then(Value::as_str) {
+                Some("agent_message") => {
                     control = value
                         .pointer("/item/text")
                         .and_then(Value::as_str)
                         .map(str::to_owned);
                 }
-            }
+                Some(
+                    item_type @ ("command_execution" | "file_change" | "mcp_tool_call"
+                    | "web_search"),
+                ) => {
+                    return Err(KuramaError::Protocol(format!(
+                        "native Codex tool event is forbidden in bridge mode: {item_type}"
+                    )));
+                }
+                _ => {}
+            },
             "turn.completed" => {
                 if let Some(usage) = value.get("usage") {
                     events.push(ModelEvent::Usage {

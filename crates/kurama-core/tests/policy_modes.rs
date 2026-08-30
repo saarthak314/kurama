@@ -85,6 +85,31 @@ fn auto_denies_boundary_expansion() {
 }
 
 #[test]
+fn auto_checks_every_composed_command_against_the_allowlist() {
+    let mut context = context(ExecutionMode::Auto);
+    context.auto.allowed_commands = vec!["pwd".into(), "rg".into(), "sed".into()];
+    let policy = DefaultPolicy::new(ExecutionMode::Auto, context.auto.clone());
+    let bash = |command: &str, class| Operation::Bash {
+        command: command.into(),
+        cwd: context.workspace_root.clone(),
+        class,
+        timeout_ms: 1_000,
+    };
+
+    assert_eq!(
+        policy.decide(
+            &context,
+            &bash("pwd && rg --files | sed -n '1,20p'", CommandClass::ReadOnly)
+        ),
+        PolicyDecision::Allow
+    );
+    assert!(matches!(
+        policy.decide(&context, &bash("pwd && rm -rf .", CommandClass::Mutating)),
+        PolicyDecision::Deny { .. }
+    ));
+}
+
+#[test]
 fn yolo_allows_every_classified_operation() {
     let context = context(ExecutionMode::Yolo);
     let policy = DefaultPolicy::new(ExecutionMode::Yolo, AutoBoundaries::default());
@@ -109,7 +134,7 @@ fn yolo_allows_every_classified_operation() {
 }
 
 #[test]
-fn supervised_bash_allowlist_rejects_shell_composition() {
+fn supervised_bash_allowlist_accepts_composed_reads_and_rejects_mutation() {
     let context = context(ExecutionMode::Supervised);
     let policy = DefaultPolicy::new(ExecutionMode::Supervised, context.auto.clone());
     let bash = |command: &str| Operation::Bash {
@@ -120,6 +145,10 @@ fn supervised_bash_allowlist_rejects_shell_composition() {
     };
     assert_eq!(
         policy.decide(&context, &bash("git status --short")),
+        PolicyDecision::Allow
+    );
+    assert_eq!(
+        policy.decide(&context, &bash("pwd && rg --files | sed -n '1,240p'")),
         PolicyDecision::Allow
     );
     assert!(matches!(

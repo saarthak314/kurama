@@ -13,7 +13,7 @@ use kurama_adapters::BashTool;
 use kurama_protocol::{
     KuramaError,
     agent::WriteScope,
-    id::{CallId, SessionId},
+    id::{AgentId, CallId, SessionId},
     policy::ExecutionMode,
     runtime::RuntimeEvent,
     tool::{CommandClass, Operation, ToolContext, ToolInvocation, ToolLimits},
@@ -311,11 +311,12 @@ async fn bash_timeout_and_cancellation_terminate_descendants() {
         "timeout_ms": 30
     }));
 
-    let error = BashTool::default()
+    let result = BashTool::default()
         .execute(fixture.context(limits()), timeout_call, &NeverCancel)
         .await
-        .expect_err("timeout");
-    assert!(matches!(error, KuramaError::Tool(_)), "{error:?}");
+        .expect("timeout result");
+    assert!(result.is_error);
+    assert_eq!(result.metadata["timed_out"], true);
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(!timeout_marker.exists());
 
@@ -342,6 +343,55 @@ async fn bash_timeout_and_cancellation_terminate_descendants() {
 }
 
 #[tokio::test]
+async fn bash_timeout_returns_partial_output_as_a_tool_result() {
+    let fixture = Fixture::empty();
+    let call = invocation(serde_json::json!({
+        "command": "printf 'before timeout\\n'; sleep 0.2; printf 'after timeout\\n'",
+        "cwd": ".",
+        "timeout_ms": 30
+    }));
+
+    let result = BashTool::default()
+        .execute(fixture.context(limits()), call, &NeverCancel)
+        .await
+        .expect("timeout result");
+
+    assert!(result.is_error);
+    assert!(
+        result.output.contains("before timeout"),
+        "{}",
+        result.output
+    );
+    assert!(
+        result.output.contains("timed out after 30 ms"),
+        "{}",
+        result.output
+    );
+    assert_eq!(result.metadata["timed_out"], true);
+}
+
+#[tokio::test]
+async fn child_bash_output_does_not_create_parent_tool_deltas() {
+    let fixture = Fixture::empty();
+    let sink = Arc::new(RecordingSink::default());
+    let mut context = fixture.context(limits());
+    context.agent_id = Some(AgentId::from("child-1"));
+    let call = invocation(serde_json::json!({
+        "command": "printf child-output",
+        "cwd": ".",
+        "timeout_ms": 1000
+    }));
+
+    let result = BashTool::with_event_sink("/bin/bash", sink.clone())
+        .execute(context, call, &NeverCancel)
+        .await
+        .expect("child command");
+
+    assert_eq!(result.output, "child-output");
+    assert!(sink.chunks.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn bash_timeout_still_applies_after_the_shell_exits() {
     let fixture = Fixture::empty();
     let marker = fixture.path("detached-child-finished");
@@ -351,11 +401,14 @@ async fn bash_timeout_still_applies_after_the_shell_exits() {
         "timeout_ms": 30
     }));
 
-    let error = BashTool::default()
+    let started = std::time::Instant::now();
+    let result = BashTool::default()
         .execute(fixture.context(limits()), call, &NeverCancel)
         .await
-        .expect_err("detached child must remain inside the command timeout");
-    assert!(matches!(error, KuramaError::Tool(_)));
+        .expect("detached child timeout result");
+    assert!(result.is_error);
+    assert_eq!(result.metadata["timed_out"], true);
+    assert!(started.elapsed() < Duration::from_millis(250));
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(!marker.exists());
 }
@@ -377,6 +430,24 @@ fn bash_classification_is_conservative() {
         .expect("classify read");
     assert!(matches!(
         read,
+        Operation::Bash {
+            class: CommandClass::ReadOnly,
+            ..
+        }
+    ));
+
+    let composed_read = tool
+        .classify(
+            &fixture.context(limits()),
+            &invocation(serde_json::json!({
+                "command": "pwd && rg --files | sed -n '1,240p'",
+                "cwd": ".",
+                "timeout_ms": 1000
+            })),
+        )
+        .expect("classify composed read");
+    assert!(matches!(
+        composed_read,
         Operation::Bash {
             class: CommandClass::ReadOnly,
             ..

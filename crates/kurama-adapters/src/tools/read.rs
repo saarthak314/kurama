@@ -61,6 +61,10 @@ impl Tool for ReadTool {
                                 "end_byte": {"type": "integer", "minimum": 0}
                             },
                             "required": ["path"],
+                            "oneOf": [
+                                {"required": ["start_line", "end_line"]},
+                                {"required": ["start_byte", "end_byte"]}
+                            ],
                             "additionalProperties": false
                         }
                     }

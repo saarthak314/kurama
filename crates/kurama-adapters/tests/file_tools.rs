@@ -20,6 +20,26 @@ struct Fixture {
     root: PathBuf,
 }
 
+#[test]
+fn read_descriptor_requires_complete_line_or_byte_ranges() {
+    let descriptor = ReadTool::default().descriptor();
+    let variants = descriptor.parameters["properties"]["files"]["items"]["oneOf"]
+        .as_array()
+        .expect("read range variants");
+
+    assert_eq!(variants.len(), 2);
+    assert!(
+        variants.iter().any(|variant| {
+            variant["required"] == serde_json::json!(["start_line", "end_line"])
+        })
+    );
+    assert!(
+        variants.iter().any(|variant| {
+            variant["required"] == serde_json::json!(["start_byte", "end_byte"])
+        })
+    );
+}
+
 impl Fixture {
     fn empty() -> Self {
         let temp = tempfile::tempdir().expect("tempdir");

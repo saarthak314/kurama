@@ -6,7 +6,7 @@ use std::{
 use kurama_protocol::{
     agent::WriteScope,
     policy::{AutoBoundaries, ExecutionMode, PolicyContext, PolicyDecision},
-    tool::{CommandClass, Operation},
+    tool::{CommandClass, Operation, split_shell_commands},
     traits::ApprovalPolicy,
 };
 
@@ -115,25 +115,31 @@ impl DefaultPolicy {
                 class,
                 ..
             } => {
-                let Some(tokens) = safe_split(command) else {
+                let Some(segments) = split_shell_commands(command) else {
                     return deny("command uses shell composition");
                 };
-                let executable = tokens
-                    .first()
-                    .and_then(|value| Path::new(value).file_name())
-                    .and_then(|value| value.to_str());
                 if !within_workspace(cwd, context) {
                     return deny("command working directory is outside the workspace");
                 }
                 if *class != CommandClass::ReadOnly && context.write_scope.is_read_only() {
                     return deny("child write scope is read-only");
                 }
-                if executable.is_some_and(|name| {
-                    context
-                        .auto
-                        .allowed_commands
-                        .iter()
-                        .any(|allowed| allowed == name)
+                if segments.into_iter().all(|segment| {
+                    safe_split(segment)
+                        .and_then(|tokens| {
+                            tokens
+                                .first()
+                                .and_then(|value| Path::new(value).file_name())
+                                .and_then(|value| value.to_str())
+                                .map(str::to_owned)
+                        })
+                        .is_some_and(|name| {
+                            context
+                                .auto
+                                .allowed_commands
+                                .iter()
+                                .any(|allowed| allowed == &name)
+                        })
                 }) {
                     PolicyDecision::Allow
                 } else {
@@ -266,12 +272,6 @@ fn canonical_candidate(path: &Path, base: &Path) -> Option<PathBuf> {
 }
 
 fn safe_split(command: &str) -> Option<Vec<String>> {
-    if command.contains(['\n', '\r', '|', '&', ';', '<', '>', '`'])
-        || command.contains("$(")
-        || command.contains("${")
-    {
-        return None;
-    }
     let mut tokens = Vec::new();
     let mut token = String::new();
     let mut quote = None;
@@ -334,13 +334,24 @@ fn safe_split(command: &str) -> Option<Vec<String>> {
 }
 
 fn supervised_command_allowed(command: &str, cwd: &Path, context: &PolicyContext) -> bool {
-    let Some(tokens) = safe_split(command) else {
+    let Some(segments) = split_shell_commands(command) else {
         return false;
     };
+    segments.into_iter().all(|segment| {
+        let Some(tokens) = safe_split(segment) else {
+            return false;
+        };
+        supervised_segment_allowed(&tokens, cwd, context)
+    })
+}
+
+fn supervised_segment_allowed(tokens: &[String], cwd: &Path, context: &PolicyContext) -> bool {
     let Some(executable) = tokens.first().map(String::as_str) else {
         return false;
     };
     let command_allowed = match executable {
+        "basename" | "cat" | "dirname" | "file" | "grep" | "head" | "printf" | "pwd"
+        | "realpath" | "stat" | "tail" | "uniq" | "wc" => true,
         "ls" => !tokens
             .iter()
             .skip(1)
@@ -351,12 +362,25 @@ fn supervised_command_allowed(command: &str, cwd: &Path, context: &PolicyContext
                 || token == "--pre"
                 || token.starts_with("--pre=")
         }),
-        "sed" => sed_is_read_only(&tokens),
-        "head" | "tail" => true,
-        "git" => git_is_read_only(&tokens),
+        "find" => find_is_read_only(tokens),
+        "sed" => sed_is_read_only(tokens),
+        "sort" => !tokens
+            .iter()
+            .skip(1)
+            .any(|token| token == "-o" || token.starts_with("--output=")),
+        "git" => git_is_read_only(tokens),
         _ => false,
     };
-    command_allowed && path_arguments_stay_inside(&tokens, cwd, context)
+    command_allowed && path_arguments_stay_inside(tokens, cwd, context)
+}
+
+fn find_is_read_only(tokens: &[String]) -> bool {
+    !tokens.iter().skip(1).any(|token| {
+        matches!(
+            token.as_str(),
+            "-delete" | "-exec" | "-execdir" | "-fprint" | "-fprint0" | "-fls" | "-ok" | "-okdir"
+        )
+    })
 }
 
 fn sed_is_read_only(tokens: &[String]) -> bool {
@@ -381,13 +405,15 @@ fn sed_is_read_only(tokens: &[String]) -> bool {
 }
 
 fn git_is_read_only(tokens: &[String]) -> bool {
-    matches!(tokens.get(1).map(String::as_str), Some("status" | "diff"))
-        && !tokens.iter().any(|token| {
-            token == "-c"
-                || token.starts_with("--config-env")
-                || token == "--ext-diff"
-                || token == "--textconv"
-        })
+    matches!(
+        tokens.get(1).map(String::as_str),
+        Some("diff" | "grep" | "log" | "ls-files" | "ls-tree" | "rev-parse" | "show" | "status")
+    ) && !tokens.iter().any(|token| {
+        token == "-c"
+            || token.starts_with("--config-env")
+            || token == "--ext-diff"
+            || token == "--textconv"
+    })
 }
 
 fn path_arguments_stay_inside(tokens: &[String], cwd: &Path, context: &PolicyContext) -> bool {

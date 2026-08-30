@@ -1297,15 +1297,29 @@ impl EngineActor {
             }
         };
         let snapshots = manager.snapshots().await;
-        for result in &results {
-            if let Some(snapshot) = snapshots
-                .iter()
-                .find(|snapshot| snapshot.id == result.agent_id)
-            {
-                self.append(SessionEvent::AgentCompleted {
-                    snapshot: snapshot.clone(),
-                    summary: result.summary.clone(),
-                })?;
+        for snapshot in snapshots {
+            match snapshot.state {
+                kurama_protocol::agent::AgentState::Completed => {
+                    if let Some(result) =
+                        results.iter().find(|result| result.agent_id == snapshot.id)
+                    {
+                        self.append(SessionEvent::AgentCompleted {
+                            snapshot,
+                            summary: result.summary.clone(),
+                        })?;
+                    }
+                }
+                kurama_protocol::agent::AgentState::Failed => {
+                    let error = snapshot
+                        .last_error
+                        .clone()
+                        .unwrap_or_else(|| "sub-agent failed".into());
+                    self.append(SessionEvent::AgentFailed { snapshot, error })?;
+                }
+                kurama_protocol::agent::AgentState::Cancelled => {
+                    self.append(SessionEvent::AgentCancelled { snapshot })?;
+                }
+                _ => {}
             }
         }
         Ok(results)

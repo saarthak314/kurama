@@ -137,8 +137,23 @@ pub fn parse_control(text: &str, delegation_enabled: bool) -> Result<Vec<ModelEv
         KuramaError::Protocol(format!("invalid bridge control output: {error}"))
     })?;
     match control.kind {
-        ControlKind::Final => Ok(vec![ModelEvent::TextDelta { text: control.text }]),
+        ControlKind::Final => {
+            if control.text.trim().is_empty()
+                || !control.calls.is_empty()
+                || !control.agents.is_empty()
+            {
+                return Err(KuramaError::Protocol(
+                    "bridge returned an invalid final control object".into(),
+                ));
+            }
+            Ok(vec![ModelEvent::TextDelta { text: control.text }])
+        }
         ControlKind::ToolCalls => {
+            if !control.text.is_empty() || !control.agents.is_empty() {
+                return Err(KuramaError::Protocol(
+                    "bridge returned contaminated tool-call control".into(),
+                ));
+            }
             let calls = control.calls;
             if calls.is_empty() || calls.len() > 8 {
                 return Err(KuramaError::Protocol(
@@ -151,6 +166,11 @@ pub fn parse_control(text: &str, delegation_enabled: bool) -> Result<Vec<ModelEv
             if !delegation_enabled {
                 return Err(KuramaError::Protocol(
                     "bridge returned delegation while disabled".into(),
+                ));
+            }
+            if !control.text.is_empty() || !control.calls.is_empty() {
+                return Err(KuramaError::Protocol(
+                    "bridge returned contaminated delegation control".into(),
                 ));
             }
             let agents = control.agents;

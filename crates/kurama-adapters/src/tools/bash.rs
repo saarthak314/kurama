@@ -8,7 +8,10 @@ use std::{
 use kurama_protocol::{
     KuramaError,
     runtime::RuntimeEvent,
-    tool::{CommandClass, Operation, ToolContext, ToolDescriptor, ToolInvocation, ToolResult},
+    tool::{
+        CommandClass, Operation, ToolContext, ToolDescriptor, ToolInvocation, ToolResult,
+        split_shell_commands,
+    },
     traits::{BoxFuture, CancelSignal, EventSink, Tool},
 };
 use serde::Deserialize;
@@ -146,19 +149,24 @@ impl Tool for BashTool {
                 .stderr
                 .take()
                 .ok_or_else(|| KuramaError::Tool("Bash stderr pipe is unavailable".into()))?;
+            let event_sink = if context.agent_id.is_none() {
+                self.event_sink.clone()
+            } else {
+                None
+            };
             let mut stdout_task = tokio::spawn(capture_stream(
                 stdout,
                 context.limits,
                 invocation.call_id.clone(),
                 "stdout",
-                self.event_sink.clone(),
+                event_sink.clone(),
             ));
             let mut stderr_task = tokio::spawn(capture_stream(
                 stderr,
                 context.limits,
                 invocation.call_id.clone(),
                 "stderr",
-                self.event_sink.clone(),
+                event_sink,
             ));
 
             let mut status = None;
@@ -181,19 +189,26 @@ impl Tool for BashTool {
             };
             drop(wait);
 
-            let status = match outcome {
-                WaitOutcome::Completed => status.expect("completed command has an exit status"),
+            let (status, mut stdout, mut stderr, timed_out) = match outcome {
+                WaitOutcome::Completed => (
+                    Some(status.expect("completed command has an exit status")),
+                    stdout.expect("completed command has captured stdout"),
+                    stderr.expect("completed command has captured stderr"),
+                    false,
+                ),
                 WaitOutcome::TimedOut => {
                     terminate_process_group(&mut child, pid).await?;
                     if status.is_none() {
-                        child.wait().await?;
+                        status = Some(child.wait().await?);
                     }
-                    finish_remaining_capture(&mut stdout_task, &mut stderr_task, stdout, stderr)
-                        .await?;
-                    return Err(KuramaError::Tool(format!(
-                        "command timed out after {} ms",
-                        arguments.timeout_ms
-                    )));
+                    let (stdout, stderr) = finish_remaining_capture(
+                        &mut stdout_task,
+                        &mut stderr_task,
+                        stdout,
+                        stderr,
+                    )
+                    .await?;
+                    (status, stdout, stderr, true)
                 }
                 WaitOutcome::Cancelled => {
                     terminate_process_group(&mut child, pid).await?;
@@ -205,20 +220,27 @@ impl Tool for BashTool {
                     return Err(KuramaError::Cancelled);
                 }
             };
-            let mut stdout = stdout.expect("completed command has captured stdout");
-            let mut stderr = stderr.expect("completed command has captured stderr");
             let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-            let exit_code = status.code();
-            let signal = exit_signal(&status);
-            let is_error = !status.success();
+            let exit_code = status.as_ref().and_then(ExitStatus::code);
+            let signal = status.as_ref().and_then(exit_signal);
+            let is_error = timed_out || status.as_ref().is_none_or(|status| !status.success());
             let truncated = stdout.truncated || stderr.truncated;
-            let output = combined_output(&stdout.text, &stderr.text);
+            let timeout_message =
+                timed_out.then(|| format!("command timed out after {} ms", arguments.timeout_ms));
+            let mut output = combined_output(&stdout.text, &stderr.text);
+            if let Some(timeout_message) = &timeout_message {
+                if !output.is_empty() && !output.ends_with('\n') {
+                    output.push('\n');
+                }
+                output.push_str(timeout_message);
+            }
             let mut metadata = serde_json::json!({
                 "command_class": classify_command(&arguments.command),
                 "cwd": cwd,
                 "exit_code": exit_code,
                 "signal": signal,
                 "elapsed_ms": elapsed_ms,
+                "timed_out": timed_out,
                 "stdout": stdout.text.clone(),
                 "stderr": stderr.text.clone(),
                 "stdout_truncated": stdout.truncated,
@@ -230,6 +252,10 @@ impl Tool for BashTool {
                 "stdout_omitted_lines": stdout.omitted_lines,
                 "stderr_omitted_lines": stderr.omitted_lines
             });
+            if let Some(timeout_message) = timeout_message {
+                metadata["execution_error"] = serde_json::Value::Bool(true);
+                metadata["display_output"] = serde_json::Value::String(timeout_message);
+            }
             if truncated {
                 let mut staging = serde_json::Map::new();
                 if let Some(path) = stdout.take_staged_path() {
@@ -293,9 +319,21 @@ fn parse_arguments(invocation: &ToolInvocation) -> Result<BashArguments, KuramaE
 }
 
 fn classify_command(command: &str) -> CommandClass {
-    if has_shell_control(command) {
+    let Some(segments) = split_shell_commands(command) else {
         return CommandClass::Unknown;
+    };
+    let mut class = CommandClass::ReadOnly;
+    for segment in segments {
+        match classify_simple_command(segment) {
+            CommandClass::Mutating => return CommandClass::Mutating,
+            CommandClass::Unknown => class = CommandClass::Unknown,
+            CommandClass::ReadOnly => {}
+        }
     }
+    class
+}
+
+fn classify_simple_command(command: &str) -> CommandClass {
     let Some(tokens) = shlex::split(command) else {
         return CommandClass::Unknown;
     };
@@ -307,7 +345,38 @@ fn classify_command(command: &str) -> CommandClass {
         return CommandClass::Unknown;
     };
     match program {
-        "ls" | "rg" | "head" | "tail" => CommandClass::ReadOnly,
+        "basename" | "cat" | "dirname" | "file" | "grep" | "head" | "ls" | "printf" | "pwd"
+        | "realpath" | "rg" | "stat" | "tail" | "uniq" | "wc" => CommandClass::ReadOnly,
+        "sort" => {
+            if tokens
+                .iter()
+                .skip(1)
+                .any(|token| token == "-o" || token.starts_with("--output="))
+            {
+                CommandClass::Mutating
+            } else {
+                CommandClass::ReadOnly
+            }
+        }
+        "find" => {
+            if tokens.iter().skip(1).any(|token| {
+                matches!(
+                    token.as_str(),
+                    "-delete"
+                        | "-exec"
+                        | "-execdir"
+                        | "-fprint"
+                        | "-fprint0"
+                        | "-fls"
+                        | "-ok"
+                        | "-okdir"
+                )
+            }) {
+                CommandClass::Mutating
+            } else {
+                CommandClass::ReadOnly
+            }
+        }
         "sed" => {
             if tokens
                 .iter()
@@ -320,7 +389,9 @@ fn classify_command(command: &str) -> CommandClass {
             }
         }
         "git" => match tokens.get(1).map(String::as_str) {
-            Some("status" | "diff") => CommandClass::ReadOnly,
+            Some(
+                "diff" | "grep" | "log" | "ls-files" | "ls-tree" | "rev-parse" | "show" | "status",
+            ) => CommandClass::ReadOnly,
             Some(
                 "add" | "am" | "apply" | "branch" | "checkout" | "cherry-pick" | "clean" | "clone"
                 | "commit" | "fetch" | "init" | "merge" | "mv" | "pull" | "push" | "rebase"
@@ -332,32 +403,6 @@ fn classify_command(command: &str) -> CommandClass {
         | "truncate" | "tee" | "dd" => CommandClass::Mutating,
         _ => CommandClass::Unknown,
     }
-}
-
-fn has_shell_control(command: &str) -> bool {
-    let mut single_quote = false;
-    let mut double_quote = false;
-    let mut escaped = false;
-    for character in command.chars() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if character == '\\' && !single_quote {
-            escaped = true;
-            continue;
-        }
-        match character {
-            '\'' if !double_quote => single_quote = !single_quote,
-            '"' if !single_quote => double_quote = !double_quote,
-            ';' | '|' | '&' | '>' | '<' | '\n' | '\r' if !single_quote && !double_quote => {
-                return true;
-            }
-            '$' | '`' if !single_quote => return true,
-            _ => {}
-        }
-    }
-    single_quote || double_quote || escaped
 }
 
 async fn capture_stream<R: AsyncRead + Unpin>(
@@ -571,11 +616,21 @@ async fn terminate_process_group(child: &mut Child, pid: u32) -> Result<ExitStat
     let pid = i32::try_from(pid)
         .map_err(|_| KuramaError::Tool("Bash process identifier exceeds i32".into()))?;
     signal_process_group(pid, libc::SIGTERM)?;
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    if process_group_is_owned(pid)? {
-        signal_process_group(pid, libc::SIGKILL)?;
+    match tokio::time::timeout(Duration::from_millis(50), child.wait()).await {
+        Ok(status) => {
+            let status = status?;
+            if process_group_is_owned(pid)? {
+                signal_process_group(pid, libc::SIGKILL)?;
+            }
+            Ok(status)
+        }
+        Err(_) => {
+            if process_group_is_owned(pid)? {
+                signal_process_group(pid, libc::SIGKILL)?;
+            }
+            Ok(child.wait().await?)
+        }
     }
-    Ok(child.wait().await?)
 }
 
 #[cfg(unix)]

@@ -50,6 +50,75 @@ pub struct ToolInvocation {
     pub arguments: serde_json::Value,
 }
 
+pub fn split_shell_commands(command: &str) -> Option<Vec<&str>> {
+    let mut single_quote = false;
+    let mut double_quote = false;
+    let mut escaped = false;
+    let mut start = 0;
+    let mut segments = Vec::new();
+    let bytes = command.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let character = command[index..].chars().next()?;
+        let character_len = character.len_utf8();
+        if escaped {
+            escaped = false;
+            index += character_len;
+            continue;
+        }
+        if character == '\\' && !single_quote {
+            escaped = true;
+            index += character_len;
+            continue;
+        }
+        match character {
+            '\'' if !double_quote => single_quote = !single_quote,
+            '"' if !single_quote => double_quote = !double_quote,
+            '>' | '<' | '`' | '$' | '(' | ')' if !single_quote && !double_quote => return None,
+            '|' if !single_quote && !double_quote => {
+                if bytes.get(index + 1) == Some(&b'|') {
+                    return None;
+                }
+                push_shell_segment(command, start, index, &mut segments)?;
+                start = index + 1;
+            }
+            '&' if !single_quote && !double_quote => {
+                if bytes.get(index + 1) != Some(&b'&') {
+                    return None;
+                }
+                push_shell_segment(command, start, index, &mut segments)?;
+                index += 1;
+                start = index + 1;
+            }
+            ';' | '\n' | '\r' if !single_quote && !double_quote => {
+                push_shell_segment(command, start, index, &mut segments)?;
+                start = index + character_len;
+            }
+            _ => {}
+        }
+        index += character_len;
+    }
+    if single_quote || double_quote || escaped {
+        return None;
+    }
+    push_shell_segment(command, start, command.len(), &mut segments)?;
+    Some(segments)
+}
+
+fn push_shell_segment<'a>(
+    command: &'a str,
+    start: usize,
+    end: usize,
+    segments: &mut Vec<&'a str>,
+) -> Option<()> {
+    let segment = command.get(start..end)?.trim();
+    if segment.is_empty() {
+        return None;
+    }
+    segments.push(segment);
+    Some(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandClass {

@@ -327,6 +327,23 @@ impl ContextManager {
                     changed_files: snapshot.changed_files.clone(),
                     evidence_refs: Vec::new(),
                 }),
+                SessionEvent::AgentFailed {
+                    snapshot, error, ..
+                } => Some(ModelItem::AgentResult {
+                    agent_id: snapshot.id.clone(),
+                    summary: format!("Sub-agent failed: {error}"),
+                    changed_files: snapshot.changed_files.clone(),
+                    evidence_refs: Vec::new(),
+                }),
+                SessionEvent::AgentCancelled { snapshot, .. } => Some(ModelItem::AgentResult {
+                    agent_id: snapshot.id.clone(),
+                    summary: snapshot.last_error.clone().map_or_else(
+                        || "Sub-agent was cancelled before completing.".into(),
+                        |error| format!("Sub-agent was cancelled: {error}"),
+                    ),
+                    changed_files: snapshot.changed_files.clone(),
+                    evidence_refs: Vec::new(),
+                }),
                 _ => None,
             })
             .collect()

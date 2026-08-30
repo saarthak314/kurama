@@ -16,7 +16,7 @@ use kurama_core::testing::{
 use kurama_sdk::{
     AgentBudget, AgentBuilder, AgentCommand, AgentRuntime, AgentSpec, AgentState, ApprovalPolicy,
     ApprovalResponse, BackendCapabilities, BoxFuture, CancelSignal, DelegationRequest,
-    EventEnvelope, ExecutionMode, FinishReason, KuramaError, ModelBackend, ModelEvent,
+    EventEnvelope, ExecutionMode, FinishReason, KuramaError, ModelBackend, ModelEvent, ModelItem,
     ModelProfile, ModelRequest, ModelStream, Operation, OrchestrationContext, PolicyContext,
     PolicyDecision, RuntimeEvent, SessionEvent, SessionMetadata, SessionStore, Tool, ToolContext,
     ToolDescriptor, ToolInvocation, ToolResult, Usage, WriteScope,
@@ -215,7 +215,7 @@ async fn child_finishes_when_no_queued_work_remains() {
 }
 
 #[tokio::test]
-async fn child_final_turn_overage_surfaces_budget_exhaustion() {
+async fn child_final_turn_overage_preserves_the_completed_result() {
     let budget = child_budget(1_000, 7);
     let backend = Arc::new(RecordingBackend::new(vec![
         vec![delegation(budget), completed(FinishReason::ToolCalls)],
@@ -240,7 +240,54 @@ async fn child_final_turn_overage_surfaces_budget_exhaustion() {
     let child_snapshot = wait_for_child_result(&mut events).await;
 
     assert_eq!(child_requests(&backend).len(), 1);
-    assert_budget_exhausted(child_snapshot);
+    assert_eq!(child_snapshot.state, AgentState::Completed);
+    assert_eq!(child_snapshot.last_error, None);
+    let parent_requests: Vec<_> = backend
+        .requests()
+        .into_iter()
+        .filter(|request| request.agent_id.is_none())
+        .collect();
+    assert!(parent_requests.last().is_some_and(|request| {
+        request.items.iter().any(|item| {
+            matches!(item, ModelItem::AgentResult { summary, .. } if summary == "over budget")
+        })
+    }));
+}
+
+#[tokio::test]
+async fn failed_child_outcome_reaches_the_parent_context() {
+    let backend = Arc::new(RecordingBackend::new(vec![
+        vec![
+            delegation(child_budget(16_000, 2_000)),
+            completed(FinishReason::ToolCalls),
+        ],
+        vec![Err(KuramaError::Model("child failed".into()))],
+        vec![Err(KuramaError::Model("child failed again".into()))],
+        vec![text("parent complete"), completed(FinishReason::Stop)],
+    ]));
+    let runtime = orchestrated_runtime(
+        backend.clone(),
+        Arc::new(AllowAllPolicy),
+        Arc::new(MemoryStore::default()),
+        None,
+    );
+    let (handle, mut events) = runtime
+        .start(session("failed-child-context"), Vec::new())
+        .expect("start");
+    handle.submit("delegate", true).await.expect("submit");
+
+    wait_for_turn(&mut events).await;
+
+    let parent_requests: Vec<_> = backend
+        .requests()
+        .into_iter()
+        .filter(|request| request.agent_id.is_none())
+        .collect();
+    assert!(parent_requests.last().is_some_and(|request| {
+        request.items.iter().any(|item| {
+            matches!(item, ModelItem::AgentResult { summary, .. } if summary.contains("failed"))
+        })
+    }));
 }
 
 #[tokio::test]

@@ -61,6 +61,24 @@ fn codex_initial_command_is_read_only_isolated_and_jsonl() {
             .any(|pair| pair == ["--sandbox", "read-only"])
     );
     assert!(command.args.iter().any(|argument| argument == "--json"));
+    for feature in [
+        "apps",
+        "browser_use",
+        "computer_use",
+        "image_generation",
+        "multi_agent",
+        "shell_tool",
+        "unified_exec",
+        "view_image",
+    ] {
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--disable", feature]),
+            "native Codex feature remained enabled: {feature}"
+        );
+    }
     assert!(
         command
             .args
@@ -144,6 +162,26 @@ fn codex_resume_command_preserves_thread_cursor() {
 
     assert_eq!(&command.args[..2], ["exec", "resume"]);
     assert!(command.args.iter().any(|argument| argument == "thread-1"));
+    assert!(
+        command
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--disable", "shell_tool"])
+    );
+}
+
+#[test]
+fn codex_rejects_native_tool_execution_events() {
+    let error = CodexBridge::parse_fixture(concat!(
+        r#"{"type":"thread.started","thread_id":"thread-1"}"#,
+        "\n",
+        r#"{"type":"item.completed","item":{"id":"item-1","type":"command_execution","command":"pwd","aggregated_output":"/workspace\n","exit_code":0,"status":"completed"}}"#,
+        "\n",
+        r#"{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5,"cached_input_tokens":0}}"#,
+    ))
+    .expect_err("native tool execution must fail closed");
+
+    assert!(error.to_string().contains("native Codex tool"), "{error}");
 }
 
 #[test]
@@ -263,7 +301,7 @@ fn control_schema_omits_delegation_when_disabled() {
 
 #[test]
 fn strict_control_parser_normalizes_tools_and_delegation() {
-    let tools = parse_control(r#"{"kind":"tool_calls","text":"ignored","calls":[{"call_id":"c1","name":"read","arguments":"{\"files\":[]}"}],"agents":[{"objective":"ignored","write_roots":[],"write_files":[],"depends_on":[]}] }"#, true)
+    let tools = parse_control(r#"{"kind":"tool_calls","text":"","calls":[{"call_id":"c1","name":"read","arguments":"{\"files\":[]}"}],"agents":[]}"#, true)
         .expect("tools");
     assert!(matches!(tools.as_slice(), [ModelEvent::ToolCall { name, .. }] if name == "read"));
 
@@ -277,6 +315,20 @@ fn strict_control_parser_normalizes_tools_and_delegation() {
         [ModelEvent::Delegation { .. }]
     ));
     assert!(parse_control(r#"{"kind":"delegate","agents":[]}"#, false).is_err());
+    assert!(
+        parse_control(
+            r#"{"kind":"final","text":"","calls":[],"agents":[{"objective":"stale","write_roots":[],"write_files":[],"depends_on":[]}]}"#,
+            true,
+        )
+        .is_err()
+    );
+    assert!(
+        parse_control(
+            r#"{"kind":"tool_calls","text":"stale","calls":[{"call_id":"c1","name":"read","arguments":"{\"files\":[]}"}],"agents":[]}"#,
+            true,
+        )
+        .is_err()
+    );
 }
 
 #[test]

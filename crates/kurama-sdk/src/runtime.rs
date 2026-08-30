@@ -276,13 +276,34 @@ impl ChildRunner for RuntimeChildRunner {
                                 let replay = store.replay_agent(&session.id, &child_id)?;
                                 let (usage, replay_completed_turns) = child_budget_state(&replay);
                                 completed_turns = replay_completed_turns;
+                                if pending_messages.is_empty() {
+                                    let _ = context.progress.send(ChildProgress {
+                                        phase: Some("completed turn".into()),
+                                        completed_turns,
+                                        ..ChildProgress::default()
+                                    }).await;
+                                    let _ = handle.shutdown().await;
+                                    let (changed_files, evidence_refs) = child_artifacts(
+                                        store.as_ref(),
+                                        &session.id,
+                                        &child_id,
+                                    )?;
+                                    return Ok(AgentResult {
+                                        agent_id: child_id,
+                                        summary: if summary.trim().is_empty() {
+                                            "completed without a textual summary".into()
+                                        } else {
+                                            summary
+                                        },
+                                        changed_files,
+                                        evidence_refs,
+                                    });
+                                }
                                 let over_budget = usage.input_tokens > child_budget.max_input_tokens
                                     || usage.output_tokens > child_budget.max_output_tokens
                                     || completed_turns > child_budget.max_turns;
-                                let next_profile = if pending_messages.is_empty()
-                                    || over_budget
-                                    || completed_turns >= child_budget.max_turns
-                                {
+                                let next_profile = if over_budget
+                                    || completed_turns >= child_budget.max_turns {
                                     None
                                 } else {
                                     remaining_budgeted_profile(
@@ -312,24 +333,6 @@ impl ChildRunner for RuntimeChildRunner {
                                     let _ = handle.shutdown().await;
                                     context.cancel.cancel();
                                     return Err(KuramaError::Cancelled);
-                                }
-                                if pending_messages.is_empty() {
-                                    let _ = handle.shutdown().await;
-                                    let (changed_files, evidence_refs) = child_artifacts(
-                                        store.as_ref(),
-                                        &session.id,
-                                        &child_id,
-                                    )?;
-                                    return Ok(AgentResult {
-                                        agent_id: child_id,
-                                        summary: if summary.trim().is_empty() {
-                                            "completed without a textual summary".into()
-                                        } else {
-                                            summary
-                                        },
-                                        changed_files,
-                                        evidence_refs,
-                                    });
                                 }
                                 let next_profile = next_profile.expect("queued work has budget");
                                 let message = pending_messages.join("\n");
