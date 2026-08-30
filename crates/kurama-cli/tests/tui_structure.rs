@@ -1,11 +1,14 @@
 use kurama_cli::{
     app::App,
     commands::{Command, parse_command},
-    tui::{AgentRow, Overlay, TuiState, render},
+    tui::{
+        AgentRow, Overlay, ToolLifecycle, ToolTranscript, TranscriptDetail, TranscriptEntry,
+        TuiState, render, transcript_lines,
+    },
 };
 use kurama_protocol::{
     agent::AgentState,
-    id::{AgentId, OperationId, SessionId},
+    id::{AgentId, CallId, OperationId, SessionId},
     policy::{ApprovalRequest, ExecutionMode},
     runtime::RuntimeEvent,
     tool::Operation,
@@ -33,6 +36,19 @@ fn rendered(state: &TuiState, width: u16, height: u16) -> Buffer {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal.draw(|frame| render(frame, state)).unwrap();
     terminal.backend().buffer().clone()
+}
+
+fn plain(lines: Vec<ratatui::text::Line<'static>>) -> String {
+    lines
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|span| span.content.into_owned())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn cell_at_text<'a>(buffer: &'a Buffer, needle: &str) -> &'a Cell {
@@ -128,12 +144,104 @@ fn transcript_uses_compact_codex_style_hierarchy() {
 
     assert!(text.contains("› Review the parser."));
     assert!(text.contains("I’ll inspect the parser and its focused tests."));
-    assert!(text.contains("• Ran bash"));
-    assert!(text.contains("  └ cargo test -p kurama-cli"));
+    assert!(text.contains("• I’ll inspect the parser and its focused tests."));
+    assert!(text.contains("└ Ran bash"));
+    assert!(!text.contains("cargo test -p kurama-cli"));
     assert!(text.contains("• MODE · supervised"));
     assert!(!text.contains("│ YOU"));
     assert!(!text.contains("│ KURAMA"));
     assert!(!text.contains("TOOL / bash  /"));
+}
+
+#[test]
+fn transcript_groups_turns_and_expands_complete_tool_output() {
+    let entries = vec![
+        TranscriptEntry::UserTurn {
+            body: "inspect".into(),
+        },
+        TranscriptEntry::ToolCall(ToolTranscript {
+            call_id: Some(CallId::from("call_1")),
+            name: "bash".into(),
+            output: "line one\nline two".into(),
+            lifecycle: ToolLifecycle::Completed,
+        }),
+    ];
+
+    let compact = plain(transcript_lines(&entries, 80, TranscriptDetail::Compact));
+    let expanded = plain(transcript_lines(&entries, 80, TranscriptDetail::Expanded));
+
+    assert!(compact.contains("› inspect"));
+    assert!(compact.contains("└ Ran bash"));
+    assert!(!compact.contains("line one"));
+    assert!(!compact.contains("line two"));
+    assert!(expanded.contains("line one"));
+    assert!(expanded.contains("line two"));
+}
+
+#[test]
+fn transcript_uses_codex_gutters_and_separates_user_turns() {
+    let entries = vec![
+        TranscriptEntry::UserTurn {
+            body: "first".into(),
+        },
+        TranscriptEntry::AssistantMessage {
+            body: "answer".into(),
+        },
+        TranscriptEntry::ToolCall(ToolTranscript {
+            call_id: None,
+            name: "read".into(),
+            output: "hidden".into(),
+            lifecycle: ToolLifecycle::Running,
+        }),
+        TranscriptEntry::Error {
+            body: "broken".into(),
+        },
+        TranscriptEntry::UserTurn {
+            body: "second".into(),
+        },
+    ];
+
+    let text = plain(transcript_lines(&entries, 80, TranscriptDetail::Compact));
+    let lines = text.lines().collect::<Vec<_>>();
+
+    assert_eq!(lines[0], "› first");
+    assert_eq!(lines[1], "• answer");
+    assert_eq!(lines[2], "└ Running read");
+    assert_eq!(lines[3], "Error: broken");
+    assert_eq!(lines[4], "");
+    assert_eq!(lines[5], "› second");
+}
+
+#[test]
+fn transcript_tool_summaries_follow_lifecycle_without_truncating_expanded_output() {
+    let output = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ\nline two";
+    let entries = vec![
+        TranscriptEntry::ToolCall(ToolTranscript {
+            call_id: None,
+            name: "bash".into(),
+            output: output.into(),
+            lifecycle: ToolLifecycle::Completed,
+        }),
+        TranscriptEntry::ToolCall(ToolTranscript {
+            call_id: None,
+            name: "write".into(),
+            output: "permission denied".into(),
+            lifecycle: ToolLifecycle::Failed,
+        }),
+    ];
+
+    let compact = plain(transcript_lines(&entries, 20, TranscriptDetail::Compact));
+    let expanded = plain(transcript_lines(&entries, 20, TranscriptDetail::Expanded));
+
+    assert!(compact.contains("└ Ran bash"));
+    assert!(compact.contains("└ write failed"));
+    assert!(!compact.contains("permission denied"));
+    assert!(expanded.contains("abcdefghijklmnopqr"));
+    assert!(expanded.contains("stuvwxyz0123456789"));
+    assert!(expanded.contains("ABCDEFGHIJ"));
+    assert!(expanded.contains("line two"));
+    assert!(expanded.contains("permission denied"));
+    assert!(!expanded.contains('…'));
 }
 
 #[test]
@@ -171,6 +279,23 @@ fn committed_transcript_is_not_redrawn_in_the_live_viewport() {
 }
 
 #[test]
+fn expanded_transcript_view_renders_committed_canonical_history() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_user("committed question");
+    state.mark_transcript_committed(1);
+    state.push_tool("TOOL / bash", "complete output");
+
+    let compact = buffer_text(&rendered(&state, 80, 20));
+    assert!(!compact.contains("committed question"));
+    assert!(!compact.contains("complete output"));
+
+    state.toggle_transcript_view();
+    let expanded = buffer_text(&rendered(&state, 80, 20));
+    assert!(expanded.contains("committed question"));
+    assert!(expanded.contains("complete output"));
+}
+
+#[test]
 fn runtime_errors_render_in_the_transcript_instead_of_the_status_line() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.apply_runtime_event(RuntimeEvent::Error {
@@ -180,12 +305,12 @@ fn runtime_errors_render_in_the_transcript_instead_of_the_status_line() {
     let buffer = rendered(&state, 100, 20);
     let text = buffer_text(&buffer);
 
-    assert!(text.contains("× ERROR · protocol error: malformed bridge output"));
+    assert!(text.contains("Error: protocol error: malformed bridge output"));
     assert!(
         text.lines()
             .any(|line| line.contains("work/model") && line.contains("ready"))
     );
-    assert_eq!(cell_at_text(&buffer, "ERROR").fg, Color::Rgb(255, 92, 82));
+    assert_eq!(cell_at_text(&buffer, "Error").fg, Color::Rgb(255, 92, 82));
 }
 
 #[test]
@@ -308,8 +433,11 @@ fn assistant_markdown_preserves_viewport_wrapping_and_style() {
     let buffer = rendered(&state, 40, 20);
     let text = buffer_text(&buffer);
 
-    assert!(text.contains("abcdefghijklmnopqrstuvwxyz0123456789"));
-    assert!(text.contains("ABCDEFGHIJ"));
+    let compact = text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    assert!(compact.contains("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ"));
     assert!(!text.contains("**"));
     assert!(
         cell_at_text(&buffer, "abcdefghijklmnopqrstuvwxyz")
@@ -332,7 +460,7 @@ fn assistant_markdown_wraps_words_without_orphan_punctuation() {
     let text = buffer_text(&buffer);
     let lines = text.lines().map(str::trim).collect::<Vec<_>>();
 
-    assert!(lines.contains(&"1234567890"));
+    assert!(lines.contains(&"• 1234567890"));
     assert!(lines.contains(&"hello."));
     assert!(!lines.contains(&"."));
     assert!(
@@ -384,8 +512,12 @@ fn tables_stack_when_separators_do_not_fit() {
 
     let text = buffer_text(&rendered(&state, 8, 16));
 
-    assert!(text.contains("A: x"));
-    assert!(text.contains("B: y"));
+    let compact = text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    assert!(compact.contains("A:x"), "{text:?}\n{compact:?}");
+    assert!(compact.contains("B:y"), "{text:?}\n{compact:?}");
 }
 
 #[test]
@@ -414,6 +546,7 @@ fn transcript_scroll_reaches_visual_lines_beyond_u16_max() {
         .collect::<Vec<_>>()
         .join("\n");
     state.push_tool("TOOL / bash", output);
+    state.toggle_transcript_view();
     state.scroll = usize::from(u16::MAX) + 5;
 
     let text = buffer_text(&rendered(&state, 40, 12));
@@ -442,6 +575,7 @@ fn transcript_follows_the_latest_answer_after_long_tool_output() {
 fn tool_output_wraps_on_unicode_grapheme_clusters() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.push_tool("TOOL / bash", "A👨‍👩‍👧‍👦B");
+    state.toggle_transcript_view();
 
     let text = buffer_text(&rendered(&state, 10, 16));
 
@@ -511,11 +645,12 @@ fn tool_output_preserves_every_wrapped_line() {
             "tail-ten"
         ),
     );
+    state.toggle_transcript_view();
 
     let text = buffer_text(&rendered(&state, 40, 30));
 
-    assert!(text.contains("  └ abcdefghijklmnopqrstuvwxyz012345"));
-    assert!(text.contains("    6789ABCDEFGHIJ"));
+    assert!(text.contains("  abcdefghijklmnopqrstuvwxyz01234567"));
+    assert!(text.contains("  89ABCDEFGHIJ"));
     assert!(text.contains("head-two"));
     assert!(text.contains("middle-four"));
     assert!(text.contains("middle-five"));

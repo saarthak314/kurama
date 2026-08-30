@@ -43,8 +43,8 @@ use crate::{
     args::{Args, ResumeChoice},
     commands::{Command, parse_command},
     tui::{
-        OnboardingState, OnboardingSubmission, Overlay, SURFACE, TerminalGuard, TuiState, render,
-        spawn_input_thread, transcript_lines,
+        OnboardingState, OnboardingSubmission, Overlay, SURFACE, TerminalGuard, TranscriptDetail,
+        TuiState, render, spawn_input_thread, transcript_lines,
     },
 };
 
@@ -477,6 +477,21 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.state.queue_command(EngineCommand::Shutdown);
             return Ok(true);
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
+            self.state.toggle_transcript_view();
+            return Ok(false);
+        }
+        if self.state.transcript_view_expanded() {
+            match key.code {
+                KeyCode::Esc => self.state.toggle_transcript_view(),
+                KeyCode::Up => self.state.scroll = self.state.scroll.saturating_add(1),
+                KeyCode::Down => self.state.scroll = self.state.scroll.saturating_sub(1),
+                KeyCode::PageUp => self.state.scroll = self.state.scroll.saturating_add(5),
+                KeyCode::PageDown => self.state.scroll = self.state.scroll.saturating_sub(5),
+                _ => {}
+            }
+            return Ok(false);
         }
         if self.transcript_is_visible() {
             match key.code {
@@ -1120,7 +1135,19 @@ where
     let content_width = terminal_width
         .saturating_sub(TRANSCRIPT_HORIZONTAL_PADDING * 2)
         .max(1);
-    let lines = transcript_lines(state.stable_transcript(), content_width);
+    let mut lines = transcript_lines(
+        state.stable_transcript(),
+        content_width,
+        TranscriptDetail::Compact,
+    );
+    if state.transcript.len() > state.live_transcript().len()
+        && matches!(
+            state.stable_transcript().first(),
+            Some(crate::tui::TranscriptEntry::UserTurn { .. })
+        )
+    {
+        lines.insert(0, ratatui::text::Line::from(""));
+    }
 
     for chunk in lines.chunks(MAX_TRANSCRIPT_INSERT_HEIGHT) {
         terminal
@@ -1350,6 +1377,60 @@ mod tests {
 
     use super::*;
     use crate::tui::TranscriptEntry;
+
+    fn test_app() -> App {
+        App {
+            state: TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised),
+            engine: None,
+            runtime_events: None,
+            tool_events: None,
+            orchestrator: None,
+            session_id: None,
+            restart_args: None,
+            control: None,
+        }
+    }
+
+    #[test]
+    fn ctrl_o_toggles_expanded_transcript_view_and_escape_closes_it() {
+        let mut app = test_app();
+
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("open transcript view");
+        assert!(app.state.transcript_view_expanded());
+        assert!(app.state.composer.is_empty());
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .expect("close transcript view");
+        assert!(!app.state.transcript_view_expanded());
+    }
+
+    #[test]
+    fn expanded_transcript_view_uses_arrow_and_page_scrolling() {
+        let mut app = test_app();
+        app.state.toggle_transcript_view();
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)))
+            .expect("scroll transcript up");
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::PageUp,
+            KeyModifiers::NONE,
+        )))
+        .expect("page transcript up");
+        assert_eq!(app.state.scroll, 6);
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
+            .expect("scroll transcript down");
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::PageDown,
+            KeyModifiers::NONE,
+        )))
+        .expect("page transcript down");
+        assert_eq!(app.state.scroll, 0);
+    }
 
     #[test]
     fn queued_tool_delta_is_applied_before_completion() {
