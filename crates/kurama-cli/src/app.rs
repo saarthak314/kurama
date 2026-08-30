@@ -1349,13 +1349,18 @@ fn set_inline_viewport_height<B>(
 where
     B: Backend + Clone,
 {
-    let current_area = terminal.get_frame().area();
+    let mut current_area = terminal.get_frame().area();
     if current_area.height == viewport_height {
         return Ok(());
     }
 
     let size = terminal.size()?;
     let viewport_height = viewport_height.min(size.height);
+    let growth = viewport_height.saturating_sub(current_area.height);
+    if growth > 0 {
+        terminal.insert_before(growth, |_| {})?;
+        current_area = terminal.get_frame().area();
+    }
     let viewport_top = size.height.saturating_sub(viewport_height);
     let clear_top = current_area.top().min(viewport_top);
     terminal
@@ -2798,6 +2803,44 @@ Session ID: ses_cafebabe"
         assert_eq!(worked_row, answer_row + 2, "{rows:#?}");
         assert_eq!(worked_row + 1, composer_row, "{rows:#?}");
         assert_eq!(composer_row, 22, "{rows:#?}");
+    }
+
+    #[test]
+    fn growing_inline_viewport_preserves_committed_startup_history() {
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        state.prepend_startup("0.1.0", "~/project");
+        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24))
+            .expect("initialize inline terminal");
+        let mut transcript_cache = TranscriptRenderCache::default();
+
+        prepare_inline_frame(&mut state, &mut terminal, &mut transcript_cache)
+            .expect("commit startup");
+        terminal
+            .draw(|frame| render_with_transcript(frame, &state, transcript_cache.lines()))
+            .expect("draw startup frame");
+
+        state.submit_turn("inspect the repository", false);
+        prepare_inline_frame(&mut state, &mut terminal, &mut transcript_cache)
+            .expect("commit user turn");
+        terminal
+            .draw(|frame| render_with_transcript(frame, &state, transcript_cache.lines()))
+            .expect("draw active frame");
+
+        let text = terminal
+            .backend()
+            .scrollback()
+            .content()
+            .iter()
+            .chain(terminal.backend().buffer().content().iter())
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert_eq!(text.matches("◢ kurama").count(), 1, "{text}");
+        assert_eq!(text.matches("~/project").count(), 1, "{text}");
+        assert_eq!(
+            text.matches("› inspect the repository").count(),
+            1,
+            "{text}"
+        );
     }
 
     #[test]
