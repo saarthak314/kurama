@@ -413,6 +413,28 @@ async fn bash_timeout_still_applies_after_the_shell_exits() {
     assert!(!marker.exists());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_timeout_does_not_wait_for_detached_process_group_pipes() {
+    let fixture = Fixture::empty();
+    let call = invocation(serde_json::json!({
+        "command": "set -m; (sleep 1) &",
+        "cwd": ".",
+        "timeout_ms": 30
+    }));
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(500),
+        BashTool::default().execute(fixture.context(limits()), call, &NeverCancel),
+    )
+    .await
+    .expect("detached process pipes must not outlive the tool timeout")
+    .expect("timeout result");
+
+    assert!(result.is_error);
+    assert_eq!(result.metadata["timed_out"], true);
+}
+
 #[test]
 fn bash_classification_is_conservative() {
     let fixture = Fixture::empty();

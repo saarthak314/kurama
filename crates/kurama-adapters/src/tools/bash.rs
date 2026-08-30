@@ -18,6 +18,7 @@ use serde::Deserialize;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::{Child, Command},
+    sync::oneshot,
 };
 
 use super::{BoundedText, PathGuard, limits::staged_output};
@@ -26,6 +27,7 @@ const MAX_COMMAND_BYTES: usize = 32_768;
 const MAX_TIMEOUT_MS: u64 = 3_600_000;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
 const EVENT_CHUNK_BYTES: usize = 4 * 1024;
+const CAPTURE_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const DISPLAY_STAGING_KEY: &str = "_display_staging";
 
 pub struct BashTool {
@@ -154,12 +156,17 @@ impl Tool for BashTool {
             } else {
                 None
             };
+            let (stdout_stop, stdout_stop_rx) = oneshot::channel();
+            let (stderr_stop, stderr_stop_rx) = oneshot::channel();
+            let mut stdout_stop = Some(stdout_stop);
+            let mut stderr_stop = Some(stderr_stop);
             let mut stdout_task = tokio::spawn(capture_stream(
                 stdout,
                 context.limits,
                 invocation.call_id.clone(),
                 "stdout",
                 event_sink.clone(),
+                stdout_stop_rx,
             ));
             let mut stderr_task = tokio::spawn(capture_stream(
                 stderr,
@@ -167,6 +174,7 @@ impl Tool for BashTool {
                 invocation.call_id.clone(),
                 "stderr",
                 event_sink,
+                stderr_stop_rx,
             ));
 
             let mut status = None;
@@ -201,6 +209,8 @@ impl Tool for BashTool {
                     if status.is_none() {
                         status = Some(child.wait().await?);
                     }
+                    request_capture_stop(&mut stdout_stop);
+                    request_capture_stop(&mut stderr_stop);
                     let (stdout, stderr) = finish_remaining_capture(
                         &mut stdout_task,
                         &mut stderr_task,
@@ -215,6 +225,8 @@ impl Tool for BashTool {
                     if status.is_none() {
                         child.wait().await?;
                     }
+                    request_capture_stop(&mut stdout_stop);
+                    request_capture_stop(&mut stderr_stop);
                     finish_remaining_capture(&mut stdout_task, &mut stderr_task, stdout, stderr)
                         .await?;
                     return Err(KuramaError::Cancelled);
@@ -411,6 +423,7 @@ async fn capture_stream<R: AsyncRead + Unpin>(
     call_id: kurama_protocol::id::CallId,
     stream: &'static str,
     event_sink: Option<Arc<dyn EventSink>>,
+    mut stop: oneshot::Receiver<()>,
 ) -> Result<CapturedStream, KuramaError> {
     let mut bounded = if event_sink.is_some() {
         staged_output(limits, "bash", stream)?
@@ -420,7 +433,10 @@ async fn capture_stream<R: AsyncRead + Unpin>(
     let mut pending_utf8 = Vec::new();
     let mut chunk = [0_u8; READ_CHUNK_BYTES];
     loop {
-        let read = reader.read(&mut chunk).await?;
+        let read = tokio::select! {
+            _ = &mut stop => break,
+            read = reader.read(&mut chunk) => read?,
+        };
         if read == 0 {
             break;
         }
@@ -547,15 +563,33 @@ async fn finish_remaining_capture(
     stdout: Option<CapturedStream>,
     stderr: Option<CapturedStream>,
 ) -> Result<(CapturedStream, CapturedStream), KuramaError> {
-    let stdout = match stdout {
-        Some(stdout) => stdout,
-        None => join_capture(stdout_task.await)?,
+    let capture = async {
+        let stdout = match stdout {
+            Some(stdout) => stdout,
+            None => join_capture((&mut *stdout_task).await)?,
+        };
+        let stderr = match stderr {
+            Some(stderr) => stderr,
+            None => join_capture((&mut *stderr_task).await)?,
+        };
+        Ok((stdout, stderr))
     };
-    let stderr = match stderr {
-        Some(stderr) => stderr,
-        None => join_capture(stderr_task.await)?,
-    };
-    Ok((stdout, stderr))
+    match tokio::time::timeout(CAPTURE_SHUTDOWN_TIMEOUT, capture).await {
+        Ok(result) => result,
+        Err(_) => {
+            stdout_task.abort();
+            stderr_task.abort();
+            Err(KuramaError::Tool(
+                "Bash output capture exceeded its shutdown deadline".into(),
+            ))
+        }
+    }
+}
+
+fn request_capture_stop(stop: &mut Option<oneshot::Sender<()>>) {
+    if let Some(stop) = stop.take() {
+        let _ = stop.send(());
+    }
 }
 
 fn join_capture(
