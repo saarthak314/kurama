@@ -252,12 +252,8 @@ fn approval_layout(approval: &ApprovalState, width: usize, max_height: usize) ->
     };
     let controls = approval_controls(approval.editing, width, control_height);
     let body_height = max_height.saturating_sub(controls.len());
-    let detail = indented_lines(
-        &approval_detail(&approval.request.operation),
-        width,
-        Style::default(),
-        false,
-    );
+    let detail_text = approval_detail(&approval.request.operation);
+    let detail = indented_lines(&detail_text, width, Style::default(), false);
     let summary = indented_lines(
         &approval.request.summary,
         width,
@@ -294,7 +290,7 @@ fn approval_layout(approval: &ApprovalState, width: usize, max_height: usize) ->
         if show_title {
             lines.push(title);
         }
-        lines.extend(detail.into_iter().take(detail_height));
+        lines.extend(bounded_detail_lines(&detail_text, width, detail_height));
         lines.extend(summary.into_iter().take(summary_height));
         let editor = editor_preview(&approval.editor, editor_width, editor_budget);
         let cursor = (!editor.is_empty()).then(|| {
@@ -324,7 +320,7 @@ fn approval_layout(approval: &ApprovalState, width: usize, max_height: usize) ->
         if show_title {
             lines.push(title);
         }
-        lines.extend(detail.into_iter().take(detail_height));
+        lines.extend(bounded_detail_lines(&detail_text, width, detail_height));
         lines.extend(summary.into_iter().take(summary_height));
         lines.extend(controls);
         debug_assert!(lines.len() <= max_height);
@@ -416,6 +412,93 @@ fn indented_lines(value: &str, width: usize, style: Style, prose: bool) -> Vec<L
         .into_iter()
         .map(|line| Line::from(vec![Span::raw("  "), Span::styled(line, style)]))
         .collect()
+}
+
+fn bounded_detail_lines(value: &str, width: usize, max_lines: usize) -> Vec<Line<'static>> {
+    if max_lines == 0 || width == 0 {
+        return Vec::new();
+    }
+    let content_width = width.saturating_sub(2).max(1);
+    let wrapped = hard_wrap(value, content_width);
+    if wrapped.len() <= max_lines {
+        return wrapped
+            .into_iter()
+            .map(|line| Line::from(vec![Span::raw("  "), Span::raw(line)]))
+            .collect();
+    }
+    if max_lines == 1 {
+        return vec![Line::from(vec![
+            Span::raw("  "),
+            Span::raw(middle_truncate(value, content_width)),
+        ])];
+    }
+    if max_lines == 2 {
+        let first = format!(
+            "{}…",
+            truncate_display(&wrapped[0], content_width.saturating_sub(1))
+        );
+        let last = format!(
+            "…{}",
+            truncate_tail(
+                wrapped.last().map_or("", String::as_str),
+                content_width.saturating_sub(1)
+            )
+        );
+        return [first, last]
+            .into_iter()
+            .map(|line| Line::from(vec![Span::raw("  "), Span::raw(line)]))
+            .collect();
+    }
+
+    let visible_lines = max_lines.saturating_sub(1);
+    let head_lines = visible_lines.div_ceil(2);
+    let tail_lines = visible_lines.saturating_sub(head_lines);
+    let omitted = wrapped.len().saturating_sub(visible_lines);
+    let mut lines = wrapped.iter().take(head_lines).cloned().collect::<Vec<_>>();
+    lines.push(truncate_display(
+        &format!("… {omitted} lines omitted …"),
+        content_width,
+    ));
+    lines.extend(
+        wrapped
+            .iter()
+            .skip(wrapped.len().saturating_sub(tail_lines))
+            .cloned(),
+    );
+    lines
+        .into_iter()
+        .map(|line| Line::from(vec![Span::raw("  "), Span::raw(line)]))
+        .collect()
+}
+
+fn middle_truncate(value: &str, width: usize) -> String {
+    if Line::from(value).width() <= width {
+        return value.to_owned();
+    }
+    if width <= 1 {
+        return "…".repeat(width);
+    }
+    let head_width = 4.min(width.saturating_sub(1));
+    let tail_width = width.saturating_sub(head_width).saturating_sub(1);
+    format!(
+        "{}…{}",
+        truncate_display(value, head_width),
+        truncate_tail(value, tail_width)
+    )
+}
+
+fn truncate_tail(value: &str, width: usize) -> String {
+    let mut tail = Vec::new();
+    let mut used = 0_usize;
+    for grapheme in value.graphemes(true).rev() {
+        let grapheme_width = Line::from(grapheme).width();
+        if used.saturating_add(grapheme_width) > width {
+            break;
+        }
+        tail.push(grapheme);
+        used = used.saturating_add(grapheme_width);
+    }
+    tail.into_iter().rev().collect()
 }
 
 fn editor_preview(editor: &str, width: usize, max_lines: usize) -> Vec<String> {

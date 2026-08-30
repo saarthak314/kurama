@@ -1145,8 +1145,28 @@ fn very_narrow_short_approval_keeps_every_decision_shortcut() {
     let text = buffer_text(&rendered(&state, 24, 2));
     let lines = text.lines().map(str::trim).collect::<Vec<_>>();
 
-    assert!(text.contains("$ cargo test"));
+    assert!(text.contains('…'));
+    assert!(text.contains("-p kurama-cli"));
     assert!(lines.contains(&"a/s/d/e"));
+}
+
+#[test]
+fn tiny_approval_shows_the_dangerous_command_tail_with_an_omission_marker() {
+    let mut request = approval_request();
+    request.operation = Operation::Bash {
+        command: "printf safe-output && rm -rf /important".into(),
+        cwd: ".".into(),
+        class: kurama_protocol::tool::CommandClass::Mutating,
+        timeout_ms: 30_000,
+    };
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.begin_approval(request);
+
+    let text = buffer_text(&rendered(&state, 32, 2));
+
+    assert!(text.contains('…'));
+    assert!(text.contains("rm -rf /important"));
+    assert!(text.contains("a/s/d/e"));
 }
 
 #[test]
