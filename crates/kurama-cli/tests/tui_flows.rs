@@ -57,6 +57,7 @@ fn runtime_events_drive_typed_activity_without_duplicate_errors() {
     state.apply_runtime_event(RuntimeEvent::ToolStarted {
         operation_id: OperationId::from("operation_1"),
         name: "bash".into(),
+        context: "cargo test".into(),
     });
     assert!(matches!(state.activity(), ActivityState::RunningTool { name, .. } if name == "bash"));
 
@@ -114,6 +115,7 @@ fn tool_events_preserve_complete_output_and_lifecycle() {
     state.apply_runtime_event(RuntimeEvent::ToolStarted {
         operation_id: OperationId::from("operation_1"),
         name: "bash".into(),
+        context: "printf output".into(),
     });
     state.apply_runtime_event(tool_delta(
         "call_1",
@@ -126,6 +128,7 @@ fn tool_events_preserve_complete_output_and_lifecycle() {
         TranscriptEntry::ToolCall(tool)
             if tool.call_id.as_ref().is_some_and(|call_id| call_id.as_ref() == "call_1")
                 && tool.name == "bash"
+                && tool.context.as_deref() == Some("printf output")
                 && tool.lifecycle == ToolLifecycle::Running
     ));
 
@@ -155,6 +158,14 @@ fn replay_hydrates_explicit_transcript_variants() {
         replay_event(SessionEvent::AssistantMessage {
             text: "checking".into(),
         }),
+        replay_event(SessionEvent::ToolProposed {
+            operation_id: OperationId::from("operation_1"),
+            call_id: CallId::from("call_1"),
+            operation: Operation::Read {
+                path: "src/lib.rs".into(),
+                external: false,
+            },
+        }),
         replay_event(SessionEvent::ToolCompleted {
             operation_id: OperationId::from("operation_1"),
             result: tool_result("call_1", "done", "read"),
@@ -181,6 +192,7 @@ fn replay_hydrates_explicit_transcript_variants() {
         ] if user == "inspect"
             && assistant == "checking"
             && tool.name == "read"
+            && tool.context.as_deref() == Some("src/lib.rs")
             && tool.output == "done"
             && tool.lifecycle == ToolLifecycle::Completed
             && label == "MODE"

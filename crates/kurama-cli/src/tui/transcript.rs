@@ -1206,11 +1206,17 @@ pub fn transcript_lines(
             }
             TranscriptEntry::ToolCall(tool) => {
                 let name = tool_name(&tool.name);
-                let summary = match tool.lifecycle {
+                let action = match tool.lifecycle {
                     ToolLifecycle::Running => format!("Running {name}"),
                     ToolLifecycle::Completed => format!("Ran {name}"),
                     ToolLifecycle::Failed => format!("{name} failed"),
                 };
+                let summary = tool
+                    .context
+                    .as_deref()
+                    .filter(|context| !context.trim().is_empty())
+                    .map_or(action.clone(), |context| format!("{action} · {context}"));
+                let summary = truncate_display(&summary, width.saturating_sub(2).max(1));
                 let failed = tool.lifecycle == ToolLifecycle::Failed;
                 push_prefixed_lines(
                     &mut lines,

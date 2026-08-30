@@ -46,6 +46,7 @@ pub enum RuntimeEvent {
     ToolStarted {
         operation_id: OperationId,
         name: String,
+        context: String,
     },
     ToolOutputDelta {
         call_id: CallId,

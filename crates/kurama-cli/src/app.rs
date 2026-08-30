@@ -2363,6 +2363,7 @@ Session ID: s_cached"
             .try_send(RuntimeEvent::ToolStarted {
                 operation_id: OperationId::from("operation_1"),
                 name: "bash".into(),
+                context: "printf output".into(),
             })
             .expect("queue tool start");
         let mut result = ToolResult::success(CallId::from("call_1"), "canonical output");

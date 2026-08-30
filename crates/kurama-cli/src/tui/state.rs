@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use kurama_protocol::{
     agent::{AgentSnapshot, AgentState},
-    id::{AgentId, CallId},
+    id::{AgentId, CallId, OperationId},
     policy::{ApprovalRequest, ApprovalResponse, ExecutionMode},
     runtime::{AgentCommand, EngineCommand, RuntimeEvent},
     session::{EventEnvelope, SessionEvent},
@@ -69,6 +69,7 @@ pub enum ToolLifecycle {
 pub struct ToolTranscript {
     pub call_id: Option<CallId>,
     pub name: String,
+    pub context: Option<String>,
     pub output: String,
     pub lifecycle: ToolLifecycle,
 }
@@ -113,6 +114,8 @@ pub struct TuiState {
     active_assistant_entry: Option<usize>,
     active_tool_entries: HashMap<CallId, usize>,
     active_tool_streams: HashMap<CallId, String>,
+    active_tool_contexts: HashMap<OperationId, String>,
+    pending_tool_context: Option<String>,
     replayed_agent_ids: HashSet<AgentId>,
     committed_transcript_entries: usize,
     sent_commands: Vec<EngineCommand>,
@@ -150,6 +153,8 @@ impl TuiState {
             active_assistant_entry: None,
             active_tool_entries: HashMap::new(),
             active_tool_streams: HashMap::new(),
+            active_tool_contexts: HashMap::new(),
+            pending_tool_context: None,
             replayed_agent_ids: HashSet::new(),
             committed_transcript_entries: 0,
             sent_commands: Vec::new(),
@@ -309,6 +314,7 @@ impl TuiState {
         self.push_transcript_entry(TranscriptEntry::ToolCall(ToolTranscript {
             call_id: None,
             name: transcript_tool_name(&label).to_owned(),
+            context: None,
             output: body.into(),
             lifecycle: ToolLifecycle::Completed,
         }));
@@ -383,16 +389,33 @@ impl TuiState {
         self.active_assistant_entry = None;
         self.active_tool_entries.clear();
         self.active_tool_streams.clear();
+        self.active_tool_contexts.clear();
+        self.pending_tool_context = None;
         self.replayed_agent_ids.clear();
         self.committed_transcript_entries = 0;
         self.transcript.clear();
         self.agents.clear();
+        let mut replayed_tool_contexts = HashMap::new();
         for envelope in replay {
             match &envelope.event {
                 SessionEvent::UserMessage { text } => self.push_user(text.clone()),
                 SessionEvent::AssistantMessage { text } => self.push_assistant(text.clone()),
-                SessionEvent::ToolCompleted { result, .. } => {
-                    self.push_transcript_entry(TranscriptEntry::ToolCall(tool_transcript(result)));
+                SessionEvent::ToolProposed {
+                    operation_id,
+                    operation,
+                    ..
+                } => {
+                    replayed_tool_contexts
+                        .insert(operation_id.clone(), operation_context(operation));
+                }
+                SessionEvent::ToolCompleted {
+                    operation_id,
+                    result,
+                } => {
+                    self.push_transcript_entry(TranscriptEntry::ToolCall(tool_transcript(
+                        result,
+                        replayed_tool_contexts.remove(operation_id),
+                    )));
                 }
                 SessionEvent::ToolUnknown { reason, .. } => {
                     self.push_notice(Some("TOOL".into()), reason.clone());
@@ -703,11 +726,18 @@ impl TuiState {
             RuntimeEvent::ApprovalRequired { request } => {
                 self.begin_approval(request);
             }
-            RuntimeEvent::ToolStarted { name, .. } => {
+            RuntimeEvent::ToolStarted {
+                operation_id,
+                name,
+                context,
+            } => {
                 self.activity = ActivityState::RunningTool {
                     name,
                     started_at: Instant::now(),
                 };
+                self.active_tool_contexts
+                    .insert(operation_id, context.clone());
+                self.pending_tool_context = Some(context);
             }
             RuntimeEvent::ToolOutputDelta {
                 call_id,
@@ -716,8 +746,11 @@ impl TuiState {
             } => {
                 self.append_tool_delta(call_id, stream, chunk);
             }
-            RuntimeEvent::ToolCompleted { result, .. } => {
-                self.complete_tool(result);
+            RuntimeEvent::ToolCompleted {
+                operation_id,
+                result,
+            } => {
+                self.complete_tool(operation_id, result);
                 self.set_thinking();
             }
             RuntimeEvent::AgentUpdated { snapshot } => self.upsert_agent(snapshot),
@@ -741,6 +774,8 @@ impl TuiState {
         if completes_active_streams {
             self.active_tool_entries.clear();
             self.active_tool_streams.clear();
+            self.active_tool_contexts.clear();
+            self.pending_tool_context = None;
         }
         if advances_pending_turn {
             self.start_next_pending_turn();
@@ -804,6 +839,7 @@ impl TuiState {
         self.push_transcript_entry(TranscriptEntry::ToolCall(ToolTranscript {
             call_id: Some(call_id.clone()),
             name,
+            context: self.pending_tool_context.clone(),
             output: bounded_live_tool_output(chunk),
             lifecycle: ToolLifecycle::Running,
         }));
@@ -813,7 +849,7 @@ impl TuiState {
         }
     }
 
-    fn complete_tool(&mut self, result: ToolResult) {
+    fn complete_tool(&mut self, operation_id: OperationId, result: ToolResult) {
         let persisted_display_output = result
             .metadata
             .get("display_output")
@@ -821,12 +857,20 @@ impl TuiState {
         let display_output = tool_display_output(&result).to_owned();
         let lifecycle = tool_lifecycle(&result);
         let name = tool_name(&result).to_owned();
+        let pending_context = self.pending_tool_context.take();
+        let context = self
+            .active_tool_contexts
+            .remove(&operation_id)
+            .or(pending_context);
 
         self.active_tool_streams.remove(&result.call_id);
         if let Some(index) = self.active_tool_entries.remove(&result.call_id)
             && let Some(TranscriptEntry::ToolCall(tool)) = self.transcript.get_mut(index)
         {
             tool.name = name;
+            if tool.context.is_none() {
+                tool.context = context;
+            }
             tool.lifecycle = lifecycle;
             if result
                 .metadata
@@ -848,6 +892,7 @@ impl TuiState {
         self.push_transcript_entry(TranscriptEntry::ToolCall(ToolTranscript {
             call_id: Some(result.call_id),
             name,
+            context,
             output: display_output,
             lifecycle,
         }));
@@ -926,12 +971,27 @@ fn tool_lifecycle(result: &ToolResult) -> ToolLifecycle {
     }
 }
 
-fn tool_transcript(result: &ToolResult) -> ToolTranscript {
+fn tool_transcript(result: &ToolResult, context: Option<String>) -> ToolTranscript {
     ToolTranscript {
         call_id: Some(result.call_id.clone()),
         name: tool_name(result).to_owned(),
+        context,
         output: tool_display_output(result).to_owned(),
         lifecycle: tool_lifecycle(result),
+    }
+}
+
+fn operation_context(operation: &kurama_protocol::tool::Operation) -> String {
+    match operation {
+        kurama_protocol::tool::Operation::Read { path, .. } => path.display().to_string(),
+        kurama_protocol::tool::Operation::Write { paths, .. } => paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        kurama_protocol::tool::Operation::Bash { command, .. } => command.clone(),
+        kurama_protocol::tool::Operation::WebSearch { query, .. } => query.clone(),
+        kurama_protocol::tool::Operation::WebOpen { url, .. } => url.clone(),
     }
 }
 

@@ -257,10 +257,10 @@ impl ChildRunner for RuntimeChildRunner {
                                     ..ChildProgress::default()
                                 }).await;
                             }
-                            RuntimeEvent::ToolStarted { name, .. } => {
+                            RuntimeEvent::ToolStarted { name, context: operation, .. } => {
                                 let _ = context.progress.send(ChildProgress {
                                     phase: Some("working".into()),
-                                    active_operation: Some(name),
+                                    active_operation: Some(format!("{name}: {operation}")),
                                     completed_turns,
                                     ..ChildProgress::default()
                                 }).await;

@@ -394,6 +394,7 @@ fn compact_tool_rows_hide_output_while_expanded_preserves_it() {
         TranscriptEntry::ToolCall(ToolTranscript {
             call_id: Some(CallId::from("call_1")),
             name: "bash".into(),
+            context: None,
             output: "line one\nline two".into(),
             lifecycle: ToolLifecycle::Completed,
         }),
@@ -423,6 +424,7 @@ fn transcript_uses_codex_gutters_and_separates_user_turns() {
         TranscriptEntry::ToolCall(ToolTranscript {
             call_id: None,
             name: "read".into(),
+            context: None,
             output: "hidden".into(),
             lifecycle: ToolLifecycle::Running,
         }),
@@ -475,12 +477,14 @@ fn transcript_tool_summaries_follow_lifecycle_without_truncating_expanded_output
         TranscriptEntry::ToolCall(ToolTranscript {
             call_id: None,
             name: "bash".into(),
+            context: Some("cargo test -p kurama-cli".into()),
             output: output.into(),
             lifecycle: ToolLifecycle::Completed,
         }),
         TranscriptEntry::ToolCall(ToolTranscript {
             call_id: None,
             name: "write".into(),
+            context: None,
             output: "permission denied".into(),
             lifecycle: ToolLifecycle::Failed,
         }),
@@ -490,6 +494,7 @@ fn transcript_tool_summaries_follow_lifecycle_without_truncating_expanded_output
     let expanded = plain(transcript_lines(&entries, 40, TranscriptDetail::Expanded));
 
     assert!(compact.contains("• Ran bash"));
+    assert!(compact.contains("cargo test -p kurama-cli"));
     assert!(compact.contains("× write failed"));
     assert!(compact.contains("  └ success · 2 lines"));
     assert!(compact.contains("  └ failure · 1 line"));
@@ -507,6 +512,7 @@ fn running_tool_output_shows_only_a_bounded_tail() {
     let entries = vec![TranscriptEntry::ToolCall(ToolTranscript {
         call_id: None,
         name: "bash".into(),
+        context: None,
         output: "first\nsecond\nthird\nfourth".into(),
         lifecycle: ToolLifecycle::Running,
     })];
@@ -526,6 +532,7 @@ fn expanded_tool_output_drops_terminal_trailing_line_breaks() {
     let entries = vec![TranscriptEntry::ToolCall(ToolTranscript {
         call_id: None,
         name: "bash".into(),
+        context: None,
         output: "line one\nline two\n".into(),
         lifecycle: ToolLifecycle::Completed,
     })];
@@ -542,6 +549,7 @@ fn expanded_tool_output_preserves_whitespace_and_code_layout() {
     let entries = vec![TranscriptEntry::ToolCall(ToolTranscript {
         call_id: None,
         name: "read".into(),
+        context: None,
         output: "fn main() {\n    let value  = 1;\n}".into(),
         lifecycle: ToolLifecycle::Completed,
     })];

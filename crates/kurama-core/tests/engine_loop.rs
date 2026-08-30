@@ -363,9 +363,13 @@ async fn engine_executes_tool_and_finishes_turn() {
     handle.submit("inspect", false).await.expect("submit");
 
     let mut saw_tool = false;
+    let mut saw_tool_context = false;
     let mut text = String::new();
     loop {
         match events.recv().await.expect("runtime event") {
+            RuntimeEvent::ToolStarted { name, context, .. } => {
+                saw_tool_context = name == "echo" && context == ".";
+            }
             RuntimeEvent::ToolCompleted { .. } => saw_tool = true,
             RuntimeEvent::AssistantDelta { text: delta } => text.push_str(&delta),
             RuntimeEvent::TurnCompleted => break,
@@ -374,6 +378,7 @@ async fn engine_executes_tool_and_finishes_turn() {
         }
     }
     assert!(saw_tool);
+    assert!(saw_tool_context);
     assert_eq!(text, "Done.");
     assert_eq!(
         store

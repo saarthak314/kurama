@@ -1169,6 +1169,7 @@ impl EngineActor {
         self.emit(RuntimeEvent::ToolStarted {
             operation_id: operation_id.clone(),
             name: invocation.name.clone(),
+            context: operation_context(&operation),
         })
         .await?;
         let call_id = invocation.call_id.clone();
@@ -1793,6 +1794,20 @@ fn operation_summary(operation: &Operation) -> String {
         Operation::Bash { command, .. } => format!("run {command}"),
         Operation::WebSearch { query, .. } => format!("search for {query}"),
         Operation::WebOpen { url, .. } => format!("open {url}"),
+    }
+}
+
+fn operation_context(operation: &Operation) -> String {
+    match operation {
+        Operation::Read { path, .. } => path.display().to_string(),
+        Operation::Write { paths, .. } => paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        Operation::Bash { command, .. } => command.clone(),
+        Operation::WebSearch { query, .. } => query.clone(),
+        Operation::WebOpen { url, .. } => url.clone(),
     }
 }
 
