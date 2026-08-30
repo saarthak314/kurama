@@ -283,7 +283,7 @@ git commit -m "feat: add responsive codex-style tui surfaces"
 
 - [ ] **Step 1: Add failing command-feedback and activity tests**
 
-Replace assertions against `state.status` with assertions against typed activity or transcript entries. Cover unknown commands, disconnected execution, profile changes, `/status`, restart notices, invalid approval edits, cancellation, and turn completion.
+Replace assertions against `state.status` with assertions against typed activity or transcript entries. Cover unknown commands, disconnected execution, profile changes, restart notices, invalid approval edits, cancellation, and turn completion.
 
 ```rust
 #[test]
@@ -303,7 +303,7 @@ Expected: the old status-string assertion or renamed behavior fails.
 
 - [ ] **Step 3: Route feedback through transcript entries**
 
-Replace direct `state.status = ...` assignments in `app.rs` and approval handling with `push_notice`, `push_error`, or typed activity transitions. `/status` and successful configuration commands emit notices; invalid commands and rejected local actions emit errors. Runtime errors remain single-emission transcript errors.
+Replace direct `state.status = ...` assignments in `app.rs` and approval handling with `push_notice`, `push_error`, or typed activity transitions. Successful configuration commands emit notices; invalid commands and rejected local actions emit errors. Runtime errors remain single-emission transcript errors.
 
 - [ ] **Step 4: Add active-only animation wakeups**
 
