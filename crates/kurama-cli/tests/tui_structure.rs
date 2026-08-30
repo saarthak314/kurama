@@ -4,6 +4,7 @@ use kurama_cli::{
     tui::{
         ActivityState, AgentRow, Overlay, ResponsiveLayout, ToolLifecycle, ToolTranscript,
         TranscriptDetail, TranscriptEntry, TuiState, activity_line, render, transcript_lines,
+        worked_for_line,
     },
 };
 use kurama_protocol::{
@@ -253,6 +254,47 @@ fn activity_line_formats_elapsed_time_and_measures_the_interrupt_hint() {
     assert!(!narrow.contains("esc to interrupt"));
     assert!(activity_line(&ActivityState::Idle, 80, now).is_none());
     assert!(activity_line(&ActivityState::AwaitingApproval, 80, now).is_none());
+}
+
+#[test]
+fn worked_for_line_matches_codex_spacing_and_fills_the_row() {
+    let line = worked_for_line(Duration::from_secs(666), 36).expect("duration divider");
+    let text = plain(vec![line.clone()]);
+
+    assert_eq!(text, "─ Worked for 11m 06s ───────────────");
+    assert_eq!(line.width(), 36);
+}
+
+#[test]
+fn completed_turn_places_duration_and_composer_at_the_bottom() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.submit_turn("show the result", false);
+    state.push_assistant("Finished cleanly.");
+    state.apply_runtime_event(RuntimeEvent::TurnCompleted);
+
+    let text = buffer_text(&rendered(&state, 80, 16));
+    let rows = text.lines().collect::<Vec<_>>();
+    let answer_row = rows
+        .iter()
+        .position(|row| row.contains("Finished cleanly."))
+        .expect("assistant answer");
+    let worked_row = rows
+        .iter()
+        .position(|row| row.contains("Worked for"))
+        .expect("duration divider");
+    let composer_row = rows
+        .iter()
+        .position(|row| row.contains("Ask Kurama"))
+        .expect("composer");
+    let footer_row = rows
+        .iter()
+        .position(|row| row.contains("work/model"))
+        .expect("footer");
+
+    assert!(worked_row > answer_row + 1, "{rows:#?}");
+    assert_eq!(worked_row + 1, composer_row, "{rows:#?}");
+    assert_eq!(composer_row + 1, footer_row, "{rows:#?}");
+    assert_eq!(footer_row, 15, "{rows:#?}");
 }
 
 #[test]

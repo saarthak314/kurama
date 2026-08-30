@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ratatui::{
     style::{Color, Modifier, Style},
@@ -52,6 +52,31 @@ pub fn activity_line(
     Some(Line::from(vec![
         Span::styled(format!("{spinner} "), Style::default().fg(Color::Cyan)),
         Span::raw(action),
+    ]))
+}
+
+pub fn worked_for_line(elapsed: Duration, width: usize) -> Option<Line<'static>> {
+    if width == 0 {
+        return None;
+    }
+
+    let label = format!("Worked for {}", compact_elapsed(elapsed.as_secs()));
+    let style = Style::default().fg(Color::DarkGray);
+    let decorated_width = display_width(&label).saturating_add(3);
+    if decorated_width > width {
+        return Some(Line::from(Span::styled(
+            truncate_display(&label, width),
+            style,
+        )));
+    }
+
+    Some(Line::from(vec![
+        Span::styled("─ ", style),
+        Span::styled(label, style),
+        Span::styled(
+            format!(" {}", "─".repeat(width.saturating_sub(decorated_width))),
+            style,
+        ),
     ]))
 }
 

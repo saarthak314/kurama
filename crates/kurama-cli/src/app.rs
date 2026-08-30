@@ -1165,7 +1165,7 @@ where
     let rows = backend.size()?.height;
     let viewport_height = rows.min(INLINE_VIEWPORT_MAX_HEIGHT);
     backend.clear_region(ClearType::All)?;
-    backend.set_cursor_position(Position::ORIGIN)?;
+    backend.set_cursor_position(Position::new(0, rows.saturating_sub(viewport_height)))?;
     Terminal::with_options(
         backend,
         TerminalOptions {
@@ -1185,11 +1185,7 @@ where
 {
     let viewport_height = height.min(INLINE_VIEWPORT_MAX_HEIGHT);
     let current_viewport_top = terminal.get_frame().area().top();
-    let viewport_top = if reset_origin {
-        0
-    } else {
-        current_viewport_top.min(height.saturating_sub(viewport_height))
-    };
+    let viewport_top = height.saturating_sub(viewport_height);
     let clear_top = if reset_origin {
         0
     } else {
@@ -1220,8 +1216,12 @@ where
 {
     if !state.stable_transcript().is_empty() {
         let size = terminal.size().map_err(|error| error.to_string())?;
-        set_inline_viewport_height(terminal, size.height.min(INLINE_VIEWPORT_MAX_HEIGHT))
-            .map_err(|error| error.to_string())?;
+        let viewport_height = if uses_full_inline_viewport(state) {
+            size.height
+        } else {
+            desired_inline_viewport_height_for_transcript(state, size.width, size.height, 0)
+        };
+        set_inline_viewport_height(terminal, viewport_height).map_err(|error| error.to_string())?;
         commit_stable_transcript(state, terminal)?;
         transcript_cache.invalidate();
     }
@@ -1306,25 +1306,28 @@ fn desired_inline_viewport_height_for_transcript(
     .max(1)
     .min(height);
     let activity_height = u16::from(
-        state.overlay() == Overlay::None && state.activity().is_animated() && input_height < height,
+        state.overlay() == Overlay::None
+            && (state.activity().is_animated() || state.last_turn_elapsed().is_some())
+            && input_height < height,
     );
     let footer_height = u16::from(input_height.saturating_add(activity_height) < height);
     let chrome_height = input_height
         .saturating_add(activity_height)
         .saturating_add(footer_height);
     let palette_height = command_palette_height(state, height.saturating_sub(chrome_height));
-    let transcript_capacity = height.saturating_sub(
-        input_height
-            .saturating_add(activity_height)
-            .saturating_add(footer_height)
-            .saturating_add(palette_height),
-    );
+    let chrome_height = input_height
+        .saturating_add(activity_height)
+        .saturating_add(footer_height)
+        .saturating_add(palette_height);
+    let gap_height = u16::from(!state.transcript.is_empty() && chrome_height < height);
+    let transcript_capacity = height.saturating_sub(chrome_height.saturating_add(gap_height));
     let transcript_height = transcript_height.min(transcript_capacity as usize) as u16;
 
     input_height
         .saturating_add(activity_height)
         .saturating_add(footer_height)
         .saturating_add(palette_height)
+        .saturating_add(gap_height)
         .saturating_add(transcript_height)
         .min(height)
 }
@@ -1343,9 +1346,7 @@ where
 
     let size = terminal.size()?;
     let viewport_height = viewport_height.min(size.height);
-    let viewport_top = current_area
-        .top()
-        .min(size.height.saturating_sub(viewport_height));
+    let viewport_top = size.height.saturating_sub(viewport_height);
     let clear_top = current_area.top().min(viewport_top);
     terminal
         .backend_mut()
@@ -2639,7 +2640,7 @@ Session ID: s_cached"
     }
 
     #[test]
-    fn inline_terminal_initialization_clears_previous_output_and_starts_at_origin() {
+    fn inline_terminal_initialization_clears_output_and_anchors_at_the_bottom() {
         let mut lines = vec![" ".repeat(80); 40];
         lines[0] = "stale shell prompt".into();
         lines[4] = "stale viewport content".into();
@@ -2658,7 +2659,7 @@ Session ID: s_cached"
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert_eq!(terminal.get_frame().area(), Rect::new(0, 0, 80, 12));
+        assert_eq!(terminal.get_frame().area(), Rect::new(0, 28, 80, 12));
         assert!(!visible.contains("stale shell prompt"));
         assert!(!visible.contains("stale viewport content"));
         assert!(!visible.contains("stale lower content"));
@@ -2701,10 +2702,11 @@ Session ID: s_cached"
     }
 
     #[test]
-    fn committed_history_sits_directly_above_the_idle_composer() {
+    fn committed_history_leaves_completion_and_composer_at_the_bottom() {
         let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        state.push_user("hi");
+        state.submit_turn("hi", false);
         state.push_assistant("hello from kurama");
+        state.apply_runtime_event(RuntimeEvent::TurnCompleted);
         let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24))
             .expect("initialize inline terminal");
 
@@ -2715,7 +2717,7 @@ Session ID: s_cached"
             .draw(|frame| render_with_transcript(frame, &state, transcript_cache.lines()))
             .expect("draw idle frame");
 
-        assert_eq!(terminal.get_frame().area().height, 2);
+        assert_eq!(terminal.get_frame().area().bottom(), 24);
         let rows = terminal
             .backend()
             .buffer()
@@ -2731,8 +2733,14 @@ Session ID: s_cached"
             .iter()
             .position(|row| row.contains("Ask Kurama"))
             .expect("composer row");
+        let worked_row = rows
+            .iter()
+            .position(|row| row.contains("Worked for"))
+            .expect("duration divider row");
 
-        assert_eq!(composer_row, answer_row + 1, "{rows:#?}");
+        assert_eq!(worked_row, answer_row + 2, "{rows:#?}");
+        assert_eq!(worked_row + 1, composer_row, "{rows:#?}");
+        assert_eq!(composer_row, 22, "{rows:#?}");
     }
 
     #[test]
@@ -2753,7 +2761,7 @@ Session ID: s_cached"
 
         terminal.backend_mut().resize(100, 30);
         resize_inline_terminal(&mut terminal, 100, 30, false).expect("grow inline terminal");
-        assert_eq!(terminal.get_frame().area(), Rect::new(0, 0, 100, 12));
+        assert_eq!(terminal.get_frame().area(), Rect::new(0, 18, 100, 12));
         terminal
             .draw(|frame| render(frame, &state))
             .expect("draw wide viewport");
@@ -2809,6 +2817,7 @@ Session ID: s_cached"
         terminal
             .draw(|frame| render(frame, &state))
             .expect("draw live viewport");
+        let viewport_top = terminal.get_frame().area().as_position();
 
         clear_inline_terminal(&mut terminal).expect("clear live viewport");
 
@@ -2825,7 +2834,7 @@ Session ID: s_cached"
                 .backend_mut()
                 .get_cursor_position()
                 .expect("exit cursor"),
-            Position::ORIGIN
+            viewport_top
         );
     }
 

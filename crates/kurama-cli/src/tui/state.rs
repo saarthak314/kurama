@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use kurama_protocol::{
     agent::{AgentSnapshot, AgentState},
@@ -110,6 +110,8 @@ pub struct TuiState {
     command_palette_dismissed: bool,
     pending_turns: VecDeque<PendingTurn>,
     activity: ActivityState,
+    turn_started_at: Option<Instant>,
+    last_turn_elapsed: Option<Duration>,
     transcript_view_expanded: bool,
     active_assistant_entry: Option<usize>,
     active_tool_entries: HashMap<CallId, usize>,
@@ -149,6 +151,8 @@ impl TuiState {
             command_palette_dismissed: false,
             pending_turns: VecDeque::new(),
             activity: ActivityState::Idle,
+            turn_started_at: None,
+            last_turn_elapsed: None,
             transcript_view_expanded: false,
             active_assistant_entry: None,
             active_tool_entries: HashMap::new(),
@@ -267,10 +271,17 @@ impl TuiState {
         &self.activity
     }
 
+    pub const fn last_turn_elapsed(&self) -> Option<Duration> {
+        self.last_turn_elapsed
+    }
+
     pub fn set_thinking(&mut self) {
-        self.activity = ActivityState::Thinking {
-            started_at: Instant::now(),
-        };
+        let now = Instant::now();
+        if self.turn_started_at.is_none() {
+            self.turn_started_at = Some(now);
+            self.last_turn_elapsed = None;
+        }
+        self.activity = ActivityState::Thinking { started_at: now };
     }
 
     pub fn submit_turn(&mut self, text: impl Into<String>, explicit_delegation: bool) {
@@ -386,6 +397,8 @@ impl TuiState {
 
     pub fn hydrate_replay(&mut self, replay: &[EventEnvelope]) {
         self.activity = ActivityState::Idle;
+        self.turn_started_at = None;
+        self.last_turn_elapsed = None;
         self.active_assistant_entry = None;
         self.active_tool_entries.clear();
         self.active_tool_streams.clear();
@@ -767,16 +780,19 @@ impl TuiState {
                     agent.transcript = transcript;
                 }
             }
-            RuntimeEvent::TurnCompleted => self.activity = ActivityState::Idle,
+            RuntimeEvent::TurnCompleted => self.finish_turn(),
             RuntimeEvent::Error { message } => {
                 if terminal_turn_event {
                     self.push_error(message);
-                    self.activity = ActivityState::Idle;
+                    self.finish_turn();
                 } else {
                     self.push_transcript_entry(TranscriptEntry::Error { body: message });
                 }
             }
-            RuntimeEvent::Shutdown => self.activity = ActivityState::Idle,
+            RuntimeEvent::Shutdown => {
+                self.turn_started_at = None;
+                self.activity = ActivityState::Idle;
+            }
         }
         if completes_active_streams || terminal_turn_event {
             self.active_tool_entries.clear();
@@ -795,7 +811,10 @@ impl TuiState {
             text,
             explicit_delegation,
         });
-        self.set_thinking();
+        let now = Instant::now();
+        self.turn_started_at = Some(now);
+        self.last_turn_elapsed = None;
+        self.activity = ActivityState::Thinking { started_at: now };
     }
 
     fn start_next_pending_turn(&mut self) {
@@ -803,6 +822,13 @@ impl TuiState {
             return;
         };
         self.start_turn(turn.text, turn.explicit_delegation);
+    }
+
+    fn finish_turn(&mut self) {
+        if let Some(started_at) = self.turn_started_at.take() {
+            self.last_turn_elapsed = Some(Instant::now().saturating_duration_since(started_at));
+        }
+        self.activity = ActivityState::Idle;
     }
 
     fn append_assistant_delta(&mut self, text: String) {

@@ -95,6 +95,19 @@ fn runtime_completion_error_and_shutdown_return_to_idle() {
 }
 
 #[test]
+fn completed_turn_duration_remains_visible_until_the_next_turn_starts() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+
+    state.submit_turn("first", false);
+    state.apply_runtime_event(RuntimeEvent::TurnCompleted);
+
+    assert!(state.last_turn_elapsed().is_some());
+
+    state.submit_turn("second", false);
+    assert!(state.last_turn_elapsed().is_none());
+}
+
+#[test]
 fn non_terminal_command_error_preserves_the_active_turn_and_tool_stream() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.set_thinking();

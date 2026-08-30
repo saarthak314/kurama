@@ -13,9 +13,10 @@ use kurama_protocol::agent::AgentState;
 use super::{
     Overlay, ResponsiveLayout, TuiState, activity_line, command_palette_height,
     composer::{approval_height, composer_height, render_approval, render_composer, render_footer},
-    layout::{main_area, visible_activity_rect},
+    layout::main_area,
     render_command_palette,
     transcript::{TranscriptDetail, render_transcript_view, transcript_lines, truncate_display},
+    worked_for_line,
 };
 
 const BORDER: Color = Color::DarkGray;
@@ -70,11 +71,16 @@ fn render_main(
         composer_height(state, area.width)
     };
     let now = Instant::now();
-    let activity_visible = !visible_activity_rect(frame_area, state).is_empty();
-    let activity = activity_visible
-        .then(|| activity_line(state.activity(), area.width as usize, now))
-        .flatten();
-    let layout = ResponsiveLayout::for_area(area, input_height, activity_visible);
+    let activity = if state.overlay == Overlay::None {
+        activity_line(state.activity(), area.width as usize, now).or_else(|| {
+            state
+                .last_turn_elapsed()
+                .and_then(|elapsed| worked_for_line(elapsed, area.width as usize))
+        })
+    } else {
+        None
+    };
+    let layout = ResponsiveLayout::for_area(area, input_height, activity.is_some());
 
     if !layout.transcript.is_empty() {
         let transcript_width = layout.transcript.width as usize;

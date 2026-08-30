@@ -12,7 +12,7 @@ mod state;
 mod syntax;
 mod transcript;
 
-pub use activity::activity_line;
+pub use activity::{activity_line, worked_for_line};
 pub use agents::{AgentRow, sort_agents};
 pub use approval::ApprovalState;
 pub(crate) use backend::{CursorTrackingBackend, SharedBackend};
