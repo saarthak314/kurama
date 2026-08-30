@@ -748,7 +748,7 @@ fn assistant_markdown_renders_inline_styles_and_links() {
     let inline_code = cell_at_text(&buffer, "cargo test");
     assert_eq!(cell_at_text(&buffer, "Use bold").fg, Color::Reset);
     assert_eq!(inline_code.fg, Color::Rgb(166, 227, 161));
-    assert_eq!(inline_code.bg, Color::Rgb(35, 39, 47));
+    assert_eq!(inline_code.bg, Color::Reset);
     assert!(!inline_code.modifier.contains(Modifier::BOLD));
     let link = cell_at_text(&buffer, "docs");
     assert_eq!(link.fg, Color::Rgb(116, 177, 255));
@@ -1090,7 +1090,7 @@ fn table_cells_preserve_inline_markdown_styles() {
     );
     let inline_code = cell_at_text(&buffer, "ready");
     assert_eq!(inline_code.fg, Color::Rgb(166, 227, 161));
-    assert_eq!(inline_code.bg, Color::Rgb(35, 39, 47));
+    assert_eq!(inline_code.bg, Color::Reset);
     assert!(!inline_code.modifier.contains(Modifier::BOLD));
     let link = cell_at_text(&buffer, "docs");
     assert_eq!(link.fg, Color::Rgb(116, 177, 255));

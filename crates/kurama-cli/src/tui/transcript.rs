@@ -1199,9 +1199,7 @@ fn code_style() -> Style {
 }
 
 fn inline_code_style() -> Style {
-    Style::default()
-        .fg(Color::Rgb(166, 227, 161))
-        .bg(Color::Rgb(35, 39, 47))
+    Style::default().fg(Color::Rgb(166, 227, 161))
 }
 
 pub fn transcript_lines(
