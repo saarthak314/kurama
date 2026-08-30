@@ -3,7 +3,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -50,6 +50,7 @@ use crate::{
 
 const TRANSCRIPT_HORIZONTAL_PADDING: usize = 2;
 const MAX_TRANSCRIPT_INSERT_HEIGHT: usize = 1_024;
+const ACTIVITY_FRAME_INTERVAL: Duration = Duration::from_millis(32);
 
 pub struct App {
     pub state: TuiState,
@@ -350,7 +351,10 @@ impl App {
         );
         state.hydrate_replay(&transcript_replay);
         if resumed_yolo {
-            state.status = "Previous run used YOLO; resumed in supervised mode".into();
+            state.push_notice(
+                Some("MODE".into()),
+                "Previous run used YOLO; resumed in supervised mode",
+            );
         }
         Ok(Self {
             state,
@@ -416,9 +420,9 @@ impl App {
         self.restart_args.as_ref()
     }
 
-    fn request_restart(&mut self, args: Args, status: impl Into<String>) {
+    fn request_restart(&mut self, args: Args, notice: impl Into<String>) {
         self.restart_args = Some(args);
-        self.state.status = status.into();
+        self.state.push_notice(Some("RESTART".into()), notice);
         if self.engine.is_some() {
             self.state.queue_command(EngineCommand::Shutdown);
         }
@@ -562,6 +566,9 @@ impl App {
                 self.state.cursor += 1;
             }
             KeyCode::Enter => self.submit_composer()?,
+            KeyCode::Esc => {
+                self.state.interrupt_active();
+            }
             _ => {}
         }
         Ok(())
@@ -585,12 +592,24 @@ impl App {
             let command = match parse_command(trimmed) {
                 Ok(command) => command,
                 Err(error) => {
-                    self.state.status = error;
+                    self.state.push_error(error);
                     return Ok(());
                 }
             };
             match command {
                 Command::Agents => self.state.open_agents(),
+                Command::Status => {
+                    self.state.push_notice(
+                        Some("STATUS".into()),
+                        format!(
+                            "profile {}; model {}; mode {}; session {}",
+                            self.state.profile,
+                            self.state.model,
+                            execution_mode_label(self.state.mode),
+                            self.session_id.as_ref().map_or("none", AsRef::as_ref),
+                        ),
+                    );
+                }
                 Command::Model(profile) => {
                     if let Some(profile) = profile {
                         let known = self
@@ -598,9 +617,10 @@ impl App {
                             .as_ref()
                             .is_some_and(|control| control.profiles.contains(&profile));
                         if !known {
-                            self.state.status = format!("unknown profile: {profile}");
+                            self.state.push_error(format!("unknown profile: {profile}"));
                         } else if profile == self.state.profile {
-                            self.state.status = format!("profile {profile} is already active");
+                            self.state
+                                .push_error(format!("profile {profile} is already active"));
                         } else {
                             self.request_restart(
                                 Args {
@@ -612,10 +632,12 @@ impl App {
                             );
                         }
                     } else {
-                        self.state.status = self.control.as_ref().map_or_else(
-                            || "profile selection is unavailable".into(),
-                            |control| format!("profiles: {}", control.profiles.join(", ")),
-                        );
+                        if let Some(control) = &self.control {
+                            self.state
+                                .push_notice(Some("PROFILES".into()), control.profiles.join(", "));
+                        } else {
+                            self.state.push_error("profile selection is unavailable");
+                        }
                     }
                 }
                 Command::Connect => {
@@ -644,18 +666,24 @@ impl App {
                     );
                 }
                 Command::Context => {
-                    self.state.status = self.control.as_ref().map_or_else(
-                        || "context details are unavailable".into(),
-                        |control| {
+                    if let Some(control) = &self.control {
+                        self.state.push_notice(
+                            Some("CONTEXT".into()),
                             format!(
-                                "context: {} token input limit; automatic compaction; session {}",
+                                "{} token input limit; automatic compaction; session {}",
                                 control.max_input_tokens,
                                 self.session_id.as_ref().map_or("none", AsRef::as_ref)
-                            )
-                        },
-                    )
+                            ),
+                        );
+                    } else {
+                        self.state.push_error("context details are unavailable");
+                    }
                 }
-                Command::Compact => self.state.queue_command(EngineCommand::Compact),
+                Command::Compact => {
+                    self.state.queue_command(EngineCommand::Compact);
+                    self.state
+                        .push_notice(Some("CONTEXT".into()), "compaction requested");
+                }
                 Command::Mode(mode) => {
                     if let Some(control) = &self.control {
                         control
@@ -665,10 +693,15 @@ impl App {
                     }
                     self.state.mode = mode;
                     self.state.queue_command(EngineCommand::SetMode(mode));
+                    self.state.push_notice(
+                        Some("MODE".into()),
+                        format!("mode {}", execution_mode_label(mode)),
+                    );
                 }
             }
         } else if self.engine.is_none() {
-            self.state.status = "not connected; configure ~/.kurama/config.toml".into();
+            self.state
+                .push_error("not connected; configure ~/.kurama/config.toml");
         } else {
             self.state.push_user(trimmed);
             let explicit_delegation = self
@@ -679,14 +712,14 @@ impl App {
                 text: trimmed.to_owned(),
                 explicit_delegation,
             });
-            self.state.status = "thinking".into();
+            self.state.set_thinking();
         }
         Ok(())
     }
 
     fn show_sessions(&mut self) -> Result<(), String> {
         let Some(control) = &self.control else {
-            self.state.status = "session listing is unavailable".into();
+            self.state.push_error("session listing is unavailable");
             return Ok(());
         };
         let project = control.project.display().to_string();
@@ -698,7 +731,7 @@ impl App {
             .filter(|session| session.project_root == project)
             .take(4)
             .collect();
-        self.state.status = if sessions.is_empty() {
+        let body = if sessions.is_empty() {
             "no saved sessions for this project".into()
         } else {
             let summaries = sessions
@@ -708,6 +741,7 @@ impl App {
                 .join(", ");
             format!("sessions: {summaries}")
         };
+        self.state.push_notice(Some("SESSIONS".into()), body);
         Ok(())
     }
 
@@ -722,11 +756,11 @@ impl App {
                     if let Err(error) = self.apply_onboarding_submission(submission) {
                         self.state.onboarding = OnboardingState::new();
                         self.state.overlay = Overlay::None;
-                        self.state.status = error;
+                        self.state.push_error(error);
                     }
                 }
-                Ok(None) => self.state.status = self.state.onboarding.prompt().to_lowercase(),
-                Err(error) => self.state.status = error,
+                Ok(None) => {}
+                Err(error) => self.state.push_error(error),
             },
             KeyCode::Esc => {
                 self.state.onboarding = OnboardingState::new();
@@ -793,7 +827,8 @@ impl App {
                     }
                     self.state.onboarding = OnboardingState::new();
                     self.state.overlay = Overlay::None;
-                    self.state.status = format!("added profile {name}");
+                    self.state
+                        .push_notice(Some("PROFILE".into()), format!("added profile {name}"));
                 } else {
                     repository
                         .remember_project_profile(&project, &name)
@@ -875,8 +910,12 @@ impl App {
     async fn flush_commands(&mut self) -> Result<(), String> {
         let commands = self.state.take_commands();
         let Some(engine) = &self.engine else {
-            if !commands.is_empty() {
-                self.state.status = "not connected; configure ~/.kurama/config.toml".into();
+            if commands
+                .iter()
+                .any(|command| !matches!(command, EngineCommand::Shutdown))
+            {
+                self.state
+                    .push_error("not connected; configure ~/.kurama/config.toml");
             }
             return Ok(());
         };
@@ -1031,6 +1070,12 @@ fn apply_runtime_event_in_order(
     tool_open
 }
 
+fn activity_animation_visible(state: &TuiState) -> bool {
+    state.activity().is_animated()
+        && state.overlay() == Overlay::None
+        && !state.transcript_view_expanded()
+}
+
 async fn run_loop<B>(
     app: &mut App,
     terminal: &mut Terminal<B>,
@@ -1068,7 +1113,18 @@ where
 
     while input_open || runtime_open || tool_open {
         let mut exit = false;
+        let mut animation_tick = false;
+        let animate_activity = activity_animation_visible(&app.state);
+        let animation = async move {
+            if animate_activity {
+                tokio::time::sleep(ACTIVITY_FRAME_INTERVAL).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::pin!(animation);
         tokio::select! {
+            _ = &mut animation => animation_tick = true,
             event = input.recv(), if input_open => {
                 match event {
                     Some(event) => {
@@ -1102,7 +1158,7 @@ where
                 }
             }
         }
-        if commit_to_scrollback {
+        if commit_to_scrollback && !animation_tick {
             commit_stable_transcript(&mut app.state, terminal)?;
         }
         terminal
@@ -1341,6 +1397,14 @@ fn now_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+fn execution_mode_label(mode: ExecutionMode) -> &'static str {
+    match mode {
+        ExecutionMode::Supervised => "supervised",
+        ExecutionMode::Auto => "auto",
+        ExecutionMode::Yolo => "yolo",
+    }
+}
+
 struct NoopSink;
 
 impl EventSink for NoopSink {
@@ -1376,7 +1440,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::tui::TranscriptEntry;
+    use crate::tui::{ActivityState, TranscriptEntry};
 
     fn test_app() -> App {
         App {
@@ -1430,6 +1494,75 @@ mod tests {
         )))
         .expect("page transcript down");
         assert_eq!(app.state.scroll, 0);
+    }
+
+    #[test]
+    fn disconnected_submit_is_a_transcript_error() {
+        let mut app = test_app();
+        app.state.composer = "inspect".into();
+        app.state.cursor = app.state.composer.len();
+
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("submit disconnected turn");
+
+        assert_eq!(app.state.activity(), &ActivityState::Idle);
+        assert!(app.state.transcript.iter().any(
+            |entry| matches!(entry, TranscriptEntry::Error { body } if body.contains("not connected"))
+        ));
+    }
+
+    #[test]
+    fn escape_interrupts_visible_active_work() {
+        let mut app = test_app();
+        app.state.set_thinking();
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .expect("interrupt active turn");
+
+        assert_eq!(app.state.activity(), &ActivityState::Interrupted);
+        assert!(matches!(
+            app.state.sent_commands().last(),
+            Some(EngineCommand::CancelTurn)
+        ));
+    }
+
+    #[test]
+    fn higher_priority_surface_consumes_escape_without_interrupting() {
+        let mut app = test_app();
+        app.state.set_thinking();
+        app.state.toggle_transcript_view();
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .expect("close transcript view");
+
+        assert!(matches!(
+            app.state.activity(),
+            ActivityState::Thinking { .. }
+        ));
+        assert!(app.state.sent_commands().is_empty());
+    }
+
+    #[test]
+    fn animation_wakes_only_for_visible_active_work() {
+        let mut app = test_app();
+        assert_eq!(ACTIVITY_FRAME_INTERVAL, Duration::from_millis(32));
+        assert!(!activity_animation_visible(&app.state));
+
+        app.state.set_thinking();
+        assert!(activity_animation_visible(&app.state));
+
+        app.state.toggle_transcript_view();
+        assert!(!activity_animation_visible(&app.state));
+
+        app.state.toggle_transcript_view();
+        app.state.overlay = Overlay::Approval;
+        assert!(!activity_animation_visible(&app.state));
+
+        app.state.overlay = Overlay::Agents;
+        assert!(!activity_animation_visible(&app.state));
     }
 
     #[test]

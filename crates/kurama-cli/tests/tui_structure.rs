@@ -89,6 +89,7 @@ fn narrow_approval_request() -> ApprovalRequest {
 #[test]
 fn parses_all_product_commands_without_restart() {
     assert_eq!(parse_command("/agents").unwrap(), Command::Agents);
+    assert_eq!(parse_command("/status").unwrap(), Command::Status);
     assert_eq!(
         parse_command("/model openai-main").unwrap(),
         Command::Model(Some("openai-main".into()))

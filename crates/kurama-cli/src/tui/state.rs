@@ -86,7 +86,6 @@ pub struct TuiState {
     pub composer: String,
     pub cursor: usize,
     pub scroll: usize,
-    pub status: String,
     pub running_agents: usize,
     pub queued_agents: usize,
     pub overlay: Overlay,
@@ -120,7 +119,6 @@ impl TuiState {
             composer: String::new(),
             cursor: 0,
             scroll: 0,
-            status: "ready".into(),
             running_agents: 0,
             queued_agents: 0,
             overlay: Overlay::None,
@@ -160,7 +158,6 @@ impl TuiState {
         );
         state.onboarding = OnboardingState::credential(profile);
         state.overlay = Overlay::Onboarding;
-        state.status = "enter session credential".into();
         state
     }
 
@@ -223,8 +220,16 @@ impl TuiState {
 
     pub fn push_error(&mut self, body: impl Into<String>) {
         self.active_assistant_entry = None;
-        self.activity = ActivityState::Idle;
         self.push_transcript_entry(TranscriptEntry::Error { body: body.into() });
+    }
+
+    pub fn interrupt_active(&mut self) -> bool {
+        if !self.activity.is_animated() {
+            return false;
+        }
+        self.sent_commands.push(EngineCommand::CancelTurn);
+        self.activity = ActivityState::Interrupted;
+        true
     }
 
     fn push_transcript_entry(&mut self, entry: TranscriptEntry) {
@@ -418,7 +423,6 @@ impl TuiState {
                 if let Some(approval) = &mut self.approval {
                     approval.editing = false;
                 }
-                self.status = "approval pending".into();
                 Overlay::Approval
             }
             Overlay::AgentInspect | Overlay::AgentMessage | Overlay::ConfirmAgentCancel => {
@@ -432,12 +436,11 @@ impl TuiState {
         self.approval = Some(ApprovalState::new(request));
         self.overlay = Overlay::Approval;
         self.activity = ActivityState::AwaitingApproval;
-        self.status = "approval pending".into();
     }
 
     pub fn resolve_approval(&mut self, response: ApprovalResponse) {
         let Some(approval) = self.approval.take() else {
-            self.status = "no approval is pending".into();
+            self.push_error("no approval is pending");
             return;
         };
         self.sent_commands.push(EngineCommand::ResolveApproval {
@@ -445,7 +448,7 @@ impl TuiState {
             response,
         });
         self.overlay = Overlay::None;
-        self.status = "approval submitted".into();
+        self.push_notice(None, "approval submitted");
         self.set_thinking();
     }
 
@@ -481,8 +484,9 @@ impl TuiState {
             Ok(arguments) => arguments,
             Err(error) => {
                 let message = format!("invalid approval arguments: {error}");
-                self.status = message.clone();
+                self.push_error(message.clone());
                 self.overlay = Overlay::ApprovalEdit;
+                self.activity = ActivityState::AwaitingApproval;
                 if let Some(approval) = &mut self.approval {
                     approval.editing = true;
                 }
@@ -518,7 +522,6 @@ impl TuiState {
         }
         match event {
             RuntimeEvent::Status { message } => {
-                self.status = message.clone();
                 let started_at = match self.activity {
                     ActivityState::Working { started_at, .. } => started_at,
                     _ => Instant::now(),
@@ -541,7 +544,6 @@ impl TuiState {
                 self.begin_approval(request);
             }
             RuntimeEvent::ToolStarted { name, .. } => {
-                self.status = format!("running {name}");
                 self.activity = ActivityState::RunningTool {
                     name,
                     started_at: Instant::now(),
@@ -569,18 +571,12 @@ impl TuiState {
                     agent.transcript = transcript;
                 }
             }
-            RuntimeEvent::TurnCompleted => {
-                self.status = "ready".into();
-                self.activity = ActivityState::Idle;
-            }
+            RuntimeEvent::TurnCompleted => self.activity = ActivityState::Idle,
             RuntimeEvent::Error { message } => {
                 self.push_error(message);
-                self.status = "ready".into();
-            }
-            RuntimeEvent::Shutdown => {
-                self.status = "shutdown".into();
                 self.activity = ActivityState::Idle;
             }
+            RuntimeEvent::Shutdown => self.activity = ActivityState::Idle,
         }
         if completes_active_streams {
             self.active_tool_entries.clear();

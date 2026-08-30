@@ -5,7 +5,7 @@ use kurama_adapters::{AppPaths, ConfigRepository, FsSessionStore, SessionSecrets
 use kurama_cli::{
     app::App,
     args::{Args, ResumeChoice},
-    tui::{Overlay, ToolLifecycle, TranscriptEntry},
+    tui::{ActivityState, Overlay, ToolLifecycle, TranscriptEntry},
 };
 use kurama_protocol::{
     config::{AuthRef, KuramaConfig, OrchestrationConfig, ProfileConfig, ProfileKind},
@@ -80,7 +80,8 @@ fn missing_configuration_opens_onboarding_without_a_runtime() {
     .expect("select connection");
 
     assert_eq!(app.state.overlay(), Overlay::Onboarding);
-    assert!(app.state.status.contains("profile name"));
+    assert_eq!(app.state.onboarding.prompt(), "Profile name");
+    assert!(app.state.transcript.is_empty());
 }
 
 #[tokio::test]
@@ -148,7 +149,7 @@ async fn continue_resumes_the_project_session_and_downgrades_old_yolo() {
     .expect("bootstrap");
     assert_eq!(app.session_id().map(AsRef::as_ref), Some("s_previous"));
     assert_eq!(app.state.mode, ExecutionMode::Supervised);
-    assert!(app.state.status.contains("Previous run used YOLO"));
+    assert!(transcript_has_notice(&app, "Previous run used YOLO"));
 }
 
 #[tokio::test]
@@ -388,10 +389,11 @@ async fn session_commands_request_an_in_process_restart() {
         app.restart_args().and_then(|args| args.resume.as_ref()),
         Some(&ResumeChoice::Id("s_previous".into()))
     );
+    assert!(transcript_has_notice(&app, "resuming session s_previous"));
 }
 
 #[tokio::test]
-async fn invalid_slash_commands_report_status_without_exiting() {
+async fn invalid_slash_commands_append_error_without_exiting() {
     let (_temp, paths, project) = fixture();
     let repository = ConfigRepository::open(paths.clone()).expect("repository");
     repository
@@ -410,7 +412,8 @@ async fn invalid_slash_commands_report_status_without_exiting() {
         .expect("invalid command remains inside the TUI");
 
     assert!(!exit);
-    assert!(app.state.status.contains("unknown or invalid command"));
+    assert_eq!(app.state.activity(), &ActivityState::Idle);
+    assert!(transcript_has_error(&app, "unknown or invalid command"));
 }
 
 #[tokio::test]
@@ -431,16 +434,20 @@ async fn live_controls_list_context_persist_mode_and_switch_profile() {
     .expect("bootstrap");
     let session_id = app.session_id().expect("session id").to_string();
 
+    submit_command(&mut app, "/status");
+    assert!(transcript_has_notice(&app, "profile work"));
+    assert!(transcript_has_notice(&app, "mode supervised"));
     submit_command(&mut app, "/sessions");
-    assert!(app.state.status.contains(&session_id));
+    assert!(transcript_has_notice(&app, &session_id));
     submit_command(&mut app, "/context");
-    assert!(app.state.status.contains("100000 token input limit"));
-    assert!(app.state.status.contains(&session_id));
+    assert!(transcript_has_notice(&app, "100000 token input limit"));
+    assert!(transcript_has_notice(&app, &session_id));
     submit_command(&mut app, "/mode auto");
     assert_eq!(
         repository.read_state().expect("state").last_mode,
         Some(ExecutionMode::Auto)
     );
+    assert!(transcript_has_notice(&app, "mode auto"));
 
     submit_command(&mut app, "/model archive");
     assert_eq!(
@@ -450,6 +457,30 @@ async fn live_controls_list_context_persist_mode_and_switch_profile() {
     assert!(matches!(
         app.state.sent_commands().last(),
         Some(EngineCommand::Shutdown)
+    ));
+    assert!(transcript_has_notice(&app, "switching to profile archive"));
+}
+
+#[tokio::test]
+async fn normal_submit_queues_the_turn_and_sets_thinking() {
+    let (_temp, paths, project) = fixture();
+    let repository = ConfigRepository::open(paths.clone()).expect("repository");
+    repository
+        .write_config(&bridge_config())
+        .expect("write config");
+    let mut app =
+        App::bootstrap_with_paths(&Args::default(), project, paths, SessionSecrets::default())
+            .expect("bootstrap");
+
+    submit_command(&mut app, "inspect the repository");
+
+    assert!(matches!(
+        app.state.activity(),
+        ActivityState::Thinking { .. }
+    ));
+    assert!(matches!(
+        app.state.sent_commands().last(),
+        Some(EngineCommand::SubmitTurn { text, .. }) if text == "inspect the repository"
     ));
 }
 
@@ -595,6 +626,7 @@ async fn connect_adds_a_profile_without_stopping_the_active_session() {
             .profiles
             .contains_key("claude")
     );
+    assert!(transcript_has_notice(&app, "added profile claude"));
 }
 
 #[tokio::test]
@@ -640,4 +672,18 @@ fn press_enter(app: &mut App) -> bool {
         KeyModifiers::NONE,
     )))
     .expect("submit command")
+}
+
+fn transcript_has_notice(app: &App, needle: &str) -> bool {
+    app.state
+        .transcript
+        .iter()
+        .any(|entry| matches!(entry, TranscriptEntry::Notice { body, .. } if body.contains(needle)))
+}
+
+fn transcript_has_error(app: &App, needle: &str) -> bool {
+    app.state
+        .transcript
+        .iter()
+        .any(|entry| matches!(entry, TranscriptEntry::Error { body } if body.contains(needle)))
 }

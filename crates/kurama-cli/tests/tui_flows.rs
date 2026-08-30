@@ -76,7 +76,7 @@ fn runtime_events_drive_typed_activity_without_duplicate_errors() {
 }
 
 #[test]
-fn runtime_status_and_shutdown_return_to_idle() {
+fn runtime_completion_error_and_shutdown_return_to_idle() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
 
     state.apply_runtime_event(RuntimeEvent::Status {
@@ -87,6 +87,16 @@ fn runtime_status_and_shutdown_return_to_idle() {
         ActivityState::Working { label, .. } if label == "compacting context"
     ));
 
+    state.apply_runtime_event(RuntimeEvent::TurnCompleted);
+    assert_eq!(state.activity(), &ActivityState::Idle);
+
+    state.set_thinking();
+    state.apply_runtime_event(RuntimeEvent::Error {
+        message: "broken".into(),
+    });
+    assert_eq!(state.activity(), &ActivityState::Idle);
+
+    state.set_thinking();
     state.apply_runtime_event(RuntimeEvent::Shutdown);
     assert_eq!(state.activity(), &ActivityState::Idle);
 }
@@ -274,7 +284,9 @@ fn invalid_approval_json_stays_open_and_reports_the_error() {
     assert_eq!(state.overlay(), Overlay::ApprovalEdit);
     assert_eq!(state.activity(), &ActivityState::AwaitingApproval);
     assert!(state.approval.is_some());
-    assert!(state.status.contains("invalid approval arguments"));
+    assert!(state.transcript.iter().any(
+        |entry| matches!(entry, TranscriptEntry::Error { body } if body.contains("invalid approval arguments"))
+    ));
     assert!(state.sent_commands().is_empty());
 }
 
