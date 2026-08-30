@@ -1,8 +1,84 @@
+use std::{cell::RefCell, rc::Rc};
+
 use ratatui::{
     backend::{Backend, ClearType, WindowSize},
     buffer::Cell,
     layout::{Position, Size},
 };
+
+pub struct SharedBackend<B> {
+    inner: Rc<RefCell<B>>,
+}
+
+impl<B> SharedBackend<B> {
+    pub fn new(inner: B) -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(inner)),
+        }
+    }
+}
+
+impl<B> Clone for SharedBackend<B> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Rc::clone(&self.inner),
+        }
+    }
+}
+
+impl<B> Backend for SharedBackend<B>
+where
+    B: Backend,
+{
+    type Error = B::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        self.inner.borrow_mut().draw(content)
+    }
+
+    fn append_lines(&mut self, line_count: u16) -> Result<(), Self::Error> {
+        self.inner.borrow_mut().append_lines(line_count)
+    }
+
+    fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+        self.inner.borrow_mut().hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> Result<(), Self::Error> {
+        self.inner.borrow_mut().show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+        self.inner.borrow_mut().get_cursor_position()
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> Result<(), Self::Error> {
+        self.inner.borrow_mut().set_cursor_position(position)
+    }
+
+    fn clear(&mut self) -> Result<(), Self::Error> {
+        self.inner.borrow_mut().clear()
+    }
+
+    fn clear_region(&mut self, clear_type: ClearType) -> Result<(), Self::Error> {
+        self.inner.borrow_mut().clear_region(clear_type)
+    }
+
+    fn size(&self) -> Result<Size, Self::Error> {
+        self.inner.borrow().size()
+    }
+
+    fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
+        self.inner.borrow_mut().window_size()
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.inner.borrow_mut().flush()
+    }
+}
 
 pub struct CursorTrackingBackend<B> {
     inner: B,

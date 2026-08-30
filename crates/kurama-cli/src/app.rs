@@ -46,8 +46,8 @@ use crate::{
     commands::{Command, parse_command},
     tui::{
         CursorTrackingBackend, OnboardingState, OnboardingSubmission, Overlay, SURFACE,
-        TerminalGuard, TranscriptDetail, TuiState, render, spawn_input_thread, transcript_lines,
-        visible_activity_rect,
+        SharedBackend, TerminalGuard, TranscriptDetail, TuiState, approval_height, composer_height,
+        main_area, render, spawn_input_thread, transcript_lines, visible_activity_rect,
     },
 };
 
@@ -471,7 +471,9 @@ impl App {
 
     pub async fn run(mut self) -> Result<Option<ExitSummary>, String> {
         let _guard = TerminalGuard::enter().map_err(|error| error.to_string())?;
-        let backend = CursorTrackingBackend::new(CrosstermBackend::new(io::stdout()));
+        let backend = SharedBackend::new(CursorTrackingBackend::new(CrosstermBackend::new(
+            io::stdout(),
+        )));
         let mut terminal =
             initialize_inline_terminal(backend).map_err(|error| error.to_string())?;
         let mut input = spawn_input_thread(32);
@@ -1055,20 +1057,136 @@ fn resize_inline_terminal<B>(
     height: u16,
 ) -> Result<(), B::Error>
 where
-    B: Backend,
+    B: Backend + Clone,
 {
-    let previous_viewport_top = terminal.get_frame().area().top();
     let viewport_height = height.min(INLINE_VIEWPORT_MAX_HEIGHT);
     let viewport_top = height.saturating_sub(viewport_height);
-    terminal.set_cursor_position(Position::new(
-        0,
-        previous_viewport_top.min(height.saturating_sub(1)),
-    ))?;
     terminal.backend_mut().clear_region(ClearType::All)?;
-    terminal
-        .backend_mut()
-        .set_cursor_position(Position::new(0, viewport_top))?;
-    terminal.resize(Rect::new(0, 0, width, height))
+    terminal.backend_mut().flush()?;
+    replace_inline_terminal(
+        terminal,
+        Rect::new(0, 0, width, height),
+        viewport_top,
+        viewport_height,
+    )
+}
+
+fn prepare_inline_frame<B>(state: &mut TuiState, terminal: &mut Terminal<B>) -> Result<(), String>
+where
+    B: Backend + Clone,
+{
+    if !state.stable_transcript().is_empty() {
+        let size = terminal.size().map_err(|error| error.to_string())?;
+        set_inline_viewport_height(terminal, size.height.min(INLINE_VIEWPORT_MAX_HEIGHT))
+            .map_err(|error| error.to_string())?;
+        commit_stable_transcript(state, terminal)?;
+    }
+
+    let size = terminal.size().map_err(|error| error.to_string())?;
+    let viewport_height = desired_inline_viewport_height(state, size.width, size.height);
+    set_inline_viewport_height(terminal, viewport_height).map_err(|error| error.to_string())
+}
+
+fn desired_inline_viewport_height(state: &TuiState, width: u16, height: u16) -> u16 {
+    if height == 0 {
+        return 0;
+    }
+    if state.transcript_view_expanded()
+        || matches!(
+            state.overlay(),
+            Overlay::Onboarding
+                | Overlay::Agents
+                | Overlay::AgentInspect
+                | Overlay::AgentMessage
+                | Overlay::ConfirmAgentCancel
+        )
+    {
+        return height.min(INLINE_VIEWPORT_MAX_HEIGHT);
+    }
+
+    let area = main_area(Rect::new(0, 0, width, height));
+    let approval_visible = matches!(state.overlay(), Overlay::Approval | Overlay::ApprovalEdit);
+    let input_height = if approval_visible {
+        approval_height(state, area.width)
+    } else {
+        composer_height(state, area.width)
+    }
+    .max(1)
+    .min(height);
+    let activity_height = u16::from(
+        state.overlay() == Overlay::None && state.activity().is_animated() && input_height < height,
+    );
+    let footer_height = u16::from(input_height.saturating_add(activity_height) < height);
+    let transcript_capacity = height.saturating_sub(
+        input_height
+            .saturating_add(activity_height)
+            .saturating_add(footer_height),
+    );
+    let transcript_height = transcript_lines(
+        state.live_transcript(),
+        area.width as usize,
+        TranscriptDetail::Compact,
+    )
+    .len()
+    .min(transcript_capacity as usize) as u16;
+
+    input_height
+        .saturating_add(activity_height)
+        .saturating_add(footer_height)
+        .saturating_add(transcript_height)
+        .min(height)
+        .min(INLINE_VIEWPORT_MAX_HEIGHT)
+}
+
+fn set_inline_viewport_height<B>(
+    terminal: &mut Terminal<B>,
+    viewport_height: u16,
+) -> Result<(), B::Error>
+where
+    B: Backend + Clone,
+{
+    let current_area = terminal.get_frame().area();
+    if current_area.height == viewport_height {
+        return Ok(());
+    }
+
+    let size = terminal.size()?;
+    let viewport_height = viewport_height.min(size.height);
+    let viewport_top = current_area
+        .top()
+        .min(size.height.saturating_sub(viewport_height));
+    terminal.clear()?;
+    terminal.backend_mut().flush()?;
+    replace_inline_terminal(
+        terminal,
+        Rect::new(0, 0, size.width, size.height),
+        viewport_top,
+        viewport_height,
+    )
+}
+
+fn replace_inline_terminal<B>(
+    terminal: &mut Terminal<B>,
+    terminal_area: Rect,
+    viewport_top: u16,
+    viewport_height: u16,
+) -> Result<(), B::Error>
+where
+    B: Backend + Clone,
+{
+    let mut backend = terminal.backend().clone();
+    backend.set_cursor_position(Position::new(
+        0,
+        viewport_top.min(terminal_area.height.saturating_sub(1)),
+    ))?;
+    let replacement = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(viewport_height),
+        },
+    )?;
+    *terminal = replacement;
+    Ok(())
 }
 
 fn clear_inline_terminal<B>(terminal: &mut Terminal<B>) -> Result<(), B::Error>
@@ -1115,7 +1233,7 @@ pub async fn run_with<B>(
     runtime_events: mpsc::Receiver<RuntimeEvent>,
 ) -> Result<App, String>
 where
-    B: Backend,
+    B: Backend + Clone,
 {
     run_loop(
         &mut app,
@@ -1166,7 +1284,7 @@ async fn run_loop<B>(
     commit_to_scrollback: bool,
 ) -> Result<(), String>
 where
-    B: Backend,
+    B: Backend + Clone,
 {
     let (runtime_tx, mut runtime_receiver) = mpsc::channel(1);
     let mut runtime_open = if let Some(events) = runtime_events {
@@ -1186,7 +1304,7 @@ where
     };
     let mut input_open = true;
     if commit_to_scrollback {
-        commit_stable_transcript(&mut app.state, terminal)?;
+        prepare_inline_frame(&mut app.state, terminal)?;
     }
     terminal
         .draw(|frame| render(frame, &app.state))
@@ -1214,7 +1332,6 @@ where
                         app.state.reset_transcript_commit();
                         resize_inline_terminal(terminal, width, height)
                             .map_err(|error| error.to_string())?;
-                        commit_stable_transcript(&mut app.state, terminal)?;
                     }
                     Some(event) => {
                         exit = app.handle_event(event)?;
@@ -1248,7 +1365,7 @@ where
             }
         }
         if commit_to_scrollback && !animation_tick {
-            commit_stable_transcript(&mut app.state, terminal)?;
+            prepare_inline_frame(&mut app.state, terminal)?;
         }
         terminal
             .draw(|frame| render(frame, &app.state))
@@ -1855,6 +1972,39 @@ Session ID: s_cached"
     }
 
     #[test]
+    fn committed_history_sits_directly_above_the_idle_composer() {
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        state.push_user("hi");
+        state.push_assistant("hello from kurama");
+        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24))
+            .expect("initialize inline terminal");
+
+        prepare_inline_frame(&mut state, &mut terminal).expect("prepare inline frame");
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("draw idle frame");
+
+        assert_eq!(terminal.get_frame().area(), Rect::new(0, 12, 80, 2));
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(80)
+            .map(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        let answer_row = rows
+            .iter()
+            .position(|row| row.contains("hello from kurama"))
+            .expect("committed answer row");
+        let composer_row = rows
+            .iter()
+            .position(|row| row.contains("Ask Kurama"))
+            .expect("composer row");
+
+        assert_eq!(composer_row, answer_row + 1, "{rows:#?}");
+    }
+
+    #[test]
     fn inline_resize_does_not_commit_live_viewport_to_scrollback() {
         let state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
         let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24))
@@ -1958,23 +2108,27 @@ Session ID: s_cached"
         )
         .await
         .expect("run inline terminal");
-        let inserted_row = (0..80)
-            .map(|x| {
-                terminal
-                    .backend()
-                    .buffer()
-                    .cell((x, 4))
-                    .expect("inserted cell")
-                    .symbol()
+        let inserted_row = (0..16)
+            .find(|y| {
+                (0..80)
+                    .map(|x| {
+                        terminal
+                            .backend()
+                            .buffer()
+                            .cell((x, *y))
+                            .expect("inserted cell")
+                            .symbol()
+                    })
+                    .collect::<String>()
+                    .contains("› committed question")
             })
-            .collect::<String>();
+            .expect("committed transcript row");
 
-        assert!(inserted_row.contains("› committed question"));
         assert!((0..80).all(|x| {
             terminal
                 .backend()
                 .buffer()
-                .cell((x, 4))
+                .cell((x, inserted_row))
                 .expect("inserted background")
                 .bg
                 == Color::Reset
