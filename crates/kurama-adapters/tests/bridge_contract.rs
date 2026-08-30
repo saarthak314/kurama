@@ -278,6 +278,60 @@ fn claude_recovers_protocol_calls_misrouted_as_native_tool_use() {
 }
 
 #[test]
+fn claude_recovers_direct_native_tool_arguments_without_resuming_poisoned_history() {
+    let events = ClaudeBridge::parse_fixture(concat!(
+        r#"{"type":"system","subtype":"init","session_id":"session-1"}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"bash","input":{"command":"pwd","cwd":"/workspace/project","timeout_ms":10000}}]}}"#,
+        "\n",
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"<tool_use_error>Error: No such tool available: bash</tool_use_error>","is_error":true,"tool_use_id":"toolu_1"}]}}"#,
+        "\n",
+        r#"{"type":"result","subtype":"success","session_id":"session-1","structured_output":{"kind":"final","text":"bash is unavailable","calls":[],"agents":[]}}"#,
+    ))
+    .expect("Claude stream JSON");
+
+    assert!(matches!(
+        events.as_slice(),
+        [
+            ModelEvent::ResponseStarted { .. },
+            ModelEvent::ToolCall {
+                name,
+                arguments,
+                ..
+            },
+            ModelEvent::ResponseCompleted {
+                cursor: None,
+                finish_reason: kurama_protocol::model::FinishReason::ToolCalls,
+            }
+        ] if name == "bash" && arguments["command"] == "pwd"
+    ));
+}
+
+#[test]
+fn claude_recovers_structured_output_tool_blocks_with_code_fences() {
+    let events = ClaudeBridge::parse_fixture(concat!(
+        r#"{"type":"system","subtype":"init","session_id":"session-1"}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"structured_1","name":"StructuredOutput","input":{"kind":"final","text":"```rust\nfn main() { println!(\"hello\"); }\n```","calls":[],"agents":[]}}]}}"#,
+        "\n",
+        r#"{"type":"result","subtype":"success","session_id":"session-1","result":""}"#,
+    ))
+    .expect("Claude stream JSON");
+
+    assert!(matches!(
+        events.as_slice(),
+        [
+            ModelEvent::ResponseStarted { .. },
+            ModelEvent::TextDelta { text },
+            ModelEvent::ResponseCompleted {
+                finish_reason: kurama_protocol::model::FinishReason::Stop,
+                ..
+            }
+        ] if text == "```rust\nfn main() { println!(\"hello\"); }\n```"
+    ));
+}
+
+#[test]
 fn control_schema_omits_delegation_when_disabled() {
     let disabled = control_schema(false);
     let enabled = control_schema(true);
@@ -363,6 +417,25 @@ fn control_parser_recovers_literal_backslashes_inside_strings() {
 }
 
 #[test]
+fn control_parser_recovers_literal_control_characters_in_code_blocks() {
+    let control = concat!(
+        "{\"kind\":\"final\",\"text\":\"```rust\n",
+        "fn main() {\n",
+        "\tprintln!(\\\"hello\\\");\n",
+        "}\n",
+        "```\",\"calls\":[],\"agents\":[]}",
+    );
+
+    let events = parse_control(control, false).expect("multiline final control");
+
+    assert!(matches!(
+        events.as_slice(),
+        [ModelEvent::TextDelta { text }]
+            if text == "```rust\nfn main() {\n\tprintln!(\"hello\");\n}\n```"
+    ));
+}
+
+#[test]
 fn codex_and_claude_jsonl_fixtures_normalize() {
     let codex = CodexBridge::parse_fixture(include_str!(
         "../../../tests/fixtures/codex/tool_turn.jsonl"
@@ -429,6 +502,48 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":4,"output_tokens
             cursor: Some(BackendCursor { backend, value }),
             ..
         }) if backend == "codex_cli" && value == "thread-live"
+    ));
+}
+
+#[tokio::test]
+async fn long_completed_bridge_preserves_final_despite_late_nonzero_exit() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let executable = temporary.path().join("codex");
+    write_executable(
+        &executable,
+        r#"#!/bin/sh
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-live"}'
+index=0
+while [ "$index" -lt 128 ]; do
+  printf '%s\n' '{"type":"item.completed","item":{"type":"reasoning","text":"working"}}'
+  index=$((index + 1))
+done
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"kind\":\"final\",\"text\":\"done\",\"calls\":[],\"agents\":[]}"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":4,"output_tokens":2,"cached_input_tokens":1}}'
+exit 7
+"#,
+    );
+    let bridge = CodexBridge::new(
+        temporary.path().join("work"),
+        temporary.path().join("control.json"),
+    )
+    .with_program(executable.display().to_string());
+
+    let stream = bridge
+        .stream(request(), &NeverCancel)
+        .await
+        .expect("bridge stream");
+    let events = stream.collect::<Vec<_>>().await;
+
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Ok(ModelEvent::TextDelta { text }) if text == "done"))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(Ok(ModelEvent::ResponseCompleted { .. }))
     ));
 }
 

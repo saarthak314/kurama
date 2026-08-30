@@ -317,6 +317,36 @@ fn repair_invalid_json_escapes(text: &str) -> Cow<'_, str> {
                     index += valid_escape_len;
                 }
             }
+            b'\n' => {
+                repaired.extend_from_slice(b"\\n");
+                changed = true;
+                index += 1;
+            }
+            b'\r' => {
+                repaired.extend_from_slice(b"\\r");
+                changed = true;
+                index += 1;
+            }
+            b'\t' => {
+                repaired.extend_from_slice(b"\\t");
+                changed = true;
+                index += 1;
+            }
+            0x08 => {
+                repaired.extend_from_slice(b"\\b");
+                changed = true;
+                index += 1;
+            }
+            0x0c => {
+                repaired.extend_from_slice(b"\\f");
+                changed = true;
+                index += 1;
+            }
+            control if control < 0x20 => {
+                repaired.extend_from_slice(format!("\\u{control:04x}").as_bytes());
+                changed = true;
+                index += 1;
+            }
             _ => {
                 repaired.push(byte);
                 index += 1;

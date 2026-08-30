@@ -156,7 +156,9 @@ struct ClaudeDecoder {
     delegation_enabled: bool,
     session_id: Option<String>,
     control: Option<String>,
+    structured_control: Option<String>,
     protocol_calls: Vec<ModelEvent>,
+    recovered_native_calls: bool,
     partial: String,
     completed: bool,
 }
@@ -167,7 +169,9 @@ impl ClaudeDecoder {
             delegation_enabled,
             session_id: None,
             control: None,
+            structured_control: None,
             protocol_calls: Vec::new(),
+            recovered_native_calls: false,
             partial: String::new(),
             completed: false,
         }
@@ -221,11 +225,19 @@ impl BridgeDecoder for ClaudeDecoder {
                         let Some(name) = block.get("name").and_then(Value::as_str) else {
                             continue;
                         };
+                        let Some(input) = block.get("input") else {
+                            continue;
+                        };
+                        if name == "StructuredOutput" {
+                            if input.is_object() {
+                                self.structured_control = Some(input.to_string());
+                            }
+                            continue;
+                        }
                         if !matches!(name, "read" | "write" | "bash" | "web-search") {
                             continue;
                         }
-                        let Some(input) = block.get("input").filter(|input| input.is_object())
-                        else {
+                        let Some(input) = input.as_object() else {
                             continue;
                         };
                         let Some(call_id) = input
@@ -235,8 +247,13 @@ impl BridgeDecoder for ClaudeDecoder {
                         else {
                             continue;
                         };
-                        let Some(arguments) = input.get("arguments") else {
-                            continue;
+                        let arguments = match input.get("arguments") {
+                            Some(arguments) => arguments.clone(),
+                            None => {
+                                let mut arguments = input.clone();
+                                arguments.remove("call_id");
+                                Value::Object(arguments)
+                            }
                         };
                         let encoded = json!({
                             "kind": "tool_calls",
@@ -256,6 +273,7 @@ impl BridgeDecoder for ClaudeDecoder {
                         }
                         self.protocol_calls
                             .extend(parse_control(&encoded, self.delegation_enabled)?);
+                        self.recovered_native_calls = true;
                     }
                 }
             }
@@ -295,6 +313,7 @@ impl BridgeDecoder for ClaudeDecoder {
                 let control_value = value
                     .get("structured_output")
                     .map(Value::to_string)
+                    .or_else(|| self.structured_control.take())
                     .or_else(|| {
                         value
                             .get("result")
@@ -317,10 +336,14 @@ impl BridgeDecoder for ClaudeDecoder {
                 });
                 events.extend(normalized);
                 events.push(ModelEvent::ResponseCompleted {
-                    cursor: self.session_id.clone().map(|value| BackendCursor {
-                        backend: BACKEND.into(),
-                        value,
-                    }),
+                    cursor: if self.recovered_native_calls {
+                        None
+                    } else {
+                        self.session_id.clone().map(|value| BackendCursor {
+                            backend: BACKEND.into(),
+                            value,
+                        })
+                    },
                     finish_reason: if tool_calls {
                         FinishReason::ToolCalls
                     } else {

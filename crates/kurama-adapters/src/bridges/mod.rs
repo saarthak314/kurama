@@ -170,6 +170,9 @@ fn decoded_event_stream<D: BridgeDecoder>(
                         }
                     },
                     Some(Err(error)) => {
+                        if state.decoder.finish().is_ok() {
+                            return None;
+                        }
                         state.lines.cancel_and_wait().await;
                         state.ended = true;
                         let error = control::bounded_kurama_error(error, &state.secrets);
