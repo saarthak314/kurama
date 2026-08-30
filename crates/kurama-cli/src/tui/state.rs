@@ -522,14 +522,8 @@ impl TuiState {
         }
         match event {
             RuntimeEvent::Status { message } => {
-                let started_at = match self.activity {
-                    ActivityState::Working { started_at, .. } => started_at,
-                    _ => Instant::now(),
-                };
-                self.activity = ActivityState::Working {
-                    label: message,
-                    started_at,
-                };
+                self.push_notice(None, message);
+                self.activity = ActivityState::Idle;
             }
             RuntimeEvent::AssistantDelta { text } => {
                 if matches!(
@@ -558,7 +552,7 @@ impl TuiState {
             }
             RuntimeEvent::ToolCompleted { result, .. } => {
                 self.complete_tool(result);
-                self.activity = ActivityState::Idle;
+                self.set_thinking();
             }
             RuntimeEvent::AgentUpdated { snapshot } => self.upsert_agent(snapshot),
             RuntimeEvent::AgentInspection {

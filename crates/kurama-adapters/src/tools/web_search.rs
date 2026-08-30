@@ -17,7 +17,10 @@ use url::{Host, Url};
 
 use crate::{credentials::SecretValue, http::HttpClient};
 
-use super::{html_text::html_to_text, limits::BoundedOutput};
+use super::{
+    html_text::html_to_text,
+    limits::{staged_output, take_truncated_staging},
+};
 
 const MAX_REDIRECTS: usize = 5;
 const MAX_PAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -318,22 +321,29 @@ impl Tool for WebSearchTool {
                         "text/html" => html_to_text(&String::from_utf8_lossy(&page.bytes)),
                         _ => String::from_utf8_lossy(&page.bytes).into_owned(),
                     };
-                    let mut bounded = BoundedOutput::new(context.limits);
+                    let mut bounded = staged_output(context.limits, "web-open", "output")?;
                     bounded.push(readable.as_bytes());
-                    let bounded = bounded.finish();
+                    let mut bounded = bounded.finish();
+                    let staged_path = take_truncated_staging(&mut bounded)?;
+                    let mut metadata = serde_json::json!({
+                        "url": page.url,
+                        "content_type": page.content_type,
+                        "bytes": page.bytes.len(),
+                        "readable_bytes": bounded.total_bytes,
+                        "readable_lines": bounded.total_lines,
+                        "omitted_bytes": bounded.omitted_bytes,
+                        "omitted_lines": bounded.omitted_lines
+                    });
+                    if let Some(path) = staged_path {
+                        metadata["_display_staging"] = serde_json::json!({
+                            "output": path
+                        });
+                    }
                     Ok(ToolResult {
                         call_id: invocation.call_id,
                         output: bounded.text,
                         is_error: false,
-                        metadata: serde_json::json!({
-                            "url": page.url,
-                            "content_type": page.content_type,
-                            "bytes": page.bytes.len(),
-                            "readable_bytes": bounded.total_bytes,
-                            "readable_lines": bounded.total_lines,
-                            "omitted_bytes": bounded.omitted_bytes,
-                            "omitted_lines": bounded.omitted_lines
-                        }),
+                        metadata,
                         truncated: bounded.truncated,
                         blob_refs: Vec::new(),
                     })

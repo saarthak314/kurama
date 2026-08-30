@@ -110,6 +110,7 @@ async fn read_requires_an_explicit_range_and_returns_file_metadata() {
     );
     assert_eq!(result.metadata["files"][0]["total_bytes"], 14);
     assert_eq!(result.metadata["files"][0]["utf8"], true);
+    assert!(result.metadata.get("_display_staging").is_none());
 
     let missing_end = invocation(
         "read",
@@ -150,6 +151,16 @@ async fn read_supports_binary_byte_ranges_and_bounds_visible_output() {
             .unwrap()
             > 0
     );
+    let staged_path = PathBuf::from(
+        result.metadata["_display_staging"]["output"]
+            .as_str()
+            .expect("staged read output"),
+    );
+    assert_eq!(
+        fs::read(&staged_path).expect("complete staged read output"),
+        b"== bytes.bin ==\nHEAD\xffmiddle\nTAIL\n"
+    );
+    fs::remove_file(staged_path).expect("remove staged read output");
 
     let mut bounded = BoundedOutput::new(ToolLimits {
         max_bytes: 64,

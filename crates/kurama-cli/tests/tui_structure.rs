@@ -576,7 +576,8 @@ fn assistant_markdown_renders_inline_styles_and_links() {
             .contains(Modifier::CROSSED_OUT)
     );
     let inline_code = cell_at_text(&buffer, "cargo test");
-    assert_eq!(inline_code.fg, Color::Rgb(224, 226, 232));
+    assert_eq!(cell_at_text(&buffer, "Use bold").fg, Color::Reset);
+    assert_eq!(inline_code.fg, Color::Reset);
     assert!(inline_code.modifier.contains(Modifier::BOLD));
     let link = cell_at_text(&buffer, "docs");
     assert_eq!(link.fg, Color::Rgb(116, 177, 255));
@@ -634,10 +635,7 @@ fn assistant_markdown_renders_blocks_lists_code_quotes_rules_and_tables() {
             .modifier
             .contains(Modifier::BOLD)
     );
-    assert_eq!(
-        cell_at_text(&buffer, "fn main()").fg,
-        Color::Rgb(220, 178, 73)
-    );
+    assert_eq!(cell_at_text(&buffer, "fn main()").fg, Color::Reset);
     assert!(
         cell_at_text(&buffer, "Name")
             .modifier
@@ -823,7 +821,7 @@ fn table_cells_preserve_inline_markdown_styles() {
             .contains(Modifier::BOLD)
     );
     let inline_code = cell_at_text(&buffer, "ready");
-    assert_eq!(inline_code.fg, Color::Rgb(224, 226, 232));
+    assert_eq!(inline_code.fg, Color::Reset);
     assert!(inline_code.modifier.contains(Modifier::BOLD));
     let link = cell_at_text(&buffer, "docs");
     assert_eq!(link.fg, Color::Rgb(116, 177, 255));
@@ -1039,6 +1037,25 @@ fn every_tui_view_preserves_the_terminal_default_background() {
             state.overlay
         );
     }
+}
+
+#[test]
+fn running_agent_metadata_uses_the_active_accent_not_failure_red() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.set_agents(vec![AgentRow {
+        id: AgentId::from("a_1"),
+        role: "reviewer".into(),
+        profile: "frontier".into(),
+        task: "inspect parser".into(),
+        state: AgentState::Running,
+        activity: "reading".into(),
+        transcript: Vec::new(),
+    }]);
+    state.open_agents();
+
+    let buffer = rendered(&state, 120, 30);
+
+    assert_eq!(cell_at_text(&buffer, "RUNNING").fg, Color::Cyan);
 }
 
 #[test]

@@ -10,10 +10,9 @@ use unicode_segmentation::UnicodeSegmentation;
 use super::{ToolLifecycle, TranscriptEntry, TuiState};
 
 const DIM: Color = Color::Rgb(126, 132, 146);
-const TEXT: Color = Color::Rgb(224, 226, 232);
+const TEXT: Color = Color::Reset;
 const BORDER: Color = Color::Rgb(48, 53, 64);
 const RED: Color = Color::Rgb(255, 92, 82);
-const AMBER: Color = Color::Rgb(220, 178, 73);
 const GREEN: Color = Color::Rgb(111, 207, 151);
 const BLUE: Color = Color::Rgb(116, 177, 255);
 
@@ -1125,7 +1124,7 @@ fn text_style() -> Style {
 }
 
 fn code_style() -> Style {
-    Style::default().fg(AMBER)
+    text_style()
 }
 
 fn inline_code_style() -> Style {

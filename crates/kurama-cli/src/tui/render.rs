@@ -21,7 +21,7 @@ const BORDER: Color = Color::DarkGray;
 const DIM: Color = Color::DarkGray;
 const TEXT: Color = Color::Reset;
 pub(crate) const SURFACE: Color = Color::Reset;
-const RED: Color = Color::Red;
+const ACCENT: Color = Color::Cyan;
 const AMBER: Color = Color::Yellow;
 const GREEN: Color = Color::Cyan;
 
@@ -121,7 +121,7 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) {
         let lines = vec![
             Line::from(Span::styled(
                 state.onboarding.step_label(),
-                Style::default().fg(RED).add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(
@@ -130,7 +130,10 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) {
             )),
             Line::from(""),
             Line::from(vec![
-                Span::styled("›  ", Style::default().fg(RED).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "›  ",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(
                     if input.is_empty() {
                         " "
@@ -160,7 +163,7 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) {
     let mut lines = vec![
         Line::from(Span::styled(
             state.onboarding.step_label(),
-            Style::default().fg(RED).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
@@ -193,7 +196,7 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) {
                     .add_modifier(Modifier::BOLD),
             ),
             if selected {
-                Span::styled("   SELECTED", Style::default().fg(RED))
+                Span::styled("   SELECTED", Style::default().fg(ACCENT))
             } else {
                 Span::raw("")
             },
@@ -208,7 +211,7 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) {
     lines.push(Line::from(vec![
         Span::styled(
             "REMOTE-FIRST",
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             "   Kurama ships no model runtime. Local models connect through an existing endpoint.",
@@ -236,7 +239,7 @@ fn render_agents(frame: &mut Frame<'_>, state: &TuiState) {
         Line::from(vec![
             Span::styled(
                 "/AGENTS",
-                Style::default().fg(RED).add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(
@@ -265,13 +268,16 @@ fn render_agents(frame: &mut Frame<'_>, state: &TuiState) {
         let selected = index == state.selected_agent;
         let state_text = format!("{:?}", agent.state).to_uppercase();
         let state_color = match agent.state {
-            AgentState::Running => RED,
-            AgentState::Queued => AMBER,
+            AgentState::Running => ACCENT,
+            AgentState::Queued => DIM,
             AgentState::Completed => GREEN,
             AgentState::Failed | AgentState::Cancelled => DIM,
         };
         lines.push(Line::from(vec![
-            Span::styled(if selected { "▶ " } else { "  " }, Style::default().fg(RED)),
+            Span::styled(
+                if selected { "▶ " } else { "  " },
+                Style::default().fg(ACCENT),
+            ),
             Span::styled(
                 format!(
                     "{:<10}{:<14}{:<13}{:<22}",
@@ -294,7 +300,7 @@ fn render_agents(frame: &mut Frame<'_>, state: &TuiState) {
     if let Some(agent) = state.selected_agent() {
         lines.push(Line::from(Span::styled(
             format!("SELECTED  {}", agent.id),
-            Style::default().fg(RED).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(Span::styled(
             agent.activity.as_str(),
@@ -328,7 +334,7 @@ fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) {
     };
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("/AGENTS  /  ", Style::default().fg(RED)),
+            Span::styled("/AGENTS  /  ", Style::default().fg(ACCENT)),
             Span::styled(
                 agent.id.to_string(),
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
@@ -337,7 +343,7 @@ fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) {
         Line::from(""),
         Line::from(Span::styled(
             agent.role.to_uppercase(),
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             agent.task.as_str(),
@@ -350,7 +356,7 @@ fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) {
         Line::from(""),
         Line::from(Span::styled(
             "CURRENT",
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             agent.activity.as_str(),
@@ -373,7 +379,7 @@ fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) {
     } else if state.overlay == Overlay::ConfirmAgentCancel {
         lines.push(Line::from(Span::styled(
             format!("Cancel {}?  y confirm  ·  n/esc return", agent.id),
-            Style::default().fg(RED).add_modifier(Modifier::BOLD),
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
         )));
     } else {
         lines.push(Line::from(Span::styled(

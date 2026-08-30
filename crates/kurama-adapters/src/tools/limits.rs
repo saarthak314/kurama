@@ -4,10 +4,13 @@ use std::{
     fs::{File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use kurama_protocol::{session::BlobRef, tool::ToolLimits};
 use sha2::{Digest, Sha256};
+
+static NEXT_STAGING_FILE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundedText {
@@ -226,6 +229,48 @@ impl BoundedOutput {
                 }
             }
         }
+    }
+}
+
+pub(super) fn staged_output(
+    limits: ToolLimits,
+    tool: &str,
+    stream: &str,
+) -> std::io::Result<BoundedOutput> {
+    let mut collision = None;
+    for _ in 0..16 {
+        let sequence = NEXT_STAGING_FILE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "kurama-{tool}-{}-{sequence}-{stream}.tmp",
+            std::process::id()
+        ));
+        match BoundedOutput::with_staging(limits, path) {
+            Ok(output) => return Ok(output),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                collision = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(collision.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a unique tool display staging file",
+        )
+    }))
+}
+
+pub(super) fn take_truncated_staging(
+    bounded: &mut BoundedText,
+) -> std::io::Result<Option<PathBuf>> {
+    let Some(path) = bounded.staged_path.take() else {
+        return Ok(None);
+    };
+    if bounded.truncated {
+        Ok(Some(path))
+    } else {
+        std::fs::remove_file(path)?;
+        Ok(None)
     }
 }
 

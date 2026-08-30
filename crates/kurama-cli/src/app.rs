@@ -942,22 +942,30 @@ fn replay_for_transcript(replay: &[EventEnvelope], store: &dyn SessionStore) -> 
         else {
             continue;
         };
-        let Ok(stdout) = display_blob_text(display_blobs.get("stdout"), store) else {
+        let Ok(Some(display_output)) = display_output_from_blobs(display_blobs, store) else {
             continue;
         };
-        let Ok(stderr) = display_blob_text(display_blobs.get("stderr"), store) else {
-            continue;
-        };
-        if stdout.is_none() && stderr.is_none() {
-            continue;
-        }
-        let display_output = combined_tool_output(
-            stdout.as_deref().unwrap_or_default(),
-            stderr.as_deref().unwrap_or_default(),
-        );
         result.metadata["display_output"] = serde_json::Value::String(display_output);
     }
     transcript_replay
+}
+
+fn display_output_from_blobs(
+    display_blobs: &serde_json::Map<String, serde_json::Value>,
+    store: &dyn SessionStore,
+) -> Result<Option<String>, String> {
+    if let Some(output) = display_blob_text(display_blobs.get("output"), store)? {
+        return Ok(Some(output));
+    }
+    let stdout = display_blob_text(display_blobs.get("stdout"), store)?;
+    let stderr = display_blob_text(display_blobs.get("stderr"), store)?;
+    if stdout.is_none() && stderr.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(combined_tool_output(
+        stdout.as_deref().unwrap_or_default(),
+        stderr.as_deref().unwrap_or_default(),
+    )))
 }
 
 fn display_blob_text(

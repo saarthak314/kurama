@@ -1,10 +1,7 @@
 use std::{
     path::PathBuf,
     process::{ExitStatus, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -20,14 +17,13 @@ use tokio::{
     process::{Child, Command},
 };
 
-use super::{BoundedOutput, BoundedText, PathGuard};
+use super::{BoundedText, PathGuard, limits::staged_output};
 
 const MAX_COMMAND_BYTES: usize = 32_768;
 const MAX_TIMEOUT_MS: u64 = 3_600_000;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
 const EVENT_CHUNK_BYTES: usize = 4 * 1024;
 const DISPLAY_STAGING_KEY: &str = "_display_staging";
-static NEXT_STAGING_FILE: AtomicU64 = AtomicU64::new(0);
 
 pub struct BashTool {
     shell_path: PathBuf,
@@ -372,10 +368,11 @@ async fn capture_stream<R: AsyncRead + Unpin>(
     event_sink: Option<Arc<dyn EventSink>>,
 ) -> Result<CapturedStream, KuramaError> {
     let mut bounded = if event_sink.is_some() {
-        staged_output(limits, stream)
+        staged_output(limits, "bash", stream)?
     } else {
-        BoundedOutput::new(limits)
+        super::BoundedOutput::new(limits)
     };
+    let mut pending_utf8 = Vec::new();
     let mut chunk = [0_u8; READ_CHUNK_BYTES];
     loop {
         let read = reader.read(&mut chunk).await?;
@@ -384,33 +381,89 @@ async fn capture_stream<R: AsyncRead + Unpin>(
         }
         bounded.push(&chunk[..read]);
         if let Some(sink) = &event_sink {
-            let visible = String::from_utf8_lossy(&chunk[..read]);
-            for visible in utf8_chunks(&visible, EVENT_CHUNK_BYTES) {
-                let _ = sink.emit(RuntimeEvent::ToolOutputDelta {
-                    call_id: call_id.clone(),
-                    stream: stream.into(),
-                    chunk: visible.to_owned(),
-                });
-            }
+            emit_decoded_output(
+                &mut pending_utf8,
+                &chunk[..read],
+                false,
+                sink.as_ref(),
+                &call_id,
+                stream,
+            );
         }
+    }
+    if let Some(sink) = &event_sink {
+        emit_decoded_output(
+            &mut pending_utf8,
+            &[],
+            true,
+            sink.as_ref(),
+            &call_id,
+            stream,
+        );
     }
     Ok(CapturedStream(bounded.finish()))
 }
 
-fn staged_output(limits: kurama_protocol::tool::ToolLimits, stream: &str) -> BoundedOutput {
-    for _ in 0..16 {
-        let sequence = NEXT_STAGING_FILE.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "kurama-bash-{}-{sequence}-{stream}.tmp",
-            std::process::id()
-        ));
-        match BoundedOutput::with_staging(limits, path) {
-            Ok(output) => return output,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(_) => break,
+fn emit_decoded_output(
+    pending: &mut Vec<u8>,
+    bytes: &[u8],
+    flush: bool,
+    sink: &dyn EventSink,
+    call_id: &kurama_protocol::id::CallId,
+    stream: &str,
+) {
+    pending.extend_from_slice(bytes);
+    let mut consumed = 0;
+    let mut visible = String::new();
+    loop {
+        let remaining = &pending[consumed..];
+        if remaining.is_empty() {
+            break;
+        }
+        match std::str::from_utf8(remaining) {
+            Ok(text) => {
+                visible.push_str(text);
+                consumed = pending.len();
+                break;
+            }
+            Err(error) => {
+                let valid_end = consumed + error.valid_up_to();
+                if valid_end > consumed {
+                    let prefix = std::str::from_utf8(&pending[consumed..valid_end])
+                        .expect("validated UTF-8 prefix");
+                    visible.push_str(prefix);
+                    consumed = valid_end;
+                }
+                if let Some(error_len) = error.error_len() {
+                    visible.push('�');
+                    consumed += error_len;
+                    continue;
+                }
+                if flush {
+                    visible.push_str(&String::from_utf8_lossy(&pending[consumed..]));
+                    consumed = pending.len();
+                }
+                break;
+            }
         }
     }
-    BoundedOutput::new(limits)
+    pending.drain(..consumed);
+    emit_visible_output(sink, call_id, stream, &visible);
+}
+
+fn emit_visible_output(
+    sink: &dyn EventSink,
+    call_id: &kurama_protocol::id::CallId,
+    stream: &str,
+    visible: &str,
+) {
+    for visible in utf8_chunks(visible, EVENT_CHUNK_BYTES) {
+        let _ = sink.emit(RuntimeEvent::ToolOutputDelta {
+            call_id: call_id.clone(),
+            stream: stream.into(),
+            chunk: visible.to_owned(),
+        });
+    }
 }
 
 struct CapturedStream(BoundedText);

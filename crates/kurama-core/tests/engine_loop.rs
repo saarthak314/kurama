@@ -1,9 +1,11 @@
 use std::{
+    future::pending,
     path::PathBuf,
     sync::atomic::{AtomicUsize, Ordering},
     sync::{Arc, Mutex},
 };
 
+use futures_util::{StreamExt as _, stream};
 use kurama_core::{
     context::{ContextManager, ContextPolicy},
     engine::{Engine, EngineConfig},
@@ -15,7 +17,7 @@ use kurama_core::{
 use kurama_protocol::{
     agent::{AgentSnapshot, AgentState, WriteScope},
     id::{CallId, OperationId, SessionId},
-    model::{FinishReason, ModelEvent, ModelProfile},
+    model::{BackendCapabilities, FinishReason, ModelEvent, ModelProfile, ModelRequest},
     policy::{ApprovalResponse, AutoBoundaries, ExecutionMode, PolicyContext, PolicyDecision},
     runtime::RuntimeEvent,
     session::{EventEnvelope, FileCheckpoint, SessionEvent, SessionMetadata},
@@ -23,8 +25,11 @@ use kurama_protocol::{
         CommandClass, Operation, ToolContext, ToolDescriptor, ToolInvocation, ToolLimits,
         ToolResult,
     },
-    traits::{ApprovalPolicy, BoxFuture, CancelSignal, ModelBackend, SessionStore, Tool},
+    traits::{
+        ApprovalPolicy, BoxFuture, CancelSignal, ModelBackend, ModelStream, SessionStore, Tool,
+    },
 };
+use tokio::sync::Notify;
 
 fn replay_event(sequence: u64, event: SessionEvent) -> EventEnvelope {
     EventEnvelope::new(sequence, sequence, SessionId::from("resume"), None, event)
@@ -114,8 +119,7 @@ fn seed_replay(store: &MemoryStore, replay: &[EventEnvelope]) {
 }
 
 struct StagedOutputTool {
-    stdout_path: PathBuf,
-    stderr_path: PathBuf,
+    output_path: PathBuf,
 }
 
 impl Tool for StagedOutputTool {
@@ -151,8 +155,7 @@ impl Tool for StagedOutputTool {
                 is_error: false,
                 metadata: serde_json::json!({
                     "_display_staging": {
-                        "stdout": self.stdout_path,
-                        "stderr": self.stderr_path
+                        "output": self.output_path
                     }
                 }),
                 truncated: true,
@@ -172,13 +175,10 @@ fn unique_staging_path(stream: &str) -> PathBuf {
 }
 
 #[tokio::test]
-async fn tool_completion_persists_display_blobs_without_full_output_in_events() {
-    let full_stdout = "head\nfull middle output\ntail\n";
-    let full_stderr = "warn\n";
-    let stdout_path = unique_staging_path("stdout");
-    let stderr_path = unique_staging_path("stderr");
-    std::fs::write(&stdout_path, full_stdout).expect("stage stdout");
-    std::fs::write(&stderr_path, full_stderr).expect("stage stderr");
+async fn tool_completion_keeps_durable_output_bounded_and_hydrates_live_display() {
+    let full_output = "head\nfull middle output\ntail\n";
+    let output_path = unique_staging_path("output");
+    std::fs::write(&output_path, full_output).expect("stage output");
     let backend = ScriptedBackend::new(vec![
         vec![
             Ok(ModelEvent::ToolCall {
@@ -209,8 +209,7 @@ async fn tool_completion_persists_display_blobs_without_full_output_in_events() 
         profile: ModelProfile::new("test", "frontier", 4_000, 500),
         backend: Arc::new(backend),
         tools: vec![Arc::new(StagedOutputTool {
-            stdout_path: stdout_path.clone(),
-            stderr_path: stderr_path.clone(),
+            output_path: output_path.clone(),
         })],
         policy: Arc::new(AllowAllPolicy),
         store: store.clone(),
@@ -229,7 +228,25 @@ async fn tool_completion_persists_display_blobs_without_full_output_in_events() 
     };
     let (handle, mut events) = Engine::spawn(config, Vec::new()).expect("spawn engine");
     handle.submit("inspect", false).await.expect("submit");
-    while !matches!(events.recv().await, Some(RuntimeEvent::TurnCompleted)) {}
+    let mut live_result = None;
+    loop {
+        match events.recv().await.expect("runtime event") {
+            RuntimeEvent::ToolCompleted { result, .. } => live_result = Some(result),
+            RuntimeEvent::TurnCompleted => break,
+            RuntimeEvent::Error { message } => panic!("engine error: {message}"),
+            _ => {}
+        }
+    }
+
+    let live_result = live_result.expect("live tool result");
+    assert_eq!(
+        live_result.metadata["display_output"].as_str(),
+        Some(full_output)
+    );
+    assert_eq!(
+        live_result.output,
+        "head\n[omitted]\ntail\n\n[stderr]\nwarn\n"
+    );
 
     let completion = store
         .events("session")
@@ -245,17 +262,11 @@ async fn tool_completion_persists_display_blobs_without_full_output_in_events() 
     let display_blobs = result.metadata["display_blobs"]
         .as_object()
         .expect("display blob references");
-    let stdout: kurama_protocol::session::BlobRef =
-        serde_json::from_value(display_blobs["stdout"].clone()).expect("stdout blob reference");
-    let stderr: kurama_protocol::session::BlobRef =
-        serde_json::from_value(display_blobs["stderr"].clone()).expect("stderr blob reference");
+    let output: kurama_protocol::session::BlobRef =
+        serde_json::from_value(display_blobs["output"].clone()).expect("output blob reference");
     assert_eq!(
-        store.get_blob(&stdout).expect("stdout blob"),
-        full_stdout.as_bytes()
-    );
-    assert_eq!(
-        store.get_blob(&stderr).expect("stderr blob"),
-        full_stderr.as_bytes()
+        store.get_blob(&output).expect("output blob"),
+        full_output.as_bytes()
     );
     assert!(
         !serde_json::to_string(&completion)
@@ -293,8 +304,7 @@ async fn tool_completion_persists_display_blobs_without_full_output_in_events() 
             .expect("serialize model request")
             .contains("full middle output")
     );
-    assert!(!stdout_path.exists());
-    assert!(!stderr_path.exists());
+    assert!(!output_path.exists());
 }
 
 #[tokio::test]
@@ -365,6 +375,14 @@ async fn engine_executes_tool_and_finishes_turn() {
     }
     assert!(saw_tool);
     assert_eq!(text, "Done.");
+    assert_eq!(
+        store
+            .events("session")
+            .iter()
+            .filter(|event| matches!(event.event, SessionEvent::AssistantMessage { .. }))
+            .count(),
+        1
+    );
     assert_eq!(store.operation_completion_count("session", "o_1"), 1);
 }
 
@@ -447,6 +465,154 @@ async fn cancellation_is_observed_while_streaming() {
     });
     assert!(token.cancel());
     assert!(task.await.expect("join"));
+}
+
+struct BlockingPartialBackend {
+    blocked: Arc<Notify>,
+}
+
+impl ModelBackend for BlockingPartialBackend {
+    fn backend_name(&self) -> &'static str {
+        "blocking-partial"
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::remote_default()
+    }
+
+    fn stream<'a>(
+        &'a self,
+        _request: ModelRequest,
+        _cancel: &'a dyn CancelSignal,
+    ) -> BoxFuture<'a, Result<ModelStream, kurama_protocol::KuramaError>> {
+        Box::pin(async move {
+            let blocked = Arc::clone(&self.blocked);
+            let events = stream::iter([Ok(ModelEvent::TextDelta {
+                text: "partial cancellation".into(),
+            })])
+            .chain(stream::once(async move {
+                blocked.notify_one();
+                pending::<Result<ModelEvent, kurama_protocol::KuramaError>>().await
+            }));
+            Ok(Box::pin(events) as ModelStream)
+        })
+    }
+}
+
+fn partial_stream_config(
+    session_id: &str,
+    backend: Arc<dyn ModelBackend>,
+    store: Arc<MemoryStore>,
+) -> EngineConfig {
+    EngineConfig {
+        session: SessionMetadata {
+            id: session_id.into(),
+            created_at_ms: 0,
+            project_root: ".".into(),
+            profile: "test".into(),
+            mode: ExecutionMode::Supervised,
+            redaction_best_effort: false,
+        },
+        profile: ModelProfile::new("test", "frontier", 4_000, 500),
+        backend,
+        tools: Vec::new(),
+        policy: Arc::new(AllowAllPolicy),
+        store,
+        sink: Arc::new(CollectingSink::default()),
+        orchestrator: Arc::new(NoDelegation),
+        ids: Arc::new(SequenceIds::new(1)),
+        context_policy: ContextPolicy::default(),
+        workspace_root: PathBuf::from("."),
+        write_scope: WriteScope::default(),
+        auto: AutoBoundaries::default(),
+        agent_id: None,
+        orchestration: None,
+        provider_retry_delays_ms: Vec::new(),
+        command_capacity: 32,
+        event_capacity: 128,
+    }
+}
+
+#[tokio::test]
+async fn stream_failure_flushes_and_persists_sub_threshold_assistant_text() {
+    let store = Arc::new(MemoryStore::default());
+    let backend = Arc::new(ScriptedBackend::new(vec![vec![
+        Ok(ModelEvent::TextDelta {
+            text: "partial failure".into(),
+        }),
+        Err(kurama_protocol::KuramaError::Model(
+            "provider disconnected".into(),
+        )),
+    ]]));
+    let (handle, mut events) = Engine::spawn(
+        partial_stream_config("partial-failure", backend, Arc::clone(&store)),
+        Vec::new(),
+    )
+    .expect("spawn engine");
+
+    handle.submit("inspect", false).await.expect("submit");
+    let mut streamed = String::new();
+    loop {
+        match events.recv().await.expect("runtime event") {
+            RuntimeEvent::AssistantDelta { text } => streamed.push_str(&text),
+            RuntimeEvent::Error { message } => {
+                assert!(message.contains("provider disconnected"));
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(streamed, "partial failure");
+    let assistant_messages = store
+        .events("partial-failure")
+        .into_iter()
+        .filter_map(|event| match event.event {
+            SessionEvent::AssistantMessage { text } => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(assistant_messages, ["partial failure"]);
+}
+
+#[tokio::test]
+async fn cancellation_flushes_and_persists_sub_threshold_assistant_text() {
+    let store = Arc::new(MemoryStore::default());
+    let blocked = Arc::new(Notify::new());
+    let backend = Arc::new(BlockingPartialBackend {
+        blocked: Arc::clone(&blocked),
+    });
+    let (handle, mut events) = Engine::spawn(
+        partial_stream_config("partial-cancel", backend, Arc::clone(&store)),
+        Vec::new(),
+    )
+    .expect("spawn engine");
+
+    handle.submit("inspect", false).await.expect("submit");
+    blocked.notified().await;
+    handle.cancel_turn().await.expect("cancel turn");
+    let mut streamed = String::new();
+    loop {
+        match events.recv().await.expect("runtime event") {
+            RuntimeEvent::AssistantDelta { text } => streamed.push_str(&text),
+            RuntimeEvent::Error { message } => {
+                assert_eq!(message, "cancelled");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(streamed, "partial cancellation");
+    let assistant_messages = store
+        .events("partial-cancel")
+        .into_iter()
+        .filter_map(|event| match event.event {
+            SessionEvent::AssistantMessage { text } => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(assistant_messages, ["partial cancellation"]);
 }
 
 #[derive(Default)]

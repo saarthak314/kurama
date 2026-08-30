@@ -281,12 +281,12 @@ async fn bash_bounds_stdout_and_stderr_with_head_and_tail() {
 }
 
 #[tokio::test]
-async fn bash_stream_events_remain_bounded_after_lossy_utf8_conversion() {
+async fn bash_stream_events_decode_split_utf8_and_remain_bounded() {
     let fixture = Fixture::empty();
     let sink = Arc::new(RecordingSink::default());
     let tool = BashTool::with_event_sink("/bin/bash", sink.clone());
     let call = invocation(serde_json::json!({
-        "command": "printf '\\377%.0s' {1..8000}",
+        "command": "printf '\\342'; sleep 0.05; printf '\\202\\254'; printf '\\377%.0s' {1..8000}",
         "cwd": ".",
         "timeout_ms": 1000
     }));
@@ -297,6 +297,7 @@ async fn bash_stream_events_remain_bounded_after_lossy_utf8_conversion() {
 
     let chunks = sink.chunks.lock().unwrap();
     assert!(!chunks.is_empty());
+    assert!(chunks.concat().starts_with('€'));
     assert!(chunks.iter().all(|chunk| chunk.len() <= 4 * 1024));
 }
 

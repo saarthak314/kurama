@@ -8,7 +8,6 @@ use kurama_protocol::{
     session::{EventEnvelope, SessionEvent},
     tool::{Operation, ToolResult},
 };
-use std::{thread, time::Duration};
 
 #[test]
 fn onboarding_offers_only_supported_connection_types() {
@@ -79,14 +78,7 @@ fn runtime_events_drive_typed_activity_without_duplicate_errors() {
 fn runtime_completion_error_and_shutdown_return_to_idle() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
 
-    state.apply_runtime_event(RuntimeEvent::Status {
-        message: "compacting context".into(),
-    });
-    assert!(matches!(
-        state.activity(),
-        ActivityState::Working { label, .. } if label == "compacting context"
-    ));
-
+    state.set_thinking();
     state.apply_runtime_event(RuntimeEvent::TurnCompleted);
     assert_eq!(state.activity(), &ActivityState::Idle);
 
@@ -102,25 +94,17 @@ fn runtime_completion_error_and_shutdown_return_to_idle() {
 }
 
 #[test]
-fn repeated_status_updates_preserve_activity_start_time() {
+fn status_updates_append_notices_without_starting_activity() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.apply_runtime_event(RuntimeEvent::Status {
-        message: "indexing".into(),
-    });
-    let started_at = match state.activity() {
-        ActivityState::Working { started_at, .. } => *started_at,
-        activity => panic!("expected working activity, got {activity:?}"),
-    };
-
-    thread::sleep(Duration::from_millis(2));
-    state.apply_runtime_event(RuntimeEvent::Status {
-        message: "indexing".into(),
+        message: "mode changed to auto".into(),
     });
 
+    assert_eq!(state.activity(), &ActivityState::Idle);
     assert!(matches!(
-        state.activity(),
-        ActivityState::Working { label, started_at: repeated }
-            if label == "indexing" && *repeated == started_at
+        &state.transcript[..],
+        [TranscriptEntry::Notice { label: None, body }]
+            if body == "mode changed to auto"
     ));
 }
 
@@ -152,7 +136,7 @@ fn tool_events_preserve_complete_output_and_lifecycle() {
         result,
     });
 
-    assert_eq!(state.activity(), &ActivityState::Idle);
+    assert!(matches!(state.activity(), ActivityState::Thinking { .. }));
     assert!(matches!(
         &state.transcript[0],
         TranscriptEntry::ToolCall(tool)

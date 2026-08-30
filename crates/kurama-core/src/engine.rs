@@ -16,7 +16,7 @@ use kurama_protocol::{
         PolicyDecision,
     },
     runtime::{AgentCommand, EngineCommand, RuntimeEvent},
-    session::{EventEnvelope, FileCheckpoint, SessionEvent, SessionMetadata},
+    session::{BlobRef, EventEnvelope, FileCheckpoint, SessionEvent, SessionMetadata},
     tool::{Operation, ToolContext, ToolInvocation, ToolLimits, ToolResult},
     traits::{
         ApprovalPolicy, EventSink, IdGenerator, ModelBackend, Orchestrator, SessionStore, Tool,
@@ -908,7 +908,10 @@ impl EngineActor {
                                 attempt += 1;
                                 break;
                             }
-                            Some(Err(error)) => return Err(error),
+                            Some(Err(error)) => {
+                                self.preserve_partial_assistant(&round, &mut runtime_buffer).await?;
+                                return Err(error);
+                            }
                             None => {
                                 self.flush_deltas(&mut runtime_buffer, true).await?;
                                 round.tool_calls_empty = round.tool_calls.is_empty();
@@ -918,7 +921,10 @@ impl EngineActor {
                         }
                     }
                     command = self.command_rx.recv() => {
-                        self.handle_turn_command(command, cancel).await?;
+                        if let Err(error) = self.handle_turn_command(command, cancel).await {
+                            self.preserve_partial_assistant(&round, &mut runtime_buffer).await?;
+                            return Err(error);
+                        }
                     }
                 }
             }
@@ -949,9 +955,10 @@ impl EngineActor {
         if let Some((operation_id, result)) =
             self.completed_tool_calls.get(&invocation.call_id).cloned()
         {
+            let runtime_result = self.hydrate_display_output(&result)?;
             self.emit(RuntimeEvent::ToolCompleted {
                 operation_id,
-                result: result.clone(),
+                result: runtime_result,
             })
             .await?;
             return Ok(result);
@@ -1161,9 +1168,10 @@ impl EngineActor {
             result.call_id.clone(),
             (operation_id.clone(), result.clone()),
         );
+        let runtime_result = self.hydrate_display_output(&result)?;
         self.emit(RuntimeEvent::ToolCompleted {
             operation_id,
-            result: result.clone(),
+            result: runtime_result,
         })
         .await?;
         Ok(result)
@@ -1202,6 +1210,38 @@ impl EngineActor {
             );
         }
         Ok(())
+    }
+
+    fn hydrate_display_output(&self, result: &ToolResult) -> Result<ToolResult, KuramaError> {
+        let Some(display_blobs) = result
+            .metadata
+            .get("display_blobs")
+            .and_then(serde_json::Value::as_object)
+        else {
+            return Ok(result.clone());
+        };
+        let display_output = if let Some(output) =
+            display_blob_text(display_blobs.get("output"), self.store.as_ref())?
+        {
+            Some(output)
+        } else {
+            let stdout = display_blob_text(display_blobs.get("stdout"), self.store.as_ref())?;
+            let stderr = display_blob_text(display_blobs.get("stderr"), self.store.as_ref())?;
+            if stdout.is_some() || stderr.is_some() {
+                Some(combined_tool_output(
+                    stdout.as_deref().unwrap_or_default(),
+                    stderr.as_deref().unwrap_or_default(),
+                ))
+            } else {
+                None
+            }
+        };
+        let Some(display_output) = display_output else {
+            return Ok(result.clone());
+        };
+        let mut hydrated = result.clone();
+        hydrated.metadata["display_output"] = serde_json::Value::String(display_output);
+        Ok(hydrated)
     }
 
     async fn execute_delegation(
@@ -1374,6 +1414,21 @@ impl EngineActor {
         Ok(())
     }
 
+    async fn preserve_partial_assistant(
+        &mut self,
+        round: &ModelRound,
+        runtime_buffer: &mut String,
+    ) -> Result<(), KuramaError> {
+        if round.text.is_empty() {
+            return Ok(());
+        }
+        self.flush_deltas(runtime_buffer, true).await?;
+        self.append(SessionEvent::AssistantMessage {
+            text: round.text.clone(),
+        })?;
+        Ok(())
+    }
+
     async fn compact_context(&mut self) -> Result<(), KuramaError> {
         let Some(compaction) = self.context.compaction_request() else {
             return self
@@ -1513,6 +1568,29 @@ impl Drop for StagedDisplayFiles {
 
 fn empty_arguments() -> serde_json::Value {
     serde_json::Value::Object(Default::default())
+}
+
+fn display_blob_text(
+    value: Option<&serde_json::Value>,
+    store: &dyn SessionStore,
+) -> Result<Option<String>, KuramaError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let reference: BlobRef = serde_json::from_value(value.clone()).map_err(|error| {
+        KuramaError::Protocol(format!("invalid display blob reference: {error}"))
+    })?;
+    let bytes = store.get_blob(&reference)?;
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+fn combined_tool_output(stdout: &str, stderr: &str) -> String {
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (false, true) => stdout.to_owned(),
+        (true, false) => stderr.to_owned(),
+        (true, true) => String::new(),
+        (false, false) => format!("{stdout}\n[stderr]\n{stderr}"),
+    }
 }
 
 fn completed_tool_calls_for_active_turn(

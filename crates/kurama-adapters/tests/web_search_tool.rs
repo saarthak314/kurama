@@ -96,7 +96,7 @@ async fn json_search_normalizes_only_public_result_fields() {
 async fn yolo_open_keeps_limits_but_allows_private_http() {
     let endpoint = serve_once(
         "text/html",
-        "<main>Hello &amp; bye<script>secret()</script></main>",
+        "<main><p>alpha</p><p>middle content</p><p>omega</p><script>secret()</script></main>",
     )
     .await;
     let invocation = ToolInvocation {
@@ -105,12 +105,27 @@ async fn yolo_open_keeps_limits_but_allows_private_http() {
         arguments: serde_json::json!({"operation": "open", "url": endpoint}),
     };
 
+    let mut context = context(ExecutionMode::Yolo);
+    context.limits = ToolLimits {
+        max_bytes: 24,
+        max_lines: 2,
+    };
     let result = WebSearchTool::default()
-        .execute(context(ExecutionMode::Yolo), invocation, &NeverCancel)
+        .execute(context, invocation, &NeverCancel)
         .await
         .expect("open");
-    assert_eq!(result.output, "Hello & bye");
+    assert!(result.truncated);
     assert!(!result.output.contains("secret"));
+    let staged_path = std::path::PathBuf::from(
+        result.metadata["_display_staging"]["output"]
+            .as_str()
+            .expect("staged web output"),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&staged_path).expect("complete staged web output"),
+        "alpha\nmiddle content\nomega"
+    );
+    std::fs::remove_file(staged_path).expect("remove staged web output");
 }
 
 #[test]

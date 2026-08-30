@@ -221,10 +221,9 @@ async fn resume_hydrates_the_visible_transcript_once() {
         redaction_best_effort: false,
     };
     store.create(&metadata).expect("create session");
-    let stdout_blob = store
+    let output_blob = store
         .put_blob(b"head\nfull middle output\ntail\n")
-        .expect("store stdout blob");
-    let stderr_blob = store.put_blob(b"warning\n").expect("store stderr blob");
+        .expect("store output blob");
     for (sequence, event) in [
         SessionEvent::SessionStarted { metadata },
         SessionEvent::UserMessage {
@@ -245,13 +244,12 @@ async fn resume_hydrates_the_visible_transcript_once() {
             operation_id: OperationId::from("operation"),
             result: ToolResult {
                 call_id: CallId::from("call"),
-                output: "head\n[omitted]\ntail\n\n[stderr]\nwarning\n".into(),
+                output: "head\n[omitted]\ntail\n".into(),
                 is_error: false,
                 metadata: serde_json::json!({
-                    "tool_name": "bash",
+                    "tool_name": "read",
                     "display_blobs": {
-                        "stdout": stdout_blob.clone(),
-                        "stderr": stderr_blob.clone()
+                        "output": output_blob.clone()
                     }
                 }),
                 truncated: true,
@@ -297,10 +295,7 @@ async fn resume_hydrates_the_visible_transcript_once() {
             _ => None,
         })
         .expect("durable tool result");
-    assert_eq!(
-        durable_result.output,
-        "head\n[omitted]\ntail\n\n[stderr]\nwarning\n"
-    );
+    assert_eq!(durable_result.output, "head\n[omitted]\ntail\n");
     assert!(durable_result.metadata.get("display_output").is_none());
     assert!(
         !serde_json::to_string(&durable_replay)
@@ -317,8 +312,8 @@ async fn resume_hydrates_the_visible_transcript_once() {
             TranscriptEntry::Error { body: error },
         ] if user == "inspect the parser"
             && assistant == "checking it"
-            && tool.name == "bash"
-            && tool.output == "head\nfull middle output\ntail\n\n[stderr]\nwarning\n"
+            && tool.name == "read"
+            && tool.output == "head\nfull middle output\ntail\n"
             && tool.lifecycle == ToolLifecycle::Completed
             && error == "provider disconnected"
     ));

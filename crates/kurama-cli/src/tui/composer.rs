@@ -143,7 +143,7 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect,
                 state.running_agents, state.queued_agents
             ),
             if state.running_agents > 0 {
-                Style::default().fg(Color::Red)
+                Style::default().fg(Color::Cyan)
             } else {
                 Style::default().add_modifier(Modifier::DIM)
             },
@@ -499,8 +499,8 @@ fn mode_label(mode: ExecutionMode) -> &'static str {
 fn mode_style(mode: ExecutionMode) -> Style {
     Style::default().fg(match mode {
         ExecutionMode::Supervised => Color::Cyan,
-        ExecutionMode::Auto => Color::Yellow,
-        ExecutionMode::Yolo => Color::Red,
+        ExecutionMode::Auto => Color::Cyan,
+        ExecutionMode::Yolo => Color::Cyan,
     })
 }
 

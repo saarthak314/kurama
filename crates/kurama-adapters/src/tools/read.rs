@@ -1,6 +1,9 @@
 use std::{fs, time::UNIX_EPOCH};
 
-use super::{BoundedOutput, PathGuard, limits::sha256_hex};
+use super::{
+    BoundedOutput, PathGuard,
+    limits::{sha256_hex, staged_output, take_truncated_staging},
+};
 use kurama_protocol::{
     KuramaError,
     tool::{Operation, ToolContext, ToolDescriptor, ToolInvocation, ToolResult},
@@ -103,10 +106,8 @@ impl Tool for ReadTool {
             }
             let arguments = parse_arguments(&invocation)?;
             let guard = PathGuard::new(&context)?;
-            let mut aggregate = BoundedOutput::new(context.limits);
+            let mut aggregate = staged_output(context.limits, "read", "output")?;
             let mut files = Vec::with_capacity(arguments.files.len());
-            let mut truncated = false;
-            let mut blob_refs = Vec::new();
 
             for file in arguments.files {
                 if cancel.is_cancelled() {
@@ -130,13 +131,9 @@ impl Tool for ReadTool {
                 let bounded = bounded.finish();
                 let heading = format!("== {} ==\n", file.path);
                 aggregate.push(heading.as_bytes());
-                aggregate.push(bounded.text.as_bytes());
-                if !bounded.text.ends_with('\n') {
+                aggregate.push(selected);
+                if !selected.ends_with(b"\n") {
                     aggregate.push(b"\n");
-                }
-                truncated |= bounded.truncated;
-                if let Some(reference) = bounded.blob_ref.clone() {
-                    blob_refs.push(reference);
                 }
 
                 files.push(serde_json::json!({
@@ -156,24 +153,27 @@ impl Tool for ReadTool {
                 }));
             }
 
-            let aggregate = aggregate.finish();
-            truncated |= aggregate.truncated;
-            if let Some(reference) = aggregate.blob_ref.clone() {
-                blob_refs.push(reference);
+            let mut aggregate = aggregate.finish();
+            let staged_path = take_truncated_staging(&mut aggregate)?;
+            let mut metadata = serde_json::json!({
+                "files": files,
+                "total_bytes": aggregate.total_bytes,
+                "total_lines": aggregate.total_lines,
+                "omitted_bytes": aggregate.omitted_bytes,
+                "omitted_lines": aggregate.omitted_lines
+            });
+            if let Some(path) = staged_path {
+                metadata["_display_staging"] = serde_json::json!({
+                    "output": path
+                });
             }
             Ok(ToolResult {
                 call_id: invocation.call_id,
                 output: aggregate.text,
                 is_error: false,
-                metadata: serde_json::json!({
-                    "files": files,
-                    "total_bytes": aggregate.total_bytes,
-                    "total_lines": aggregate.total_lines,
-                    "omitted_bytes": aggregate.omitted_bytes,
-                    "omitted_lines": aggregate.omitted_lines
-                }),
-                truncated,
-                blob_refs,
+                metadata,
+                truncated: aggregate.truncated,
+                blob_refs: Vec::new(),
             })
         })
     }
