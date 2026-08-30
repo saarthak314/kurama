@@ -1285,7 +1285,7 @@ fn push_prefixed_lines(
     width: usize,
 ) {
     let prefix_width = Line::from(first_prefix).width();
-    for (index, line) in hard_wrap(body, width.saturating_sub(prefix_width).max(1))
+    for (index, line) in word_wrap(body, width.saturating_sub(prefix_width).max(1))
         .into_iter()
         .enumerate()
     {

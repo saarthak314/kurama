@@ -387,6 +387,28 @@ fn transcript_uses_codex_gutters_and_separates_user_turns() {
 }
 
 #[test]
+fn narrow_user_prompt_keeps_punctuation_attached_and_continuation_aligned() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_user(
+        "Fix prompt wrapping; preserve its behavior, and keep the continuation gutter aligned.",
+    );
+
+    let text = buffer_text(&rendered(&state, 48, 16));
+    let rows = text.lines().map(str::trim_end).collect::<Vec<_>>();
+
+    assert!(
+        rows.contains(&"  › Fix prompt wrapping; preserve its"),
+        "{rows:#?}"
+    );
+    assert!(
+        rows.contains(&"    behavior, and keep the continuation gutter"),
+        "{rows:#?}"
+    );
+    assert!(rows.contains(&"    aligned."), "{rows:#?}");
+    assert!(!rows.iter().any(|row| row.trim_start().starts_with(',')));
+}
+
+#[test]
 fn transcript_tool_summaries_follow_lifecycle_without_truncating_expanded_output() {
     let output = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ\nline two";
     let entries = vec![
