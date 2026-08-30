@@ -54,13 +54,14 @@ use crate::{
 const TRANSCRIPT_HORIZONTAL_PADDING: usize = 2;
 const MAX_TRANSCRIPT_INSERT_HEIGHT: usize = 1_024;
 const INLINE_VIEWPORT_MAX_HEIGHT: u16 = 12;
+const TOOL_EVENT_CAPACITY: usize = 64;
 const ACTIVITY_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct App {
     pub state: TuiState,
     engine: Option<EngineHandle>,
     runtime_events: Option<RuntimeEvents>,
-    tool_events: Option<mpsc::UnboundedReceiver<RuntimeEvent>>,
+    tool_events: Option<mpsc::Receiver<RuntimeEvent>>,
     orchestrator: Option<Arc<dyn Orchestrator>>,
     session_id: Option<SessionId>,
     restart_args: Option<Args>,
@@ -311,7 +312,7 @@ impl App {
             http.clone(),
         )?;
         drop(secrets);
-        let (tool_tx, tool_rx) = mpsc::unbounded_channel();
+        let (tool_tx, tool_rx) = mpsc::channel(TOOL_EVENT_CAPACITY);
         let tool_sink: Arc<dyn EventSink> = Arc::new(ToolEventSink { sender: tool_tx });
         let tools = standard_tools(http, search_backend, Some(tool_sink));
         let sink: Arc<dyn EventSink> = Arc::new(NoopSink);
@@ -1263,7 +1264,7 @@ where
 fn apply_runtime_event_in_order(
     state: &mut TuiState,
     event: RuntimeEvent,
-    tool_receiver: &mut mpsc::UnboundedReceiver<RuntimeEvent>,
+    tool_receiver: &mut mpsc::Receiver<RuntimeEvent>,
 ) -> bool {
     let mut tool_open = true;
     if matches!(
@@ -1293,7 +1294,7 @@ async fn run_loop<B>(
     terminal: &mut Terminal<B>,
     input: &mut mpsc::Receiver<Event>,
     runtime_events: Option<mpsc::Receiver<RuntimeEvent>>,
-    tool_events: Option<mpsc::UnboundedReceiver<RuntimeEvent>>,
+    tool_events: Option<mpsc::Receiver<RuntimeEvent>>,
     commit_to_scrollback: bool,
 ) -> Result<(), String>
 where
@@ -1307,7 +1308,7 @@ where
         drop(runtime_tx);
         false
     };
-    let (tool_tx, mut tool_receiver) = mpsc::unbounded_channel();
+    let (tool_tx, mut tool_receiver) = mpsc::channel(1);
     let mut tool_open = if let Some(events) = tool_events {
         tool_receiver = events;
         true
@@ -1631,15 +1632,18 @@ impl EventSink for NoopSink {
 }
 
 struct ToolEventSink {
-    sender: mpsc::UnboundedSender<RuntimeEvent>,
+    sender: mpsc::Sender<RuntimeEvent>,
 }
 
 impl EventSink for ToolEventSink {
     fn emit(&self, event: RuntimeEvent) -> Result<(), KuramaError> {
         if matches!(event, RuntimeEvent::ToolOutputDelta { .. }) {
-            self.sender
-                .send(event)
-                .map_err(|_| KuramaError::Cancelled)?;
+            match self.sender.try_send(event) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(KuramaError::Cancelled);
+                }
+            }
         }
         Ok(())
     }
@@ -1851,9 +1855,9 @@ Session ID: s_cached"
     #[test]
     fn queued_tool_delta_is_applied_before_completion() {
         let mut state = TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised);
-        let (tool_sender, mut tool_receiver) = mpsc::unbounded_channel();
+        let (tool_sender, mut tool_receiver) = mpsc::channel(1);
         tool_sender
-            .send(RuntimeEvent::ToolOutputDelta {
+            .try_send(RuntimeEvent::ToolOutputDelta {
                 call_id: CallId::from("call_1"),
                 stream: "stdout".into(),
                 chunk: "partial output".into(),
@@ -1883,11 +1887,31 @@ Session ID: s_cached"
     }
 
     #[test]
+    fn live_tool_output_drops_excess_events_instead_of_growing_unbounded() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let sink = ToolEventSink { sender };
+        let delta = || RuntimeEvent::ToolOutputDelta {
+            call_id: CallId::from("call_1"),
+            stream: "stdout".into(),
+            chunk: "output".into(),
+        };
+
+        sink.emit(delta()).expect("first live delta");
+        sink.emit(delta()).expect("excess live delta is dropped");
+
+        assert!(receiver.try_recv().is_ok());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
     fn queued_tool_delta_is_applied_before_runtime_error() {
         let mut state = TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised);
-        let (tool_sender, mut tool_receiver) = mpsc::unbounded_channel();
+        let (tool_sender, mut tool_receiver) = mpsc::channel(1);
         tool_sender
-            .send(RuntimeEvent::ToolOutputDelta {
+            .try_send(RuntimeEvent::ToolOutputDelta {
                 call_id: CallId::from("call_1"),
                 stream: "stdout".into(),
                 chunk: "partial output".into(),

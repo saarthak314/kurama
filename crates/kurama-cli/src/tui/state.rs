@@ -12,6 +12,9 @@ use kurama_protocol::{
 
 use super::{AgentRow, ApprovalState, OnboardingState, sort_agents};
 
+const MAX_LIVE_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
+const LIVE_OUTPUT_OMITTED: &str = "[earlier live output omitted]\n";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Overlay {
     #[default]
@@ -604,7 +607,7 @@ impl TuiState {
                 if stream_changed {
                     append_stream_boundary(&mut tool.output, &stream);
                 }
-                tool.output.push_str(&chunk);
+                append_live_tool_output(&mut tool.output, &chunk);
             }
             self.active_tool_streams.insert(call_id, stream);
             return;
@@ -623,7 +626,7 @@ impl TuiState {
         self.push_transcript_entry(TranscriptEntry::ToolCall(ToolTranscript {
             call_id: Some(call_id.clone()),
             name,
-            output: chunk,
+            output: bounded_live_tool_output(chunk),
             lifecycle: ToolLifecycle::Running,
         }));
         if let Some(index) = self.transcript.len().checked_sub(1) {
@@ -671,6 +674,31 @@ impl TuiState {
             lifecycle,
         }));
     }
+}
+
+fn append_live_tool_output(output: &mut String, chunk: &str) {
+    output.push_str(chunk);
+    if output.len() <= MAX_LIVE_TOOL_OUTPUT_BYTES {
+        return;
+    }
+
+    let retained_bytes = MAX_LIVE_TOOL_OUTPUT_BYTES.saturating_sub(LIVE_OUTPUT_OMITTED.len());
+    let mut retained_start = output.len().saturating_sub(retained_bytes);
+    while !output.is_char_boundary(retained_start) {
+        retained_start += 1;
+    }
+    let retained = output[retained_start..].to_owned();
+    output.clear();
+    output.push_str(LIVE_OUTPUT_OMITTED);
+    output.push_str(&retained);
+}
+
+fn bounded_live_tool_output(mut output: String) -> String {
+    if output.len() > MAX_LIVE_TOOL_OUTPUT_BYTES {
+        let contents = std::mem::take(&mut output);
+        append_live_tool_output(&mut output, &contents);
+    }
+    output
 }
 
 fn append_stream_boundary(body: &mut String, stream: &str) {

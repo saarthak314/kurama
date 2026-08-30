@@ -334,6 +334,26 @@ fn tool_output_deltas_for_the_same_call_update_one_entry() {
 }
 
 #[test]
+fn running_tool_output_retains_only_a_bounded_live_tail() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    for index in 0..256 {
+        state.apply_runtime_event(tool_delta(
+            "call_1",
+            "stdout",
+            &format!("{index:03}:{}\n", "x".repeat(1_024)),
+        ));
+    }
+
+    assert!(matches!(
+        &state.transcript[0],
+        TranscriptEntry::ToolCall(tool)
+            if tool.output.len() <= 128 * 1_024
+                && tool.output.starts_with("[earlier live output omitted]\n")
+                && tool.output.ends_with(&format!("255:{}\n", "x".repeat(1_024)))
+    ));
+}
+
+#[test]
 fn tool_completion_finalizes_the_streamed_entry_by_result_call_id() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
 
