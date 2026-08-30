@@ -221,15 +221,30 @@ fn activity_line_formats_elapsed_time_and_measures_the_interrupt_hint() {
         activity_line(&hours_state(now), 24, now).expect("narrow activity line"),
     ]);
 
-    assert_eq!(seconds, "• Thinking (59s • esc to interrupt)");
-    assert_eq!(minutes, "• Working tests (1m 00s • esc to interrupt)");
+    assert_eq!(seconds, "⠋ Thinking (59s • esc to interrupt)");
+    assert_eq!(minutes, "⠋ Working tests (1m 00s • esc to interrupt)");
     assert_eq!(
         hours,
-        "• Running cargo test (1h 00m 00s • esc to interrupt)"
+        "⠋ Running cargo test (1h 00m 00s • esc to interrupt)"
     );
     assert!(!narrow.contains("esc to interrupt"));
     assert!(activity_line(&ActivityState::Idle, 80, now).is_none());
     assert!(activity_line(&ActivityState::AwaitingApproval, 80, now).is_none());
+}
+
+#[test]
+fn activity_spinner_advances_between_frame_ticks() {
+    let started_at = Instant::now();
+    let activity = ActivityState::Thinking { started_at };
+    let first = plain(vec![
+        activity_line(&activity, 80, started_at).expect("first spinner frame"),
+    ]);
+    let second = plain(vec![
+        activity_line(&activity, 80, started_at + Duration::from_millis(100))
+            .expect("second spinner frame"),
+    ]);
+
+    assert_ne!(first, second);
 }
 
 #[test]

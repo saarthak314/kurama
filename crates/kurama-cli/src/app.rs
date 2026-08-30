@@ -47,7 +47,8 @@ use crate::{
     tui::{
         CursorTrackingBackend, OnboardingState, OnboardingSubmission, Overlay, SURFACE,
         SharedBackend, TerminalGuard, TranscriptDetail, TuiState, approval_height, composer_height,
-        main_area, render, spawn_input_thread, transcript_lines, visible_activity_rect,
+        cursor_position, main_area, render, spawn_input_thread, transcript_lines,
+        visible_activity_rect,
     },
 };
 
@@ -471,9 +472,11 @@ impl App {
 
     pub async fn run(mut self) -> Result<Option<ExitSummary>, String> {
         let _guard = TerminalGuard::enter().map_err(|error| error.to_string())?;
-        let backend = SharedBackend::new(CursorTrackingBackend::new(CrosstermBackend::new(
-            io::stdout(),
-        )));
+        let initial_cursor = cursor_position(Duration::from_millis(100)).unwrap_or_default();
+        let backend = SharedBackend::new(CursorTrackingBackend::with_cursor_position(
+            CrosstermBackend::new(io::stdout()),
+            initial_cursor,
+        ));
         let mut terminal =
             initialize_inline_terminal(backend).map_err(|error| error.to_string())?;
         let mut input = spawn_input_thread(32);
@@ -1040,7 +1043,7 @@ where
 {
     let rows = backend.size()?.height;
     let viewport_height = rows.min(INLINE_VIEWPORT_MAX_HEIGHT);
-    let viewport_top = rows.saturating_sub(viewport_height);
+    let viewport_top = backend.get_cursor_position()?.y.min(rows.saturating_sub(1));
     backend.set_cursor_position(Position::new(0, viewport_top))?;
     backend.clear_region(ClearType::AfterCursor)?;
     Terminal::with_options(
@@ -1946,7 +1949,7 @@ Session ID: s_cached"
     }
 
     #[test]
-    fn inline_terminal_initialization_anchors_at_bottom_without_erasing_history() {
+    fn inline_terminal_initialization_starts_at_the_invocation_cursor() {
         let mut lines = vec![" ".repeat(80); 40];
         lines[0] = "stale shell prompt".into();
         lines[4] = "stale viewport content".into();
@@ -1965,9 +1968,9 @@ Session ID: s_cached"
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert_eq!(terminal.get_frame().area(), Rect::new(0, 28, 80, 12));
+        assert_eq!(terminal.get_frame().area(), Rect::new(0, 4, 80, 12));
         assert!(visible.contains("stale shell prompt"));
-        assert!(visible.contains("stale viewport content"));
+        assert!(!visible.contains("stale viewport content"));
         assert!(!visible.contains("stale lower content"));
     }
 
@@ -1984,7 +1987,7 @@ Session ID: s_cached"
             .draw(|frame| render(frame, &state))
             .expect("draw idle frame");
 
-        assert_eq!(terminal.get_frame().area(), Rect::new(0, 12, 80, 2));
+        assert_eq!(terminal.get_frame().area().height, 2);
         let rows = terminal
             .backend()
             .buffer()
@@ -2063,7 +2066,7 @@ Session ID: s_cached"
                 .backend_mut()
                 .get_cursor_position()
                 .expect("exit cursor"),
-            Position::new(0, 12)
+            Position::ORIGIN
         );
     }
 

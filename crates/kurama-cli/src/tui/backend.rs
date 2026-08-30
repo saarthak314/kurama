@@ -86,10 +86,18 @@ pub struct CursorTrackingBackend<B> {
 }
 
 impl<B> CursorTrackingBackend<B> {
+    #[cfg(test)]
     pub const fn new(inner: B) -> Self {
         Self {
             inner,
             cursor_position: None,
+        }
+    }
+
+    pub const fn with_cursor_position(inner: B, cursor_position: Position) -> Self {
+        Self {
+            inner,
+            cursor_position: Some(cursor_position),
         }
     }
 }

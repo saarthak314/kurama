@@ -7,6 +7,7 @@ use ratatui::{
 
 use super::{ActivityState, transcript::truncate_display};
 
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const INTERRUPT_HINT: &str = "esc to interrupt";
 
 pub fn activity_line(
@@ -31,29 +32,32 @@ pub fn activity_line(
         }
     };
 
-    let elapsed = compact_elapsed(now.saturating_duration_since(started_at).as_secs());
+    let elapsed = now.saturating_duration_since(started_at);
+    let spinner =
+        SPINNER_FRAMES[(elapsed.as_millis() / 100 % SPINNER_FRAMES.len() as u128) as usize];
+    let elapsed = compact_elapsed(elapsed.as_secs());
     let action = detail.map_or_else(|| verb.to_owned(), |detail| format!("{verb} {detail}"));
     let full_suffix = format!(" ({elapsed} • {INTERRUPT_HINT})");
     if display_width(&action).saturating_add(display_width(&full_suffix)) + 2 <= width {
-        return Some(styled_activity(action, full_suffix));
+        return Some(styled_activity(spinner, action, full_suffix));
     }
 
     let elapsed_suffix = format!(" ({elapsed})");
     if display_width(&action).saturating_add(display_width(&elapsed_suffix)) + 2 <= width {
-        return Some(styled_activity(action, elapsed_suffix));
+        return Some(styled_activity(spinner, action, elapsed_suffix));
     }
 
     let available = width.saturating_sub(2);
     let action = truncate_display(&action, available);
     Some(Line::from(vec![
-        Span::styled("• ", Style::default().fg(Color::Cyan)),
+        Span::styled(format!("{spinner} "), Style::default().fg(Color::Cyan)),
         Span::raw(action),
     ]))
 }
 
-fn styled_activity(action: String, suffix: String) -> Line<'static> {
+fn styled_activity(spinner: &str, action: String, suffix: String) -> Line<'static> {
     Line::from(vec![
-        Span::styled("• ", Style::default().fg(Color::Cyan)),
+        Span::styled(format!("{spinner} "), Style::default().fg(Color::Cyan)),
         Span::raw(action),
         Span::styled(suffix, Style::default().add_modifier(Modifier::DIM)),
     ])

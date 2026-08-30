@@ -8,6 +8,7 @@ mod layout;
 mod onboarding;
 mod render;
 mod state;
+mod terminal_probe;
 mod transcript;
 
 pub use activity::activity_line;
@@ -22,4 +23,5 @@ pub use onboarding::{OnboardingState, OnboardingSubmission};
 pub(crate) use render::SURFACE;
 pub use render::render;
 pub use state::{ActivityState, Overlay, ToolLifecycle, ToolTranscript, TranscriptEntry, TuiState};
+pub(crate) use terminal_probe::cursor_position;
 pub use transcript::{TranscriptDetail, transcript_lines};
