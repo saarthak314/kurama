@@ -9,17 +9,18 @@ mod providers;
 use futures_util::StreamExt;
 use http::{HttpClient, HttpErrorClass};
 use kurama_protocol::{
+    KuramaError,
     id::SessionId,
     model::{DelegationSchema, ModelEvent, ModelItem, ModelProfile, ModelRequest},
     tool::ToolDescriptor,
-    traits::{BoxFuture, CancelSignal, ModelBackend},
+    traits::ModelBackend,
 };
 use providers::{normalize_delegation_events, openai::OpenAiBackend, sse::SseDecoder};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
-    sync::oneshot,
-};
+
+#[path = "support/provider_http.rs"]
+mod provider_http;
+
+use provider_http::{NeverCancel, serve_sse_once};
 
 fn request() -> ModelRequest {
     ModelRequest {
@@ -164,9 +165,37 @@ fn maps_responses_stream_to_normalized_events() {
         event,
         ModelEvent::Usage { usage } if usage.input_tokens == 120 && usage.output_tokens == 18
     )));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ModelEvent::ResponseCompleted { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn openai_normalization_rejects_transport_eof_before_response_completed() {
+    let error = OpenAiBackend::parse_fixture(include_str!(
+        "../../../tests/fixtures/openai/truncated_text.jsonl"
+    ))
+    .expect_err("truncated stream must fail");
+
     assert!(matches!(
-        events.last(),
-        Some(ModelEvent::ResponseCompleted { .. })
+        error,
+        KuramaError::Model(message)
+            if message == "OpenAI stream ended before response.completed"
+    ));
+}
+
+#[test]
+fn openai_normalization_rejects_empty_transport_eof() {
+    let error = OpenAiBackend::parse_fixture("").expect_err("empty stream must fail");
+
+    assert!(matches!(
+        error,
+        KuramaError::Model(message)
+            if message == "OpenAI stream ended before response.completed"
     ));
 }
 
@@ -186,7 +215,7 @@ fn bounds_and_redacts_http_errors() {
 
 #[tokio::test]
 async fn openai_backend_posts_responses_request_and_streams_fixture() {
-    let (endpoint, captured) = serve_once(include_str!(
+    let (endpoint, captured) = serve_sse_once(include_str!(
         "../../../tests/fixtures/openai/tool_turn.jsonl"
     ))
     .await;
@@ -212,63 +241,53 @@ async fn openai_backend_posts_responses_request_and_streams_fixture() {
     ));
 }
 
-async fn serve_once(body: &'static str) -> (String, oneshot::Receiver<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
-    let address = listener.local_addr().expect("server address");
-    let (sender, receiver) = oneshot::channel();
-    tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.expect("accept request");
-        let mut request = Vec::new();
-        let mut chunk = [0_u8; 4096];
-        loop {
-            let read = socket.read(&mut chunk).await.expect("read request");
-            if read == 0 {
-                break;
-            }
-            request.extend_from_slice(&chunk[..read]);
-            if request_complete(&request) {
-                break;
-            }
-        }
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        socket
-            .write_all(response.as_bytes())
-            .await
-            .expect("write response");
-        let _ = sender.send(String::from_utf8(request).expect("HTTP request UTF-8"));
-    });
-    (format!("http://{address}/v1"), receiver)
-}
-
-fn request_complete(request: &[u8]) -> bool {
-    let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
-        return false;
-    };
-    let headers = String::from_utf8_lossy(&request[..header_end]);
-    let content_length = headers
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().ok())
-                .flatten()
+#[tokio::test]
+async fn openai_backend_bounds_and_redacts_stream_errors() {
+    let secret = "secret-token";
+    let provider_message = format!("{secret} {}", "x".repeat(20_000));
+    let body = format!(
+        "data: {}\n\n",
+        serde_json::json!({
+            "type": "error",
+            "error": {"message": provider_message}
         })
-        .unwrap_or_default();
-    request.len() >= header_end + 4 + content_length
+    );
+    let (endpoint, captured) = serve_sse_once(body).await;
+    let backend =
+        OpenAiBackend::from_endpoint(HttpClient::default(), &endpoint, secret).expect("backend");
+
+    let error = match backend.stream(request(), &NeverCancel).await {
+        Ok(_) => panic!("provider error must fail"),
+        Err(error) => error,
+    };
+    let _ = captured.await.expect("captured request");
+
+    let KuramaError::Model(message) = error else {
+        panic!("expected model error");
+    };
+    assert!(message.starts_with("OpenAI stream: [REDACTED]"));
+    assert!(!message.contains(secret));
+    assert!(message.len() <= 16 * 1024 + 128);
 }
 
-struct NeverCancel;
+#[tokio::test]
+async fn openai_backend_rejects_transport_eof_before_response_completed() {
+    let (endpoint, captured) = serve_sse_once(include_str!(
+        "../../../tests/fixtures/openai/truncated_text.jsonl"
+    ))
+    .await;
+    let backend = OpenAiBackend::from_endpoint(HttpClient::default(), &endpoint, "test-key")
+        .expect("backend");
 
-impl CancelSignal for NeverCancel {
-    fn is_cancelled(&self) -> bool {
-        false
-    }
+    let error = match backend.stream(request(), &NeverCancel).await {
+        Ok(_) => panic!("truncated stream must fail"),
+        Err(error) => error,
+    };
+    let _ = captured.await.expect("captured request");
 
-    fn cancelled(&self) -> BoxFuture<'_, ()> {
-        Box::pin(std::future::pending())
-    }
+    assert!(matches!(
+        error,
+        KuramaError::Model(message)
+            if message == "OpenAI stream ended before response.completed"
+    ));
 }

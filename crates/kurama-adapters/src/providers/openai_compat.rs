@@ -324,8 +324,9 @@ impl CompatNormalizer {
         if self.completed {
             Ok(Vec::new())
         } else {
-            self.completed = true;
-            self.finish_events()
+            Err(KuramaError::Model(
+                "OpenAI-compatible stream ended before [DONE]".into(),
+            ))
         }
     }
 }

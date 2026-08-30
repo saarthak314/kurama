@@ -6,12 +6,20 @@ mod http;
 #[path = "../src/providers/mod.rs"]
 mod providers;
 
+use http::HttpClient;
 use kurama_protocol::{
+    KuramaError,
     id::SessionId,
     model::{DelegationSchema, ModelEvent, ModelItem, ModelProfile, ModelRequest},
     tool::ToolDescriptor,
+    traits::ModelBackend,
 };
 use providers::anthropic::AnthropicBackend;
+
+#[path = "support/provider_http.rs"]
+mod provider_http;
+
+use provider_http::{NeverCancel, serve_sse_once};
 
 fn request() -> ModelRequest {
     ModelRequest {
@@ -81,8 +89,55 @@ fn maps_messages_stream_to_normalized_events() {
         event,
         ModelEvent::Usage { usage } if usage.input_tokens == 80 && usage.output_tokens == 14
     )));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ModelEvent::ResponseCompleted { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn anthropic_normalization_rejects_transport_eof_before_message_stop() {
+    let error = AnthropicBackend::parse_fixture(include_str!(
+        "../../../tests/fixtures/anthropic/truncated_text.jsonl"
+    ))
+    .expect_err("truncated stream must fail");
+
     assert!(matches!(
-        events.last(),
-        Some(ModelEvent::ResponseCompleted { .. })
+        error,
+        KuramaError::Model(message) if message == "Anthropic stream ended before message_stop"
+    ));
+}
+
+#[test]
+fn anthropic_normalization_rejects_empty_transport_eof() {
+    let error = AnthropicBackend::parse_fixture("").expect_err("empty stream must fail");
+
+    assert!(matches!(
+        error,
+        KuramaError::Model(message) if message == "Anthropic stream ended before message_stop"
+    ));
+}
+
+#[tokio::test]
+async fn anthropic_backend_rejects_transport_eof_before_message_stop() {
+    let (endpoint, captured) = serve_sse_once(include_str!(
+        "../../../tests/fixtures/anthropic/truncated_text.jsonl"
+    ))
+    .await;
+    let backend = AnthropicBackend::from_endpoint(HttpClient::default(), &endpoint, "test-key")
+        .expect("backend");
+
+    let error = match backend.stream(request(), &NeverCancel).await {
+        Ok(_) => panic!("truncated stream must fail"),
+        Err(error) => error,
+    };
+    let _ = captured.await.expect("captured request");
+
+    assert!(matches!(
+        error,
+        KuramaError::Model(message) if message == "Anthropic stream ended before message_stop"
     ));
 }

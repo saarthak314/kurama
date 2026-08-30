@@ -6,12 +6,20 @@ mod http;
 #[path = "../src/providers/mod.rs"]
 mod providers;
 
+use http::HttpClient;
 use kurama_protocol::{
+    KuramaError,
     id::SessionId,
     model::{DelegationSchema, ModelEvent, ModelItem, ModelProfile, ModelRequest},
     tool::ToolDescriptor,
+    traits::ModelBackend,
 };
 use providers::openai_compat::OpenAiCompatBackend;
+
+#[path = "support/provider_http.rs"]
+mod provider_http;
+
+use provider_http::{NeverCancel, serve_sse_once};
 
 fn request() -> ModelRequest {
     ModelRequest {
@@ -82,8 +90,58 @@ fn maps_chat_completions_stream_to_normalized_events() {
         event,
         ModelEvent::Usage { usage } if usage.input_tokens == 60 && usage.output_tokens == 12
     )));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ModelEvent::ResponseCompleted { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn openai_compat_normalization_rejects_transport_eof_before_done() {
+    let error = OpenAiCompatBackend::parse_fixture(include_str!(
+        "../../../tests/fixtures/openai_compat/truncated_text.jsonl"
+    ))
+    .expect_err("truncated stream must fail");
+
     assert!(matches!(
-        events.last(),
-        Some(ModelEvent::ResponseCompleted { .. })
+        error,
+        KuramaError::Model(message)
+            if message == "OpenAI-compatible stream ended before [DONE]"
+    ));
+}
+
+#[test]
+fn openai_compat_normalization_rejects_empty_transport_eof() {
+    let error = OpenAiCompatBackend::parse_fixture("").expect_err("empty stream must fail");
+
+    assert!(matches!(
+        error,
+        KuramaError::Model(message)
+            if message == "OpenAI-compatible stream ended before [DONE]"
+    ));
+}
+
+#[tokio::test]
+async fn openai_compat_backend_rejects_transport_eof_before_done() {
+    let (endpoint, captured) = serve_sse_once(include_str!(
+        "../../../tests/fixtures/openai_compat/truncated_text.jsonl"
+    ))
+    .await;
+    let backend = OpenAiCompatBackend::from_endpoint(HttpClient::default(), &endpoint, None)
+        .expect("backend");
+
+    let error = match backend.stream(request(), &NeverCancel).await {
+        Ok(_) => panic!("truncated stream must fail"),
+        Err(error) => error,
+    };
+    let _ = captured.await.expect("captured request");
+
+    assert!(matches!(
+        error,
+        KuramaError::Model(message)
+            if message == "OpenAI-compatible stream ended before [DONE]"
     ));
 }

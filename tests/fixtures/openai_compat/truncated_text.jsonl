@@ -1,0 +1,2 @@
+data: {"id":"chatcmpl_truncated","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":"stop"}]}
+

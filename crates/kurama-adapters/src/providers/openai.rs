@@ -79,7 +79,7 @@ impl OpenAiBackend {
         for event in decoder.finish()? {
             events.extend(normalizer.push(&event.data)?);
         }
-        events.extend(normalizer.finish());
+        events.extend(normalizer.finish()?);
         Ok(events)
     }
 
@@ -130,7 +130,7 @@ impl OpenAiBackend {
         for event in decoder.finish()? {
             events.extend(normalizer.push(&event.data)?);
         }
-        events.extend(normalizer.finish());
+        events.extend(normalizer.finish()?);
         normalize_delegation_events(events, request.delegation.is_some())
     }
 }
@@ -323,22 +323,13 @@ impl OpenAiNormalizer {
         Ok(events)
     }
 
-    fn finish(&mut self) -> Vec<ModelEvent> {
+    fn finish(&mut self) -> Result<Vec<ModelEvent>, KuramaError> {
         if self.completed {
-            Vec::new()
+            Ok(Vec::new())
         } else {
-            self.completed = true;
-            vec![ModelEvent::ResponseCompleted {
-                cursor: self.response_id.clone().map(|value| BackendCursor {
-                    backend: PROVIDER.into(),
-                    value,
-                }),
-                finish_reason: if self.emitted_call {
-                    FinishReason::ToolCalls
-                } else {
-                    FinishReason::Stop
-                },
-            }]
+            Err(KuramaError::Model(
+                "OpenAI stream ended before response.completed".into(),
+            ))
         }
     }
 }
