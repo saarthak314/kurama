@@ -55,6 +55,8 @@ const TRANSCRIPT_HORIZONTAL_PADDING: usize = 2;
 const MAX_TRANSCRIPT_INSERT_HEIGHT: usize = 1_024;
 const INLINE_VIEWPORT_MAX_HEIGHT: u16 = 12;
 const TOOL_EVENT_CAPACITY: usize = 64;
+const READY_EVENT_BATCH_LIMIT: usize = 128;
+const STREAM_REDRAW_INTERVAL: Duration = Duration::from_millis(33);
 const ACTIVITY_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct App {
@@ -1292,6 +1294,98 @@ fn apply_runtime_event_in_order(
     tool_open
 }
 
+fn requires_immediate_redraw(event: &RuntimeEvent) -> bool {
+    matches!(
+        event,
+        RuntimeEvent::ApprovalRequired { .. }
+            | RuntimeEvent::ToolCompleted { .. }
+            | RuntimeEvent::TurnCompleted
+            | RuntimeEvent::Error { .. }
+            | RuntimeEvent::Shutdown
+    )
+}
+
+fn stream_redraw_due(
+    last_draw: tokio::time::Instant,
+    now: tokio::time::Instant,
+    redraw_pending: bool,
+    channels_closed: bool,
+) -> bool {
+    redraw_pending && (channels_closed || now.duration_since(last_draw) >= STREAM_REDRAW_INTERVAL)
+}
+
+fn apply_runtime_channel_event(
+    state: &mut TuiState,
+    event: RuntimeEvent,
+    tool_receiver: &mut mpsc::Receiver<RuntimeEvent>,
+    tool_open: &mut bool,
+) -> (bool, bool) {
+    let immediate_redraw = requires_immediate_redraw(&event);
+    let exit = matches!(event, RuntimeEvent::Shutdown);
+    if *tool_open {
+        *tool_open = apply_runtime_event_in_order(state, event, tool_receiver);
+    } else {
+        state.apply_runtime_event(event);
+    }
+    (immediate_redraw, exit)
+}
+
+fn apply_tool_channel_event(state: &mut TuiState, event: RuntimeEvent) -> (bool, bool) {
+    let immediate_redraw = requires_immediate_redraw(&event);
+    let exit = matches!(event, RuntimeEvent::Shutdown);
+    state.apply_runtime_event(event);
+    (immediate_redraw, exit)
+}
+
+fn drain_ready_events(
+    state: &mut TuiState,
+    runtime_receiver: &mut mpsc::Receiver<RuntimeEvent>,
+    runtime_open: &mut bool,
+    tool_receiver: &mut mpsc::Receiver<RuntimeEvent>,
+    tool_open: &mut bool,
+) -> (bool, bool) {
+    let mut processed = 0;
+    let mut immediate_redraw = false;
+    let mut exit = false;
+    while processed < READY_EVENT_BATCH_LIMIT {
+        let mut progressed = false;
+        if *runtime_open {
+            match runtime_receiver.try_recv() {
+                Ok(event) => {
+                    processed += 1;
+                    progressed = true;
+                    let outcome =
+                        apply_runtime_channel_event(state, event, tool_receiver, tool_open);
+                    immediate_redraw |= outcome.0;
+                    exit |= outcome.1;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => *runtime_open = false,
+            }
+        }
+        if immediate_redraw || processed == READY_EVENT_BATCH_LIMIT {
+            break;
+        }
+        if *tool_open {
+            match tool_receiver.try_recv() {
+                Ok(event) => {
+                    processed += 1;
+                    progressed = true;
+                    let outcome = apply_tool_channel_event(state, event);
+                    immediate_redraw |= outcome.0;
+                    exit |= outcome.1;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => *tool_open = false,
+            }
+        }
+        if immediate_redraw || !progressed {
+            break;
+        }
+    }
+    (immediate_redraw, exit)
+}
+
 async fn run_loop<B>(
     app: &mut App,
     terminal: &mut Terminal<B>,
@@ -1326,31 +1420,51 @@ where
     terminal
         .draw(|frame| render(frame, &app.state))
         .map_err(|error| error.to_string())?;
+    let mut last_draw = tokio::time::Instant::now();
+    let mut next_activity_frame = last_draw + ACTIVITY_FRAME_INTERVAL;
+    let mut redraw_pending = false;
 
     while input_open || runtime_open || tool_open {
         let mut exit = false;
         let mut animation_tick = false;
+        let mut force_redraw = false;
+        let mut state_changed = false;
         let terminal_area = terminal.get_frame().area();
         let animate_activity = !visible_activity_rect(terminal_area, &app.state).is_empty();
+        let activity_deadline =
+            std::cmp::max(next_activity_frame, last_draw + STREAM_REDRAW_INTERVAL);
         let animation = async move {
             if animate_activity {
-                tokio::time::sleep(ACTIVITY_FRAME_INTERVAL).await;
+                tokio::time::sleep_until(activity_deadline).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        let redraw_deadline = last_draw + STREAM_REDRAW_INTERVAL;
+        let stream_redraw = async move {
+            if redraw_pending {
+                tokio::time::sleep_until(redraw_deadline).await;
             } else {
                 std::future::pending::<()>().await;
             }
         };
         tokio::pin!(animation);
+        tokio::pin!(stream_redraw);
         tokio::select! {
-            _ = &mut animation => animation_tick = true,
+            biased;
             event = input.recv(), if input_open => {
                 match event {
                     Some(Event::Resize(width, height)) if commit_to_scrollback => {
                         resize_inline_terminal(terminal, width, height)
                             .map_err(|error| error.to_string())?;
+                        state_changed = true;
+                        force_redraw = true;
                     }
                     Some(event) => {
                         exit = app.handle_event(event)?;
                         app.flush_commands().await?;
+                        state_changed = true;
+                        force_redraw = true;
                     }
                     None => input_open = false,
                 }
@@ -1358,33 +1472,72 @@ where
             event = runtime_receiver.recv(), if runtime_open => {
                 match event {
                     Some(event) => {
-                        exit = matches!(event, RuntimeEvent::Shutdown);
-                        if tool_open {
-                            tool_open = apply_runtime_event_in_order(
+                        state_changed = true;
+                        let mut outcome = apply_runtime_channel_event(
+                            &mut app.state,
+                            event,
+                            &mut tool_receiver,
+                            &mut tool_open,
+                        );
+                        if !outcome.0 {
+                            let batch = drain_ready_events(
                                 &mut app.state,
-                                event,
+                                &mut runtime_receiver,
+                                &mut runtime_open,
                                 &mut tool_receiver,
+                                &mut tool_open,
                             );
-                        } else {
-                            app.state.apply_runtime_event(event);
+                            outcome.0 |= batch.0;
+                            outcome.1 |= batch.1;
                         }
+                        force_redraw |= outcome.0;
+                        exit |= outcome.1;
                     }
                     None => runtime_open = false,
                 }
             }
             event = tool_receiver.recv(), if tool_open => {
                 match event {
-                    Some(event) => app.state.apply_runtime_event(event),
+                    Some(event) => {
+                        state_changed = true;
+                        let mut outcome = apply_tool_channel_event(&mut app.state, event);
+                        if !outcome.0 {
+                            let batch = drain_ready_events(
+                                &mut app.state,
+                                &mut runtime_receiver,
+                                &mut runtime_open,
+                                &mut tool_receiver,
+                                &mut tool_open,
+                            );
+                            outcome.0 |= batch.0;
+                            outcome.1 |= batch.1;
+                        }
+                        force_redraw |= outcome.0;
+                        exit |= outcome.1;
+                    }
                     None => tool_open = false,
                 }
             }
+            _ = &mut stream_redraw => force_redraw = true,
+            _ = &mut animation => {
+                animation_tick = true;
+                force_redraw = true;
+            }
         }
-        if commit_to_scrollback && !animation_tick {
-            prepare_inline_frame(&mut app.state, terminal)?;
+        redraw_pending |= state_changed;
+        let now = tokio::time::Instant::now();
+        let channels_closed = !input_open && !runtime_open && !tool_open;
+        if force_redraw || stream_redraw_due(last_draw, now, redraw_pending, channels_closed) {
+            if commit_to_scrollback && !animation_tick {
+                prepare_inline_frame(&mut app.state, terminal)?;
+            }
+            terminal
+                .draw(|frame| render(frame, &app.state))
+                .map_err(|error| error.to_string())?;
+            last_draw = tokio::time::Instant::now();
+            next_activity_frame = last_draw + ACTIVITY_FRAME_INTERVAL;
+            redraw_pending = false;
         }
-        terminal
-            .draw(|frame| render(frame, &app.state))
-            .map_err(|error| error.to_string())?;
         if exit {
             break;
         }
@@ -1654,6 +1807,8 @@ impl EventSink for ToolEventSink {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, rc::Rc};
+
     use crossterm::event::{MouseEvent, MouseEventKind};
     use kurama_protocol::{
         id::{CallId, OperationId},
@@ -1662,13 +1817,83 @@ mod tests {
     };
     use ratatui::{
         TerminalOptions, Viewport,
-        backend::TestBackend,
-        layout::{Position, Rect},
+        backend::{Backend, TestBackend, WindowSize},
+        buffer::Cell as BufferCell,
+        layout::{Position, Rect, Size},
         style::Color,
     };
 
     use super::*;
     use crate::tui::{ActivityState, TranscriptEntry, visible_activity_rect};
+
+    #[derive(Clone)]
+    struct DrawBudgetBackend {
+        inner: TestBackend,
+        remaining: Rc<Cell<usize>>,
+    }
+
+    impl DrawBudgetBackend {
+        fn new(inner: TestBackend, remaining: Rc<Cell<usize>>) -> Self {
+            Self { inner, remaining }
+        }
+    }
+
+    impl Backend for DrawBudgetBackend {
+        type Error = std::convert::Infallible;
+
+        fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a BufferCell)>,
+        {
+            let remaining = self.remaining.get();
+            assert!(remaining > 0, "draw budget exceeded");
+            self.remaining.set(remaining - 1);
+            self.inner.draw(content)
+        }
+
+        fn append_lines(&mut self, line_count: u16) -> Result<(), Self::Error> {
+            self.inner.append_lines(line_count)
+        }
+
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.hide_cursor()
+        }
+
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.show_cursor()
+        }
+
+        fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+            self.inner.get_cursor_position()
+        }
+
+        fn set_cursor_position<P: Into<Position>>(
+            &mut self,
+            position: P,
+        ) -> Result<(), Self::Error> {
+            self.inner.set_cursor_position(position)
+        }
+
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            self.inner.clear()
+        }
+
+        fn clear_region(&mut self, clear_type: ClearType) -> Result<(), Self::Error> {
+            self.inner.clear_region(clear_type)
+        }
+
+        fn size(&self) -> Result<Size, Self::Error> {
+            self.inner.size()
+        }
+
+        fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
+            self.inner.window_size()
+        }
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.inner.flush()
+        }
+    }
 
     fn test_app() -> App {
         App {
@@ -1884,6 +2109,158 @@ Session ID: s_cached"
 
         app.state.overlay = Overlay::Agents;
         assert!(visible_activity_rect(normal_area, &app.state).is_empty());
+    }
+
+    #[test]
+    fn stream_redraw_waits_for_cadence_but_terminal_events_do_not() {
+        let last_draw = tokio::time::Instant::now();
+        assert!(!stream_redraw_due(
+            last_draw,
+            last_draw + STREAM_REDRAW_INTERVAL - Duration::from_millis(1),
+            true,
+            false,
+        ));
+        assert!(stream_redraw_due(
+            last_draw,
+            last_draw + STREAM_REDRAW_INTERVAL,
+            true,
+            false,
+        ));
+        assert!(stream_redraw_due(last_draw, last_draw, true, true));
+        assert!(!stream_redraw_due(
+            last_draw,
+            last_draw + STREAM_REDRAW_INTERVAL,
+            false,
+            true,
+        ));
+
+        for event in [
+            RuntimeEvent::ApprovalRequired {
+                request: ApprovalRequest {
+                    operation_id: OperationId::from("operation_approval"),
+                    operation: Operation::Read {
+                        path: "README.md".into(),
+                        external: false,
+                    },
+                    summary: "Read README".into(),
+                    arguments: serde_json::json!({"path": "README.md"}),
+                },
+            },
+            RuntimeEvent::ToolCompleted {
+                operation_id: OperationId::from("operation_tool"),
+                result: ToolResult::success(CallId::from("call_tool"), "done"),
+            },
+            RuntimeEvent::TurnCompleted,
+            RuntimeEvent::Error {
+                message: "failed".into(),
+            },
+            RuntimeEvent::Shutdown,
+        ] {
+            assert!(requires_immediate_redraw(&event));
+        }
+        assert!(!requires_immediate_redraw(&RuntimeEvent::AssistantDelta {
+            text: "x".into()
+        }));
+    }
+
+    #[tokio::test]
+    async fn immediately_ready_runtime_deltas_share_one_redraw() {
+        const DELTA_COUNT: usize = 32;
+
+        let mut app = test_app();
+        let remaining_draws = Rc::new(Cell::new(2));
+        let backend = DrawBudgetBackend::new(TestBackend::new(80, 24), Rc::clone(&remaining_draws));
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let (_input_sender, mut input) = mpsc::channel(1);
+        let (runtime_sender, runtime_events) = mpsc::channel(DELTA_COUNT + 1);
+        for _ in 0..DELTA_COUNT {
+            runtime_sender
+                .try_send(RuntimeEvent::AssistantDelta { text: "x".into() })
+                .expect("queue delta");
+        }
+        runtime_sender
+            .try_send(RuntimeEvent::Shutdown)
+            .expect("queue shutdown");
+        drop(runtime_sender);
+
+        run_loop(
+            &mut app,
+            &mut terminal,
+            &mut input,
+            Some(runtime_events),
+            None,
+            false,
+        )
+        .await
+        .expect("run loop");
+
+        assert_eq!(remaining_draws.get(), 0);
+        assert!(matches!(
+            &app.state.transcript[..],
+            [TranscriptEntry::AssistantMessage { body }] if body.len() == DELTA_COUNT
+        ));
+        assert_eq!(app.state.activity(), &ActivityState::Idle);
+    }
+
+    #[tokio::test]
+    async fn batched_tool_deltas_keep_the_canonical_completion_output() {
+        let mut app = test_app();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        let (_input_sender, mut input) = mpsc::channel(1);
+        let (runtime_sender, runtime_events) = mpsc::channel(3);
+        let (tool_sender, tool_events) = mpsc::channel(4);
+        tool_sender
+            .try_send(RuntimeEvent::ToolOutputDelta {
+                call_id: CallId::from("call_1"),
+                stream: "stdout".into(),
+                chunk: "partial ".into(),
+            })
+            .expect("queue first delta");
+        tool_sender
+            .try_send(RuntimeEvent::ToolOutputDelta {
+                call_id: CallId::from("call_1"),
+                stream: "stdout".into(),
+                chunk: "output".into(),
+            })
+            .expect("queue second delta");
+        drop(tool_sender);
+
+        runtime_sender
+            .try_send(RuntimeEvent::ToolStarted {
+                operation_id: OperationId::from("operation_1"),
+                name: "bash".into(),
+            })
+            .expect("queue tool start");
+        let mut result = ToolResult::success(CallId::from("call_1"), "canonical output");
+        result.metadata = serde_json::json!({"tool_name": "bash"});
+        runtime_sender
+            .try_send(RuntimeEvent::ToolCompleted {
+                operation_id: OperationId::from("operation_1"),
+                result,
+            })
+            .expect("queue completion");
+        runtime_sender
+            .try_send(RuntimeEvent::Shutdown)
+            .expect("queue shutdown");
+        drop(runtime_sender);
+
+        run_loop(
+            &mut app,
+            &mut terminal,
+            &mut input,
+            Some(runtime_events),
+            Some(tool_events),
+            false,
+        )
+        .await
+        .expect("run loop");
+
+        assert!(matches!(
+            &app.state.transcript[..],
+            [TranscriptEntry::ToolCall(tool)]
+                if tool.output == "canonical output"
+                    && tool.lifecycle == crate::tui::ToolLifecycle::Completed
+        ));
     }
 
     #[test]
