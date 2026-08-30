@@ -33,7 +33,8 @@ use kurama_protocol::{
 use kurama_sdk::AgentBuilder;
 use ratatui::{
     Terminal, TerminalOptions, Viewport,
-    backend::{Backend, CrosstermBackend},
+    backend::{Backend, ClearType, CrosstermBackend},
+    layout::Position,
     style::Style,
     widgets::{Block, Padding, Paragraph, Widget},
 };
@@ -436,16 +437,8 @@ impl App {
     pub async fn run(mut self) -> Result<(), String> {
         let _guard = TerminalGuard::enter().map_err(|error| error.to_string())?;
         let backend = CursorTrackingBackend::new(CrosstermBackend::new(io::stdout()));
-        let rows = crossterm::terminal::size()
-            .map_err(|error| error.to_string())?
-            .1;
-        let mut terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(inline_viewport_height(rows)),
-            },
-        )
-        .map_err(|error| error.to_string())?;
+        let mut terminal =
+            initialize_inline_terminal(backend).map_err(|error| error.to_string())?;
         let mut input = spawn_input_thread(32);
         loop {
             let runtime_events = self.runtime_events.take();
@@ -993,8 +986,19 @@ fn combined_tool_output(stdout: &str, stderr: &str) -> String {
     }
 }
 
-fn inline_viewport_height(rows: u16) -> u16 {
-    rows.saturating_sub(1).clamp(6, 24).min(rows)
+fn initialize_inline_terminal<B>(mut backend: B) -> Result<Terminal<B>, B::Error>
+where
+    B: Backend,
+{
+    let rows = backend.size()?.height;
+    backend.clear_region(ClearType::All)?;
+    backend.set_cursor_position(Position::ORIGIN)?;
+    Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(rows),
+        },
+    )
 }
 
 pub async fn run(args: Args) -> Result<(), String> {
@@ -1683,10 +1687,29 @@ mod tests {
     }
 
     #[test]
-    fn inline_viewport_height_stays_within_the_terminal() {
-        assert_eq!(inline_viewport_height(40), 24);
-        assert_eq!(inline_viewport_height(20), 19);
-        assert_eq!(inline_viewport_height(6), 6);
+    fn inline_terminal_initialization_clears_the_screen_and_uses_full_height() {
+        let mut lines = vec![" ".repeat(80); 40];
+        lines[0] = "stale shell prompt".into();
+        lines[4] = "stale viewport content".into();
+        lines[30] = "stale lower content".into();
+        let mut backend = TestBackend::with_lines(lines);
+        backend
+            .set_cursor_position(Position::new(0, 4))
+            .expect("position inline viewport");
+
+        let mut terminal = initialize_inline_terminal(backend).expect("initialize terminal");
+        let visible = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert_eq!(terminal.get_frame().area(), Rect::new(0, 0, 80, 40));
+        assert!(!visible.contains("stale shell prompt"));
+        assert!(!visible.contains("stale viewport content"));
+        assert!(!visible.contains("stale lower content"));
     }
 
     #[tokio::test]
