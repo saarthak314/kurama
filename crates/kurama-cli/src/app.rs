@@ -152,7 +152,7 @@ impl fmt::Display for ExitSummary {
         write!(formatter, " output={}", self.usage.output_tokens)?;
         write!(
             formatter,
-            "\nTo continue this session, run kurama resume {}\nSession ID: {}",
+            "\nResume with kurama resume {}\nSession ID: {}",
             self.session_id, self.session_id
         )
     }
@@ -2129,7 +2129,7 @@ mod tests {
         assert_eq!(
             app.exit_summary().expect("exit summary").to_string(),
             "Token usage: total=0 input=0 output=0\n\
-To continue this session, run kurama resume s_exit\n\
+Resume with kurama resume s_exit\n\
 Session ID: s_exit"
         );
     }
@@ -2148,7 +2148,7 @@ Session ID: s_exit"
         assert_eq!(
             summary.to_string(),
             "Token usage: total=150 input=120 (+ 80 cached) output=30\n\
-To continue this session, run kurama resume s_cached\n\
+Resume with kurama resume s_cached\n\
 Session ID: s_cached"
         );
     }
