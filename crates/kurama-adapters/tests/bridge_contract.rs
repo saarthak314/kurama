@@ -332,6 +332,23 @@ fn claude_recovers_structured_output_tool_blocks_with_code_fences() {
 }
 
 #[test]
+fn claude_surfaces_assistant_error_records_as_model_failures() {
+    let error = ClaudeBridge::parse_fixture(concat!(
+        r#"{"type":"system","subtype":"init","session_id":"session-1"}"#,
+        "\n",
+        r#"{"type":"assistant","error":"authentication_failed","message":{"content":[{"type":"text","text":"Failed to authenticate: OAuth session expired"}]}}"#,
+        "\n",
+        r#"{"type":"result","subtype":"success","session_id":"session-1","result":"Failed to authenticate: OAuth session expired","structured_output":null}"#,
+    ))
+    .expect_err("Claude assistant error must fail the model request");
+
+    assert_eq!(
+        error.to_string(),
+        "model error: Failed to authenticate: OAuth session expired"
+    );
+}
+
+#[test]
 fn control_schema_omits_delegation_when_disabled() {
     let disabled = control_schema(false);
     let enabled = control_schema(true);

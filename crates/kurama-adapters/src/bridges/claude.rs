@@ -183,6 +183,9 @@ impl BridgeDecoder for ClaudeDecoder {
         let mut events = Vec::new();
         let value: Value = serde_json::from_str(line)
             .map_err(|error| KuramaError::Protocol(format!("invalid Claude JSONL: {error}")))?;
+        if let Some(message) = claude_error_message(&value) {
+            return Err(KuramaError::Model(message));
+        }
         match value
             .get("type")
             .and_then(Value::as_str)
@@ -352,14 +355,6 @@ impl BridgeDecoder for ClaudeDecoder {
                 });
                 self.completed = true;
             }
-            "error" => {
-                let message = value
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .or_else(|| value.get("message").and_then(Value::as_str))
-                    .unwrap_or("Claude CLI failed");
-                return Err(KuramaError::Model(message.to_owned()));
-            }
             _ => {}
         }
         Ok(events)
@@ -374,4 +369,42 @@ impl BridgeDecoder for ClaudeDecoder {
             ))
         }
     }
+}
+
+fn claude_error_message(value: &Value) -> Option<String> {
+    let has_error = value.get("error").is_some_and(|error| !error.is_null())
+        || value.get("type").and_then(Value::as_str) == Some("error");
+    if !has_error {
+        return None;
+    }
+
+    value
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .map(|content| {
+            content
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<String>()
+        })
+        .filter(|message| !message.is_empty())
+        .or_else(|| {
+            value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| Some("Claude CLI failed".into()))
 }
