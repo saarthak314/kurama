@@ -230,6 +230,7 @@ impl Engine {
             recovery_operations: recovery.operations.into_iter().collect(),
             interrupted_agents: recovery.interrupted_agents,
             resume_incomplete_turn,
+            shutdown_requested: false,
         };
         tokio::spawn(actor.run());
         Ok((
@@ -271,6 +272,7 @@ struct EngineActor {
     recovery_operations: Vec<(OperationId, RecoveryAction)>,
     interrupted_agents: Vec<kurama_protocol::agent::AgentSnapshot>,
     resume_incomplete_turn: bool,
+    shutdown_requested: bool,
 }
 
 impl EngineActor {
@@ -289,6 +291,10 @@ impl EngineActor {
         if recovered && self.resume_incomplete_turn {
             self.resume_incomplete_turn = false;
             if let Err(error) = self.resume_turn().await {
+                if self.shutdown_requested {
+                    let _ = self.emit(RuntimeEvent::Shutdown).await;
+                    return;
+                }
                 let _ = self
                     .emit(RuntimeEvent::Error {
                         message: error.to_string(),
@@ -318,10 +324,14 @@ impl EngineActor {
                 EngineCommand::SetMode(mode) => self.change_mode(mode).await,
                 EngineCommand::Agent(command) => self.agent_command(command).await,
                 EngineCommand::Shutdown => {
-                    let _ = self.emit(RuntimeEvent::Shutdown).await;
-                    break;
+                    self.shutdown_requested = true;
+                    Ok(())
                 }
             };
+            if self.shutdown_requested {
+                let _ = self.emit(RuntimeEvent::Shutdown).await;
+                break;
+            }
             if let Err(error) = result {
                 let _ = self
                     .emit(RuntimeEvent::Error {
@@ -801,6 +811,9 @@ impl EngineActor {
                 self.emit(RuntimeEvent::TurnCompleted).await
             }
             Err(error) => {
+                if self.shutdown_requested {
+                    return Err(error);
+                }
                 self.append(SessionEvent::TurnFailed {
                     error: error.to_string(),
                 })?;
@@ -1287,6 +1300,7 @@ impl EngineActor {
                             return Err(KuramaError::Cancelled);
                         }
                         Some(EngineCommand::Shutdown) | None => {
+                            self.shutdown_requested = true;
                             cancel.cancel();
                             manager.cancel_all().await;
                             return Err(KuramaError::Cancelled);
@@ -1348,6 +1362,7 @@ impl EngineActor {
                 }
                 Some(EngineCommand::Agent(command)) => self.agent_command(command).await?,
                 Some(EngineCommand::Shutdown) | None => {
+                    self.shutdown_requested = true;
                     cancel.cancel();
                     return Err(KuramaError::Cancelled);
                 }
@@ -1367,7 +1382,15 @@ impl EngineActor {
         cancel: &CancelToken,
     ) -> Result<(), KuramaError> {
         match command {
-            Some(EngineCommand::CancelTurn) | Some(EngineCommand::Shutdown) | None => {
+            Some(EngineCommand::CancelTurn) => {
+                cancel.cancel();
+                if let Some(manager) = &self.agent_manager {
+                    manager.cancel_all().await;
+                }
+                Err(KuramaError::Cancelled)
+            }
+            Some(EngineCommand::Shutdown) | None => {
+                self.shutdown_requested = true;
                 cancel.cancel();
                 if let Some(manager) = &self.agent_manager {
                     manager.cancel_all().await;

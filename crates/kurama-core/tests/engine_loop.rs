@@ -615,6 +615,37 @@ async fn cancellation_flushes_and_persists_sub_threshold_assistant_text() {
     assert_eq!(assistant_messages, ["partial cancellation"]);
 }
 
+#[tokio::test]
+async fn shutdown_during_streaming_is_acknowledged_without_an_error() {
+    let blocked = Arc::new(Notify::new());
+    let backend = Arc::new(BlockingPartialBackend {
+        blocked: Arc::clone(&blocked),
+    });
+    let (handle, mut events) = Engine::spawn(
+        partial_stream_config("shutdown-stream", backend, Arc::new(MemoryStore::default())),
+        Vec::new(),
+    )
+    .expect("spawn engine");
+
+    handle.submit("inspect", false).await.expect("submit");
+    blocked.notified().await;
+    handle.shutdown().await.expect("request shutdown");
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match events.recv().await.expect("runtime event") {
+                RuntimeEvent::Shutdown => break,
+                RuntimeEvent::Error { message } => {
+                    panic!("shutdown surfaced an error: {message}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("shutdown acknowledgement timed out");
+}
+
 #[derive(Default)]
 struct AskPolicy;
 
