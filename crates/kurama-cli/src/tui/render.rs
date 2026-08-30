@@ -334,9 +334,10 @@ fn agent_row(agent: &crate::tui::AgentRow, selected: bool, width: usize) -> Line
     };
     let marker = if selected { "▶ " } else { "  " };
     let body = if width >= 72 {
+        let id = truncate(agent.id.as_ref(), 8);
         format!(
             "{:<10}{:<14}{:<13}{:<22}",
-            agent.id,
+            id,
             truncate(&agent.role, 12),
             truncate(&agent.profile, 11),
             truncate(&agent.task, 20)

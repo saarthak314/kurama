@@ -110,6 +110,20 @@ fn narrow_agent_panel_uses_a_compact_row_layout() {
 }
 
 #[test]
+fn wide_agent_panel_bounds_long_ids_before_the_state_column() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    let long_id = "a_087e900147ae313237cc3f20c3706149";
+    state.set_agents(vec![row(long_id, AgentState::Completed)]);
+    state.open_agents();
+
+    let text = rendered_at(&state, 96, 28);
+
+    assert!(text.contains("reviewer"), "role was clipped: {text}");
+    assert!(text.contains("COMPLETED"), "state was clipped: {text}");
+    assert!(!text.contains(long_id), "long ID was not bounded: {text}");
+}
+
+#[test]
 fn replay_restores_terminal_agents_without_duplicating_startup_updates() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     let session_id = SessionId::from("s_resume");
