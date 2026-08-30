@@ -236,3 +236,97 @@ async fn anthropic_backend_bounds_candidate_non_text_events() {
     let _ = captured.await.expect("captured request");
     drop(release);
 }
+
+#[tokio::test]
+async fn anthropic_normalization_bounds_cumulative_tool_argument_bytes() {
+    let mut body = format!(
+        "event: message_start\ndata: {}\n\nevent: content_block_start\ndata: {}\n\nevent: content_block_start\ndata: {}\n\n",
+        serde_json::json!({"type":"message_start","message":{"id":"msg_bounded","usage":{"input_tokens":1}}}),
+        serde_json::json!({
+            "type":"content_block_start",
+            "index":0,
+            "content_block":{
+                "type":"tool_use",
+                "id":"tool_bounded",
+                "name":"write",
+                "input":{}
+            }
+        }),
+        serde_json::json!({
+            "type":"content_block_start",
+            "index":1,
+            "content_block":{
+                "type":"tool_use",
+                "id":"tool_bounded_b",
+                "name":"write",
+                "input":{}
+            }
+        }),
+    );
+    let chunk = "x".repeat(4 * 1024);
+    for _ in 0..129 {
+        for index in [0, 1] {
+            body.push_str(&format!(
+                "event: content_block_delta\ndata: {}\n\n",
+                serde_json::json!({
+                    "type":"content_block_delta",
+                    "index":index,
+                    "delta":{"type":"input_json_delta","partial_json":chunk}
+                })
+            ));
+        }
+    }
+
+    let (endpoint, captured) = serve_sse_once(body).await;
+    let backend = AnthropicBackend::from_endpoint(HttpClient::default(), &endpoint, "test-key")
+        .expect("backend");
+    let mut stream = backend
+        .stream(request(), &NeverCancel)
+        .await
+        .expect("stream");
+    let error = loop {
+        match stream.next().await.expect("bounded stream item") {
+            Ok(_) => {}
+            Err(error) => break error,
+        }
+    };
+    let _ = captured.await.expect("captured request");
+
+    assert!(matches!(
+        error,
+        KuramaError::Protocol(message)
+            if message.contains("Anthropic tool arguments") && message.contains("1048576")
+    ));
+}
+
+#[test]
+fn anthropic_normalization_bounds_tool_call_count() {
+    let mut body = format!(
+        "event: message_start\ndata: {}\n\n",
+        serde_json::json!({"type":"message_start","message":{"id":"msg_bounded","usage":{"input_tokens":1}}})
+    );
+    for index in 0..65_u64 {
+        body.push_str(&format!(
+            "event: content_block_start\ndata: {}\n\n",
+            serde_json::json!({
+                "type":"content_block_start",
+                "index":index,
+                "content_block":{
+                    "type":"tool_use",
+                    "id":format!("tool_{index}"),
+                    "name":"read",
+                    "input":{}
+                }
+            })
+        ));
+    }
+
+    let error =
+        AnthropicBackend::parse_fixture(&body).expect_err("tool call count must be bounded");
+
+    assert!(matches!(
+        error,
+        KuramaError::Protocol(message)
+            if message.contains("Anthropic tool calls") && message.contains("64")
+    ));
+}

@@ -569,6 +569,99 @@ async fn openai_backend_rejects_oversized_sse_record_before_eof() {
     drop(release);
 }
 
+#[tokio::test]
+async fn openai_normalization_bounds_cumulative_tool_argument_bytes() {
+    let mut body = format!(
+        "data: {}\n\ndata: {}\n\ndata: {}\n\n",
+        serde_json::json!({"type":"response.created","response":{"id":"resp_bounded"}}),
+        serde_json::json!({
+            "type":"response.output_item.added",
+            "item":{
+                "type":"function_call",
+                "id":"fc_bounded_a",
+                "call_id":"call_bounded_a",
+                "name":"write",
+                "arguments":"{\"content\":\""
+            }
+        }),
+        serde_json::json!({
+            "type":"response.output_item.added",
+            "item":{
+                "type":"function_call",
+                "id":"fc_bounded_b",
+                "call_id":"call_bounded_b",
+                "name":"write",
+                "arguments":"{\"content\":\""
+            }
+        }),
+    );
+    let chunk = "x".repeat(4 * 1024);
+    for _ in 0..128 {
+        for item_id in ["fc_bounded_a", "fc_bounded_b"] {
+            body.push_str(&format!(
+                "data: {}\n\n",
+                serde_json::json!({
+                    "type":"response.function_call_arguments.delta",
+                    "item_id":item_id,
+                    "delta":chunk
+                })
+            ));
+        }
+    }
+
+    let (endpoint, captured) = serve_sse_once(body).await;
+    let backend = OpenAiBackend::from_endpoint(HttpClient::default(), &endpoint, "test-key")
+        .expect("backend");
+    let mut stream = backend
+        .stream(request(), &NeverCancel)
+        .await
+        .expect("stream");
+    let error = loop {
+        match stream.next().await.expect("bounded stream item") {
+            Ok(_) => {}
+            Err(error) => break error,
+        }
+    };
+    let _ = captured.await.expect("captured request");
+
+    assert!(matches!(
+        error,
+        KuramaError::Protocol(message)
+            if message.contains("OpenAI tool arguments") && message.contains("1048576")
+    ));
+}
+
+#[test]
+fn openai_normalization_bounds_tool_call_count() {
+    let mut body = format!(
+        "data: {}\n\n",
+        serde_json::json!({"type":"response.created","response":{"id":"resp_bounded"}})
+    );
+    for index in 0..65 {
+        body.push_str(&format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{
+                    "type":"function_call",
+                    "id":format!("fc_{index}"),
+                    "call_id":format!("call_{index}"),
+                    "name":"read",
+                    "arguments":"{}"
+                }
+            })
+        ));
+    }
+
+    let error = OpenAiBackend::parse_fixture(&body).expect_err("tool call count must be bounded");
+
+    assert!(matches!(
+        error,
+        KuramaError::Protocol(message)
+            if message.contains("OpenAI tool calls") && message.contains("64")
+    ));
+}
+
 fn openai_text_stream(deltas: &[&str]) -> String {
     let mut body = format!(
         "data: {}\n\n",

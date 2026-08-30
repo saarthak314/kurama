@@ -185,3 +185,92 @@ async fn openai_compat_backend_yields_before_response_eof() {
     }
     let _ = server.captured.await.expect("captured request");
 }
+
+#[tokio::test]
+async fn openai_compat_normalization_bounds_cumulative_tool_argument_bytes() {
+    let mut body = format!(
+        "data: {}\n\n",
+        serde_json::json!({
+            "id":"chat_bounded",
+            "choices":[{
+                "delta":{"tool_calls":[{
+                    "index":0,
+                    "id":"call_bounded_a",
+                    "function":{"name":"write","arguments":"{\"content\":\""}
+                },{
+                    "index":1,
+                    "id":"call_bounded_b",
+                    "function":{"name":"write","arguments":"{\"content\":\""}
+                }]}
+            }]
+        })
+    );
+    let chunk = "x".repeat(4 * 1024);
+    for _ in 0..128 {
+        body.push_str(&format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id":"chat_bounded",
+                "choices":[{
+                    "delta":{"tool_calls":[{
+                        "index":0,
+                        "function":{"arguments":chunk}
+                    },{
+                        "index":1,
+                        "function":{"arguments":chunk}
+                    }]}
+                }]
+            })
+        ));
+    }
+
+    let (endpoint, captured) = serve_sse_once(body).await;
+    let backend = OpenAiCompatBackend::from_endpoint(HttpClient::default(), &endpoint, None)
+        .expect("backend");
+    let mut stream = backend
+        .stream(request(), &NeverCancel)
+        .await
+        .expect("stream");
+    let error = loop {
+        match stream.next().await.expect("bounded stream item") {
+            Ok(_) => {}
+            Err(error) => break error,
+        }
+    };
+    let _ = captured.await.expect("captured request");
+
+    assert!(matches!(
+        error,
+        KuramaError::Protocol(message)
+            if message.contains("Chat tool arguments") && message.contains("1048576")
+    ));
+}
+
+#[test]
+fn openai_compat_normalization_bounds_tool_call_count() {
+    let mut body = String::new();
+    for index in 0..65_u64 {
+        body.push_str(&format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id":"chat_bounded",
+                "choices":[{
+                    "delta":{"tool_calls":[{
+                        "index":index,
+                        "id":format!("call_{index}"),
+                        "function":{"name":"read","arguments":"{}"}
+                    }]}
+                }]
+            })
+        ));
+    }
+
+    let error =
+        OpenAiCompatBackend::parse_fixture(&body).expect_err("tool call count must be bounded");
+
+    assert!(matches!(
+        error,
+        KuramaError::Protocol(message)
+            if message.contains("Chat tool calls") && message.contains("64")
+    ));
+}

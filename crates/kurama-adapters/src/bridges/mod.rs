@@ -393,6 +393,27 @@ async fn drive_process(
             stderr_task.abort();
             return;
         }
+        _ = inactivity.wait() => {
+            terminate_process_group(&mut child).await;
+            stdin_task.abort();
+            let diagnostic = bounded_stderr_diagnostic(
+                &program,
+                &mut stderr_task,
+                INACTIVITY_STDERR_JOIN_TIMEOUT,
+            )
+            .await
+            .or(stdout_error)
+            .or(last_stdout)
+            .unwrap_or_else(|| "no diagnostic output".into());
+            let error = inactivity_error(
+                &program,
+                inactivity_timeout,
+                &diagnostic,
+                &secrets,
+            );
+            let _ = sender.send(Err(error)).await;
+            return;
+        }
         status = child.wait() => status,
     };
     let status = match status {

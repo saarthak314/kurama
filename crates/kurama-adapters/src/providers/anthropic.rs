@@ -19,6 +19,8 @@ use super::{
 use super::endpoint_url;
 
 const PROVIDER: &str = "anthropic";
+const MAX_STREAMED_TOOL_CALLS: usize = 64;
+const MAX_STREAMED_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AnthropicBackend {
@@ -132,6 +134,8 @@ impl kurama_protocol::traits::ModelBackend for AnthropicBackend {
 struct AnthropicNormalizer {
     message_id: Option<String>,
     calls: BTreeMap<u64, PendingTool>,
+    tool_call_count: usize,
+    tool_argument_bytes: usize,
     input_tokens: u64,
     cached_input_tokens: u64,
     output_tokens: u64,
@@ -187,6 +191,18 @@ impl AnthropicNormalizer {
                         .pointer("/content_block/input")
                         .cloned()
                         .unwrap_or_else(|| json!({}));
+                    let json = if input.as_object().is_some_and(|object| object.is_empty()) {
+                        String::new()
+                    } else {
+                        input.to_string()
+                    };
+                    let previous_arguments = self
+                        .calls
+                        .get(&index)
+                        .map(|call| call.json.len())
+                        .unwrap_or_default();
+                    self.reserve_tool_call()?;
+                    self.replace_tool_arguments(previous_arguments, json.len())?;
                     self.calls.insert(
                         index,
                         PendingTool {
@@ -200,11 +216,7 @@ impl AnthropicNormalizer {
                                 .and_then(Value::as_str)
                                 .unwrap_or_default()
                                 .to_owned(),
-                            json: if input.as_object().is_some_and(|object| object.is_empty()) {
-                                String::new()
-                            } else {
-                                input.to_string()
-                            },
+                            json,
                         },
                     );
                 }
@@ -221,15 +233,20 @@ impl AnthropicNormalizer {
                     let index = value.get("index").and_then(Value::as_u64).ok_or_else(|| {
                         KuramaError::Protocol("Anthropic JSON delta omitted index".into())
                     })?;
+                    if !self.calls.contains_key(&index) {
+                        return Err(KuramaError::Protocol(format!(
+                            "Anthropic JSON for unknown block {index}"
+                        )));
+                    }
+                    let partial_json = value
+                        .pointer("/delta/partial_json")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    self.append_tool_arguments(partial_json.len())?;
                     let call = self.calls.get_mut(&index).ok_or_else(|| {
                         KuramaError::Protocol(format!("Anthropic JSON for unknown block {index}"))
                     })?;
-                    call.json.push_str(
-                        value
-                            .pointer("/delta/partial_json")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default(),
-                    );
+                    call.json.push_str(partial_json);
                 }
                 _ => {}
             },
@@ -285,6 +302,39 @@ impl AnthropicNormalizer {
             _ => {}
         }
         Ok(events)
+    }
+
+    fn reserve_tool_call(&mut self) -> Result<(), KuramaError> {
+        let count = self.tool_call_count.saturating_add(1);
+        if count > MAX_STREAMED_TOOL_CALLS {
+            return Err(KuramaError::Protocol(format!(
+                "Anthropic tool calls exceed limit of {MAX_STREAMED_TOOL_CALLS}"
+            )));
+        }
+        self.tool_call_count = count;
+        Ok(())
+    }
+
+    fn append_tool_arguments(&mut self, additional_bytes: usize) -> Result<(), KuramaError> {
+        self.replace_tool_arguments(0, additional_bytes)
+    }
+
+    fn replace_tool_arguments(
+        &mut self,
+        previous_bytes: usize,
+        replacement_bytes: usize,
+    ) -> Result<(), KuramaError> {
+        let bytes = self
+            .tool_argument_bytes
+            .saturating_sub(previous_bytes)
+            .saturating_add(replacement_bytes);
+        if bytes > MAX_STREAMED_TOOL_ARGUMENT_BYTES {
+            return Err(KuramaError::Protocol(format!(
+                "Anthropic tool arguments exceed {MAX_STREAMED_TOOL_ARGUMENT_BYTES} bytes"
+            )));
+        }
+        self.tool_argument_bytes = bytes;
+        Ok(())
     }
 
     fn completion(&self) -> ModelEvent {

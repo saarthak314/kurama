@@ -641,6 +641,86 @@ async fn silent_codex_bridge_times_out_after_inactivity() {
     assert!(message.len() <= 16 * 1024 + 128, "{message}");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn bridge_stdout_eof_times_out_and_kills_the_process_group() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let executable = temporary.path().join("codex");
+    let pids = temporary.path().join("pids");
+    write_executable(
+        &executable,
+        &format!(
+            r#"#!/bin/sh
+trap '' TERM
+sh -c 'trap "" TERM; while :; do sleep 1; done' >/dev/null 2>&1 &
+descendant=$!
+printf '%s %s\n' "$$" "$descendant" > '{}'
+printf '%s\n' '{{"type":"heartbeat"}}'
+exec >/dev/null
+printf '%s\n' 'secret-value' >&2
+sleep 10
+"#,
+            pids.display()
+        ),
+    );
+    let mut command = CodexBridge::command_for(
+        &request(),
+        None,
+        &temporary.path().join("work"),
+        &temporary.path().join("control.json"),
+    );
+    command.program = executable.display().to_string();
+
+    let bridge_task = tokio::spawn(async move {
+        event_stream_with_inactivity(
+            command,
+            TestBridgeDecoder::default(),
+            &NeverCancel,
+            vec!["secret-value".into()],
+            Duration::from_secs(3),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !pids.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("bridge process did not start");
+    let result = tokio::time::timeout(Duration::from_secs(4), bridge_task)
+        .await
+        .expect("bridge waited forever after stdout EOF")
+        .expect("bridge task panicked");
+    let error = match result {
+        Ok(_) => panic!("incomplete bridge unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+
+    assert!(message.contains("inactive"), "{message}");
+    assert!(message.contains("[REDACTED]"), "{message}");
+    assert!(!message.contains("secret-value"), "{message}");
+    assert!(message.len() <= 16 * 1024 + 128, "{message}");
+
+    let contents = fs::read_to_string(&pids).expect("process IDs");
+    let mut process_ids = contents
+        .split_whitespace()
+        .map(|value| value.parse::<i32>().expect("numeric process ID"));
+    let leader = process_ids.next().expect("leader process ID");
+    let descendant = process_ids.next().expect("descendant process ID");
+    let descendant_gone = wait_for_process_exit(descendant).await;
+    if !descendant_gone {
+        unsafe {
+            libc::kill(-leader, libc::SIGKILL);
+        }
+    }
+    assert!(
+        descendant_gone,
+        "bridge descendant survived stdout-EOF timeout"
+    );
+}
+
 #[test]
 fn bridge_inactivity_diagnostics_are_bounded_and_redacted() {
     let secret = "secret-value";

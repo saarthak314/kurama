@@ -19,6 +19,8 @@ use super::{
 use super::endpoint_url;
 
 const PROVIDER: &str = "openai";
+const MAX_STREAMED_TOOL_CALLS: usize = 64;
+const MAX_STREAMED_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
 pub struct OpenAiBackend {
@@ -145,6 +147,8 @@ impl kurama_protocol::traits::ModelBackend for OpenAiBackend {
 struct OpenAiNormalizer {
     response_id: Option<String>,
     calls: BTreeMap<String, PendingCall>,
+    tool_call_count: usize,
+    tool_argument_bytes: usize,
     emitted_call: bool,
     completed: bool,
 }
@@ -189,6 +193,17 @@ impl OpenAiNormalizer {
                         .ok_or_else(|| {
                             KuramaError::Protocol("OpenAI function call omitted item.id".into())
                         })?;
+                    let arguments = value
+                        .pointer("/item/arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let previous_arguments = self
+                        .calls
+                        .get(item_id)
+                        .map(|call| call.arguments.len())
+                        .unwrap_or_default();
+                    self.reserve_tool_call()?;
+                    self.replace_tool_arguments(previous_arguments, arguments.len())?;
                     self.calls.insert(
                         item_id.to_owned(),
                         PendingCall {
@@ -202,21 +217,24 @@ impl OpenAiNormalizer {
                                 .and_then(Value::as_str)
                                 .unwrap_or_default()
                                 .to_owned(),
-                            arguments: value
-                                .pointer("/item/arguments")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_owned(),
+                            arguments: arguments.to_owned(),
                         },
                     );
                 }
             }
             "response.function_call_arguments.delta" => {
                 let item_id = string(&value, "item_id")?;
+                if !self.calls.contains_key(item_id) {
+                    return Err(KuramaError::Protocol(format!(
+                        "OpenAI arguments for unknown item {item_id}"
+                    )));
+                }
+                let delta = string(&value, "delta")?;
+                self.append_tool_arguments(delta.len())?;
                 let call = self.calls.get_mut(item_id).ok_or_else(|| {
                     KuramaError::Protocol(format!("OpenAI arguments for unknown item {item_id}"))
                 })?;
-                call.arguments.push_str(string(&value, "delta")?);
+                call.arguments.push_str(delta);
             }
             "response.function_call_arguments.done" => {
                 let item_id = string(&value, "item_id")?;
@@ -224,6 +242,7 @@ impl OpenAiNormalizer {
                     KuramaError::Protocol(format!("OpenAI completion for unknown item {item_id}"))
                 })?;
                 if let Some(arguments) = value.get("arguments").and_then(Value::as_str) {
+                    self.replace_tool_arguments(call.arguments.len(), arguments.len())?;
                     call.arguments = arguments.to_owned();
                 }
                 if let Some(item) = value.get("item") {
@@ -237,11 +256,10 @@ impl OpenAiNormalizer {
                         .and_then(Value::as_str)
                         .unwrap_or(&call.name)
                         .to_owned();
-                    call.arguments = item
-                        .get("arguments")
-                        .and_then(Value::as_str)
-                        .unwrap_or(&call.arguments)
-                        .to_owned();
+                    if let Some(arguments) = item.get("arguments").and_then(Value::as_str) {
+                        self.replace_tool_arguments(call.arguments.len(), arguments.len())?;
+                        call.arguments = arguments.to_owned();
+                    }
                 }
                 let arguments = parse_arguments(&call.arguments, "OpenAI")?;
                 self.emitted_call = true;
@@ -300,6 +318,39 @@ impl OpenAiNormalizer {
             _ => {}
         }
         Ok(events)
+    }
+
+    fn reserve_tool_call(&mut self) -> Result<(), KuramaError> {
+        let count = self.tool_call_count.saturating_add(1);
+        if count > MAX_STREAMED_TOOL_CALLS {
+            return Err(KuramaError::Protocol(format!(
+                "OpenAI tool calls exceed limit of {MAX_STREAMED_TOOL_CALLS}"
+            )));
+        }
+        self.tool_call_count = count;
+        Ok(())
+    }
+
+    fn append_tool_arguments(&mut self, additional_bytes: usize) -> Result<(), KuramaError> {
+        self.replace_tool_arguments(0, additional_bytes)
+    }
+
+    fn replace_tool_arguments(
+        &mut self,
+        previous_bytes: usize,
+        replacement_bytes: usize,
+    ) -> Result<(), KuramaError> {
+        let bytes = self
+            .tool_argument_bytes
+            .saturating_sub(previous_bytes)
+            .saturating_add(replacement_bytes);
+        if bytes > MAX_STREAMED_TOOL_ARGUMENT_BYTES {
+            return Err(KuramaError::Protocol(format!(
+                "OpenAI tool arguments exceed {MAX_STREAMED_TOOL_ARGUMENT_BYTES} bytes"
+            )));
+        }
+        self.tool_argument_bytes = bytes;
+        Ok(())
     }
 
     fn finish(&mut self) -> Result<Vec<ModelEvent>, KuramaError> {

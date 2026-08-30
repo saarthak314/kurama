@@ -18,6 +18,8 @@ use super::{
 use super::endpoint_url;
 
 const PROVIDER: &str = "openai_compatible";
+const MAX_STREAMED_TOOL_CALLS: usize = 64;
+const MAX_STREAMED_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
 pub struct OpenAiCompatBackend {
@@ -153,6 +155,8 @@ impl kurama_protocol::traits::ModelBackend for OpenAiCompatBackend {
 struct CompatNormalizer {
     response_id: Option<String>,
     calls: BTreeMap<u64, PendingCall>,
+    tool_call_count: usize,
+    tool_argument_bytes: usize,
     finish_reason: Option<FinishReason>,
     started: bool,
     completed: bool,
@@ -233,6 +237,15 @@ impl CompatNormalizer {
                                 .ok_or_else(|| {
                                     KuramaError::Protocol("Chat tool delta omitted index".into())
                                 })?;
+                        if !self.calls.contains_key(&index) {
+                            self.reserve_tool_call()?;
+                        }
+                        let arguments = tool_call
+                            .pointer("/function/arguments")
+                            .and_then(Value::as_str);
+                        if let Some(arguments) = arguments {
+                            self.append_tool_arguments(arguments.len())?;
+                        }
                         let call = self.calls.entry(index).or_default();
                         if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
                             call.call_id = id.to_owned();
@@ -242,10 +255,7 @@ impl CompatNormalizer {
                         {
                             call.name = name.to_owned();
                         }
-                        if let Some(arguments) = tool_call
-                            .pointer("/function/arguments")
-                            .and_then(Value::as_str)
-                        {
+                        if let Some(arguments) = arguments {
                             call.arguments.push_str(arguments);
                         }
                     }
@@ -263,6 +273,28 @@ impl CompatNormalizer {
             }
         }
         Ok(events)
+    }
+
+    fn reserve_tool_call(&mut self) -> Result<(), KuramaError> {
+        let count = self.tool_call_count.saturating_add(1);
+        if count > MAX_STREAMED_TOOL_CALLS {
+            return Err(KuramaError::Protocol(format!(
+                "Chat tool calls exceed limit of {MAX_STREAMED_TOOL_CALLS}"
+            )));
+        }
+        self.tool_call_count = count;
+        Ok(())
+    }
+
+    fn append_tool_arguments(&mut self, additional_bytes: usize) -> Result<(), KuramaError> {
+        let bytes = self.tool_argument_bytes.saturating_add(additional_bytes);
+        if bytes > MAX_STREAMED_TOOL_ARGUMENT_BYTES {
+            return Err(KuramaError::Protocol(format!(
+                "Chat tool arguments exceed {MAX_STREAMED_TOOL_ARGUMENT_BYTES} bytes"
+            )));
+        }
+        self.tool_argument_bytes = bytes;
+        Ok(())
     }
 
     fn drain_calls(&mut self) -> Result<Vec<ModelEvent>, KuramaError> {
