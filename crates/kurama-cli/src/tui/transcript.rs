@@ -7,6 +7,9 @@ use ratatui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use super::{ToolLifecycle, TranscriptEntry, TuiState};
 
 const DIM: Color = Color::Rgb(126, 132, 146);
@@ -15,6 +18,11 @@ const BORDER: Color = Color::Rgb(48, 53, 64);
 const RED: Color = Color::Rgb(255, 92, 82);
 const GREEN: Color = Color::Rgb(111, 207, 151);
 const BLUE: Color = Color::Rgb(116, 177, 255);
+
+#[cfg(test)]
+thread_local! {
+    static TRANSCRIPT_RENDER_CALLS: Cell<usize> = const { Cell::new(0) };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptDetail {
@@ -1184,6 +1192,9 @@ pub fn transcript_lines(
     width: usize,
     detail: TranscriptDetail,
 ) -> Vec<Line<'static>> {
+    #[cfg(test)]
+    TRANSCRIPT_RENDER_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     let mut lines = Vec::new();
     for entry in entries {
         match entry {
@@ -1270,6 +1281,16 @@ pub fn transcript_lines(
         }
     }
     lines
+}
+
+#[cfg(test)]
+pub(crate) fn reset_transcript_render_calls() {
+    TRANSCRIPT_RENDER_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn transcript_render_calls() -> usize {
+    TRANSCRIPT_RENDER_CALLS.with(Cell::get)
 }
 
 fn compact_tool_output(tool: &super::ToolTranscript, output: &str, width: usize) -> Vec<String> {

@@ -21,7 +21,9 @@ pub use input::{TerminalGuard, spawn_input_thread};
 pub use layout::ResponsiveLayout;
 pub(crate) use layout::{main_area, visible_activity_rect};
 pub use onboarding::{OnboardingState, OnboardingSubmission};
-pub(crate) use render::SURFACE;
 pub use render::render;
+pub(crate) use render::{SURFACE, render_with_transcript};
 pub use state::{ActivityState, Overlay, ToolLifecycle, ToolTranscript, TranscriptEntry, TuiState};
 pub use transcript::{TranscriptDetail, transcript_lines};
+#[cfg(test)]
+pub(crate) use transcript::{reset_transcript_render_calls, transcript_render_calls};

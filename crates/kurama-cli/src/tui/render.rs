@@ -27,6 +27,14 @@ const AMBER: Color = Color::Yellow;
 const GREEN: Color = Color::Cyan;
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
+    render_with_transcript(frame, state, None);
+}
+
+pub(crate) fn render_with_transcript(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    prepared_transcript: Option<&[Line<'static>]>,
+) {
     if frame.area().is_empty() {
         return;
     }
@@ -34,7 +42,7 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
         render_transcript_view(frame, state);
         return;
     }
-    render_main(frame, state);
+    render_main(frame, state, prepared_transcript);
     match state.overlay {
         Overlay::None | Overlay::Approval | Overlay::ApprovalEdit => {}
         Overlay::Onboarding => render_onboarding(frame, state),
@@ -45,7 +53,11 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
     }
 }
 
-fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
+fn render_main(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    prepared_transcript: Option<&[Line<'static>]>,
+) {
     let frame_area = frame.area();
     let area = main_area(frame_area);
     if area.is_empty() {
@@ -65,11 +77,18 @@ fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
     let layout = ResponsiveLayout::for_area(area, input_height, activity_visible);
 
     if !layout.transcript.is_empty() {
-        let transcript = transcript_lines(
-            state.live_transcript(),
-            layout.transcript.width as usize,
-            TranscriptDetail::Compact,
-        );
+        let transcript_width = layout.transcript.width as usize;
+        let rendered_transcript;
+        let transcript = if let Some(transcript) = prepared_transcript {
+            transcript
+        } else {
+            rendered_transcript = transcript_lines(
+                state.live_transcript(),
+                transcript_width,
+                TranscriptDetail::Compact,
+            );
+            &rendered_transcript
+        };
         let viewport_height = layout.transcript.height as usize;
         let scroll = state
             .scroll
@@ -78,9 +97,10 @@ fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
             .len()
             .saturating_sub(viewport_height.saturating_add(scroll));
         let transcript = transcript
-            .into_iter()
+            .iter()
             .skip(start)
             .take(viewport_height)
+            .cloned()
             .collect::<Vec<_>>();
         frame.render_widget(Paragraph::new(Text::from(transcript)), layout.transcript);
     }

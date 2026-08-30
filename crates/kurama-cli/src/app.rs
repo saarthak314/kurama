@@ -37,6 +37,7 @@ use ratatui::{
     backend::{Backend, ClearType, CrosstermBackend},
     layout::{Position, Rect},
     style::Style,
+    text::Line,
     widgets::{Block, Padding, Paragraph, Widget},
 };
 use tokio::sync::mpsc;
@@ -47,10 +48,13 @@ use crate::{
     tui::{
         CursorTrackingBackend, OnboardingState, OnboardingSubmission, Overlay, SURFACE,
         SharedBackend, TerminalGuard, TranscriptDetail, TuiState, approval_height,
-        command_palette_height, composer_height, main_area, render, spawn_input_thread,
-        transcript_lines, visible_activity_rect,
+        command_palette_height, composer_height, main_area, render_with_transcript,
+        spawn_input_thread, transcript_lines, visible_activity_rect,
     },
 };
+
+#[cfg(test)]
+use crate::tui::render;
 
 const TRANSCRIPT_HORIZONTAL_PADDING: usize = 2;
 const MAX_TRANSCRIPT_INSERT_HEIGHT: usize = 1_024;
@@ -59,6 +63,37 @@ const TOOL_EVENT_CAPACITY: usize = 64;
 const READY_EVENT_BATCH_LIMIT: usize = 128;
 const STREAM_REDRAW_INTERVAL: Duration = Duration::from_millis(33);
 const ACTIVITY_FRAME_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Default)]
+struct TranscriptRenderCache {
+    width: Option<usize>,
+    lines: Vec<Line<'static>>,
+}
+
+impl TranscriptRenderCache {
+    fn invalidate(&mut self) {
+        self.width = None;
+        self.lines.clear();
+    }
+
+    fn prepare(&mut self, state: &TuiState, frame_area: Rect) {
+        if state.transcript_view_expanded() {
+            self.invalidate();
+            return;
+        }
+
+        let width = main_area(frame_area).width as usize;
+        if self.width == Some(width) {
+            return;
+        }
+        self.lines = transcript_lines(state.live_transcript(), width, TranscriptDetail::Compact);
+        self.width = Some(width);
+    }
+
+    fn lines(&self) -> Option<&[Line<'static>]> {
+        self.width.map(|_| self.lines.as_slice())
+    }
+}
 
 #[derive(Clone, Copy)]
 struct ResizeMode {
@@ -1175,7 +1210,11 @@ where
     )
 }
 
-fn prepare_inline_frame<B>(state: &mut TuiState, terminal: &mut Terminal<B>) -> Result<(), String>
+fn prepare_inline_frame<B>(
+    state: &mut TuiState,
+    terminal: &mut Terminal<B>,
+    transcript_cache: &mut TranscriptRenderCache,
+) -> Result<(), String>
 where
     B: Backend + Clone,
 {
@@ -1184,18 +1223,59 @@ where
         set_inline_viewport_height(terminal, size.height.min(INLINE_VIEWPORT_MAX_HEIGHT))
             .map_err(|error| error.to_string())?;
         commit_stable_transcript(state, terminal)?;
+        transcript_cache.invalidate();
     }
 
     let size = terminal.size().map_err(|error| error.to_string())?;
-    let viewport_height = desired_inline_viewport_height(state, size.width, size.height);
-    set_inline_viewport_height(terminal, viewport_height).map_err(|error| error.to_string())
+    let viewport_height = if uses_full_inline_viewport(state) {
+        size.height
+    } else {
+        transcript_cache.prepare(state, Rect::new(0, 0, size.width, size.height));
+        desired_inline_viewport_height_for_transcript(
+            state,
+            size.width,
+            size.height,
+            transcript_cache.lines.len(),
+        )
+    };
+    set_inline_viewport_height(terminal, viewport_height).map_err(|error| error.to_string())?;
+    Ok(())
 }
 
+fn prepare_fullscreen_frame<B>(
+    state: &TuiState,
+    terminal: &mut Terminal<B>,
+    transcript_cache: &mut TranscriptRenderCache,
+) -> Result<(), String>
+where
+    B: Backend,
+{
+    terminal.autoresize().map_err(|error| error.to_string())?;
+    transcript_cache.prepare(state, terminal.get_frame().area());
+    Ok(())
+}
+
+#[cfg(test)]
 fn desired_inline_viewport_height(state: &TuiState, width: u16, height: u16) -> u16 {
     if height == 0 {
         return 0;
     }
-    if state.transcript_view_expanded()
+    if uses_full_inline_viewport(state) {
+        return height;
+    }
+
+    let area = main_area(Rect::new(0, 0, width, height));
+    let transcript_height = transcript_lines(
+        state.live_transcript(),
+        area.width as usize,
+        TranscriptDetail::Compact,
+    )
+    .len();
+    desired_inline_viewport_height_for_transcript(state, width, height, transcript_height)
+}
+
+fn uses_full_inline_viewport(state: &TuiState) -> bool {
+    state.transcript_view_expanded()
         || matches!(
             state.overlay(),
             Overlay::Onboarding
@@ -1204,8 +1284,16 @@ fn desired_inline_viewport_height(state: &TuiState, width: u16, height: u16) -> 
                 | Overlay::AgentMessage
                 | Overlay::ConfirmAgentCancel
         )
-    {
-        return height;
+}
+
+fn desired_inline_viewport_height_for_transcript(
+    state: &TuiState,
+    width: u16,
+    height: u16,
+    transcript_height: usize,
+) -> u16 {
+    if height == 0 {
+        return 0;
     }
 
     let area = main_area(Rect::new(0, 0, width, height));
@@ -1231,13 +1319,7 @@ fn desired_inline_viewport_height(state: &TuiState, width: u16, height: u16) -> 
             .saturating_add(footer_height)
             .saturating_add(palette_height),
     );
-    let transcript_height = transcript_lines(
-        state.live_transcript(),
-        area.width as usize,
-        TranscriptDetail::Compact,
-    )
-    .len()
-    .min(transcript_capacity as usize) as u16;
+    let transcript_height = transcript_height.min(transcript_capacity as usize) as u16;
 
     input_height
         .saturating_add(activity_height)
@@ -1512,11 +1594,14 @@ where
         false
     };
     let mut input_open = true;
+    let mut transcript_cache = TranscriptRenderCache::default();
     if commit_to_scrollback {
-        prepare_inline_frame(&mut app.state, terminal)?;
+        prepare_inline_frame(&mut app.state, terminal, &mut transcript_cache)?;
+    } else {
+        prepare_fullscreen_frame(&app.state, terminal, &mut transcript_cache)?;
     }
     terminal
-        .draw(|frame| render(frame, &app.state))
+        .draw(|frame| render_with_transcript(frame, &app.state, transcript_cache.lines()))
         .map_err(|error| error.to_string())?;
     let mut last_draw = tokio::time::Instant::now();
     let mut next_activity_frame = last_draw + ACTIVITY_FRAME_INTERVAL;
@@ -1630,15 +1715,22 @@ where
         if !app.state.sent_commands().is_empty() {
             app.flush_commands().await?;
         }
+        if state_changed {
+            transcript_cache.invalidate();
+        }
         redraw_pending |= state_changed;
         let now = tokio::time::Instant::now();
         let channels_closed = !input_open && !runtime_open && !tool_open;
         if force_redraw || stream_redraw_due(last_draw, now, redraw_pending, channels_closed) {
             if commit_to_scrollback && !animation_tick {
-                prepare_inline_frame(&mut app.state, terminal)?;
+                prepare_inline_frame(&mut app.state, terminal, &mut transcript_cache)?;
+            } else if !commit_to_scrollback {
+                prepare_fullscreen_frame(&app.state, terminal, &mut transcript_cache)?;
+            } else {
+                transcript_cache.prepare(&app.state, terminal.get_frame().area());
             }
             terminal
-                .draw(|frame| render(frame, &app.state))
+                .draw(|frame| render_with_transcript(frame, &app.state, transcript_cache.lines()))
                 .map_err(|error| error.to_string())?;
             last_draw = tokio::time::Instant::now();
             next_activity_frame = last_draw + ACTIVITY_FRAME_INTERVAL;
@@ -2610,9 +2702,11 @@ Session ID: s_cached"
         let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24))
             .expect("initialize inline terminal");
 
-        prepare_inline_frame(&mut state, &mut terminal).expect("prepare inline frame");
+        let mut transcript_cache = TranscriptRenderCache::default();
+        prepare_inline_frame(&mut state, &mut terminal, &mut transcript_cache)
+            .expect("prepare inline frame");
         terminal
-            .draw(|frame| render(frame, &state))
+            .draw(|frame| render_with_transcript(frame, &state, transcript_cache.lines()))
             .expect("draw idle frame");
 
         assert_eq!(terminal.get_frame().area().height, 2);
@@ -2837,6 +2931,57 @@ Session ID: s_cached"
         assert_eq!(text.matches("committed answer").count(), 1, "{text}");
     }
 
+    #[test]
+    fn inline_prepare_reuses_markdown_render_for_draw() {
+        let mut state = TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised);
+        state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+            text: "## Heading\n\n- one\n- two\n\n```rust\nfn main() {}\n```".into(),
+        });
+        let mut terminal =
+            initialize_inline_terminal(TestBackend::new(80, 24)).expect("inline terminal");
+
+        crate::tui::reset_transcript_render_calls();
+        let mut transcript_cache = TranscriptRenderCache::default();
+        prepare_inline_frame(&mut state, &mut terminal, &mut transcript_cache)
+            .expect("prepare inline frame");
+        terminal
+            .draw(|frame| render_with_transcript(frame, &state, transcript_cache.lines()))
+            .expect("render inline frame");
+
+        assert_eq!(crate::tui::transcript_render_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn animation_redraws_reuse_unchanged_markdown() {
+        let mut app = test_app();
+        app.state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+            text: "## Heading\n\n- one\n- two\n\n```rust\nfn main() {}\n```".into(),
+        });
+        let mut terminal =
+            initialize_inline_terminal(TestBackend::new(80, 24)).expect("inline terminal");
+        let (input_sender, mut input) = mpsc::channel(1);
+        let closer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            drop(input_sender);
+        });
+
+        crate::tui::reset_transcript_render_calls();
+        run_loop(
+            &mut app,
+            &mut terminal,
+            &mut input,
+            None,
+            None,
+            true,
+            ResizeMode::PRESERVE,
+        )
+        .await
+        .expect("run animated inline frame");
+        closer.await.expect("close input channel");
+
+        assert_eq!(crate::tui::transcript_render_calls(), 1);
+    }
+
     #[tokio::test]
     async fn fullscreen_run_with_keeps_transcript_in_the_live_view() {
         let mut app = App {
@@ -2869,6 +3014,36 @@ Session ID: s_cached"
             .collect::<String>();
 
         assert!(visible.contains("visible fullscreen question"));
+        assert_eq!(app.state.live_transcript().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fullscreen_resize_wraps_markdown_at_the_current_backend_width() {
+        let mut app = test_app();
+        app.state
+            .push_assistant("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda");
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("fullscreen terminal");
+        terminal.backend_mut().resize(28, 12);
+        let (input_sender, input) = mpsc::channel(1);
+        let (runtime_sender, runtime_events) = mpsc::channel(1);
+        drop(input_sender);
+        drop(runtime_sender);
+
+        crate::tui::reset_transcript_render_calls();
+        let app = run_with(app, &mut terminal, input, runtime_events)
+            .await
+            .expect("run resized fullscreen terminal");
+        let visible = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert_eq!(terminal.get_frame().area().width, 28);
+        assert!(visible.contains("lambda"), "{visible}");
+        assert_eq!(crate::tui::transcript_render_calls(), 1);
         assert_eq!(app.state.live_transcript().len(), 1);
     }
 
