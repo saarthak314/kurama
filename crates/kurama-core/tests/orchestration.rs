@@ -14,16 +14,18 @@ use kurama_protocol::{
     KuramaError,
     agent::{
         AgentBudget, AgentResult, AgentSpec, AgentState, DelegationRequest, OrchestrationContext,
-        WriteScope,
+        ResolvedAgentSpec, SchedulePlan, WriteScope,
     },
+    id::{AgentId, SessionId},
     model::ModelProfile,
     policy::{ApprovalRequest, ApprovalResponse},
     runtime::RuntimeEvent,
+    session::SessionEvent,
     tool::Operation,
-    traits::{BoxFuture, Orchestrator},
+    traits::{BoxFuture, EventSink, Orchestrator, SessionStore},
 };
 use tokio::{
-    sync::{Notify, mpsc, oneshot},
+    sync::{Barrier, Notify, mpsc, oneshot},
     time::Duration,
 };
 
@@ -62,6 +64,32 @@ fn context() -> OrchestrationContext {
         depth: 0,
         yolo: false,
     }
+}
+
+fn resolved_agent(id: &str, role: &str, objective: &str, depends_on: &[&str]) -> ResolvedAgentSpec {
+    ResolvedAgentSpec {
+        id: id.into(),
+        parent_id: None,
+        depth: 1,
+        role: role.into(),
+        objective: objective.into(),
+        profile: ModelProfile::new("parent", "p", 100_000, 10_000),
+        context_refs: Vec::new(),
+        write_scope: WriteScope::default(),
+        budget: AgentBudget::default(),
+        depends_on: depends_on.iter().map(|value| (*value).into()).collect(),
+        escalation_profiles: Vec::new(),
+    }
+}
+
+fn cancelled_event_count(store: &MemoryStore, session_id: &str, agent_id: &AgentId) -> usize {
+    let session_id: SessionId = session_id.into();
+    store
+        .replay_agent(&session_id, agent_id)
+        .expect("replay agent")
+        .into_iter()
+        .filter(|event| matches!(event.event, SessionEvent::AgentCancelled { .. }))
+        .count()
 }
 
 #[test]
@@ -138,6 +166,68 @@ impl ChildRunner for ReportingRunner {
 }
 
 #[tokio::test]
+async fn manager_canonicalizes_unique_objective_dependencies() {
+    let mut implementation = agent("ignored", None, &[]);
+    implementation.objective = "implement api".into();
+    let mut review = agent("ignored", None, &["implement api"]);
+    review.objective = "review api".into();
+    let plan = SmartOrchestrator::new(Arc::new(SequenceIds::new(2)))
+        .resolve(
+            DelegationRequest {
+                agents: vec![implementation, review],
+            },
+            &context(),
+        )
+        .expect("resolve");
+    let manager = AgentManager::new(
+        "objective-dependency".into(),
+        None,
+        2,
+        Arc::new(MemoryStore::default()),
+        Arc::new(CollectingSink::default()),
+    );
+
+    let results = tokio::time::timeout(
+        Duration::from_millis(250),
+        manager.execute(plan, "project".into(), Arc::new(ReportingRunner)),
+    )
+    .await
+    .expect("objective dependency must not deadlock")
+    .expect("execute");
+
+    assert_eq!(results.len(), 2);
+}
+
+#[tokio::test]
+async fn manager_rejects_cyclic_resolved_dependencies() {
+    let plan = SchedulePlan {
+        ready: Vec::new(),
+        queued: Vec::new(),
+        blocked: vec![
+            resolved_agent("agent-a", "first", "first task", &["second"]),
+            resolved_agent("agent-b", "second", "second task", &["first"]),
+        ],
+    };
+    let manager = AgentManager::new(
+        "cyclic-dependency".into(),
+        None,
+        2,
+        Arc::new(MemoryStore::default()),
+        Arc::new(CollectingSink::default()),
+    );
+
+    let error = tokio::time::timeout(
+        Duration::from_millis(250),
+        manager.execute(plan, "project".into(), Arc::new(ReportingRunner)),
+    )
+    .await
+    .expect("cyclic plan must not deadlock")
+    .expect_err("cyclic plan must be rejected");
+
+    assert!(error.to_string().contains("cycle"));
+}
+
+#[tokio::test]
 async fn manager_runs_and_exposes_compact_child_inspection() {
     let orchestrator = SmartOrchestrator::new(Arc::new(SequenceIds::new(1)));
     let plan = orchestrator
@@ -168,6 +258,324 @@ async fn manager_runs_and_exposes_compact_child_inspection() {
 
 struct ControlledRunner {
     started: mpsc::UnboundedSender<kurama_protocol::id::AgentId>,
+}
+
+struct CleanupRunner {
+    started: Option<mpsc::UnboundedSender<kurama_protocol::id::AgentId>>,
+    finished: Arc<AtomicUsize>,
+    cleanup_delay: Duration,
+}
+
+impl ChildRunner for CleanupRunner {
+    fn run(
+        &self,
+        context: ChildRunContext,
+    ) -> BoxFuture<'static, Result<AgentResult, KuramaError>> {
+        let started = self.started.clone();
+        let finished = self.finished.clone();
+        let cleanup_delay = self.cleanup_delay;
+        Box::pin(async move {
+            if let Some(started) = started {
+                started.send(context.agent_id).expect("started");
+            }
+            context.cancel.cancelled().await;
+            tokio::time::sleep(cleanup_delay).await;
+            finished.fetch_add(1, Ordering::SeqCst);
+            Err(KuramaError::Cancelled)
+        })
+    }
+}
+
+struct NonCooperativeRunner {
+    started: mpsc::UnboundedSender<kurama_protocol::id::AgentId>,
+    dropped: Arc<AtomicUsize>,
+}
+
+struct DropCounter(Arc<AtomicUsize>);
+
+impl Drop for DropCounter {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl ChildRunner for NonCooperativeRunner {
+    fn run(
+        &self,
+        context: ChildRunContext,
+    ) -> BoxFuture<'static, Result<AgentResult, KuramaError>> {
+        let started = self.started.clone();
+        let dropped = self.dropped.clone();
+        Box::pin(async move {
+            started.send(context.agent_id).expect("started");
+            let _drop_counter = DropCounter(dropped);
+            std::future::pending::<Result<AgentResult, KuramaError>>().await
+        })
+    }
+}
+
+struct ErrorPathRunner {
+    barrier: Arc<Barrier>,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl ChildRunner for ErrorPathRunner {
+    fn run(
+        &self,
+        context: ChildRunContext,
+    ) -> BoxFuture<'static, Result<AgentResult, KuramaError>> {
+        let barrier = self.barrier.clone();
+        let dropped = self.dropped.clone();
+        Box::pin(async move {
+            let _drop_counter = DropCounter(dropped);
+            barrier.wait().await;
+            if context.launch.brief.role == "first" {
+                context
+                    .progress
+                    .send(ChildProgress {
+                        phase: Some("sink-failure".into()),
+                        ..ChildProgress::default()
+                    })
+                    .await
+                    .expect("progress");
+            }
+            std::future::pending::<Result<AgentResult, KuramaError>>().await
+        })
+    }
+}
+
+struct FailingProgressSink;
+
+impl EventSink for FailingProgressSink {
+    fn emit(&self, event: RuntimeEvent) -> Result<(), KuramaError> {
+        if matches!(
+            event,
+            RuntimeEvent::AgentUpdated { snapshot }
+                if snapshot.phase.as_deref() == Some("sink-failure")
+        ) {
+            return Err(KuramaError::Protocol("sink rejected child progress".into()));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn manager_timeout_cancels_and_awaits_child_cleanup() {
+    let mut spec = resolved_agent("timed-child", "worker", "slow task", &[]);
+    spec.budget.max_seconds = 0;
+    let plan = SchedulePlan {
+        ready: vec![spec],
+        queued: Vec::new(),
+        blocked: Vec::new(),
+    };
+    let finished = Arc::new(AtomicUsize::new(0));
+    let manager = AgentManager::new(
+        "timeout-cleanup".into(),
+        None,
+        1,
+        Arc::new(MemoryStore::default()),
+        Arc::new(CollectingSink::default()),
+    );
+
+    manager
+        .execute(
+            plan,
+            "project".into(),
+            Arc::new(CleanupRunner {
+                started: None,
+                finished: finished.clone(),
+                cleanup_delay: Duration::from_millis(20),
+            }),
+        )
+        .await
+        .expect("execute");
+
+    assert_eq!(finished.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn cancel_all_aborts_non_cooperative_child_after_grace() {
+    let plan = SchedulePlan {
+        ready: vec![resolved_agent("stuck-child", "worker", "never stops", &[])],
+        queued: Vec::new(),
+        blocked: Vec::new(),
+    };
+    let manager = AgentManager::new(
+        "non-cooperative-cancel".into(),
+        None,
+        1,
+        Arc::new(MemoryStore::default()),
+        Arc::new(CollectingSink::default()),
+    );
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let executing = manager.execute(
+        plan,
+        "project".into(),
+        Arc::new(NonCooperativeRunner {
+            started: started_tx,
+            dropped: dropped.clone(),
+        }),
+    );
+    tokio::pin!(executing);
+    tokio::select! {
+        result = &mut executing => panic!("execution ended before cancellation: {result:?}"),
+        started = started_rx.recv() => started.expect("child started"),
+    };
+
+    tokio::time::timeout(Duration::from_millis(500), manager.cancel_all())
+        .await
+        .expect("cancel_all must abort a non-cooperative child");
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    tokio::time::timeout(Duration::from_millis(250), &mut executing)
+        .await
+        .expect("execution must stop")
+        .expect("execute");
+}
+
+#[tokio::test]
+async fn execute_error_cancels_and_awaits_live_children() {
+    let plan = SchedulePlan {
+        ready: vec![
+            resolved_agent("error-child-a", "first", "first task", &[]),
+            resolved_agent("error-child-b", "second", "second task", &[]),
+        ],
+        queued: Vec::new(),
+        blocked: Vec::new(),
+    };
+    let manager = AgentManager::new(
+        "error-cleanup".into(),
+        None,
+        2,
+        Arc::new(MemoryStore::default()),
+        Arc::new(FailingProgressSink),
+    );
+    let dropped = Arc::new(AtomicUsize::new(0));
+
+    let error = tokio::time::timeout(
+        Duration::from_millis(500),
+        manager.execute(
+            plan,
+            "project".into(),
+            Arc::new(ErrorPathRunner {
+                barrier: Arc::new(Barrier::new(2)),
+                dropped: dropped.clone(),
+            }),
+        ),
+    )
+    .await
+    .expect("execute must return after bounded child cleanup")
+    .expect_err("sink failure must escape");
+    let dropped_when_execute_returned = dropped.load(Ordering::SeqCst);
+    manager.cancel_all().await;
+
+    assert!(error.to_string().contains("sink rejected child progress"));
+    assert_eq!(dropped_when_execute_returned, 2);
+}
+
+#[tokio::test]
+async fn cancel_all_terminalizes_without_repolling_execute() {
+    let session_id = "cancel-drop";
+    let agent_ids: Vec<AgentId> = vec!["child-a".into(), "child-b".into()];
+    let plan = SchedulePlan {
+        ready: vec![
+            resolved_agent("child-a", "first", "first task", &[]),
+            resolved_agent("child-b", "second", "second task", &[]),
+        ],
+        queued: Vec::new(),
+        blocked: Vec::new(),
+    };
+    let store = Arc::new(MemoryStore::default());
+    let manager = AgentManager::new(
+        session_id.into(),
+        None,
+        1,
+        store.clone(),
+        Arc::new(CollectingSink::default()),
+    );
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let finished = Arc::new(AtomicUsize::new(0));
+    let mut executing = Box::pin(manager.execute(
+        plan,
+        "project".into(),
+        Arc::new(CleanupRunner {
+            started: Some(started_tx),
+            finished: finished.clone(),
+            cleanup_delay: Duration::from_millis(20),
+        }),
+    ));
+    tokio::select! {
+        result = &mut executing => panic!("execution ended before cancellation: {result:?}"),
+        started = started_rx.recv() => assert_eq!(started.expect("child started"), agent_ids[0]),
+    };
+
+    manager.cancel_all().await;
+    drop(executing);
+
+    assert_eq!(finished.load(Ordering::SeqCst), 1);
+    assert!(started_rx.try_recv().is_err());
+    for agent_id in agent_ids {
+        let inspection = manager.inspect(&agent_id).await.expect("inspect");
+        assert_eq!(inspection.snapshot.state, AgentState::Cancelled);
+        assert_eq!(cancelled_event_count(&store, session_id, &agent_id), 1);
+    }
+}
+
+#[tokio::test]
+async fn cancel_all_awaits_running_children_and_repoll_does_not_duplicate_events() {
+    let session_id = "cancel-all";
+    let plan = SchedulePlan {
+        ready: vec![
+            resolved_agent("child-a", "first", "first task", &[]),
+            resolved_agent("child-b", "second", "second task", &[]),
+            resolved_agent("child-c", "third", "third task", &[]),
+        ],
+        queued: Vec::new(),
+        blocked: Vec::new(),
+    };
+    let agent_ids: Vec<_> = plan.ready.iter().map(|agent| agent.id.clone()).collect();
+    let store = Arc::new(MemoryStore::default());
+    let manager = AgentManager::new(
+        session_id.into(),
+        None,
+        2,
+        store.clone(),
+        Arc::new(CollectingSink::default()),
+    );
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let finished = Arc::new(AtomicUsize::new(0));
+    let executing = manager.execute(
+        plan,
+        "project".into(),
+        Arc::new(CleanupRunner {
+            started: Some(started_tx),
+            finished: finished.clone(),
+            cleanup_delay: Duration::from_millis(20),
+        }),
+    );
+    tokio::pin!(executing);
+    for _ in 0..2 {
+        tokio::select! {
+            result = &mut executing => panic!("execution ended before cancellation: {result:?}"),
+            started = started_rx.recv() => started.expect("child started"),
+        };
+    }
+
+    manager.cancel_all().await;
+    let finished_when_cancel_returned = finished.load(Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_millis(250), &mut executing)
+        .await
+        .expect("execution must stop")
+        .expect("execute");
+
+    assert_eq!(finished_when_cancel_returned, 2);
+    assert_eq!(finished.load(Ordering::SeqCst), 2);
+    assert!(started_rx.try_recv().is_err());
+    for agent_id in agent_ids {
+        let inspection = manager.inspect(&agent_id).await.expect("inspect");
+        assert_eq!(inspection.snapshot.state, AgentState::Cancelled);
+        assert_eq!(cancelled_event_count(&store, session_id, &agent_id), 1);
+    }
 }
 
 impl ChildRunner for ControlledRunner {
@@ -505,5 +913,8 @@ async fn manager_enforces_seconds_across_retries_and_escalation() {
     );
     let inspection = manager.inspect(&agent_id).await.expect("inspect");
     assert_eq!(inspection.snapshot.state, AgentState::Failed);
-    assert_eq!(inspection.snapshot.last_error.as_deref(), Some("cancelled"));
+    assert_eq!(
+        inspection.snapshot.last_error.as_deref(),
+        Some("child execution timed out")
+    );
 }

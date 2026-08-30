@@ -1,10 +1,10 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
     time::Duration,
 };
 
-use futures_util::{StreamExt, stream::FuturesUnordered};
+use futures_util::{FutureExt, future::Shared};
 use kurama_protocol::{
     KuramaError,
     agent::{
@@ -20,10 +20,14 @@ use kurama_protocol::{
 };
 use tokio::{
     sync::{Mutex, mpsc, oneshot},
+    task::JoinHandle,
     time::Instant,
 };
 
 use crate::{cancel::CancelToken, orchestrator::scopes_overlap};
+
+const CHILD_CLEANUP_GRACE: Duration = Duration::from_millis(100);
+const CHILD_TIMEOUT_ERROR: &str = "child execution timed out";
 
 #[derive(Debug, Clone, Default)]
 pub struct ChildProgress {
@@ -50,6 +54,15 @@ pub struct ChildApproval {
     pub request: ApprovalRequest,
     pub response: oneshot::Sender<ApprovalResponse>,
 }
+
+struct ChildCompletion {
+    outcome: Result<AgentResult, KuramaError>,
+    timed_out: bool,
+}
+
+type ChildCompletionMessage = (AgentId, ChildCompletion);
+type ChildCompletionSender = mpsc::UnboundedSender<ChildCompletionMessage>;
+type ChildCompletionReceiver = mpsc::UnboundedReceiver<ChildCompletionMessage>;
 
 pub trait ChildRunner: Send + Sync {
     fn run(&self, context: ChildRunContext)
@@ -90,6 +103,7 @@ struct ManagedAgent {
     profile_attempts: u8,
     next_escalation: usize,
     execution_deadline: Option<Instant>,
+    task: Option<Shared<BoxFuture<'static, ()>>>,
 }
 
 impl AgentManager {
@@ -131,17 +145,31 @@ impl AgentManager {
         project_summary: String,
         runner: Arc<dyn ChildRunner>,
     ) -> Result<Vec<AgentResult>, KuramaError> {
-        let specs: Vec<_> = plan
+        let result = self.execute_inner(plan, project_summary, runner).await;
+        if result.is_err() {
+            self.cancel_all().await;
+        }
+        result
+    }
+
+    async fn execute_inner(
+        &self,
+        plan: SchedulePlan,
+        project_summary: String,
+        runner: Arc<dyn ChildRunner>,
+    ) -> Result<Vec<AgentResult>, KuramaError> {
+        let mut specs: Vec<_> = plan
             .ready
             .into_iter()
             .chain(plan.queued)
             .chain(plan.blocked)
             .collect();
+        canonicalize_dependencies(&mut specs)?;
         self.register(&specs).await?;
 
         let (progress_tx, mut progress_rx) = mpsc::channel(64);
         let (approval_tx, mut approval_rx) = mpsc::channel(32);
-        let mut running = FuturesUnordered::new();
+        let (completed_tx, mut completed_rx) = completion_channel();
         let mut results = Vec::new();
 
         loop {
@@ -153,18 +181,21 @@ impl AgentManager {
                 runner.clone(),
                 progress_tx.clone(),
                 approval_tx.clone(),
-                &mut running,
+                completed_tx.clone(),
             )
             .await?;
 
             if self.all_terminal().await {
                 break;
             }
-            if running.is_empty() {
+            if !self.has_running().await {
                 self.fail_unrunnable().await?;
                 if self.all_terminal().await {
                     break;
                 }
+                return Err(KuramaError::Protocol(
+                    "agent dependency graph cannot make progress".into(),
+                ));
             }
 
             tokio::select! {
@@ -178,18 +209,20 @@ impl AgentManager {
                         self.queue_approval(approval).await?;
                     }
                 }
-                completed = running.next(), if !running.is_empty() => {
+                completed = completed_rx.recv() => {
                     while let Ok((agent_id, progress)) = progress_rx.try_recv() {
                         self.apply_progress(&agent_id, progress).await?;
                     }
-                    if let Some((agent_id, outcome)) = completed
-                        && let Some(result) = self.finish(&agent_id, outcome).await?
-                    {
-                        results.push(result);
+                    if let Some((agent_id, completion)) = completed {
+                        self.await_agent_task(&agent_id).await;
+                        if let Some(result) = self.finish(&agent_id, completion).await? {
+                            results.push(result);
+                        }
                     }
                 }
             }
         }
+        self.await_all_tasks().await;
         Ok(results)
     }
 
@@ -323,9 +356,42 @@ impl AgentManager {
     }
 
     pub async fn cancel_all(&self) {
-        let state = self.state.lock().await;
-        for agent in state.agents.values() {
-            agent.cancel.cancel();
+        let (tasks, snapshots) = {
+            let mut state = self.state.lock().await;
+            state.active_approval = None;
+            state.queued_approvals.clear();
+            let mut tasks = Vec::new();
+            let mut snapshots = Vec::new();
+            for agent in state.agents.values_mut() {
+                agent.cancel.cancel();
+                agent.messages = None;
+                agent.pending_messages.clear();
+                if let Some(task) = agent.task.clone() {
+                    tasks.push(task);
+                }
+                if matches!(
+                    agent.snapshot.state,
+                    AgentState::Completed | AgentState::Failed | AgentState::Cancelled
+                ) {
+                    continue;
+                }
+                agent.snapshot.state = AgentState::Cancelled;
+                let snapshot = agent.snapshot.clone();
+                let _ = self.append_agent_event(
+                    agent,
+                    SessionEvent::AgentCancelled {
+                        snapshot: snapshot.clone(),
+                    },
+                );
+                snapshots.push(snapshot);
+            }
+            (tasks, snapshots)
+        };
+        for task in tasks {
+            task.await;
+        }
+        for snapshot in snapshots {
+            let _ = self.emit(RuntimeEvent::AgentUpdated { snapshot }).await;
         }
     }
 
@@ -360,6 +426,7 @@ impl AgentManager {
                     profile_attempts: 0,
                     next_escalation: 0,
                     execution_deadline: None,
+                    task: None,
                 };
                 self.append_agent_event(
                     &agent,
@@ -380,12 +447,10 @@ impl AgentManager {
         runner: Arc<dyn ChildRunner>,
         progress_tx: mpsc::Sender<(AgentId, ChildProgress)>,
         approval_tx: mpsc::Sender<ChildApproval>,
-        running: &mut FuturesUnordered<
-            BoxFuture<'static, (AgentId, Result<AgentResult, KuramaError>)>,
-        >,
+        completed_tx: ChildCompletionSender,
     ) -> Result<(), KuramaError> {
         loop {
-            let launch = {
+            let snapshot = {
                 let mut state = self.state.lock().await;
                 let active: Vec<_> = state
                     .agents
@@ -396,17 +461,18 @@ impl AgentManager {
                 if active.len() >= self.max_concurrency {
                     return Ok(());
                 }
-                let completed: Vec<_> = state
+                let completed: BTreeSet<_> = state
                     .agents
                     .values()
                     .filter(|agent| agent.snapshot.state == AgentState::Completed)
-                    .flat_map(agent_dependency_keys)
+                    .map(|agent| agent.spec.id.to_string())
                     .collect();
                 let candidate_id = state
                     .agents
                     .values()
                     .find(|agent| {
                         agent.snapshot.state == AgentState::Queued
+                            && !agent.cancel.is_cancelled()
                             && agent
                                 .spec
                                 .depends_on
@@ -441,66 +507,92 @@ impl AgentManager {
                         snapshot: snapshot.clone(),
                     },
                 )?;
-                (
-                    agent.spec.clone(),
-                    agent.cancel.clone(),
-                    message_rx,
-                    snapshot,
-                    execution_deadline,
-                )
-            };
-            self.emit(RuntimeEvent::AgentUpdated {
-                snapshot: launch.3.clone(),
-            })
-            .await?;
-
-            let (spec, cancel, messages, _, execution_deadline) = launch;
-            let (child_progress_tx, mut child_progress_rx) = mpsc::channel(32);
-            let forwarding = progress_tx.clone();
-            let forwarding_id = spec.id.clone();
-            let forward = async move {
-                while let Some(progress) = child_progress_rx.recv().await {
-                    if forwarding
-                        .send((forwarding_id.clone(), progress))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                let spec = agent.spec.clone();
+                let cancel = agent.cancel.clone();
+                let (child_progress_tx, mut child_progress_rx) = mpsc::channel(32);
+                let forwarding = progress_tx.clone();
+                let forwarding_id = spec.id.clone();
+                let forwarding_cancel = cancel.clone();
+                let forward_task = tokio::spawn(async move {
+                    while let Some(progress) = child_progress_rx.recv().await {
+                        let send = forwarding.send((forwarding_id.clone(), progress));
+                        tokio::select! {
+                            () = forwarding_cancel.cancelled() => break,
+                            result = send => {
+                                if result.is_err() {
+                                    break;
+                                }
+                            }
+                        }
                     }
-                }
-            };
-            let forward_task = tokio::spawn(forward);
-            let context = ChildRunContext {
-                agent_id: spec.id.clone(),
-                launch: ChildLaunch {
-                    parent_session_id: self.session_id.clone(),
-                    parent_agent_id: self.parent_agent_id.clone(),
-                    depth: 1,
-                    brief: ChildBrief {
-                        role: spec.role.clone(),
-                        objective: spec.objective.clone(),
-                        project_summary: project_summary.into(),
-                        context_refs: spec.context_refs.clone(),
+                });
+                let context = ChildRunContext {
+                    agent_id: spec.id.clone(),
+                    launch: ChildLaunch {
+                        parent_session_id: self.session_id.clone(),
+                        parent_agent_id: self.parent_agent_id.clone(),
+                        depth: 1,
+                        brief: ChildBrief {
+                            role: spec.role.clone(),
+                            objective: spec.objective.clone(),
+                            project_summary: project_summary.into(),
+                            context_refs: spec.context_refs.clone(),
+                        },
+                        profile: spec.profile.clone(),
+                        budget: spec.budget.clone(),
+                        write_scope: spec.write_scope.clone(),
+                        delegation_enabled: false,
                     },
-                    profile: spec.profile.clone(),
-                    budget: spec.budget.clone(),
-                    write_scope: spec.write_scope.clone(),
-                    delegation_enabled: false,
-                },
-                cancel: cancel.clone(),
-                messages,
-                progress: child_progress_tx,
-                approvals: approval_tx.clone(),
+                    cancel: cancel.clone(),
+                    messages: message_rx,
+                    progress: child_progress_tx,
+                    approvals: approval_tx.clone(),
+                };
+                let agent_id = spec.id.clone();
+                let child_runner = runner.clone();
+                let child_task = tokio::spawn(async move { child_runner.run(context).await });
+                let completion = completed_tx.clone();
+                let supervisor: JoinHandle<()> = tokio::spawn(async move {
+                    let mut child_task = child_task;
+                    let deadline = tokio::time::sleep_until(execution_deadline);
+                    tokio::pin!(deadline);
+                    let child_completion = tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => {
+                            stop_child_task(&mut child_task).await;
+                            ChildCompletion {
+                                outcome: Err(KuramaError::Cancelled),
+                                timed_out: false,
+                            }
+                        }
+                        () = &mut deadline => {
+                            cancel.cancel();
+                            stop_child_task(&mut child_task).await;
+                            ChildCompletion {
+                                outcome: Err(KuramaError::Cancelled),
+                                timed_out: true,
+                            }
+                        }
+                        result = &mut child_task => {
+                            ChildCompletion {
+                                outcome: flatten_child_result(result),
+                                timed_out: false,
+                            }
+                        }
+                    };
+                    let _ = forward_task.await;
+                    let _ = completion.send((agent_id, child_completion));
+                });
+                agent.task = Some(
+                    async move {
+                        let _ = supervisor.await;
+                    }
+                    .boxed()
+                    .shared(),
+                );
+                snapshot
             };
-            let agent_id = spec.id.clone();
-            let future = runner.run(context);
-            running.push(Box::pin(async move {
-                let result = tokio::time::timeout_at(execution_deadline, future)
-                    .await
-                    .unwrap_or(Err(KuramaError::Cancelled));
-                let _ = forward_task.await;
-                (agent_id, result)
-            }));
+            self.emit(RuntimeEvent::AgentUpdated { snapshot }).await?;
         }
     }
 
@@ -566,17 +658,40 @@ impl AgentManager {
     async fn finish(
         &self,
         agent_id: &AgentId,
-        outcome: Result<AgentResult, KuramaError>,
+        completion: ChildCompletion,
     ) -> Result<Option<AgentResult>, KuramaError> {
+        let ChildCompletion { outcome, timed_out } = completion;
         let (snapshot, result, next_request) = {
             let mut state = self.state.lock().await;
+            let agent = state
+                .agents
+                .get(agent_id)
+                .ok_or_else(|| KuramaError::NotFound(agent_id.to_string()))?;
+            if matches!(
+                agent.snapshot.state,
+                AgentState::Completed | AgentState::Failed | AgentState::Cancelled
+            ) {
+                return Ok(None);
+            }
             let next_request = remove_agent_approvals(&mut state, agent_id);
             let agent = state
                 .agents
                 .get_mut(agent_id)
                 .ok_or_else(|| KuramaError::NotFound(agent_id.to_string()))?;
             agent.messages = None;
-            if agent.cancel.is_cancelled() {
+            if timed_out {
+                agent.snapshot.state = AgentState::Failed;
+                agent.snapshot.last_error = Some(CHILD_TIMEOUT_ERROR.into());
+                let snapshot = agent.snapshot.clone();
+                self.append_agent_event(
+                    agent,
+                    SessionEvent::AgentFailed {
+                        snapshot: snapshot.clone(),
+                        error: CHILD_TIMEOUT_ERROR.into(),
+                    },
+                )?;
+                (snapshot, None, next_request)
+            } else if agent.cancel.is_cancelled() {
                 agent.snapshot.state = AgentState::Cancelled;
                 let snapshot = agent.snapshot.clone();
                 self.append_agent_event(
@@ -665,42 +780,71 @@ impl AgentManager {
     }
 
     async fn fail_unrunnable(&self) -> Result<(), KuramaError> {
-        let failed_keys: Vec<_> = self
-            .state
-            .lock()
-            .await
-            .agents
-            .values()
-            .filter(|agent| {
-                matches!(
-                    agent.snapshot.state,
-                    AgentState::Failed | AgentState::Cancelled
-                )
-            })
-            .flat_map(agent_dependency_keys)
-            .collect();
         let snapshots = {
             let mut state = self.state.lock().await;
             let mut snapshots = Vec::new();
-            for agent in state.agents.values_mut().filter(|agent| {
-                agent.snapshot.state == AgentState::Queued
-                    && agent
-                        .spec
-                        .depends_on
-                        .iter()
-                        .any(|dependency| failed_keys.contains(dependency))
-            }) {
-                agent.snapshot.state = AgentState::Failed;
-                agent.snapshot.last_error = Some("dependency did not complete".into());
-                let snapshot = agent.snapshot.clone();
-                self.append_agent_event(
-                    agent,
-                    SessionEvent::AgentFailed {
-                        snapshot: snapshot.clone(),
-                        error: "dependency did not complete".into(),
-                    },
-                )?;
-                snapshots.push(snapshot);
+            loop {
+                let cancelled: Vec<_> = state
+                    .agents
+                    .values()
+                    .filter(|agent| {
+                        agent.snapshot.state == AgentState::Queued && agent.cancel.is_cancelled()
+                    })
+                    .map(|agent| agent.spec.id.clone())
+                    .collect();
+                for agent_id in cancelled {
+                    let agent = state.agents.get_mut(&agent_id).expect("cancelled agent");
+                    agent.snapshot.state = AgentState::Cancelled;
+                    let snapshot = agent.snapshot.clone();
+                    self.append_agent_event(
+                        agent,
+                        SessionEvent::AgentCancelled {
+                            snapshot: snapshot.clone(),
+                        },
+                    )?;
+                    snapshots.push(snapshot);
+                }
+                let failed_ids: BTreeSet<_> = state
+                    .agents
+                    .values()
+                    .filter(|agent| {
+                        matches!(
+                            agent.snapshot.state,
+                            AgentState::Failed | AgentState::Cancelled
+                        )
+                    })
+                    .map(|agent| agent.spec.id.to_string())
+                    .collect();
+                let blocked: Vec<_> = state
+                    .agents
+                    .values()
+                    .filter(|agent| {
+                        agent.snapshot.state == AgentState::Queued
+                            && agent
+                                .spec
+                                .depends_on
+                                .iter()
+                                .any(|dependency| failed_ids.contains(dependency))
+                    })
+                    .map(|agent| agent.spec.id.clone())
+                    .collect();
+                if blocked.is_empty() {
+                    break;
+                }
+                for agent_id in blocked {
+                    let agent = state.agents.get_mut(&agent_id).expect("blocked agent");
+                    agent.snapshot.state = AgentState::Failed;
+                    agent.snapshot.last_error = Some("dependency did not complete".into());
+                    let snapshot = agent.snapshot.clone();
+                    self.append_agent_event(
+                        agent,
+                        SessionEvent::AgentFailed {
+                            snapshot: snapshot.clone(),
+                            error: "dependency did not complete".into(),
+                        },
+                    )?;
+                    snapshots.push(snapshot);
+                }
             }
             snapshots
         };
@@ -708,6 +852,42 @@ impl AgentManager {
             self.emit(RuntimeEvent::AgentUpdated { snapshot }).await?;
         }
         Ok(())
+    }
+
+    async fn has_running(&self) -> bool {
+        self.state
+            .lock()
+            .await
+            .agents
+            .values()
+            .any(|agent| agent.snapshot.state == AgentState::Running)
+    }
+
+    async fn await_agent_task(&self, agent_id: &AgentId) {
+        let task = self
+            .state
+            .lock()
+            .await
+            .agents
+            .get(agent_id)
+            .and_then(|agent| agent.task.clone());
+        if let Some(task) = task {
+            task.await;
+        }
+    }
+
+    async fn await_all_tasks(&self) {
+        let tasks = self
+            .state
+            .lock()
+            .await
+            .agents
+            .values()
+            .filter_map(|agent| agent.task.clone())
+            .collect::<Vec<_>>();
+        for task in tasks {
+            task.await;
+        }
     }
 
     async fn all_terminal(&self) -> bool {
@@ -789,9 +969,147 @@ fn approval_is_live(agents: &BTreeMap<AgentId, ManagedAgent>, approval: &ChildAp
         })
 }
 
-fn agent_dependency_keys(agent: &ManagedAgent) -> [String; 2] {
-    [
-        agent.spec.role.clone(),
-        format!("{}:{}", agent.spec.role, agent.spec.objective),
-    ]
+fn flatten_child_result(
+    result: Result<Result<AgentResult, KuramaError>, tokio::task::JoinError>,
+) -> Result<AgentResult, KuramaError> {
+    result.map_err(|error| KuramaError::Protocol(format!("child task failed: {error}")))?
+}
+
+fn completion_channel() -> (ChildCompletionSender, ChildCompletionReceiver) {
+    mpsc::unbounded_channel()
+}
+
+async fn stop_child_task(child_task: &mut JoinHandle<Result<AgentResult, KuramaError>>) {
+    if tokio::time::timeout(CHILD_CLEANUP_GRACE, &mut *child_task)
+        .await
+        .is_err()
+    {
+        child_task.abort();
+        let _ = child_task.await;
+    }
+}
+
+fn canonicalize_dependencies(specs: &mut [ResolvedAgentSpec]) -> Result<(), KuramaError> {
+    let mut ids = BTreeMap::new();
+    let mut keys = BTreeMap::new();
+    let mut roles: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut objectives: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, spec) in specs.iter().enumerate() {
+        if ids.insert(spec.id.to_string(), index).is_some() {
+            return Err(KuramaError::Protocol(format!(
+                "duplicate agent id {}",
+                spec.id
+            )));
+        }
+        let key = format!("{}:{}", spec.role, spec.objective);
+        if keys.insert(key, index).is_some() {
+            return Err(KuramaError::Protocol(
+                "delegation contains duplicate role/objective pairs".into(),
+            ));
+        }
+        roles.entry(spec.role.clone()).or_default().push(index);
+        objectives
+            .entry(spec.objective.clone())
+            .or_default()
+            .push(index);
+    }
+
+    let mut graph = vec![Vec::new(); specs.len()];
+    for index in 0..specs.len() {
+        let mut canonical = BTreeSet::new();
+        for dependency in &specs[index].depends_on {
+            let dependency_index =
+                resolve_dependency(dependency, &ids, &keys, &roles, &objectives)?;
+            graph[index].push(dependency_index);
+            canonical.insert(specs[dependency_index].id.to_string());
+        }
+        specs[index].depends_on = canonical.into_iter().collect();
+    }
+    ensure_dependency_graph_acyclic(&graph)
+}
+
+fn resolve_dependency(
+    dependency: &str,
+    ids: &BTreeMap<String, usize>,
+    keys: &BTreeMap<String, usize>,
+    roles: &BTreeMap<String, Vec<usize>>,
+    objectives: &BTreeMap<String, Vec<usize>>,
+) -> Result<usize, KuramaError> {
+    if let Some(index) = ids.get(dependency).or_else(|| keys.get(dependency)) {
+        return Ok(*index);
+    }
+    let candidates: BTreeSet<_> = roles
+        .get(dependency)
+        .into_iter()
+        .chain(objectives.get(dependency))
+        .flatten()
+        .copied()
+        .collect();
+    match candidates.len() {
+        0 => Err(KuramaError::Protocol(format!(
+            "unknown dependency {dependency}"
+        ))),
+        1 => Ok(*candidates.iter().next().expect("one dependency")),
+        _ => Err(KuramaError::Protocol(format!(
+            "ambiguous dependency {dependency}"
+        ))),
+    }
+}
+
+fn ensure_dependency_graph_acyclic(graph: &[Vec<usize>]) -> Result<(), KuramaError> {
+    fn visit(
+        index: usize,
+        graph: &[Vec<usize>],
+        visiting: &mut [bool],
+        visited: &mut [bool],
+    ) -> Result<(), KuramaError> {
+        if visiting[index] {
+            return Err(KuramaError::Protocol(
+                "agent dependency graph contains a cycle".into(),
+            ));
+        }
+        if visited[index] {
+            return Ok(());
+        }
+        visiting[index] = true;
+        for dependency in &graph[index] {
+            visit(*dependency, graph, visiting, visited)?;
+        }
+        visiting[index] = false;
+        visited[index] = true;
+        Ok(())
+    }
+
+    let mut visiting = vec![false; graph.len()];
+    let mut visited = vec![false; graph.len()];
+    for index in 0..graph.len() {
+        visit(index, graph, &mut visiting, &mut visited)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_delivery_exceeds_old_capacity_while_receiver_is_paused() {
+        let (sender, mut receiver) = completion_channel();
+        for index in 0..32 {
+            sender
+                .send((
+                    format!("agent-{index}").into(),
+                    ChildCompletion {
+                        outcome: Err(KuramaError::Cancelled),
+                        timed_out: false,
+                    },
+                ))
+                .expect("completion delivery");
+        }
+
+        assert_eq!(receiver.len(), 32);
+        for _ in 0..32 {
+            receiver.try_recv().expect("queued completion");
+        }
+    }
 }
