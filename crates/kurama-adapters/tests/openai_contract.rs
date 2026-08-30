@@ -20,7 +20,10 @@ use providers::{normalize_delegation_events, openai::OpenAiBackend, sse::SseDeco
 #[path = "support/provider_http.rs"]
 mod provider_http;
 
-use provider_http::{NeverCancel, serve_sse_once};
+use provider_http::{
+    DelayedSseResponse, NeverCancel, serve_sse_once, serve_sse_until_released,
+    split_first_sse_event,
+};
 
 fn request() -> ModelRequest {
     ModelRequest {
@@ -242,11 +245,195 @@ async fn openai_backend_posts_responses_request_and_streams_fixture() {
 }
 
 #[tokio::test]
+async fn openai_backend_yields_before_response_eof() {
+    let fixture = include_str!("../../../tests/fixtures/openai/tool_turn.jsonl");
+    let (first, tail) = split_first_sse_event(fixture);
+    let server = serve_sse_until_released(first, tail).await;
+    let backend = OpenAiBackend::from_endpoint(HttpClient::default(), &server.endpoint, "test-key")
+        .expect("backend");
+
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        backend.stream(request(), &NeverCancel),
+    )
+    .await
+    .expect("OpenAI stream waited for response EOF")
+    .expect("stream");
+    let first = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+        .await
+        .expect("first event timed out")
+        .expect("first event")
+        .expect("first event error");
+
+    assert!(matches!(first, ModelEvent::ResponseStarted { .. }));
+    server.release.send(()).expect("release response tail");
+    while let Some(event) = stream.next().await {
+        event.expect("remaining event");
+    }
+    let _ = server.captured.await.expect("captured request");
+}
+
+#[tokio::test]
+async fn openai_backend_streams_delegation_without_exposing_control_text() {
+    let control = r#"<kurama_delegate>{"agents":[{"objective":"Review the patch","context_refs":[],"write_scope":{"roots":[],"files":[]},"budget":{"max_input_tokens":8000,"max_output_tokens":1000,"max_turns":2,"max_seconds":120},"depends_on":[]}]}</kurama_delegate>"#;
+    let body = format!(
+        "data: {}\n\ndata: {}\n\ndata: {}\n\n",
+        serde_json::json!({"type":"response.created","response":{"id":"resp_delegate"}}),
+        serde_json::json!({"type":"response.output_text.delta","delta":control}),
+        serde_json::json!({"type":"response.completed","response":{"id":"resp_delegate"}}),
+    );
+    let (endpoint, captured) = serve_sse_once(body).await;
+    let backend = OpenAiBackend::from_endpoint(HttpClient::default(), &endpoint, "test-key")
+        .expect("backend");
+
+    let events = backend
+        .stream(request(), &NeverCancel)
+        .await
+        .expect("stream")
+        .collect::<Vec<_>>()
+        .await;
+    let events = events
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("events");
+    let _ = captured.await.expect("captured request");
+
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, ModelEvent::TextDelta { .. }))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ModelEvent::Delegation { request } if request.agents[0].objective == "Review the patch"
+    )));
+    assert!(matches!(
+        events.last(),
+        Some(ModelEvent::ResponseCompleted {
+            finish_reason: kurama_protocol::model::FinishReason::ToolCalls,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn openai_backend_rejects_split_delegation_open_after_text() {
+    let body = openai_text_stream(&["ordinary text", "<kurama_", "delegate>"]);
+    let (endpoint, captured) = serve_sse_once(body).await;
+    let backend = OpenAiBackend::from_endpoint(HttpClient::default(), &endpoint, "test-key")
+        .expect("backend");
+
+    let mut stream = backend
+        .stream(request(), &NeverCancel)
+        .await
+        .expect("stream");
+    let mut emitted_text = String::new();
+    let mut error = None;
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(ModelEvent::TextDelta { text }) => emitted_text.push_str(&text),
+            Ok(_) => {}
+            Err(stream_error) => {
+                error = Some(stream_error);
+                break;
+            }
+        }
+    }
+    let _ = captured.await.expect("captured request");
+
+    assert_eq!(emitted_text, "ordinary text");
+    assert!(matches!(
+        error.expect("delegation marker error"),
+        KuramaError::Protocol(message) if message.contains("delegation marker")
+    ));
+}
+
+#[tokio::test]
+async fn openai_backend_rejects_split_delegation_close_after_text() {
+    let body = openai_text_stream(&["ordinary text", "</kurama_", "delegate>"]);
+    let (endpoint, captured) = serve_sse_once(body).await;
+    let backend = OpenAiBackend::from_endpoint(HttpClient::default(), &endpoint, "test-key")
+        .expect("backend");
+
+    let mut stream = backend
+        .stream(request(), &NeverCancel)
+        .await
+        .expect("stream");
+    let mut emitted_text = String::new();
+    let mut error = None;
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(ModelEvent::TextDelta { text }) => emitted_text.push_str(&text),
+            Ok(_) => {}
+            Err(stream_error) => {
+                error = Some(stream_error);
+                break;
+            }
+        }
+    }
+    let _ = captured.await.expect("captured request");
+
+    assert_eq!(emitted_text, "ordinary text");
+    assert!(matches!(
+        error.expect("delegation marker error"),
+        KuramaError::Protocol(message) if message.contains("delegation marker")
+    ));
+}
+
+#[tokio::test]
+async fn openai_backend_bounds_candidate_non_text_bytes() {
+    let arguments = serde_json::json!({"blob": "x".repeat(70 * 1024)}).to_string();
+    let body = format!(
+        "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\n",
+        serde_json::json!({"type":"response.created","response":{"id":"resp_buffer"}}),
+        serde_json::json!({"type":"response.output_text.delta","delta":"<kurama_delegate>{"}),
+        serde_json::json!({"type":"response.output_item.added","item":{"type":"function_call","id":"fc_buffer","call_id":"call_buffer","name":"read","arguments":""}}),
+        serde_json::json!({"type":"response.function_call_arguments.done","item_id":"fc_buffer","arguments":arguments}),
+    );
+    let DelayedSseResponse {
+        endpoint,
+        captured,
+        first_sent: _,
+        release,
+        disconnected,
+    } = serve_sse_until_released(body, "x").await;
+    let backend = OpenAiBackend::from_endpoint(HttpClient::default(), &endpoint, "test-key")
+        .expect("backend");
+    let mut stream = backend
+        .stream(request(), &NeverCancel)
+        .await
+        .expect("stream");
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match stream.next().await.expect("bounded stream item") {
+                Ok(_) => {}
+                Err(error) => break error,
+            }
+        }
+    })
+    .await
+    .expect("candidate byte bound waited for EOF");
+    assert!(matches!(
+        error,
+        KuramaError::Protocol(message)
+            if message.contains("delegation candidate") && message.contains("bytes")
+    ));
+    drop(stream);
+    tokio::time::timeout(std::time::Duration::from_secs(1), disconnected)
+        .await
+        .expect("bounded candidate response stayed open")
+        .expect("disconnect signal");
+    let _ = captured.await.expect("captured request");
+    drop(release);
+}
+
+#[tokio::test]
 async fn openai_backend_bounds_and_redacts_stream_errors() {
     let secret = "secret-token";
     let provider_message = format!("{secret} {}", "x".repeat(20_000));
     let body = format!(
-        "data: {}\n\n",
+        "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_error\"}}}}\n\ndata: {}\n\n",
         serde_json::json!({
             "type": "error",
             "error": {"message": provider_message}
@@ -256,10 +443,23 @@ async fn openai_backend_bounds_and_redacts_stream_errors() {
     let backend =
         OpenAiBackend::from_endpoint(HttpClient::default(), &endpoint, secret).expect("backend");
 
-    let error = match backend.stream(request(), &NeverCancel).await {
-        Ok(_) => panic!("provider error must fail"),
-        Err(error) => error,
-    };
+    let mut stream = backend
+        .stream(request(), &NeverCancel)
+        .await
+        .expect("stream");
+    assert!(matches!(
+        stream
+            .next()
+            .await
+            .expect("started event")
+            .expect("started"),
+        ModelEvent::ResponseStarted { .. }
+    ));
+    let error = stream
+        .next()
+        .await
+        .expect("provider error event")
+        .expect_err("provider error must fail");
     let _ = captured.await.expect("captured request");
 
     let KuramaError::Model(message) = error else {
@@ -279,15 +479,110 @@ async fn openai_backend_rejects_transport_eof_before_response_completed() {
     let backend = OpenAiBackend::from_endpoint(HttpClient::default(), &endpoint, "test-key")
         .expect("backend");
 
-    let error = match backend.stream(request(), &NeverCancel).await {
-        Ok(_) => panic!("truncated stream must fail"),
-        Err(error) => error,
-    };
+    let mut stream = backend
+        .stream(request(), &NeverCancel)
+        .await
+        .expect("stream");
+    let mut error = None;
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(_) => {}
+            Err(stream_error) => {
+                error = Some(stream_error);
+                break;
+            }
+        }
+    }
     let _ = captured.await.expect("captured request");
 
     assert!(matches!(
-        error,
+        error.expect("truncated stream error"),
         KuramaError::Model(message)
             if message == "OpenAI stream ended before response.completed"
     ));
+}
+
+#[tokio::test]
+async fn dropping_openai_stream_after_first_event_closes_in_flight_response() {
+    let fixture = include_str!("../../../tests/fixtures/openai/tool_turn.jsonl");
+    let (first, tail) = split_first_sse_event(fixture);
+    let DelayedSseResponse {
+        endpoint,
+        captured,
+        first_sent: _,
+        release,
+        disconnected,
+    } = serve_sse_until_released(first, tail).await;
+    let backend = OpenAiBackend::from_endpoint(HttpClient::default(), &endpoint, "test-key")
+        .expect("backend");
+    let mut stream = backend
+        .stream(request(), &NeverCancel)
+        .await
+        .expect("stream");
+    assert!(matches!(
+        stream.next().await.expect("first event").expect("event"),
+        ModelEvent::ResponseStarted { .. }
+    ));
+
+    drop(stream);
+    tokio::time::timeout(std::time::Duration::from_secs(1), disconnected)
+        .await
+        .expect("response stayed open after stream drop")
+        .expect("disconnect signal");
+    let _ = captured.await.expect("captured request");
+    drop(release);
+}
+
+#[tokio::test]
+async fn openai_backend_rejects_oversized_sse_record_before_eof() {
+    let secret = "secret-token";
+    let oversized = format!("data: {secret}{}", "x".repeat(1024 * 1024));
+    let DelayedSseResponse {
+        endpoint,
+        captured,
+        first_sent: _,
+        release,
+        disconnected,
+    } = serve_sse_until_released(oversized, "").await;
+    let backend =
+        OpenAiBackend::from_endpoint(HttpClient::default(), &endpoint, secret).expect("backend");
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        backend.stream(request(), &NeverCancel),
+    )
+    .await
+    .expect("oversized SSE record waited for EOF");
+    let error = match result {
+        Ok(_) => panic!("oversized SSE record must fail"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(message.contains("SSE record exceeds 1048576 bytes"));
+    assert!(!message.contains(secret));
+    assert!(message.len() <= 16 * 1024 + 128);
+    tokio::time::timeout(std::time::Duration::from_secs(1), disconnected)
+        .await
+        .expect("oversized response stayed open")
+        .expect("disconnect signal");
+    let _ = captured.await.expect("captured request");
+    drop(release);
+}
+
+fn openai_text_stream(deltas: &[&str]) -> String {
+    let mut body = format!(
+        "data: {}\n\n",
+        serde_json::json!({"type":"response.created","response":{"id":"resp_text"}})
+    );
+    for delta in deltas {
+        body.push_str(&format!(
+            "data: {}\n\n",
+            serde_json::json!({"type":"response.output_text.delta","delta":delta})
+        ));
+    }
+    body.push_str(&format!(
+        "data: {}\n\n",
+        serde_json::json!({"type":"response.completed","response":{"id":"resp_text"}})
+    ));
+    body
 }

@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use url::Url;
 use zeroize::Zeroizing;
 
-use crate::http::{HttpClient, bounded_redacted_error};
+use crate::http::{HttpClient, SseNormalizer, sse_model_stream};
 
 use super::{
     chat_messages, chat_tools, normalize_delegation_events, provider_instructions, sse::SseDecoder,
@@ -83,57 +83,6 @@ impl OpenAiCompatBackend {
         events.extend(normalizer.finish()?);
         Ok(events)
     }
-
-    async fn collect(
-        &self,
-        request: &ModelRequest,
-        cancel: &dyn kurama_protocol::traits::CancelSignal,
-    ) -> Result<Vec<ModelEvent>, KuramaError> {
-        if cancel.is_cancelled() {
-            return Err(KuramaError::Cancelled);
-        }
-        let url = endpoint_url(&self.endpoint, "chat/completions")?;
-        let mut builder = self
-            .http
-            .post(url)
-            .json(&Self::request_body(request, self.parallel_tool_calls));
-        if let Some(api_key) = &self.api_key {
-            builder = builder.bearer_auth(api_key.as_str());
-        }
-        let secrets = self
-            .api_key
-            .as_ref()
-            .map(|key| key.as_str())
-            .into_iter()
-            .collect::<Vec<_>>();
-        let mut response = tokio::select! {
-            _ = cancel.cancelled() => return Err(KuramaError::Cancelled),
-            response = builder.send() => response.map_err(|error| HttpClient::transport_error(PROVIDER, &error, &secrets).into_kurama())?,
-        };
-        if !response.status().is_success() {
-            return Err(HttpClient::response_error(PROVIDER, response, &secrets)
-                .await
-                .into_kurama());
-        }
-        let mut decoder = SseDecoder::default();
-        let mut normalizer = CompatNormalizer::default();
-        let mut events = Vec::new();
-        loop {
-            let chunk = tokio::select! {
-                _ = cancel.cancelled() => return Err(KuramaError::Cancelled),
-                chunk = response.chunk() => chunk.map_err(|error| HttpClient::transport_error(PROVIDER, &error, &secrets).into_kurama())?,
-            };
-            let Some(chunk) = chunk else { break };
-            for event in decoder.push(&chunk)? {
-                events.extend(normalizer.push(&event.data)?);
-            }
-        }
-        for event in decoder.finish()? {
-            events.extend(normalizer.push(&event.data)?);
-        }
-        events.extend(normalizer.finish()?);
-        normalize_delegation_events(events, request.delegation.is_some())
-    }
 }
 
 impl kurama_protocol::traits::ModelBackend for OpenAiCompatBackend {
@@ -152,17 +101,50 @@ impl kurama_protocol::traits::ModelBackend for OpenAiCompatBackend {
         Result<kurama_protocol::traits::ModelStream, KuramaError>,
     > {
         Box::pin(async move {
-            let secrets = self
+            if cancel.is_cancelled() {
+                return Err(KuramaError::Cancelled);
+            }
+            let url = endpoint_url(&self.endpoint, "chat/completions")?;
+            let mut builder = self
+                .http
+                .post(url)
+                .json(&Self::request_body(&request, self.parallel_tool_calls));
+            if let Some(api_key) = &self.api_key {
+                builder = builder.bearer_auth(api_key.as_str());
+            }
+            let borrowed_secrets = self
                 .api_key
                 .as_ref()
                 .map(|key| key.as_str())
                 .into_iter()
                 .collect::<Vec<_>>();
-            let events = self
-                .collect(&request, cancel)
-                .await
-                .map_err(|error| bounded_redacted_error(error, &secrets))?;
-            Ok(super::event_stream(events.into_iter().map(Ok).collect()))
+            let response = tokio::select! {
+                _ = cancel.cancelled() => return Err(KuramaError::Cancelled),
+                response = builder.send() => response.map_err(|error| HttpClient::transport_error(PROVIDER, &error, &borrowed_secrets).into_kurama())?,
+            };
+            if !response.status().is_success() {
+                return Err(
+                    HttpClient::response_error(PROVIDER, response, &borrowed_secrets)
+                        .await
+                        .into_kurama(),
+                );
+            }
+            let secrets = self
+                .api_key
+                .as_ref()
+                .map(|key| Zeroizing::new(key.to_string()))
+                .into_iter()
+                .collect();
+            sse_model_stream(
+                response,
+                &request,
+                cancel,
+                PROVIDER,
+                secrets,
+                CompatNormalizer::default(),
+                normalize_delegation_events,
+            )
+            .await
         })
     }
 }
@@ -328,6 +310,16 @@ impl CompatNormalizer {
                 "OpenAI-compatible stream ended before [DONE]".into(),
             ))
         }
+    }
+}
+
+impl SseNormalizer for CompatNormalizer {
+    fn push(&mut self, payload: &str) -> Result<Vec<ModelEvent>, KuramaError> {
+        CompatNormalizer::push(self, payload)
+    }
+
+    fn finish(&mut self) -> Result<Vec<ModelEvent>, KuramaError> {
+        CompatNormalizer::finish(self)
     }
 }
 

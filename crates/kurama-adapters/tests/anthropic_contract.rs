@@ -6,6 +6,7 @@ mod http;
 #[path = "../src/providers/mod.rs"]
 mod providers;
 
+use futures_util::StreamExt;
 use http::HttpClient;
 use kurama_protocol::{
     KuramaError,
@@ -19,7 +20,10 @@ use providers::anthropic::AnthropicBackend;
 #[path = "support/provider_http.rs"]
 mod provider_http;
 
-use provider_http::{NeverCancel, serve_sse_once};
+use provider_http::{
+    DelayedSseResponse, NeverCancel, serve_sse_once, serve_sse_until_released,
+    split_first_sse_event,
+};
 
 fn request() -> ModelRequest {
     ModelRequest {
@@ -130,14 +134,105 @@ async fn anthropic_backend_rejects_transport_eof_before_message_stop() {
     let backend = AnthropicBackend::from_endpoint(HttpClient::default(), &endpoint, "test-key")
         .expect("backend");
 
-    let error = match backend.stream(request(), &NeverCancel).await {
-        Ok(_) => panic!("truncated stream must fail"),
-        Err(error) => error,
-    };
+    let mut stream = backend
+        .stream(request(), &NeverCancel)
+        .await
+        .expect("stream");
+    let mut error = None;
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(_) => {}
+            Err(stream_error) => {
+                error = Some(stream_error);
+                break;
+            }
+        }
+    }
     let _ = captured.await.expect("captured request");
 
     assert!(matches!(
-        error,
+        error.expect("truncated stream error"),
         KuramaError::Model(message) if message == "Anthropic stream ended before message_stop"
     ));
+}
+
+#[tokio::test]
+async fn anthropic_backend_yields_before_response_eof() {
+    let fixture = include_str!("../../../tests/fixtures/anthropic/tool_turn.jsonl");
+    let (first, tail) = split_first_sse_event(fixture);
+    let server = serve_sse_until_released(first, tail).await;
+    let backend =
+        AnthropicBackend::from_endpoint(HttpClient::default(), &server.endpoint, "test-key")
+            .expect("backend");
+
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        backend.stream(request(), &NeverCancel),
+    )
+    .await
+    .expect("Anthropic stream waited for response EOF")
+    .expect("stream");
+    let first = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+        .await
+        .expect("first event timed out")
+        .expect("first event")
+        .expect("first event error");
+
+    assert!(matches!(first, ModelEvent::ResponseStarted { .. }));
+    server.release.send(()).expect("release response tail");
+    while let Some(event) = stream.next().await {
+        event.expect("remaining event");
+    }
+    let _ = server.captured.await.expect("captured request");
+}
+
+#[tokio::test]
+async fn anthropic_backend_bounds_candidate_non_text_events() {
+    let mut body = format!(
+        "event: message_start\ndata: {}\n\nevent: content_block_delta\ndata: {}\n\n",
+        serde_json::json!({"type":"message_start","message":{"id":"msg_buffer","usage":{"input_tokens":1}}}),
+        serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"<kurama_delegate>{"}}),
+    );
+    for output_tokens in 0..65_u64 {
+        body.push_str(&format!(
+            "event: message_delta\ndata: {}\n\n",
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":null},"usage":{"output_tokens":output_tokens}})
+        ));
+    }
+    let DelayedSseResponse {
+        endpoint,
+        captured,
+        first_sent: _,
+        release,
+        disconnected,
+    } = serve_sse_until_released(body, "x").await;
+    let backend = AnthropicBackend::from_endpoint(HttpClient::default(), &endpoint, "test-key")
+        .expect("backend");
+    let mut stream = backend
+        .stream(request(), &NeverCancel)
+        .await
+        .expect("stream");
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match stream.next().await.expect("bounded stream item") {
+                Ok(_) => {}
+                Err(error) => break error,
+            }
+        }
+    })
+    .await
+    .expect("candidate event bound waited for EOF");
+    assert!(matches!(
+        error,
+        KuramaError::Protocol(message)
+            if message.contains("delegation candidate") && message.contains("events")
+    ));
+    drop(stream);
+    tokio::time::timeout(std::time::Duration::from_secs(1), disconnected)
+        .await
+        .expect("bounded candidate response stayed open")
+        .expect("disconnect signal");
+    let _ = captured.await.expect("captured request");
+    drop(release);
 }

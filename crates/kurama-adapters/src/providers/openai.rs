@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use url::Url;
 use zeroize::Zeroizing;
 
-use crate::http::{HttpClient, bounded_redacted_error};
+use crate::http::{HttpClient, SseNormalizer, sse_model_stream};
 
 use super::{
     normalize_delegation_events, provider_instructions, responses_input, responses_tools,
@@ -82,57 +82,6 @@ impl OpenAiBackend {
         events.extend(normalizer.finish()?);
         Ok(events)
     }
-
-    async fn collect(
-        &self,
-        request: &ModelRequest,
-        cancel: &dyn kurama_protocol::traits::CancelSignal,
-    ) -> Result<Vec<ModelEvent>, KuramaError> {
-        if cancel.is_cancelled() {
-            return Err(KuramaError::Cancelled);
-        }
-        let url = endpoint_url(&self.endpoint, "responses")?;
-        let send = self
-            .http
-            .post(url)
-            .bearer_auth(self.api_key.as_str())
-            .json(&Self::request_body(request))
-            .send();
-        let mut response = tokio::select! {
-            _ = cancel.cancelled() => return Err(KuramaError::Cancelled),
-            response = send => response.map_err(|error| {
-                HttpClient::transport_error(PROVIDER, &error, &[self.api_key.as_str()]).into_kurama()
-            })?,
-        };
-        if !response.status().is_success() {
-            return Err(
-                HttpClient::response_error(PROVIDER, response, &[self.api_key.as_str()])
-                    .await
-                    .into_kurama(),
-            );
-        }
-
-        let mut decoder = SseDecoder::default();
-        let mut normalizer = OpenAiNormalizer::default();
-        let mut events = Vec::new();
-        loop {
-            let chunk = tokio::select! {
-                _ = cancel.cancelled() => return Err(KuramaError::Cancelled),
-                chunk = response.chunk() => chunk.map_err(|error| {
-                    HttpClient::transport_error(PROVIDER, &error, &[self.api_key.as_str()]).into_kurama()
-                })?,
-            };
-            let Some(chunk) = chunk else { break };
-            for event in decoder.push(&chunk)? {
-                events.extend(normalizer.push(&event.data)?);
-            }
-        }
-        for event in decoder.finish()? {
-            events.extend(normalizer.push(&event.data)?);
-        }
-        events.extend(normalizer.finish()?);
-        normalize_delegation_events(events, request.delegation.is_some())
-    }
 }
 
 impl kurama_protocol::traits::ModelBackend for OpenAiBackend {
@@ -153,11 +102,41 @@ impl kurama_protocol::traits::ModelBackend for OpenAiBackend {
         Result<kurama_protocol::traits::ModelStream, KuramaError>,
     > {
         Box::pin(async move {
-            let events = self
-                .collect(&request, cancel)
+            if cancel.is_cancelled() {
+                return Err(KuramaError::Cancelled);
+            }
+            let url = endpoint_url(&self.endpoint, "responses")?;
+            let send = self
+                .http
+                .post(url)
+                .bearer_auth(self.api_key.as_str())
+                .json(&Self::request_body(&request))
+                .send();
+            let response = tokio::select! {
+                _ = cancel.cancelled() => return Err(KuramaError::Cancelled),
+                response = send => response.map_err(|error| {
+                    HttpClient::transport_error(PROVIDER, &error, &[self.api_key.as_str()]).into_kurama()
+                })?,
+            };
+            if !response.status().is_success() {
+                return Err(HttpClient::response_error(
+                    PROVIDER,
+                    response,
+                    &[self.api_key.as_str()],
+                )
                 .await
-                .map_err(|error| bounded_redacted_error(error, &[self.api_key.as_str()]))?;
-            Ok(super::event_stream(events.into_iter().map(Ok).collect()))
+                .into_kurama());
+            }
+            sse_model_stream(
+                response,
+                &request,
+                cancel,
+                PROVIDER,
+                vec![Zeroizing::new(self.api_key.to_string())],
+                OpenAiNormalizer::default(),
+                normalize_delegation_events,
+            )
+            .await
         })
     }
 }
@@ -331,6 +310,16 @@ impl OpenAiNormalizer {
                 "OpenAI stream ended before response.completed".into(),
             ))
         }
+    }
+}
+
+impl SseNormalizer for OpenAiNormalizer {
+    fn push(&mut self, payload: &str) -> Result<Vec<ModelEvent>, KuramaError> {
+        OpenAiNormalizer::push(self, payload)
+    }
+
+    fn finish(&mut self) -> Result<Vec<ModelEvent>, KuramaError> {
+        OpenAiNormalizer::finish(self)
     }
 }
 

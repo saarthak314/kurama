@@ -6,6 +6,7 @@ mod http;
 #[path = "../src/providers/mod.rs"]
 mod providers;
 
+use futures_util::StreamExt;
 use http::HttpClient;
 use kurama_protocol::{
     KuramaError,
@@ -19,7 +20,7 @@ use providers::openai_compat::OpenAiCompatBackend;
 #[path = "support/provider_http.rs"]
 mod provider_http;
 
-use provider_http::{NeverCancel, serve_sse_once};
+use provider_http::{NeverCancel, serve_sse_once, serve_sse_until_released, split_first_sse_event};
 
 fn request() -> ModelRequest {
     ModelRequest {
@@ -133,15 +134,54 @@ async fn openai_compat_backend_rejects_transport_eof_before_done() {
     let backend = OpenAiCompatBackend::from_endpoint(HttpClient::default(), &endpoint, None)
         .expect("backend");
 
-    let error = match backend.stream(request(), &NeverCancel).await {
-        Ok(_) => panic!("truncated stream must fail"),
-        Err(error) => error,
-    };
+    let mut stream = backend
+        .stream(request(), &NeverCancel)
+        .await
+        .expect("stream");
+    let mut error = None;
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(_) => {}
+            Err(stream_error) => {
+                error = Some(stream_error);
+                break;
+            }
+        }
+    }
     let _ = captured.await.expect("captured request");
 
     assert!(matches!(
-        error,
+        error.expect("truncated stream error"),
         KuramaError::Model(message)
             if message == "OpenAI-compatible stream ended before [DONE]"
     ));
+}
+
+#[tokio::test]
+async fn openai_compat_backend_yields_before_response_eof() {
+    let fixture = include_str!("../../../tests/fixtures/openai_compat/tool_turn.jsonl");
+    let (first, tail) = split_first_sse_event(fixture);
+    let server = serve_sse_until_released(first, tail).await;
+    let backend = OpenAiCompatBackend::from_endpoint(HttpClient::default(), &server.endpoint, None)
+        .expect("backend");
+
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        backend.stream(request(), &NeverCancel),
+    )
+    .await
+    .expect("OpenAI-compatible stream waited for response EOF")
+    .expect("stream");
+    let first = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+        .await
+        .expect("first event timed out")
+        .expect("first event")
+        .expect("first event error");
+
+    assert!(matches!(first, ModelEvent::ResponseStarted { .. }));
+    server.release.send(()).expect("release response tail");
+    while let Some(event) = stream.next().await {
+        event.expect("remaining event");
+    }
+    let _ = server.captured.await.expect("captured request");
 }

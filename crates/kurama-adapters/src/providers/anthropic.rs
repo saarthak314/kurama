@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use url::Url;
 use zeroize::Zeroizing;
 
-use crate::http::{HttpClient, bounded_redacted_error};
+use crate::http::{HttpClient, SseNormalizer, sse_model_stream};
 
 use super::{
     anthropic_messages, anthropic_tools, normalize_delegation_events, provider_instructions,
@@ -72,53 +72,6 @@ impl AnthropicBackend {
         events.extend(normalizer.finish()?);
         Ok(events)
     }
-
-    async fn collect(
-        &self,
-        request: &ModelRequest,
-        cancel: &dyn kurama_protocol::traits::CancelSignal,
-    ) -> Result<Vec<ModelEvent>, KuramaError> {
-        if cancel.is_cancelled() {
-            return Err(KuramaError::Cancelled);
-        }
-        let url = endpoint_url(&self.endpoint, "messages")?;
-        let send = self
-            .http
-            .post(url)
-            .header("x-api-key", self.api_key.as_str())
-            .header("anthropic-version", "2023-06-01")
-            .json(&Self::request_body(request))
-            .send();
-        let mut response = tokio::select! {
-            _ = cancel.cancelled() => return Err(KuramaError::Cancelled),
-            response = send => response.map_err(|error| HttpClient::transport_error(PROVIDER, &error, &[self.api_key.as_str()]).into_kurama())?,
-        };
-        if !response.status().is_success() {
-            return Err(
-                HttpClient::response_error(PROVIDER, response, &[self.api_key.as_str()])
-                    .await
-                    .into_kurama(),
-            );
-        }
-        let mut decoder = SseDecoder::default();
-        let mut normalizer = AnthropicNormalizer::default();
-        let mut events = Vec::new();
-        loop {
-            let chunk = tokio::select! {
-                _ = cancel.cancelled() => return Err(KuramaError::Cancelled),
-                chunk = response.chunk() => chunk.map_err(|error| HttpClient::transport_error(PROVIDER, &error, &[self.api_key.as_str()]).into_kurama())?,
-            };
-            let Some(chunk) = chunk else { break };
-            for event in decoder.push(&chunk)? {
-                events.extend(normalizer.push(&event.data)?);
-            }
-        }
-        for event in decoder.finish()? {
-            events.extend(normalizer.push(&event.data)?);
-        }
-        events.extend(normalizer.finish()?);
-        normalize_delegation_events(events, request.delegation.is_some())
-    }
 }
 
 impl kurama_protocol::traits::ModelBackend for AnthropicBackend {
@@ -137,11 +90,40 @@ impl kurama_protocol::traits::ModelBackend for AnthropicBackend {
         Result<kurama_protocol::traits::ModelStream, KuramaError>,
     > {
         Box::pin(async move {
-            let events = self
-                .collect(&request, cancel)
+            if cancel.is_cancelled() {
+                return Err(KuramaError::Cancelled);
+            }
+            let url = endpoint_url(&self.endpoint, "messages")?;
+            let send = self
+                .http
+                .post(url)
+                .header("x-api-key", self.api_key.as_str())
+                .header("anthropic-version", "2023-06-01")
+                .json(&Self::request_body(&request))
+                .send();
+            let response = tokio::select! {
+                _ = cancel.cancelled() => return Err(KuramaError::Cancelled),
+                response = send => response.map_err(|error| HttpClient::transport_error(PROVIDER, &error, &[self.api_key.as_str()]).into_kurama())?,
+            };
+            if !response.status().is_success() {
+                return Err(HttpClient::response_error(
+                    PROVIDER,
+                    response,
+                    &[self.api_key.as_str()],
+                )
                 .await
-                .map_err(|error| bounded_redacted_error(error, &[self.api_key.as_str()]))?;
-            Ok(super::event_stream(events.into_iter().map(Ok).collect()))
+                .into_kurama());
+            }
+            sse_model_stream(
+                response,
+                &request,
+                cancel,
+                PROVIDER,
+                vec![Zeroizing::new(self.api_key.to_string())],
+                AnthropicNormalizer::default(),
+                normalize_delegation_events,
+            )
+            .await
         })
     }
 }
@@ -329,5 +311,15 @@ impl AnthropicNormalizer {
                 "Anthropic stream ended before message_stop".into(),
             ))
         }
+    }
+}
+
+impl SseNormalizer for AnthropicNormalizer {
+    fn push(&mut self, payload: &str) -> Result<Vec<ModelEvent>, KuramaError> {
+        AnthropicNormalizer::push(self, payload)
+    }
+
+    fn finish(&mut self) -> Result<Vec<ModelEvent>, KuramaError> {
+        AnthropicNormalizer::finish(self)
     }
 }
