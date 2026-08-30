@@ -108,11 +108,12 @@ fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
 }
 
 fn main_area(area: Rect) -> Rect {
-    let horizontal = if area.width > 4 { 2 } else { 0 };
+    let total_padding = area.width.saturating_sub(4).min(4);
+    let left_padding = total_padding.saturating_add(1) / 2;
     Rect::new(
-        area.x.saturating_add(horizontal),
+        area.x.saturating_add(left_padding),
         area.y,
-        area.width.saturating_sub(horizontal.saturating_mul(2)),
+        area.width.saturating_sub(total_padding),
         area.height,
     )
 }

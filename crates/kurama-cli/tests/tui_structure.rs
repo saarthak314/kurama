@@ -164,6 +164,23 @@ fn responsive_layout_regions_stay_inside_the_requested_area() {
 }
 
 #[test]
+fn tiny_width_growth_never_reduces_visible_composer_content() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.composer = "abcd".into();
+    state.cursor = state.composer.len();
+
+    let visible_letters = |width| {
+        let text = buffer_text(&rendered(&state, width, 4));
+        ['a', 'b', 'c', 'd']
+            .into_iter()
+            .filter(|character| text.contains(*character))
+            .count()
+    };
+
+    assert!(visible_letters(5) >= visible_letters(4));
+}
+
+#[test]
 fn activity_line_formats_elapsed_time_and_measures_the_interrupt_hint() {
     let now = Instant::now();
     let seconds = ActivityState::Thinking {
@@ -196,6 +213,22 @@ fn activity_line_formats_elapsed_time_and_measures_the_interrupt_hint() {
     assert!(!narrow.contains("Esc to interrupt"));
     assert!(activity_line(&ActivityState::Idle, 80, now).is_none());
     assert!(activity_line(&ActivityState::AwaitingApproval, 80, now).is_none());
+}
+
+#[test]
+fn narrow_activity_drops_elapsed_before_the_active_tool_name() {
+    let now = Instant::now();
+    let activity = ActivityState::RunningTool {
+        name: "cargo test".into(),
+        started_at: now - Duration::from_secs(3_600),
+    };
+
+    let line = activity_line(&activity, 24, now).expect("activity line");
+    let text = plain(vec![line.clone()]);
+
+    assert!(text.contains("Running cargo test"));
+    assert!(!text.contains("1h 00m 00s"));
+    assert!(line.width() <= 24);
 }
 
 fn hours_state(now: Instant) -> ActivityState {
@@ -231,6 +264,24 @@ fn measured_footer_collapses_low_priority_context_before_mode() {
     let tiny = buffer_text(&rendered(&state, 12, 6));
     assert!(tiny.contains("YOLO"));
     assert!(!tiny.contains("work/model"));
+}
+
+#[test]
+fn footer_priority_stops_after_the_first_ambient_item_does_not_fit() {
+    let mut state = TuiState::new(
+        "work",
+        "model",
+        "a-project-name-that-cannot-fit-in-this-footer",
+        ExecutionMode::Yolo,
+    );
+    state.set_agent_counts(2, 1);
+
+    let text = buffer_text(&rendered(&state, 52, 6));
+
+    assert!(text.contains("work/model"));
+    assert!(text.contains("YOLO"));
+    assert!(!text.contains("agents 2 running · 1 queued"));
+    assert!(!text.contains("Ctrl+O details"));
 }
 
 #[test]
@@ -868,6 +919,31 @@ fn narrow_layout_preserves_action_and_stacks_approval_choices() {
     assert!(lines.contains(&"d deny"));
     assert!(lines.contains(&"e edit"));
     assert!(!text.contains("Esc to interrupt"));
+}
+
+#[test]
+fn short_narrow_approval_compacts_controls_before_losing_action() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.begin_approval(approval_request());
+
+    let text = buffer_text(&rendered(&state, 32, 2));
+
+    assert!(text.contains("$ cargo test -p kurama-cli"));
+    assert!(text.contains("a approve"));
+    assert!(text.contains("d deny"));
+    assert!(text.contains("e edit"));
+}
+
+#[test]
+fn very_narrow_short_approval_keeps_every_decision_shortcut() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.begin_approval(approval_request());
+
+    let text = buffer_text(&rendered(&state, 24, 2));
+    let lines = text.lines().map(str::trim).collect::<Vec<_>>();
+
+    assert!(text.contains("$ cargo test"));
+    assert!(lines.contains(&"a/d/e"));
 }
 
 #[test]

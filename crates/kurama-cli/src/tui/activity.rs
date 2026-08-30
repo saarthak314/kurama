@@ -38,8 +38,37 @@ pub fn activity_line(
     let elapsed = compact_elapsed(elapsed.as_secs());
     let suffix = format!(" · {elapsed}");
     let prefix = format!("{spinner} {verb}");
+    let full_action = detail.map_or_else(|| prefix.clone(), |detail| format!("{prefix} {detail}"));
+    let full_action_width = Line::from(full_action.as_str()).width();
+    let elapsed_width = Line::from(suffix.as_str()).width();
+    let hint = format!("  {INTERRUPT_HINT}");
+    let hint_width = Line::from(hint.as_str()).width();
+
+    if full_action_width.saturating_add(elapsed_width) <= width {
+        let mut spans = action_spans(spinner, full_action);
+        spans.push(Span::styled(
+            suffix,
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+        if full_action_width
+            .saturating_add(elapsed_width)
+            .saturating_add(hint_width)
+            <= width
+        {
+            spans.push(Span::styled(
+                hint,
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        return Some(Line::from(spans));
+    }
+
+    if full_action_width <= width {
+        return Some(Line::from(action_spans(spinner, full_action)));
+    }
+
     let action = if let Some(detail) = detail {
-        let available = width.saturating_sub(Line::from(format!("{prefix}  {suffix}")).width());
+        let available = width.saturating_sub(Line::from(format!("{prefix} ")).width());
         let detail = truncate_display(detail, available);
         if detail.is_empty() {
             prefix
@@ -49,30 +78,21 @@ pub fn activity_line(
     } else {
         prefix
     };
-    let base = format!("{action}{suffix}");
-
-    if Line::from(base.as_str()).width() > width {
+    if Line::from(action.as_str()).width() > width {
         return Some(Line::from(Span::styled(
-            truncate_display(&base, width),
+            truncate_display(&action, width),
             Style::default().fg(Color::Cyan),
         )));
     }
 
-    let mut spans = vec![
+    Some(Line::from(action_spans(spinner, action)))
+}
+
+fn action_spans(spinner: &str, action: String) -> Vec<Span<'static>> {
+    vec![
         Span::styled(format!("{spinner} "), Style::default().fg(Color::Cyan)),
         Span::raw(action.trim_start_matches(spinner).trim_start().to_owned()),
-        Span::styled(suffix, Style::default().add_modifier(Modifier::DIM)),
-    ];
-    let base_width = Line::from(spans.clone()).width();
-    let hint = format!("  {INTERRUPT_HINT}");
-    if base_width.saturating_add(Line::from(hint.as_str()).width()) <= width {
-        spans.push(Span::styled(
-            hint,
-            Style::default().add_modifier(Modifier::DIM),
-        ));
-    }
-
-    Some(Line::from(spans))
+    ]
 }
 
 fn compact_elapsed(seconds: u64) -> String {

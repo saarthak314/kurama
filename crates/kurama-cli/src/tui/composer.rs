@@ -17,7 +17,6 @@ const PROMPT: &str = "› ";
 const PROMPT_WIDTH: usize = 2;
 const MAX_COMPOSER_HEIGHT: usize = 8;
 const MAX_APPROVAL_HEIGHT: usize = 14;
-const MIN_EDITOR_LINES: usize = 4;
 
 pub(crate) fn composer_height(state: &TuiState, width: u16) -> u16 {
     composer_visual(&state.composer, state.cursor, width as usize)
@@ -153,10 +152,12 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect,
     ];
     for (index, candidate) in candidates.into_iter().enumerate() {
         if index == 3 && !show_help {
-            continue;
+            break;
         }
         if footer_width(&items).saturating_add(2 + candidate.width()) <= area.width as usize {
             items.insert(0, candidate);
+        } else {
+            break;
         }
     }
 
@@ -251,8 +252,8 @@ fn approval_layout(approval: &ApprovalState, width: usize, max_height: usize) ->
         };
     }
 
-    let controls = approval_controls(approval.editing, width);
-    let body_height = max_height.saturating_sub(1 + controls.len());
+    let controls = approval_controls(approval.editing, width, max_height.saturating_sub(1));
+    let body_height = max_height.saturating_sub(controls.len());
     let detail = indented_lines(
         &approval_detail(&approval.request.operation),
         width,
@@ -265,27 +266,38 @@ fn approval_layout(approval: &ApprovalState, width: usize, max_height: usize) ->
         Style::default().add_modifier(Modifier::DIM),
         true,
     );
-    let mut title = vec![Span::styled(
+    let mut title_spans = vec![Span::styled(
         "Action required",
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     )];
     if approval.editing && width >= 31 {
-        title.push(Span::styled(
+        title_spans.push(Span::styled(
             " · Edit arguments",
             Style::default().add_modifier(Modifier::DIM),
         ));
     }
-    let mut lines = vec![Line::from(title)];
+    let title = Line::from(title_spans);
 
     if approval.editing {
         let editor_width = width.saturating_sub(2).max(1);
         let editor_full_height = hard_wrap(&approval.editor, editor_width).len();
-        let editor_reserve = editor_full_height.min(MIN_EDITOR_LINES).min(body_height);
-        let context_budget = body_height.saturating_sub(editor_reserve);
-        lines.extend(bounded_context(detail, summary, context_budget));
-        let editor_budget = body_height.saturating_sub(lines.len().saturating_sub(1));
+        let editor_reserve = usize::from(editor_full_height > 0 && body_height > 1);
+        let detail_height = detail.len().min(body_height.saturating_sub(editor_reserve));
+        let editor_budget = editor_full_height.min(body_height.saturating_sub(detail_height));
+        let mut optional_height = body_height
+            .saturating_sub(detail_height)
+            .saturating_sub(editor_budget);
+        let show_title = optional_height > 0;
+        optional_height = optional_height.saturating_sub(usize::from(show_title));
+        let summary_height = summary.len().min(optional_height);
+        let mut lines = Vec::new();
+        if show_title {
+            lines.push(title);
+        }
+        lines.extend(detail.into_iter().take(detail_height));
+        lines.extend(summary.into_iter().take(summary_height));
         let editor = editor_preview(&approval.editor, editor_width, editor_budget);
         let cursor = (!editor.is_empty()).then(|| {
             let row = lines.len().saturating_add(editor.len().saturating_sub(1)) as u16;
@@ -302,10 +314,22 @@ fn approval_layout(approval: &ApprovalState, width: usize, max_height: usize) ->
                 .map(|line| Line::from(vec![Span::raw("  "), Span::raw(line)])),
         );
         lines.extend(controls);
+        debug_assert!(lines.len() <= max_height);
         ApprovalLayout { lines, cursor }
     } else {
-        lines.extend(bounded_context(detail, summary, body_height));
+        let detail_height = detail.len().min(body_height);
+        let mut optional_height = body_height.saturating_sub(detail_height);
+        let show_title = optional_height > 0;
+        optional_height = optional_height.saturating_sub(usize::from(show_title));
+        let summary_height = summary.len().min(optional_height);
+        let mut lines = Vec::new();
+        if show_title {
+            lines.push(title);
+        }
+        lines.extend(detail.into_iter().take(detail_height));
+        lines.extend(summary.into_iter().take(summary_height));
         lines.extend(controls);
+        debug_assert!(lines.len() <= max_height);
         ApprovalLayout {
             lines,
             cursor: None,
@@ -313,13 +337,16 @@ fn approval_layout(approval: &ApprovalState, width: usize, max_height: usize) ->
     }
 }
 
-fn approval_controls(editing: bool, width: usize) -> Vec<Line<'static>> {
-    let labels = if editing {
-        vec!["Enter submit", "Esc return"]
+fn approval_controls(editing: bool, width: usize, max_lines: usize) -> Vec<Line<'static>> {
+    if max_lines == 0 {
+        return Vec::new();
+    }
+
+    let full_labels = if editing {
+        ["Enter submit", "Esc return"].as_slice()
     } else {
-        vec!["a approve once", "d deny", "e edit"]
+        ["a approve once", "d deny", "e edit"].as_slice()
     };
-    let combined = labels.join("  ");
     let style = if editing {
         Style::default().add_modifier(Modifier::DIM)
     } else {
@@ -327,29 +354,42 @@ fn approval_controls(editing: bool, width: usize) -> Vec<Line<'static>> {
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD)
     };
-    if Line::from(combined.as_str()).width().saturating_add(2) <= width {
+    let full_combined = full_labels.join("  ");
+    if Line::from(full_combined.as_str()).width().saturating_add(2) <= width {
         return vec![Line::from(vec![
             Span::raw("  "),
-            Span::styled(combined, style),
+            Span::styled(full_combined, style),
         ])];
     }
-    labels
-        .into_iter()
-        .map(|label| Line::from(vec![Span::raw("  "), Span::styled(label, style)]))
-        .collect()
-}
 
-fn bounded_context(
-    detail: Vec<Line<'static>>,
-    summary: Vec<Line<'static>>,
-    height: usize,
-) -> Vec<Line<'static>> {
-    let detail_height = detail.len().min(height);
-    let summary_height = summary.len().min(height.saturating_sub(detail_height));
-    detail
-        .into_iter()
-        .take(detail_height)
-        .chain(summary.into_iter().take(summary_height))
+    let stacked = full_labels
+        .iter()
+        .copied()
+        .map(|label| Line::from(vec![Span::raw("  "), Span::styled(label, style)]))
+        .collect::<Vec<_>>();
+    if stacked.len() <= max_lines {
+        return stacked;
+    }
+
+    let compact_labels = if editing {
+        ["Enter submit", "Esc return"].as_slice()
+    } else {
+        ["a approve", "d deny", "e edit"].as_slice()
+    };
+    let compact_combined = compact_labels.join("  ");
+    if Line::from(compact_combined.as_str()).width() <= width {
+        return vec![Line::from(Span::styled(compact_combined, style))];
+    }
+
+    if !editing && Line::from("a/d/e").width() <= width {
+        return vec![Line::from(Span::styled("a/d/e", style))];
+    }
+
+    compact_labels
+        .iter()
+        .copied()
+        .take(max_lines)
+        .map(|label| Line::from(Span::styled(label, style)))
         .collect()
 }
 
