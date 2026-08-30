@@ -288,8 +288,14 @@ fn invalid_approval_json_stays_open_and_reports_the_error() {
     assert!(error.contains("invalid approval arguments"));
     assert_eq!(state.overlay(), Overlay::ApprovalEdit);
     assert_eq!(state.activity(), &ActivityState::AwaitingApproval);
-    assert!(state.approval.is_some());
-    assert!(state.transcript.iter().any(
+    let approval = state.approval.as_ref().expect("approval remains open");
+    assert!(
+        approval
+            .validation_error
+            .as_deref()
+            .is_some_and(|message| !message.is_empty())
+    );
+    assert!(!state.transcript.iter().any(
         |entry| matches!(entry, TranscriptEntry::Error { body } if body.contains("invalid approval arguments"))
     ));
     assert!(state.sent_commands().is_empty());

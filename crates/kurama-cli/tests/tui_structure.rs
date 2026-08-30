@@ -1219,6 +1219,46 @@ fn approval_editor_keeps_trailing_json_punctuation_attached() {
 }
 
 #[test]
+fn approval_validation_error_renders_inline_with_the_editor() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.begin_approval(approval_request());
+    state.begin_approval_edit();
+    state.set_approval_editor(r#"{"command":"cargo test""#);
+    state
+        .submit_approval_edit()
+        .expect_err("invalid JSON must remain in the editor");
+
+    let text = buffer_text(&rendered(&state, 60, 16));
+
+    assert!(text.contains("Invalid JSON"), "{text}");
+    assert!(
+        !text.contains("× Error · invalid approval arguments"),
+        "{text}"
+    );
+}
+
+#[test]
+fn approval_editor_cursor_marks_the_insertion_point() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.begin_approval(approval_request());
+    state.begin_approval_edit();
+    state.set_approval_editor("abcd");
+    state.approval.as_mut().expect("approval").move_left();
+
+    let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+    terminal.draw(|frame| render(frame, &state)).unwrap();
+    let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+    let symbol = terminal
+        .backend()
+        .buffer()
+        .cell((cursor.x, cursor.y))
+        .expect("cursor cell")
+        .symbol();
+
+    assert_eq!(symbol, "d");
+}
+
+#[test]
 fn every_tui_view_preserves_the_terminal_default_background() {
     let main = TuiState::new("work", "model", ".", ExecutionMode::Yolo);
 

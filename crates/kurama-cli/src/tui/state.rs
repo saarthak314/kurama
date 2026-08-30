@@ -607,21 +607,30 @@ impl TuiState {
     pub fn begin_approval_edit(&mut self) {
         if let Some(approval) = &mut self.approval {
             approval.editing = true;
+            approval.editor_cursor = approval.editor.len();
+            approval.validation_error = None;
             self.overlay = Overlay::ApprovalEdit;
         }
     }
 
     pub fn replace_approval_arguments(&mut self, arguments: serde_json::Value) {
         if let Some(approval) = &mut self.approval {
-            approval.editor =
-                serde_json::to_string_pretty(&arguments).unwrap_or_else(|_| "{}".into());
+            approval.set_editor(
+                serde_json::to_string_pretty(&arguments).unwrap_or_else(|_| "{}".into()),
+            );
             approval.arguments = arguments;
         }
     }
 
     pub fn set_approval_editor(&mut self, editor: impl Into<String>) {
         if let Some(approval) = &mut self.approval {
-            approval.editor = editor.into();
+            approval.set_editor(editor);
+        }
+    }
+
+    pub fn insert_approval_text(&mut self, value: &str) {
+        if let Some(approval) = &mut self.approval {
+            approval.insert_str(value);
         }
     }
 
@@ -636,17 +645,18 @@ impl TuiState {
             Ok(arguments) => arguments,
             Err(error) => {
                 let message = format!("invalid approval arguments: {error}");
-                self.push_error(message.clone());
                 self.overlay = Overlay::ApprovalEdit;
                 self.activity = ActivityState::AwaitingApproval;
                 if let Some(approval) = &mut self.approval {
                     approval.editing = true;
+                    approval.validation_error = Some(error.to_string());
                 }
                 return Err(message);
             }
         };
         if let Some(approval) = &mut self.approval {
             approval.arguments = arguments.clone();
+            approval.validation_error = None;
         }
         self.resolve_approval(ApprovalResponse::Edit { arguments });
         Ok(())

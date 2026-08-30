@@ -537,10 +537,14 @@ impl App {
     pub fn handle_event(&mut self, event: Event) -> Result<bool, String> {
         let key = match event {
             Event::Paste(text) => {
-                if self.state.overlay == Overlay::None && !self.state.transcript_view_expanded() {
-                    self.state.composer.insert_str(self.state.cursor, &text);
-                    self.state.cursor = self.state.cursor.saturating_add(text.len());
-                    self.state.composer_edited();
+                match self.state.overlay {
+                    Overlay::None if !self.state.transcript_view_expanded() => {
+                        self.state.composer.insert_str(self.state.cursor, &text);
+                        self.state.cursor = self.state.cursor.saturating_add(text.len());
+                        self.state.composer_edited();
+                    }
+                    Overlay::ApprovalEdit => self.state.insert_approval_text(&text),
+                    _ => {}
                 }
                 return Ok(false);
             }
@@ -954,12 +958,38 @@ impl App {
             (Overlay::Approval, KeyCode::Char('e')) => self.state.begin_approval_edit(),
             (Overlay::ApprovalEdit, KeyCode::Char(character)) => {
                 if let Some(approval) = &mut self.state.approval {
-                    approval.editor.push(character);
+                    let mut encoded = [0_u8; 4];
+                    approval.insert_str(character.encode_utf8(&mut encoded));
                 }
             }
             (Overlay::ApprovalEdit, KeyCode::Backspace) => {
                 if let Some(approval) = &mut self.state.approval {
-                    approval.editor.pop();
+                    approval.backspace();
+                }
+            }
+            (Overlay::ApprovalEdit, KeyCode::Delete) => {
+                if let Some(approval) = &mut self.state.approval {
+                    approval.delete();
+                }
+            }
+            (Overlay::ApprovalEdit, KeyCode::Left) => {
+                if let Some(approval) = &mut self.state.approval {
+                    approval.move_left();
+                }
+            }
+            (Overlay::ApprovalEdit, KeyCode::Right) => {
+                if let Some(approval) = &mut self.state.approval {
+                    approval.move_right();
+                }
+            }
+            (Overlay::ApprovalEdit, KeyCode::Home) => {
+                if let Some(approval) = &mut self.state.approval {
+                    approval.move_home();
+                }
+            }
+            (Overlay::ApprovalEdit, KeyCode::End) => {
+                if let Some(approval) = &mut self.state.approval {
+                    approval.move_end();
                 }
             }
             (Overlay::ApprovalEdit, KeyCode::Enter) => {
@@ -2059,6 +2089,33 @@ Session ID: s_cached"
                 response: ApprovalResponse::ApproveSession,
             }) if operation_id.as_ref() == "o_session"
         ));
+    }
+
+    #[test]
+    fn approval_editor_supports_cursor_movement_and_paste() {
+        let mut app = test_app();
+        app.state.begin_approval(ApprovalRequest {
+            operation_id: OperationId::from("o_edit"),
+            operation: Operation::Bash {
+                command: "printf safe".into(),
+                cwd: ".".into(),
+                class: CommandClass::ReadOnly,
+                timeout_ms: 30_000,
+            },
+            summary: "Edit the command".into(),
+            arguments: serde_json::json!({"command":"safe"}),
+        });
+        app.state.begin_approval_edit();
+        app.state.set_approval_editor("ab");
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)))
+            .expect("move approval cursor");
+        app.handle_event(Event::Paste("XYZ".into()))
+            .expect("paste approval text");
+
+        let approval = app.state.approval.as_ref().expect("approval remains open");
+        assert_eq!(approval.editor, "aXYZb");
+        assert_eq!(approval.editor_cursor, 4);
     }
 
     #[test]

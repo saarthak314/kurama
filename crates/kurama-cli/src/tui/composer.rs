@@ -276,11 +276,17 @@ fn approval_layout(approval: &ApprovalState, width: usize, max_height: usize) ->
 
     if approval.editing {
         let editor_width = width.saturating_sub(2).max(1);
-        let editor_full_height = hard_wrap(&approval.editor, editor_width).len();
-        let editor_reserve = usize::from(editor_full_height > 0 && body_height > 1);
-        let detail_height = detail.len().min(body_height.saturating_sub(editor_reserve));
-        let editor_budget = editor_full_height.min(body_height.saturating_sub(detail_height));
-        let mut optional_height = body_height
+        let validation_height = usize::from(approval.validation_error.is_some() && body_height > 0);
+        let content_height = body_height.saturating_sub(validation_height);
+        let editor_visual =
+            approval_editor_visual(&approval.editor, approval.editor_cursor, editor_width);
+        let editor_full_height = editor_visual.lines.len();
+        let editor_reserve = usize::from(editor_full_height > 0 && content_height > 1);
+        let detail_height = detail
+            .len()
+            .min(content_height.saturating_sub(editor_reserve));
+        let editor_budget = editor_full_height.min(content_height.saturating_sub(detail_height));
+        let mut optional_height = content_height
             .saturating_sub(detail_height)
             .saturating_sub(editor_budget);
         let show_title = optional_height > 0;
@@ -292,21 +298,21 @@ fn approval_layout(approval: &ApprovalState, width: usize, max_height: usize) ->
         }
         lines.extend(bounded_detail_lines(&detail_text, width, detail_height));
         lines.extend(summary.into_iter().take(summary_height));
-        let editor = editor_preview(&approval.editor, editor_width, editor_budget);
-        let cursor = (!editor.is_empty()).then(|| {
-            let row = lines.len().saturating_add(editor.len().saturating_sub(1)) as u16;
-            let column = 2_u16.saturating_add(
-                editor
-                    .last()
-                    .map_or(0, |line| Line::from(line.as_str()).width() as u16),
-            );
+        let editor = editor_preview(editor_visual, editor_budget);
+        let cursor = editor.cursor.map(|(row, column)| {
+            let row = lines.len().saturating_add(row) as u16;
+            let column = 2_u16.saturating_add(column as u16);
             (row, column)
         });
         lines.extend(
             editor
+                .lines
                 .into_iter()
                 .map(|line| Line::from(vec![Span::raw("  "), Span::raw(line)])),
         );
+        if let Some(error) = &approval.validation_error {
+            lines.push(approval_validation_line(error, width));
+        }
         lines.extend(controls);
         debug_assert!(lines.len() <= max_height);
         ApprovalLayout { lines, cursor }
@@ -501,22 +507,93 @@ fn truncate_tail(value: &str, width: usize) -> String {
     tail.into_iter().rev().collect()
 }
 
-fn editor_preview(editor: &str, width: usize, max_lines: usize) -> Vec<String> {
-    if max_lines == 0 {
-        return Vec::new();
+struct EditorPreview {
+    lines: Vec<String>,
+    cursor: Option<(usize, usize)>,
+}
+
+fn approval_editor_visual(editor: &str, cursor: usize, width: usize) -> ComposerVisual {
+    const CURSOR_MARKER: char = '\u{2063}';
+
+    let mut cursor = cursor.min(editor.len());
+    while !editor.is_char_boundary(cursor) {
+        cursor = cursor.saturating_sub(1);
     }
-    let wrapped = hard_wrap(editor, width);
-    if wrapped.len() <= max_lines {
-        return wrapped;
+    let mut marked = editor.to_owned();
+    marked.insert(cursor, CURSOR_MARKER);
+    let mut lines = hard_wrap(&marked, width);
+    for (row, line) in lines.iter_mut().enumerate() {
+        if let Some(column) = line.find(CURSOR_MARKER) {
+            let cursor_column = Line::from(&line[..column]).width();
+            line.remove(column);
+            return ComposerVisual {
+                lines,
+                cursor_row: row,
+                cursor_column,
+            };
+        }
+    }
+    ComposerVisual {
+        lines,
+        cursor_row: 0,
+        cursor_column: 0,
+    }
+}
+
+fn editor_preview(visual: ComposerVisual, max_lines: usize) -> EditorPreview {
+    if max_lines == 0 {
+        return EditorPreview {
+            lines: Vec::new(),
+            cursor: None,
+        };
+    }
+    if visual.lines.len() <= max_lines {
+        return EditorPreview {
+            lines: visual.lines,
+            cursor: Some((visual.cursor_row, visual.cursor_column)),
+        };
     }
     if max_lines == 1 {
-        return wrapped.into_iter().rev().take(1).collect();
+        let row = visual.cursor_row.min(visual.lines.len().saturating_sub(1));
+        return EditorPreview {
+            lines: vec![visual.lines[row].clone()],
+            cursor: Some((0, visual.cursor_column)),
+        };
     }
 
-    let omitted = wrapped.len() - max_lines.saturating_sub(1);
-    let mut visible = vec![format!("… {omitted} lines above …")];
-    visible.extend(wrapped.into_iter().skip(omitted));
-    visible
+    let content_lines = max_lines.saturating_sub(1);
+    let start = visual
+        .cursor_row
+        .saturating_add(1)
+        .saturating_sub(content_lines)
+        .min(visual.lines.len().saturating_sub(content_lines));
+    if start == 0 {
+        return EditorPreview {
+            lines: visual.lines.into_iter().take(max_lines).collect(),
+            cursor: Some((visual.cursor_row, visual.cursor_column)),
+        };
+    }
+
+    let mut lines = vec![format!("… {start} lines above …")];
+    lines.extend(visual.lines.into_iter().skip(start).take(content_lines));
+    EditorPreview {
+        lines,
+        cursor: Some((
+            visual.cursor_row.saturating_sub(start).saturating_add(1),
+            visual.cursor_column,
+        )),
+    }
+}
+
+fn approval_validation_line(error: &str, width: usize) -> Line<'static> {
+    let message = format!("Invalid JSON · {error}");
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            truncate_display(&message, width.saturating_sub(2)),
+            Style::default().fg(Color::Red),
+        ),
+    ])
 }
 
 fn approval_detail(operation: &Operation) -> String {
