@@ -239,11 +239,12 @@ async fn manager_runs_and_exposes_compact_child_inspection() {
         )
         .expect("resolve");
     let agent_id = plan.ready[0].id.clone();
+    let store = Arc::new(MemoryStore::default());
     let manager = AgentManager::new(
         "session".into(),
         None,
         4,
-        Arc::new(MemoryStore::default()),
+        store.clone(),
         Arc::new(CollectingSink::default()),
     );
     let results = manager
@@ -254,6 +255,24 @@ async fn manager_runs_and_exposes_compact_child_inspection() {
     let inspection = manager.inspect(&agent_id).await.expect("inspect");
     assert_eq!(inspection.snapshot.state, AgentState::Completed);
     assert_eq!(inspection.transcript, vec!["checked the target"]);
+    let replay = store
+        .replay_agent(&"session".into(), &agent_id)
+        .expect("replay agent");
+    let progress = replay
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.event,
+                SessionEvent::AgentProgress { snapshot }
+                    if snapshot.phase.as_deref() == Some("reviewing")
+            )
+        })
+        .expect("durable child progress");
+    let completed = replay
+        .iter()
+        .position(|event| matches!(event.event, SessionEvent::AgentCompleted { .. }))
+        .expect("durable child completion");
+    assert!(progress < completed);
 }
 
 struct ControlledRunner {
@@ -612,11 +631,12 @@ async fn manager_messages_one_child_and_cancels_another() {
         .expect("resolve");
     let first = plan.ready[0].id.clone();
     let second = plan.ready[1].id.clone();
+    let store = Arc::new(MemoryStore::default());
     let manager = Arc::new(AgentManager::new(
         "controlled".into(),
         None,
         4,
-        Arc::new(MemoryStore::default()),
+        store.clone(),
         Arc::new(CollectingSink::default()),
     ));
     let (started_tx, mut started_rx) = mpsc::unbounded_channel();
@@ -644,6 +664,24 @@ async fn manager_messages_one_child_and_cancels_another() {
     let results = executing.await.expect("join").expect("execute");
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].summary, "continue with this");
+    let replay = store
+        .replay_agent(&"controlled".into(), &first)
+        .expect("replay messaged child");
+    let message = replay
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.event,
+                SessionEvent::AgentMessage { agent_id, text }
+                    if agent_id == &first && text == "continue with this"
+            )
+        })
+        .expect("durable child message");
+    let completed = replay
+        .iter()
+        .position(|event| matches!(event.event, SessionEvent::AgentCompleted { .. }))
+        .expect("durable child completion");
+    assert!(message < completed);
     assert_eq!(
         manager
             .inspect(&second)

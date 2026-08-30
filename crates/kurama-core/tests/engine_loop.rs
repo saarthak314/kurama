@@ -1083,6 +1083,96 @@ async fn repeated_model_call_id_does_not_repeat_the_side_effect() {
 }
 
 #[tokio::test]
+async fn duplicate_model_call_ids_in_one_round_are_rejected_before_execution() {
+    let backend: Arc<dyn ModelBackend> = Arc::new(ScriptedBackend::new(vec![vec![
+        Ok(ModelEvent::ToolCall {
+            call_id: "duplicate".into(),
+            name: "count".into(),
+            arguments: serde_json::json!({"value": 1}),
+        }),
+        Ok(ModelEvent::ToolCall {
+            call_id: "duplicate".into(),
+            name: "count".into(),
+            arguments: serde_json::json!({"value": 2}),
+        }),
+        Ok(ModelEvent::ResponseCompleted {
+            cursor: None,
+            finish_reason: FinishReason::ToolCalls,
+        }),
+    ]]));
+    let tool = Arc::new(CountingTool::default());
+    let executions = tool.executions.clone();
+    let config = counting_config(
+        "duplicate-round",
+        backend,
+        tool,
+        Arc::new(MemoryStore::default()),
+    );
+    let (handle, mut events) = Engine::spawn(config, Vec::new()).expect("spawn");
+    handle.submit("count twice", false).await.expect("submit");
+
+    let message = loop {
+        match events.recv().await.expect("event") {
+            RuntimeEvent::Error { message } => break message,
+            RuntimeEvent::TurnCompleted => panic!("duplicate call ids completed the turn"),
+            _ => {}
+        }
+    };
+
+    assert!(message.contains("duplicate tool call id"));
+    assert_eq!(executions.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn reused_model_call_id_cannot_alias_a_different_invocation() {
+    let backend: Arc<dyn ModelBackend> = Arc::new(ScriptedBackend::new(vec![
+        vec![
+            Ok(ModelEvent::ToolCall {
+                call_id: "reused".into(),
+                name: "count".into(),
+                arguments: serde_json::json!({"value": 1}),
+            }),
+            Ok(ModelEvent::ResponseCompleted {
+                cursor: None,
+                finish_reason: FinishReason::ToolCalls,
+            }),
+        ],
+        vec![
+            Ok(ModelEvent::ToolCall {
+                call_id: "reused".into(),
+                name: "count".into(),
+                arguments: serde_json::json!({"value": 2}),
+            }),
+            Ok(ModelEvent::ResponseCompleted {
+                cursor: None,
+                finish_reason: FinishReason::ToolCalls,
+            }),
+        ],
+    ]));
+    let tool = Arc::new(CountingTool::default());
+    let executions = tool.executions.clone();
+    let config = counting_config(
+        "conflicting-reuse",
+        backend,
+        tool,
+        Arc::new(MemoryStore::default()),
+    );
+    let (handle, mut events) = Engine::spawn(config, Vec::new()).expect("spawn");
+    handle.submit("count twice", false).await.expect("submit");
+
+    let message = loop {
+        match events.recv().await.expect("event") {
+            RuntimeEvent::Error { message } => break message,
+            RuntimeEvent::TurnCompleted => panic!("conflicting call id completed the turn"),
+            _ => {}
+        }
+    };
+
+    assert!(message.contains("different invocation"));
+    assert_eq!(executions.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
 async fn model_call_ids_are_reusable_after_turn_completion() {
     let call = || ModelEvent::ToolCall {
         call_id: "same_call".into(),

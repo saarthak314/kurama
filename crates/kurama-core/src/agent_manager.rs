@@ -297,16 +297,16 @@ impl AgentManager {
                 .agents
                 .get_mut(agent_id)
                 .ok_or_else(|| KuramaError::NotFound(agent_id.to_string()))?;
+            self.append_agent_event(
+                agent,
+                SessionEvent::AgentMessage {
+                    agent_id: agent_id.clone(),
+                    text: text.clone(),
+                },
+            )?;
             agent.transcript.push(format!("parent: {text}"));
             if agent.messages.is_none() {
                 agent.pending_messages.push(text.clone());
-                self.append_agent_event(
-                    agent,
-                    SessionEvent::AgentMessage {
-                        agent_id: agent_id.clone(),
-                        text: text.clone(),
-                    },
-                )?;
             }
             agent.messages.clone()
         };
@@ -607,21 +607,33 @@ impl AgentManager {
                 .agents
                 .get_mut(agent_id)
                 .ok_or_else(|| KuramaError::NotFound(agent_id.to_string()))?;
+            let mut snapshot = agent.snapshot.clone();
+            snapshot.phase = progress.phase;
+            snapshot.active_operation = progress.active_operation;
+            snapshot.changed_files = progress.changed_files;
+            snapshot.last_error = progress.last_error;
+            let budget_exhausted = progress.usage.input_tokens > agent.spec.budget.max_input_tokens
+                || progress.usage.output_tokens > agent.spec.budget.max_output_tokens
+                || progress.completed_turns > agent.spec.budget.max_turns;
+            if budget_exhausted {
+                snapshot.last_error = Some("child budget exhausted".into());
+            }
+            if snapshot != agent.snapshot {
+                self.append_agent_event(
+                    agent,
+                    SessionEvent::AgentProgress {
+                        snapshot: snapshot.clone(),
+                    },
+                )?;
+            }
             if let Some(line) = progress.transcript_line {
                 agent.transcript.push(line);
             }
-            agent.snapshot.phase = progress.phase;
-            agent.snapshot.active_operation = progress.active_operation;
-            agent.snapshot.changed_files = progress.changed_files;
-            agent.snapshot.last_error = progress.last_error;
-            if progress.usage.input_tokens > agent.spec.budget.max_input_tokens
-                || progress.usage.output_tokens > agent.spec.budget.max_output_tokens
-                || progress.completed_turns > agent.spec.budget.max_turns
-            {
+            if budget_exhausted {
                 agent.cancel.cancel();
-                agent.snapshot.last_error = Some("child budget exhausted".into());
             }
-            agent.snapshot.clone()
+            agent.snapshot = snapshot.clone();
+            snapshot
         };
         self.emit(RuntimeEvent::AgentUpdated { snapshot }).await
     }

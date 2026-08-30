@@ -173,6 +173,7 @@ impl Engine {
         let (command_tx, command_rx) = mpsc::channel(config.command_capacity);
         let (runtime_tx, runtime_rx) = mpsc::channel(config.event_capacity);
         let completed_tool_calls = completed_tool_calls_for_active_turn(&replay);
+        let seen_tool_calls = tool_invocations_for_active_turn(&replay)?;
         let tool_limits = ToolLimits::from_model_input_budget(
             config
                 .context_policy
@@ -228,6 +229,7 @@ impl Engine {
             runtime_tx,
             session_approvals: BTreeSet::new(),
             completed_tool_calls,
+            seen_tool_calls,
             recovery_continuation,
             recovery_operations: recovery.operations.into_iter().collect(),
             interrupted_agents: recovery.interrupted_agents,
@@ -270,6 +272,7 @@ struct EngineActor {
     runtime_tx: mpsc::Sender<RuntimeEvent>,
     session_approvals: BTreeSet<String>,
     completed_tool_calls: BTreeMap<kurama_protocol::id::CallId, (OperationId, ToolResult)>,
+    seen_tool_calls: BTreeMap<kurama_protocol::id::CallId, ToolInvocation>,
     recovery_continuation: Option<BackendCursor>,
     recovery_operations: Vec<(OperationId, RecoveryAction)>,
     interrupted_agents: Vec<kurama_protocol::agent::AgentSnapshot>,
@@ -634,6 +637,8 @@ impl EngineActor {
                     result: replaced,
                 })?;
                 invocation.arguments = arguments;
+                self.seen_tool_calls
+                    .insert(invocation.call_id.clone(), invocation.clone());
                 self.execute_tool(invocation, cancel).await
             }
         }
@@ -699,6 +704,8 @@ impl EngineActor {
                     result,
                 })?;
                 invocation.arguments = arguments;
+                self.seen_tool_calls
+                    .insert(invocation.call_id.clone(), invocation.clone());
                 self.execute_tool(invocation, cancel).await
             }
         }
@@ -791,6 +798,7 @@ impl EngineActor {
         explicit_delegation: bool,
     ) -> Result<(), KuramaError> {
         self.completed_tool_calls.clear();
+        self.seen_tool_calls.clear();
         self.append(SessionEvent::UserMessage { text })?;
         self.continue_turn(explicit_delegation).await
     }
@@ -910,6 +918,12 @@ impl EngineActor {
                                         self.flush_deltas(&mut runtime_buffer, false).await?;
                                     }
                                     ModelEvent::ToolCall { call_id, name, arguments } => {
+                                        if !round.tool_call_ids.insert(call_id.clone()) {
+                                            self.preserve_partial_assistant(&round, &mut runtime_buffer).await?;
+                                            return Err(KuramaError::Model(format!(
+                                                "model emitted duplicate tool call id {call_id} in one response"
+                                            )));
+                                        }
                                         round.tool_calls.push(ToolInvocation { call_id, name, arguments });
                                     }
                                     ModelEvent::Delegation { request } => round.delegations.push(request),
@@ -977,6 +991,25 @@ impl EngineActor {
         invocation: ToolInvocation,
         cancel: &CancelToken,
     ) -> Result<ToolResult, KuramaError> {
+        match self.seen_tool_calls.get(&invocation.call_id) {
+            Some(previous) if previous != &invocation => {
+                return Err(KuramaError::Model(format!(
+                    "model reused tool call id {} for a different invocation",
+                    invocation.call_id
+                )));
+            }
+            Some(_) => {}
+            None if self.completed_tool_calls.contains_key(&invocation.call_id) => {
+                return Err(KuramaError::Model(format!(
+                    "model reused tool call id {} without a durable invocation",
+                    invocation.call_id
+                )));
+            }
+            None => {
+                self.seen_tool_calls
+                    .insert(invocation.call_id.clone(), invocation.clone());
+            }
+        }
         if let Some((operation_id, result)) =
             self.completed_tool_calls.get(&invocation.call_id).cloned()
         {
@@ -1089,6 +1122,8 @@ impl EngineActor {
                                 result,
                             })?;
                             invocation.arguments = arguments;
+                            self.seen_tool_calls
+                                .insert(invocation.call_id.clone(), invocation.clone());
                             continue;
                         }
                     }
@@ -1664,16 +1699,7 @@ fn combined_tool_output(stdout: &str, stderr: &str) -> String {
 fn completed_tool_calls_for_active_turn(
     replay: &[EventEnvelope],
 ) -> BTreeMap<kurama_protocol::id::CallId, (OperationId, ToolResult)> {
-    let start = replay
-        .iter()
-        .rposition(|event| {
-            matches!(
-                event.event,
-                SessionEvent::TurnCompleted | SessionEvent::TurnFailed { .. }
-            )
-        })
-        .map_or(0, |index| index + 1);
-    replay[start..]
+    replay[active_turn_start(replay)..]
         .iter()
         .filter_map(|event| match &event.event {
             SessionEvent::ToolCompleted {
@@ -1688,10 +1714,45 @@ fn completed_tool_calls_for_active_turn(
         .collect()
 }
 
+fn tool_invocations_for_active_turn(
+    replay: &[EventEnvelope],
+) -> Result<BTreeMap<kurama_protocol::id::CallId, ToolInvocation>, KuramaError> {
+    let mut invocations = BTreeMap::new();
+    for event in &replay[active_turn_start(replay)..] {
+        let SessionEvent::ToolInvocationRecorded { invocation, .. } = &event.event else {
+            continue;
+        };
+        if invocations
+            .get(&invocation.call_id)
+            .is_some_and(|existing| existing != invocation)
+        {
+            return Err(KuramaError::Session(format!(
+                "active turn reuses tool call id {} for different invocations",
+                invocation.call_id
+            )));
+        }
+        invocations.insert(invocation.call_id.clone(), invocation.clone());
+    }
+    Ok(invocations)
+}
+
+fn active_turn_start(replay: &[EventEnvelope]) -> usize {
+    replay
+        .iter()
+        .rposition(|event| {
+            matches!(
+                event.event,
+                SessionEvent::TurnCompleted | SessionEvent::TurnFailed { .. }
+            )
+        })
+        .map_or(0, |index| index + 1)
+}
+
 #[derive(Default)]
 struct ModelRound {
     text: String,
     tool_calls: Vec<ToolInvocation>,
+    tool_call_ids: BTreeSet<kurama_protocol::id::CallId>,
     delegations: Vec<kurama_protocol::agent::DelegationRequest>,
     finish_reason: Option<FinishReason>,
     tool_calls_empty: bool,
