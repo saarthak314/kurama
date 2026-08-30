@@ -13,6 +13,7 @@ use kurama_protocol::agent::AgentState;
 use super::{
     Overlay, ResponsiveLayout, TuiState, activity_line,
     composer::{approval_height, composer_height, render_approval, render_composer, render_footer},
+    layout::{main_area, visible_activity_rect},
     transcript::{TranscriptDetail, render_transcript_view, transcript_lines, truncate_display},
 };
 
@@ -44,7 +45,8 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
 }
 
 fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
-    let area = main_area(frame.area());
+    let frame_area = frame.area();
+    let area = main_area(frame_area);
     if area.is_empty() {
         return;
     }
@@ -55,10 +57,11 @@ fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
         composer_height(state, area.width)
     };
     let now = Instant::now();
-    let activity = (!approval_visible)
+    let activity_visible = !visible_activity_rect(frame_area, state).is_empty();
+    let activity = activity_visible
         .then(|| activity_line(state.activity(), area.width as usize, now))
         .flatten();
-    let layout = ResponsiveLayout::for_area(area, input_height, activity.is_some());
+    let layout = ResponsiveLayout::for_area(area, input_height, activity_visible);
 
     if !layout.transcript.is_empty() {
         let transcript = transcript_lines(
@@ -105,17 +108,6 @@ fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
         layout.footer,
         !approval_visible && state.overlay == Overlay::None,
     );
-}
-
-fn main_area(area: Rect) -> Rect {
-    let total_padding = area.width.saturating_sub(4).min(4);
-    let left_padding = total_padding.saturating_add(1) / 2;
-    Rect::new(
-        area.x.saturating_add(left_padding),
-        area.y,
-        area.width.saturating_sub(total_padding),
-        area.height,
-    )
 }
 
 fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) {

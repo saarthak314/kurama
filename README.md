@@ -55,7 +55,7 @@ YOLO is unrestricted. It remains logged, but redaction is best-effort and the mo
 ## TUI Commands
 
 - `/agents` opens the child-agent controller; Enter inspects, `m` messages, and `x` cancels with confirmation.
-- `/status` summarizes the active runtime; `/model` selects a model; `/connect` manages provider connections.
+- `/model` selects a model; `/connect` manages provider connections.
 - `/sessions`, `/resume <id>`, and `/new` manage sessions.
 - `/context` explains active context; `/compact` forces compaction.
 

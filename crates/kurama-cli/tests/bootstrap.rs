@@ -434,9 +434,6 @@ async fn live_controls_list_context_persist_mode_and_switch_profile() {
     .expect("bootstrap");
     let session_id = app.session_id().expect("session id").to_string();
 
-    submit_command(&mut app, "/status");
-    assert!(transcript_has_notice(&app, "profile work"));
-    assert!(transcript_has_notice(&app, "mode supervised"));
     submit_command(&mut app, "/sessions");
     assert!(transcript_has_notice(&app, &session_id));
     submit_command(&mut app, "/context");

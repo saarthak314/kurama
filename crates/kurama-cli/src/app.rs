@@ -44,7 +44,7 @@ use crate::{
     commands::{Command, parse_command},
     tui::{
         OnboardingState, OnboardingSubmission, Overlay, SURFACE, TerminalGuard, TranscriptDetail,
-        TuiState, render, spawn_input_thread, transcript_lines,
+        TuiState, render, spawn_input_thread, transcript_lines, visible_activity_rect,
     },
 };
 
@@ -598,18 +598,6 @@ impl App {
             };
             match command {
                 Command::Agents => self.state.open_agents(),
-                Command::Status => {
-                    self.state.push_notice(
-                        Some("STATUS".into()),
-                        format!(
-                            "profile {}; model {}; mode {}; session {}",
-                            self.state.profile,
-                            self.state.model,
-                            execution_mode_label(self.state.mode),
-                            self.session_id.as_ref().map_or("none", AsRef::as_ref),
-                        ),
-                    );
-                }
                 Command::Model(profile) => {
                     if let Some(profile) = profile {
                         let known = self
@@ -1070,12 +1058,6 @@ fn apply_runtime_event_in_order(
     tool_open
 }
 
-fn activity_animation_visible(state: &TuiState) -> bool {
-    state.activity().is_animated()
-        && state.overlay() == Overlay::None
-        && !state.transcript_view_expanded()
-}
-
 async fn run_loop<B>(
     app: &mut App,
     terminal: &mut Terminal<B>,
@@ -1114,7 +1096,8 @@ where
     while input_open || runtime_open || tool_open {
         let mut exit = false;
         let mut animation_tick = false;
-        let animate_activity = activity_animation_visible(&app.state);
+        let terminal_area = terminal.get_frame().area();
+        let animate_activity = !visible_activity_rect(terminal_area, &app.state).is_empty();
         let animation = async move {
             if animate_activity {
                 tokio::time::sleep(ACTIVITY_FRAME_INTERVAL).await;
@@ -1436,11 +1419,14 @@ mod tests {
         tool::ToolResult,
     };
     use ratatui::{
-        TerminalOptions, Viewport, backend::TestBackend, layout::Position, style::Color,
+        TerminalOptions, Viewport,
+        backend::TestBackend,
+        layout::{Position, Rect},
+        style::Color,
     };
 
     use super::*;
-    use crate::tui::{ActivityState, TranscriptEntry};
+    use crate::tui::{ActivityState, TranscriptEntry, visible_activity_rect};
 
     fn test_app() -> App {
         App {
@@ -1549,20 +1535,23 @@ mod tests {
     fn animation_wakes_only_for_visible_active_work() {
         let mut app = test_app();
         assert_eq!(ACTIVITY_FRAME_INTERVAL, Duration::from_millis(32));
-        assert!(!activity_animation_visible(&app.state));
+        let normal_area = Rect::new(0, 0, 80, 24);
+        assert!(visible_activity_rect(normal_area, &app.state).is_empty());
 
         app.state.set_thinking();
-        assert!(activity_animation_visible(&app.state));
+        assert!(visible_activity_rect(Rect::new(0, 0, 80, 0), &app.state).is_empty());
+        assert!(visible_activity_rect(Rect::new(0, 0, 80, 1), &app.state).is_empty());
+        assert!(!visible_activity_rect(normal_area, &app.state).is_empty());
 
         app.state.toggle_transcript_view();
-        assert!(!activity_animation_visible(&app.state));
+        assert!(visible_activity_rect(normal_area, &app.state).is_empty());
 
         app.state.toggle_transcript_view();
         app.state.overlay = Overlay::Approval;
-        assert!(!activity_animation_visible(&app.state));
+        assert!(visible_activity_rect(normal_area, &app.state).is_empty());
 
         app.state.overlay = Overlay::Agents;
-        assert!(!activity_animation_visible(&app.state));
+        assert!(visible_activity_rect(normal_area, &app.state).is_empty());
     }
 
     #[test]

@@ -1,5 +1,7 @@
 use ratatui::layout::Rect;
 
+use super::{Overlay, TuiState, composer::composer_height};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponsiveLayout {
     pub transcript: Rect,
@@ -43,4 +45,28 @@ impl ResponsiveLayout {
             footer: empty,
         }
     }
+}
+
+pub(crate) fn visible_activity_rect(area: Rect, state: &TuiState) -> Rect {
+    let area = main_area(area);
+    if area.is_empty()
+        || state.transcript_view_expanded()
+        || state.overlay() != Overlay::None
+        || !state.activity().is_animated()
+    {
+        return Rect::new(area.x, area.y, area.width, 0);
+    }
+
+    ResponsiveLayout::for_area(area, composer_height(state, area.width), true).activity
+}
+
+pub(crate) fn main_area(area: Rect) -> Rect {
+    let total_padding = area.width.saturating_sub(4).min(4);
+    let left_padding = total_padding.saturating_add(1) / 2;
+    Rect::new(
+        area.x.saturating_add(left_padding),
+        area.y,
+        area.width.saturating_sub(total_padding),
+        area.height,
+    )
 }

@@ -3,7 +3,6 @@ use kurama_protocol::{id::SessionId, policy::ExecutionMode};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Agents,
-    Status,
     Model(Option<String>),
     Connect,
     Sessions,
@@ -21,7 +20,6 @@ pub fn parse_command(input: &str) -> Result<Command, String> {
 
     match (name, remainder.as_slice()) {
         ("/agents", []) => Ok(Command::Agents),
-        ("/status", []) => Ok(Command::Status),
         ("/model", []) => Ok(Command::Model(None)),
         ("/model", [profile]) => Ok(Command::Model(Some((*profile).to_owned()))),
         ("/connect", []) => Ok(Command::Connect),

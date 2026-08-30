@@ -14,6 +14,7 @@ pub use agents::{AgentRow, sort_agents};
 pub use approval::ApprovalState;
 pub use input::{TerminalGuard, spawn_input_thread};
 pub use layout::ResponsiveLayout;
+pub(crate) use layout::visible_activity_rect;
 pub use onboarding::{OnboardingState, OnboardingSubmission};
 pub(crate) use render::SURFACE;
 pub use render::render;

@@ -89,7 +89,6 @@ fn narrow_approval_request() -> ApprovalRequest {
 #[test]
 fn parses_all_product_commands_without_restart() {
     assert_eq!(parse_command("/agents").unwrap(), Command::Agents);
-    assert_eq!(parse_command("/status").unwrap(), Command::Status);
     assert_eq!(
         parse_command("/model openai-main").unwrap(),
         Command::Model(Some("openai-main".into()))
@@ -104,6 +103,18 @@ fn parses_all_product_commands_without_restart() {
     );
     assert!(parse_command("/restart").is_err());
     assert!(parse_command("/mode yolo").is_err());
+}
+
+#[test]
+fn activity_row_visibility_follows_layout_geometry() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.set_thinking();
+
+    for height in [0, 1] {
+        assert!(!buffer_text(&rendered(&state, 80, height)).contains("Thinking"));
+    }
+
+    assert!(buffer_text(&rendered(&state, 80, 4)).contains("Thinking"));
 }
 
 #[test]
