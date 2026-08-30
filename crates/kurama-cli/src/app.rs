@@ -1612,6 +1612,8 @@ where
         let mut animation_tick = false;
         let mut force_redraw = false;
         let mut state_changed = false;
+        let mut transcript_changed = false;
+        let transcript_len_before = app.state.transcript.len();
         let terminal_area = terminal.get_frame().area();
         let animate_activity = !visible_activity_rect(terminal_area, &app.state).is_empty();
         let activity_deadline =
@@ -1647,11 +1649,13 @@ where
                         resize_inline_terminal(terminal, width, height, resize_mode.replay)
                             .map_err(|error| error.to_string())?;
                         state_changed = true;
+                        transcript_changed = true;
                         force_redraw = true;
                     }
                     Some(event) => {
                         exit = app.handle_event(event)?;
                         state_changed = true;
+                        transcript_changed = app.state.transcript.len() != transcript_len_before;
                         force_redraw = true;
                     }
                     None => input_open = false,
@@ -1661,6 +1665,7 @@ where
                 match event {
                     Some(event) => {
                         state_changed = true;
+                        transcript_changed = true;
                         let mut outcome = apply_runtime_channel_event(
                             &mut app.state,
                             event,
@@ -1688,6 +1693,7 @@ where
                 match event {
                     Some(event) => {
                         state_changed = true;
+                        transcript_changed = true;
                         let mut outcome = apply_tool_channel_event(&mut app.state, event);
                         if !outcome.0 {
                             let batch = drain_ready_events(
@@ -1715,7 +1721,7 @@ where
         if !app.state.sent_commands().is_empty() {
             app.flush_commands().await?;
         }
-        if state_changed {
+        if transcript_changed {
             transcript_cache.invalidate();
         }
         redraw_pending |= state_changed;
@@ -2979,6 +2985,41 @@ Session ID: s_cached"
         .expect("run animated inline frame");
         closer.await.expect("close input channel");
 
+        assert_eq!(crate::tui::transcript_render_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn composer_input_reuses_unchanged_markdown() {
+        let mut app = test_app();
+        app.state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+            text: "## Heading\n\n- one\n- two\n\n```rust\nfn main() {}\n```".into(),
+        });
+        let mut terminal =
+            initialize_inline_terminal(TestBackend::new(80, 24)).expect("inline terminal");
+        let (input_sender, mut input) = mpsc::channel(1);
+        input_sender
+            .send(Event::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .expect("send composer input");
+        drop(input_sender);
+
+        crate::tui::reset_transcript_render_calls();
+        run_loop(
+            &mut app,
+            &mut terminal,
+            &mut input,
+            None,
+            None,
+            true,
+            ResizeMode::PRESERVE,
+        )
+        .await
+        .expect("run composer redraw");
+
+        assert_eq!(app.state.composer, "x");
         assert_eq!(crate::tui::transcript_render_calls(), 1);
     }
 
