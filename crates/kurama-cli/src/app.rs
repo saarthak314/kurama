@@ -59,6 +59,28 @@ const READY_EVENT_BATCH_LIMIT: usize = 128;
 const STREAM_REDRAW_INTERVAL: Duration = Duration::from_millis(33);
 const ACTIVITY_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 
+#[derive(Clone, Copy)]
+struct ResizeMode {
+    replay: bool,
+    purge_history: bool,
+}
+
+impl ResizeMode {
+    const PRESERVE: Self = Self {
+        replay: false,
+        purge_history: false,
+    };
+    const PURGE_AND_REPLAY: Self = Self {
+        replay: true,
+        purge_history: true,
+    };
+    #[cfg(test)]
+    const REPLAY: Self = Self {
+        replay: true,
+        purge_history: false,
+    };
+}
+
 pub struct App {
     pub state: TuiState,
     engine: Option<EngineHandle>,
@@ -491,6 +513,7 @@ impl App {
                 runtime_events,
                 tool_events,
                 true,
+                ResizeMode::PURGE_AND_REPLAY,
             )
             .await?;
             let Some(args) = self.restart_args.take() else {
@@ -1069,16 +1092,26 @@ fn resize_inline_terminal<B>(
     terminal: &mut Terminal<B>,
     width: u16,
     height: u16,
+    reset_origin: bool,
 ) -> Result<(), B::Error>
 where
     B: Backend + Clone,
 {
     let viewport_height = height.min(INLINE_VIEWPORT_MAX_HEIGHT);
-    let viewport_top = height.saturating_sub(viewport_height);
     let current_viewport_top = terminal.get_frame().area().top();
+    let viewport_top = if reset_origin {
+        0
+    } else {
+        current_viewport_top.min(height.saturating_sub(viewport_height))
+    };
+    let clear_top = if reset_origin {
+        0
+    } else {
+        current_viewport_top.min(viewport_top)
+    };
     terminal
         .backend_mut()
-        .set_cursor_position(Position::new(0, current_viewport_top))?;
+        .set_cursor_position(Position::new(0, clear_top))?;
     terminal
         .backend_mut()
         .clear_region(ClearType::AfterCursor)?;
@@ -1174,7 +1207,13 @@ where
     let viewport_top = current_area
         .top()
         .min(size.height.saturating_sub(viewport_height));
-    terminal.clear()?;
+    let clear_top = current_area.top().min(viewport_top);
+    terminal
+        .backend_mut()
+        .set_cursor_position(Position::new(0, clear_top))?;
+    terminal
+        .backend_mut()
+        .clear_region(ClearType::AfterCursor)?;
     terminal.backend_mut().flush()?;
     replace_inline_terminal(
         terminal,
@@ -1261,6 +1300,7 @@ where
         Some(runtime_events),
         None,
         false,
+        ResizeMode::PRESERVE,
     )
     .await?;
     Ok(app)
@@ -1393,6 +1433,7 @@ async fn run_loop<B>(
     runtime_events: Option<mpsc::Receiver<RuntimeEvent>>,
     tool_events: Option<mpsc::Receiver<RuntimeEvent>>,
     commit_to_scrollback: bool,
+    resize_mode: ResizeMode,
 ) -> Result<(), String>
 where
     B: Backend + Clone,
@@ -1455,7 +1496,13 @@ where
             event = input.recv(), if input_open => {
                 match event {
                     Some(Event::Resize(width, height)) if commit_to_scrollback => {
-                        resize_inline_terminal(terminal, width, height)
+                        if resize_mode.purge_history {
+                            purge_terminal_history().map_err(|error| error.to_string())?;
+                        }
+                        if resize_mode.replay {
+                            app.state.reset_transcript_commit();
+                        }
+                        resize_inline_terminal(terminal, width, height, resize_mode.replay)
                             .map_err(|error| error.to_string())?;
                         state_changed = true;
                         force_redraw = true;
@@ -2190,6 +2237,7 @@ Session ID: s_cached"
             Some(runtime_events),
             None,
             false,
+            ResizeMode::PRESERVE,
         )
         .await
         .expect("run loop");
@@ -2251,6 +2299,7 @@ Session ID: s_cached"
             Some(runtime_events),
             Some(tool_events),
             false,
+            ResizeMode::PRESERVE,
         )
         .await
         .expect("run loop");
@@ -2494,15 +2543,15 @@ Session ID: s_cached"
             .expect("draw initial viewport");
 
         terminal.backend_mut().resize(52, 12);
-        resize_inline_terminal(&mut terminal, 52, 12).expect("shrink inline terminal");
+        resize_inline_terminal(&mut terminal, 52, 12, false).expect("shrink inline terminal");
         assert_eq!(terminal.get_frame().area(), Rect::new(0, 0, 52, 12));
         terminal
             .draw(|frame| render(frame, &state))
             .expect("draw narrow viewport");
 
         terminal.backend_mut().resize(100, 30);
-        resize_inline_terminal(&mut terminal, 100, 30).expect("grow inline terminal");
-        assert_eq!(terminal.get_frame().area(), Rect::new(0, 18, 100, 12));
+        resize_inline_terminal(&mut terminal, 100, 30, false).expect("grow inline terminal");
+        assert_eq!(terminal.get_frame().area(), Rect::new(0, 0, 100, 12));
         terminal
             .draw(|frame| render(frame, &state))
             .expect("draw wide viewport");
@@ -2517,6 +2566,37 @@ Session ID: s_cached"
             .collect::<String>();
         assert_eq!(text.matches("Ask Kurama").count(), 1, "{text}");
         assert_eq!(text.matches("work/model").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn expanding_inline_viewport_clears_rows_above_the_old_viewport() {
+        let mut backend = TestBackend::with_lines(["stale terminal content"; 16]);
+        backend
+            .set_cursor_position(Position::new(0, 8))
+            .expect("position inline viewport");
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(8),
+            },
+        )
+        .expect("inline terminal");
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        state.toggle_transcript_view();
+
+        set_inline_viewport_height(&mut terminal, 16).expect("expand inline viewport");
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("draw expanded transcript");
+
+        let visible = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!visible.contains("stale terminal content"), "{visible}");
     }
 
     #[test]
@@ -2585,6 +2665,7 @@ Session ID: s_cached"
             Some(runtime_events),
             None,
             true,
+            ResizeMode::PRESERVE,
         )
         .await
         .expect("run inline terminal");
@@ -2617,7 +2698,7 @@ Session ID: s_cached"
     }
 
     #[tokio::test]
-    async fn inline_resize_preserves_committed_history_without_reinserting_it() {
+    async fn inline_resize_replays_committed_history_without_duplicates() {
         let mut app = test_app();
         app.state.push_user("committed question");
         app.state.push_assistant("committed answer");
@@ -2630,9 +2711,17 @@ Session ID: s_cached"
             .expect("queue resize");
         drop(input_sender);
 
-        run_loop(&mut app, &mut terminal, &mut input, None, None, true)
-            .await
-            .expect("run resized inline terminal");
+        run_loop(
+            &mut app,
+            &mut terminal,
+            &mut input,
+            None,
+            None,
+            true,
+            ResizeMode::REPLAY,
+        )
+        .await
+        .expect("run resized inline terminal");
 
         let text = terminal
             .backend()
