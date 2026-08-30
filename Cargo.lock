@@ -822,7 +822,6 @@ dependencies = [
  "lexopt",
  "pulldown-cmark",
  "ratatui",
- "rustix",
  "serde_json",
  "tempfile",
  "tokio",

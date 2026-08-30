@@ -47,8 +47,7 @@ use crate::{
     tui::{
         CursorTrackingBackend, OnboardingState, OnboardingSubmission, Overlay, SURFACE,
         SharedBackend, TerminalGuard, TranscriptDetail, TuiState, approval_height, composer_height,
-        cursor_position, main_area, render, spawn_input_thread, transcript_lines,
-        visible_activity_rect,
+        main_area, render, spawn_input_thread, transcript_lines, visible_activity_rect,
     },
 };
 
@@ -472,11 +471,10 @@ impl App {
 
     pub async fn run(mut self) -> Result<Option<ExitSummary>, String> {
         let _guard = TerminalGuard::enter().map_err(|error| error.to_string())?;
-        let initial_cursor = cursor_position(Duration::from_millis(100)).unwrap_or_default();
-        let backend = SharedBackend::new(CursorTrackingBackend::with_cursor_position(
-            CrosstermBackend::new(io::stdout()),
-            initial_cursor,
-        ));
+        purge_terminal_history().map_err(|error| error.to_string())?;
+        let backend = SharedBackend::new(CursorTrackingBackend::new(CrosstermBackend::new(
+            io::stdout(),
+        )));
         let mut terminal =
             initialize_inline_terminal(backend).map_err(|error| error.to_string())?;
         let mut input = spawn_input_thread(32);
@@ -1043,9 +1041,8 @@ where
 {
     let rows = backend.size()?.height;
     let viewport_height = rows.min(INLINE_VIEWPORT_MAX_HEIGHT);
-    let viewport_top = backend.get_cursor_position()?.y.min(rows.saturating_sub(1));
-    backend.set_cursor_position(Position::new(0, viewport_top))?;
-    backend.clear_region(ClearType::AfterCursor)?;
+    backend.clear_region(ClearType::All)?;
+    backend.set_cursor_position(Position::ORIGIN)?;
     Terminal::with_options(
         backend,
         TerminalOptions {
@@ -1949,7 +1946,7 @@ Session ID: s_cached"
     }
 
     #[test]
-    fn inline_terminal_initialization_starts_at_the_invocation_cursor() {
+    fn inline_terminal_initialization_clears_previous_output_and_starts_at_origin() {
         let mut lines = vec![" ".repeat(80); 40];
         lines[0] = "stale shell prompt".into();
         lines[4] = "stale viewport content".into();
@@ -1968,8 +1965,8 @@ Session ID: s_cached"
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert_eq!(terminal.get_frame().area(), Rect::new(0, 4, 80, 12));
-        assert!(visible.contains("stale shell prompt"));
+        assert_eq!(terminal.get_frame().area(), Rect::new(0, 0, 80, 12));
+        assert!(!visible.contains("stale shell prompt"));
         assert!(!visible.contains("stale viewport content"));
         assert!(!visible.contains("stale lower content"));
     }
