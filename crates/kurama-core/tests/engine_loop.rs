@@ -247,6 +247,8 @@ async fn tool_completion_keeps_durable_output_bounded_and_hydrates_live_display(
         live_result.output,
         "head\n[omitted]\ntail\n\n[stderr]\nwarn\n"
     );
+    assert_eq!(store.blob_reads(), 0);
+    assert_eq!(store.blob_read_bytes(), 0);
 
     let completion = store
         .events("session")

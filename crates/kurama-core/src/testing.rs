@@ -64,6 +64,8 @@ pub struct MemoryStore {
     metadata: Mutex<BTreeMap<SessionId, SessionMetadata>>,
     events: Mutex<EventLogs>,
     blobs: Mutex<BTreeMap<String, Vec<u8>>>,
+    blob_reads: AtomicU64,
+    blob_read_bytes: AtomicU64,
 }
 
 impl MemoryStore {
@@ -94,6 +96,14 @@ impl MemoryStore {
                 )
             })
             .count()
+    }
+
+    pub fn blob_reads(&self) -> u64 {
+        self.blob_reads.load(Ordering::Relaxed)
+    }
+
+    pub fn blob_read_bytes(&self) -> u64 {
+        self.blob_read_bytes.load(Ordering::Relaxed)
     }
 }
 
@@ -168,12 +178,17 @@ impl SessionStore for MemoryStore {
     }
 
     fn get_blob(&self, reference: &BlobRef) -> Result<Vec<u8>, KuramaError> {
-        self.blobs
+        let bytes = self
+            .blobs
             .lock()
             .expect("memory blobs lock")
             .get(&reference.sha256)
             .cloned()
-            .ok_or_else(|| KuramaError::NotFound(reference.sha256.clone()))
+            .ok_or_else(|| KuramaError::NotFound(reference.sha256.clone()))?;
+        self.blob_reads.fetch_add(1, Ordering::Relaxed);
+        self.blob_read_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        Ok(bytes)
     }
 }
 

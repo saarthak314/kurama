@@ -1220,7 +1220,7 @@ impl EngineActor {
         operation_id: OperationId,
         mut result: ToolResult,
     ) -> Result<ToolResult, KuramaError> {
-        self.persist_display_blobs(&mut result)?;
+        let display_output = self.persist_display_blobs(&mut result)?;
         self.append(SessionEvent::ToolCompleted {
             operation_id: operation_id.clone(),
             result: result.clone(),
@@ -1229,7 +1229,13 @@ impl EngineActor {
             result.call_id.clone(),
             (operation_id.clone(), result.clone()),
         );
-        let runtime_result = self.hydrate_display_output(&result)?;
+        let runtime_result = if let Some(display_output) = display_output {
+            let mut runtime_result = result.clone();
+            runtime_result.metadata["display_output"] = serde_json::Value::String(display_output);
+            runtime_result
+        } else {
+            self.hydrate_display_output(&result)?
+        };
         self.emit(RuntimeEvent::ToolCompleted {
             operation_id,
             result: runtime_result,
@@ -1238,13 +1244,16 @@ impl EngineActor {
         Ok(result)
     }
 
-    fn persist_display_blobs(&self, result: &mut ToolResult) -> Result<(), KuramaError> {
+    fn persist_display_blobs(
+        &self,
+        result: &mut ToolResult,
+    ) -> Result<Option<String>, KuramaError> {
         let Some(staging) = result
             .metadata
             .as_object_mut()
             .and_then(|metadata| metadata.remove("_display_staging"))
         else {
-            return Ok(());
+            return Ok(None);
         };
         let serde_json::Value::Object(staging) = staging else {
             return Err(KuramaError::Protocol(
@@ -1253,13 +1262,26 @@ impl EngineActor {
         };
         let staged_files = StagedDisplayFiles::from_metadata(staging)?;
         if !result.truncated {
-            return Ok(());
+            return Ok(None);
         }
 
+        let has_output = staged_files
+            .files
+            .iter()
+            .any(|(stream, _)| stream == "output");
         let mut display_blobs = serde_json::Map::new();
+        let mut output = None;
+        let mut stdout = None;
+        let mut stderr = None;
         for (stream, path) in &staged_files.files {
             let bytes = std::fs::read(path)?;
             let reference = self.store.put_blob(&bytes)?;
+            match stream.as_str() {
+                "output" => output = Some(display_text(bytes)),
+                "stdout" if !has_output => stdout = Some(display_text(bytes)),
+                "stderr" if !has_output => stderr = Some(display_text(bytes)),
+                _ => {}
+            }
             display_blobs.insert(stream.clone(), serde_json::json!(reference));
         }
         if !display_blobs.is_empty()
@@ -1270,7 +1292,14 @@ impl EngineActor {
                 serde_json::Value::Object(display_blobs),
             );
         }
-        Ok(())
+        Ok(output.or_else(|| {
+            (stdout.is_some() || stderr.is_some()).then(|| {
+                combined_tool_output(
+                    stdout.as_deref().unwrap_or_default(),
+                    stderr.as_deref().unwrap_or_default(),
+                )
+            })
+        }))
     }
 
     fn hydrate_display_output(&self, result: &ToolResult) -> Result<ToolResult, KuramaError> {
@@ -1685,7 +1714,17 @@ fn display_blob_text(
         KuramaError::Protocol(format!("invalid display blob reference: {error}"))
     })?;
     let bytes = store.get_blob(&reference)?;
-    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    Ok(Some(display_text(bytes)))
+}
+
+fn display_text(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => {
+            let bytes = error.into_bytes();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    }
 }
 
 fn combined_tool_output(stdout: &str, stderr: &str) -> String {
