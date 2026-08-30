@@ -225,7 +225,6 @@ impl ChildRunner for RuntimeChildRunner {
                         ..ChildProgress::default()
                     })
                     .await;
-                context.cancel.cancel();
                 return Err(KuramaError::Cancelled);
             };
             let (mut handle, mut events) = spawn_engine(initial_profile, replay)?;
@@ -236,6 +235,7 @@ impl ChildRunner for RuntimeChildRunner {
             let mut messages_open = true;
             loop {
                 tokio::select! {
+                    biased;
                     () = context.cancel.cancelled() => {
                         let _ = handle.cancel_turn().await;
                         return Err(KuramaError::Cancelled);
@@ -331,7 +331,6 @@ impl ChildRunner for RuntimeChildRunner {
                                     .await;
                                 if budget_exhausted {
                                     let _ = handle.shutdown().await;
-                                    context.cancel.cancel();
                                     return Err(KuramaError::Cancelled);
                                 }
                                 let next_profile = next_profile.expect("queued work has budget");

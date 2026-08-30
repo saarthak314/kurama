@@ -755,6 +755,17 @@ impl AgentManager {
                         )?;
                         (snapshot, None, next_request)
                     }
+                    Err(KuramaError::Cancelled) => {
+                        agent.snapshot.state = AgentState::Cancelled;
+                        let snapshot = agent.snapshot.clone();
+                        self.append_agent_event(
+                            agent,
+                            SessionEvent::AgentCancelled {
+                                snapshot: snapshot.clone(),
+                            },
+                        )?;
+                        (snapshot, None, next_request)
+                    }
                     Err(error) => {
                         agent.snapshot.state = AgentState::Failed;
                         agent.snapshot.last_error = Some(error.to_string());
