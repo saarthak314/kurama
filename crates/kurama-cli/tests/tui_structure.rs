@@ -58,8 +58,14 @@ fn cell_at_text<'a>(buffer: &'a Buffer, needle: &str) -> &'a Cell {
         let row = (0..buffer.area.width)
             .map(|x| buffer.cell((x, y)).expect("cell").symbol())
             .collect::<String>();
-        if let Some(x) = row.find(needle) {
-            return buffer.cell((x as u16, y)).expect("styled cell");
+        if let Some(byte_offset) = row.find(needle) {
+            let mut consumed = 0;
+            for x in 0..buffer.area.width {
+                if consumed == byte_offset {
+                    return buffer.cell((x, y)).expect("styled cell");
+                }
+                consumed += buffer.cell((x, y)).expect("cell").symbol().len();
+            }
         }
     }
     panic!("rendered text did not contain {needle:?}");
@@ -699,8 +705,9 @@ fn assistant_markdown_renders_inline_styles_and_links() {
     );
     let inline_code = cell_at_text(&buffer, "cargo test");
     assert_eq!(cell_at_text(&buffer, "Use bold").fg, Color::Reset);
-    assert_eq!(inline_code.fg, Color::Reset);
-    assert!(inline_code.modifier.contains(Modifier::BOLD));
+    assert_eq!(inline_code.fg, Color::Rgb(166, 227, 161));
+    assert_eq!(inline_code.bg, Color::Rgb(35, 39, 47));
+    assert!(!inline_code.modifier.contains(Modifier::BOLD));
     let link = cell_at_text(&buffer, "docs");
     assert_eq!(link.fg, Color::Rgb(116, 177, 255));
     assert!(link.modifier.contains(Modifier::UNDERLINED));
@@ -813,12 +820,52 @@ fn assistant_markdown_renders_blocks_lists_code_quotes_rules_and_tables() {
             .modifier
             .contains(Modifier::BOLD)
     );
-    assert_eq!(cell_at_text(&buffer, "fn main()").fg, Color::Reset);
+    assert_eq!(
+        cell_at_text(&buffer, "fn main()").fg,
+        Color::Rgb(198, 120, 221)
+    );
     assert!(
         cell_at_text(&buffer, "Name")
             .modifier
             .contains(Modifier::BOLD)
     );
+}
+
+#[test]
+fn fenced_rust_code_uses_distinct_syntax_styles() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_assistant(concat!(
+        "```rust\n",
+        "fn render(value: &'static str) -> usize {\n",
+        "    let answer = 42;\n",
+        "    println!(\"ready\"); // visible\n",
+        "}\n",
+        "```"
+    ));
+
+    let buffer = rendered(&state, 100, 24);
+
+    assert_eq!(
+        cell_at_text(&buffer, "fn render").fg,
+        Color::Rgb(198, 120, 221)
+    );
+    assert_eq!(
+        cell_at_text(&buffer, "render(value").fg,
+        Color::Rgb(116, 177, 255)
+    );
+    assert_eq!(
+        cell_at_text(&buffer, "'static").fg,
+        Color::Rgb(137, 220, 235)
+    );
+    assert_eq!(cell_at_text(&buffer, "usize").fg, Color::Rgb(137, 220, 235));
+    assert_eq!(cell_at_text(&buffer, "42").fg, Color::Rgb(249, 226, 175));
+    assert_eq!(
+        cell_at_text(&buffer, "\"ready\"").fg,
+        Color::Rgb(166, 227, 161)
+    );
+    let comment = cell_at_text(&buffer, "// visible");
+    assert_eq!(comment.fg, Color::Rgb(126, 132, 146));
+    assert!(comment.modifier.contains(Modifier::ITALIC));
 }
 
 #[test]
@@ -1000,8 +1047,9 @@ fn table_cells_preserve_inline_markdown_styles() {
             .contains(Modifier::BOLD)
     );
     let inline_code = cell_at_text(&buffer, "ready");
-    assert_eq!(inline_code.fg, Color::Reset);
-    assert!(inline_code.modifier.contains(Modifier::BOLD));
+    assert_eq!(inline_code.fg, Color::Rgb(166, 227, 161));
+    assert_eq!(inline_code.bg, Color::Rgb(35, 39, 47));
+    assert!(!inline_code.modifier.contains(Modifier::BOLD));
     let link = cell_at_text(&buffer, "docs");
     assert_eq!(link.fg, Color::Rgb(116, 177, 255));
     assert!(link.modifier.contains(Modifier::UNDERLINED));

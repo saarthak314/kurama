@@ -10,7 +10,7 @@ use unicode_segmentation::UnicodeSegmentation;
 #[cfg(test)]
 use std::cell::Cell;
 
-use super::{ToolLifecycle, TranscriptEntry, TuiState};
+use super::{ToolLifecycle, TranscriptEntry, TuiState, syntax::highlight_code};
 
 const DIM: Color = Color::Rgb(126, 132, 146);
 const TEXT: Color = Color::Reset;
@@ -467,11 +467,26 @@ fn render_markdown_block(
                 None,
                 lines,
             );
+            let highlighted = language
+                .as_deref()
+                .and_then(|language| highlight_code(content, language))
+                .map(|spans| {
+                    spans
+                        .into_iter()
+                        .map(|span| StyledFragment {
+                            content: span.content,
+                            style: span.style,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| {
+                    vec![StyledFragment {
+                        content: content.clone(),
+                        style: code_style(),
+                    }]
+                });
             render_hard_fragments(
-                &[StyledFragment {
-                    content: content.clone(),
-                    style: code_style(),
-                }],
+                &highlighted,
                 width,
                 context,
                 None,
@@ -1184,7 +1199,9 @@ fn code_style() -> Style {
 }
 
 fn inline_code_style() -> Style {
-    text_style().add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(Color::Rgb(166, 227, 161))
+        .bg(Color::Rgb(35, 39, 47))
 }
 
 pub fn transcript_lines(

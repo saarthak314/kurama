@@ -9,6 +9,7 @@ mod layout;
 mod onboarding;
 mod render;
 mod state;
+mod syntax;
 mod transcript;
 
 pub use activity::activity_line;
