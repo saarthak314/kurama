@@ -857,9 +857,15 @@ impl EngineActor {
             if !round.tool_calls_empty || !round.delegations_empty {
                 continue;
             }
-            match round.finish_reason.unwrap_or(FinishReason::Stop) {
+            match round.finish_reason.ok_or_else(|| {
+                KuramaError::Model("model round ended without a finish reason".into())
+            })? {
                 FinishReason::Stop => return Ok(()),
-                FinishReason::ToolCalls => continue,
+                FinishReason::ToolCalls => {
+                    return Err(KuramaError::Model(
+                        "model reported tool calls without producing work".into(),
+                    ));
+                }
                 FinishReason::Length => {
                     return Err(KuramaError::Model(
                         "model stopped at its output limit".into(),
@@ -915,6 +921,10 @@ impl EngineActor {
                                             self.append(SessionEvent::ModelCursor { cursor })?;
                                         }
                                         round.finish_reason = Some(finish_reason);
+                                        self.flush_deltas(&mut runtime_buffer, true).await?;
+                                        round.tool_calls_empty = round.tool_calls.is_empty();
+                                        round.delegations_empty = round.delegations.is_empty();
+                                        return Ok(round);
                                     }
                                 }
                             }
@@ -928,10 +938,10 @@ impl EngineActor {
                                 return Err(error);
                             }
                             None => {
-                                self.flush_deltas(&mut runtime_buffer, true).await?;
-                                round.tool_calls_empty = round.tool_calls.is_empty();
-                                round.delegations_empty = round.delegations.is_empty();
-                                return Ok(round);
+                                self.preserve_partial_assistant(&round, &mut runtime_buffer).await?;
+                                return Err(KuramaError::Model(
+                                    "model stream ended before response completion".into(),
+                                ));
                             }
                         }
                     }

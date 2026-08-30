@@ -471,6 +471,72 @@ struct BlockingPartialBackend {
     blocked: Arc<Notify>,
 }
 
+struct CompletionThenPendingBackend {
+    trailing_polls: Arc<AtomicUsize>,
+}
+
+impl ModelBackend for CompletionThenPendingBackend {
+    fn backend_name(&self) -> &'static str {
+        "completion-then-pending"
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::remote_default()
+    }
+
+    fn stream<'a>(
+        &'a self,
+        _request: ModelRequest,
+        _cancel: &'a dyn CancelSignal,
+    ) -> BoxFuture<'a, Result<ModelStream, kurama_protocol::KuramaError>> {
+        Box::pin(async move {
+            let trailing_polls = Arc::clone(&self.trailing_polls);
+            let events = stream::iter([Ok(ModelEvent::ResponseCompleted {
+                cursor: None,
+                finish_reason: FinishReason::Stop,
+            })])
+            .chain(stream::once(async move {
+                trailing_polls.fetch_add(1, Ordering::SeqCst);
+                pending::<Result<ModelEvent, kurama_protocol::KuramaError>>().await
+            }));
+            Ok(Box::pin(events) as ModelStream)
+        })
+    }
+}
+
+#[derive(Default)]
+struct ToolCallsWithoutWorkBackend {
+    calls: AtomicUsize,
+}
+
+impl ModelBackend for ToolCallsWithoutWorkBackend {
+    fn backend_name(&self) -> &'static str {
+        "tool-calls-without-work"
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::remote_default()
+    }
+
+    fn stream<'a>(
+        &'a self,
+        _request: ModelRequest,
+        _cancel: &'a dyn CancelSignal,
+    ) -> BoxFuture<'a, Result<ModelStream, kurama_protocol::KuramaError>> {
+        Box::pin(async move {
+            if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                return Err(kurama_protocol::KuramaError::Model(
+                    "backend was called again after a no-progress round".into(),
+                ));
+            }
+            Ok(Box::pin(stream::iter([Ok(ModelEvent::ResponseCompleted {
+                cursor: None,
+                finish_reason: FinishReason::ToolCalls,
+            })])) as ModelStream)
+        })
+    }
+}
+
 impl ModelBackend for BlockingPartialBackend {
     fn backend_name(&self) -> &'static str {
         "blocking-partial"
@@ -531,6 +597,111 @@ fn partial_stream_config(
         command_capacity: 32,
         event_capacity: 128,
     }
+}
+
+#[tokio::test]
+async fn eof_without_response_completed_fails_and_preserves_partial_text() {
+    let store = Arc::new(MemoryStore::default());
+    let backend = Arc::new(ScriptedBackend::new(vec![vec![Ok(
+        ModelEvent::TextDelta {
+            text: "unterminated response".into(),
+        },
+    )]]));
+    let (handle, mut events) = Engine::spawn(
+        partial_stream_config("missing-completion", backend, Arc::clone(&store)),
+        Vec::new(),
+    )
+    .expect("spawn engine");
+
+    handle.submit("inspect", false).await.expect("submit");
+    let message = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match events.recv().await.expect("runtime event") {
+                RuntimeEvent::Error { message } => break message,
+                RuntimeEvent::TurnCompleted => {
+                    panic!("unterminated model stream completed the turn")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("missing-completion failure timed out");
+
+    assert!(message.contains("ended before response completion"));
+    let assistant_messages = store
+        .events("missing-completion")
+        .into_iter()
+        .filter_map(|event| match event.event {
+            SessionEvent::AssistantMessage { text } => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(assistant_messages, ["unterminated response"]);
+}
+
+#[tokio::test]
+async fn response_completed_stops_stream_consumption() {
+    let trailing_polls = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(CompletionThenPendingBackend {
+        trailing_polls: Arc::clone(&trailing_polls),
+    });
+    let (handle, mut events) = Engine::spawn(
+        partial_stream_config(
+            "completion-terminal",
+            backend,
+            Arc::new(MemoryStore::default()),
+        ),
+        Vec::new(),
+    )
+    .expect("spawn engine");
+
+    handle.submit("inspect", false).await.expect("submit");
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match events.recv().await.expect("runtime event") {
+                RuntimeEvent::TurnCompleted => break,
+                RuntimeEvent::Error { message } => panic!("engine error: {message}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("turn remained blocked after response completion");
+
+    assert_eq!(trailing_polls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn tool_calls_finish_without_work_fails_before_another_round() {
+    let backend = Arc::new(ToolCallsWithoutWorkBackend::default());
+    let (handle, mut events) = Engine::spawn(
+        partial_stream_config(
+            "tool-calls-without-work",
+            backend.clone(),
+            Arc::new(MemoryStore::default()),
+        ),
+        Vec::new(),
+    )
+    .expect("spawn engine");
+
+    handle.submit("inspect", false).await.expect("submit");
+    let message = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match events.recv().await.expect("runtime event") {
+                RuntimeEvent::Error { message } => break message,
+                RuntimeEvent::TurnCompleted => {
+                    panic!("no-progress tool-call round completed the turn")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("no-progress tool-call failure timed out");
+
+    assert!(message.contains("tool calls without producing work"));
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
