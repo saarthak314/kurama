@@ -27,6 +27,7 @@ use tokio::{
 use crate::{cancel::CancelToken, orchestrator::scopes_overlap};
 
 const CHILD_CLEANUP_GRACE: Duration = Duration::from_millis(100);
+const CHILD_MESSAGE_CAPACITY: usize = 16;
 const CHILD_TIMEOUT_ERROR: &str = "child execution timed out";
 
 #[derive(Debug, Clone, Default)]
@@ -297,6 +298,11 @@ impl AgentManager {
                 .agents
                 .get_mut(agent_id)
                 .ok_or_else(|| KuramaError::NotFound(agent_id.to_string()))?;
+            if agent.messages.is_none() && agent.pending_messages.len() >= CHILD_MESSAGE_CAPACITY {
+                return Err(KuramaError::Protocol(
+                    "too many queued child messages".into(),
+                ));
+            }
             self.append_agent_event(
                 agent,
                 SessionEvent::AgentMessage {
@@ -487,7 +493,7 @@ impl AgentManager {
                     return Ok(());
                 };
                 let agent = state.agents.get_mut(&candidate_id).expect("candidate");
-                let (message_tx, message_rx) = mpsc::channel(16);
+                let (message_tx, message_rx) = mpsc::channel(CHILD_MESSAGE_CAPACITY);
                 for message in agent.pending_messages.drain(..) {
                     message_tx.try_send(message).map_err(|_| {
                         KuramaError::Protocol("too many queued child messages".into())

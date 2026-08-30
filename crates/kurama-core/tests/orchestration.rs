@@ -693,6 +693,66 @@ async fn manager_messages_one_child_and_cancels_another() {
     );
 }
 
+#[tokio::test]
+async fn queued_child_message_overflow_is_rejected_without_aborting_orchestration() {
+    let orchestrator = SmartOrchestrator::new(Arc::new(SequenceIds::new(20)));
+    let plan = orchestrator
+        .resolve(
+            DelegationRequest {
+                agents: vec![agent("first", None, &[]), agent("second", None, &[])],
+            },
+            &context(),
+        )
+        .expect("resolve");
+    let first = plan.ready[0].id.clone();
+    let second = plan.ready[1].id.clone();
+    let store = Arc::new(MemoryStore::default());
+    let manager = Arc::new(AgentManager::new(
+        "queued-message-cap".into(),
+        None,
+        1,
+        store,
+        Arc::new(CollectingSink::default()),
+    ));
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let executing = {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            manager
+                .execute(
+                    plan,
+                    "project".into(),
+                    Arc::new(ControlledRunner {
+                        started: started_tx,
+                    }),
+                )
+                .await
+        })
+    };
+
+    assert_eq!(started_rx.recv().await.expect("first started"), first);
+    for index in 0..16 {
+        manager
+            .message(&second, format!("queued {index}"))
+            .await
+            .expect("message within capacity");
+    }
+    let error = manager
+        .message(&second, "overflow".into())
+        .await
+        .expect_err("overflow must be rejected before launch");
+    assert!(
+        matches!(error, KuramaError::Protocol(message) if message.contains("too many queued child messages"))
+    );
+
+    manager.cancel(&first).await.expect("cancel first");
+    assert_eq!(started_rx.recv().await.expect("second started"), second);
+    let results = executing.await.expect("join").expect("execute");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].agent_id, second);
+    assert_eq!(results[0].summary, "queued 0");
+}
+
 struct ApprovalRunner {
     requested: mpsc::UnboundedSender<kurama_protocol::id::AgentId>,
     release_cancelled: Arc<Notify>,
