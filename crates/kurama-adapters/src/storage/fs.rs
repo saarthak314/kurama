@@ -47,11 +47,13 @@ fn record_operation(update: impl FnOnce(&mut StorageOperationCounts)) {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn reset_operation_counts() {
     OPERATION_COUNTS.with(|counts| counts.set(StorageOperationCounts::default()));
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn operation_counts() -> StorageOperationCounts {
     OPERATION_COUNTS.with(std::cell::Cell::get)
 }
@@ -191,6 +193,7 @@ impl FsSessionStore {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn replay_with_operation_counts_for_test(
         &self,
         session_id: &SessionId,
@@ -202,6 +205,7 @@ impl FsSessionStore {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn append_with_operation_counts_for_test(
         &self,
         event: &EventEnvelope,
@@ -217,6 +221,7 @@ impl FsSessionStore {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn list_with_operation_counts_for_test(
         &self,
     ) -> Result<(Vec<SessionSummary>, u64, u64), KuramaError> {
