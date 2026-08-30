@@ -247,6 +247,7 @@ async fn fake_provider_runs_tools_approval_child_panel_and_exact_once_resume() {
 
 fn transcript_entry_contains(entry: &TranscriptEntry, needle: &str) -> bool {
     match entry {
+        TranscriptEntry::Startup { project, .. } => project.contains(needle),
         TranscriptEntry::UserTurn { body }
         | TranscriptEntry::AssistantMessage { body }
         | TranscriptEntry::Error { body }

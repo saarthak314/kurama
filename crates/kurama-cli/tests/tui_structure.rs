@@ -54,6 +54,68 @@ fn plain(lines: Vec<ratatui::text::Line<'static>>) -> String {
         .join("\n")
 }
 
+#[test]
+fn startup_banner_shows_brand_version_mode_and_tilde_path() {
+    let lines = transcript_lines(
+        &[TranscriptEntry::Startup {
+            version: "0.1.0".into(),
+            project: "~/src/kurama".into(),
+            mode: ExecutionMode::Supervised,
+        }],
+        80,
+        TranscriptDetail::Compact,
+    );
+
+    assert_eq!(
+        plain(lines),
+        "◢ kurama  v0.1.0\n~/src/kurama  ·  supervised"
+    );
+}
+
+#[test]
+fn startup_banner_left_truncates_long_paths_on_narrow_terminals() {
+    let lines = transcript_lines(
+        &[TranscriptEntry::Startup {
+            version: "0.1.0".into(),
+            project: "~/src/harness-eng/coding-agent-with-subagents".into(),
+            mode: ExecutionMode::Supervised,
+        }],
+        28,
+        TranscriptDetail::Compact,
+    );
+    let text = plain(lines.clone());
+    let metadata = text.lines().nth(1).expect("metadata line");
+
+    assert!(lines.iter().all(|line| line.width() <= 28));
+    assert!(metadata.starts_with('…'), "{metadata}");
+    assert!(metadata.contains("subagents"), "{metadata}");
+    assert!(metadata.ends_with(" · supervised"), "{metadata}");
+    assert!(!metadata.contains("~/src"), "{metadata}");
+}
+
+#[test]
+fn startup_banner_sits_above_the_onboarding_prompt() {
+    let mut state = TuiState::onboarding("~/src/kurama");
+    state.prepend_startup("0.1.0", "~/src/kurama");
+
+    let buffer = rendered(&state, 80, 24);
+    let rows = buffer_text(&buffer)
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let banner_row = rows
+        .iter()
+        .position(|row| row.contains("◢ kurama"))
+        .expect("startup banner");
+    let prompt_row = rows
+        .iter()
+        .position(|row| row.contains("How should Kurama connect?"))
+        .expect("onboarding prompt");
+
+    assert!(banner_row < prompt_row, "{rows:#?}");
+    assert_eq!(cell_at_text(&buffer, "◢").bg, Color::Reset);
+}
+
 fn cell_at_text<'a>(buffer: &'a Buffer, needle: &str) -> &'a Cell {
     for y in 0..buffer.area.height {
         let row = (0..buffer.area.width)

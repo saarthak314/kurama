@@ -11,11 +11,13 @@ use ratatui::{
 use kurama_protocol::agent::AgentState;
 
 use super::{
-    Overlay, ResponsiveLayout, TuiState, activity_line, command_palette_height,
+    Overlay, ResponsiveLayout, TranscriptEntry, TuiState, activity_line, command_palette_height,
     composer::{approval_height, composer_height, render_approval, render_composer, render_footer},
     layout::main_area,
     render_command_palette,
-    transcript::{TranscriptDetail, render_transcript_view, transcript_lines, truncate_display},
+    transcript::{
+        TranscriptDetail, render_transcript_view, startup_lines, transcript_lines, truncate_display,
+    },
     worked_for_line,
 };
 
@@ -153,7 +155,26 @@ fn render_main(
 
 fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) {
     frame.render_widget(Clear, frame.area());
-    let area = inset(frame.area(), 4, 2);
+    let mut area = inset(frame.area(), 4, 2);
+    if area.is_empty() {
+        return;
+    }
+    if area.height >= 5
+        && let Some(TranscriptEntry::Startup {
+            version,
+            project,
+            mode,
+        }) = state.transcript.first()
+    {
+        let banner_height = 2.min(area.height);
+        frame.render_widget(
+            Paragraph::new(startup_lines(version, project, *mode, area.width as usize)),
+            Rect::new(area.x, area.y, area.width, banner_height),
+        );
+        let consumed = banner_height.saturating_add(1).min(area.height);
+        area.y = area.y.saturating_add(consumed);
+        area.height = area.height.saturating_sub(consumed);
+    }
     if area.is_empty() {
         return;
     }

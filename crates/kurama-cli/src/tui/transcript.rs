@@ -1,3 +1,4 @@
+use kurama_protocol::policy::ExecutionMode;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::{
     Frame,
@@ -18,6 +19,7 @@ const BORDER: Color = Color::Rgb(48, 53, 64);
 const RED: Color = Color::Rgb(255, 92, 82);
 const GREEN: Color = Color::Rgb(111, 207, 151);
 const BLUE: Color = Color::Rgb(116, 177, 255);
+const ACCENT: Color = Color::Cyan;
 
 #[cfg(test)]
 thread_local! {
@@ -1190,6 +1192,96 @@ pub(crate) fn truncate_display(value: &str, width: usize) -> String {
     truncated
 }
 
+fn truncate_display_left(value: &str, width: usize) -> String {
+    if display_width(value) <= width {
+        return value.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".into();
+    }
+    let mut graphemes = Vec::new();
+    let mut current_width = 0_usize;
+    for grapheme in value.graphemes(true).rev() {
+        let grapheme_width = display_width(grapheme);
+        if current_width.saturating_add(grapheme_width) >= width {
+            break;
+        }
+        graphemes.push(grapheme);
+        current_width = current_width.saturating_add(grapheme_width);
+    }
+    graphemes.reverse();
+    format!("…{}", graphemes.concat())
+}
+
+pub(crate) fn startup_lines(
+    version: &str,
+    project: &str,
+    mode: ExecutionMode,
+    width: usize,
+) -> Vec<Line<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let version = format!("v{version}");
+    let full_title = format!("◢ kurama  {version}");
+    let title = if display_width(&full_title) <= width {
+        Line::from(vec![
+            Span::styled("◢ ", Style::default().fg(ACCENT)),
+            Span::styled(
+                "kurama",
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {version}"), Style::default().fg(DIM)),
+        ])
+    } else {
+        Line::from(Span::styled(
+            truncate_display(&format!("◢ kurama {version}"), width),
+            Style::default().fg(TEXT),
+        ))
+    };
+
+    let mode = mode_label(mode);
+    let wide_separator = "  ·  ";
+    let compact_separator = " · ";
+    let wide_width = display_width(project)
+        .saturating_add(display_width(wide_separator))
+        .saturating_add(display_width(mode));
+    let separator = if wide_width <= width {
+        wide_separator
+    } else if display_width(mode).saturating_add(display_width(compact_separator)) < width {
+        compact_separator
+    } else {
+        " "
+    };
+    let suffix_width = display_width(separator).saturating_add(display_width(mode));
+    let metadata = if suffix_width < width {
+        let project = truncate_display_left(project, width.saturating_sub(suffix_width));
+        Line::from(vec![
+            Span::styled(project, Style::default().fg(DIM)),
+            Span::styled(separator, Style::default().fg(DIM)),
+            Span::styled(mode, Style::default().fg(ACCENT)),
+        ])
+    } else {
+        Line::from(Span::styled(
+            truncate_display(mode, width),
+            Style::default().fg(ACCENT),
+        ))
+    };
+
+    vec![title, metadata]
+}
+
+fn mode_label(mode: ExecutionMode) -> &'static str {
+    match mode {
+        ExecutionMode::Supervised => "supervised",
+        ExecutionMode::Auto => "auto",
+        ExecutionMode::Yolo => "yolo",
+    }
+}
+
 fn text_style() -> Style {
     Style::default().fg(TEXT)
 }
@@ -1213,6 +1305,11 @@ pub fn transcript_lines(
     let mut lines = Vec::new();
     for entry in entries {
         match entry {
+            TranscriptEntry::Startup {
+                version,
+                project,
+                mode,
+            } => lines.extend(startup_lines(version, project, *mode, width)),
             TranscriptEntry::UserTurn { body } => {
                 if !lines.is_empty() {
                     lines.push(Line::from(""));

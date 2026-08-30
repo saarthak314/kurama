@@ -82,11 +82,25 @@ struct PendingTurn {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptEntry {
-    UserTurn { body: String },
-    AssistantMessage { body: String },
+    Startup {
+        version: String,
+        project: String,
+        mode: ExecutionMode,
+    },
+    UserTurn {
+        body: String,
+    },
+    AssistantMessage {
+        body: String,
+    },
     ToolCall(ToolTranscript),
-    Error { body: String },
-    Notice { label: Option<String>, body: String },
+    Error {
+        body: String,
+    },
+    Notice {
+        label: Option<String>,
+        body: String,
+    },
 }
 
 pub struct TuiState {
@@ -252,6 +266,17 @@ impl TuiState {
         );
         state.overlay = Overlay::Onboarding;
         state
+    }
+
+    pub fn prepend_startup(&mut self, version: impl Into<String>, project: impl Into<String>) {
+        self.transcript.insert(
+            0,
+            TranscriptEntry::Startup {
+                version: version.into(),
+                project: project.into(),
+                mode: self.mode,
+            },
+        );
     }
 
     pub fn credential(project: impl Into<String>, profile: impl Into<String>) -> Self {

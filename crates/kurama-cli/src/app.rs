@@ -197,6 +197,10 @@ impl App {
         let project = cwd
             .canonicalize()
             .map_err(|error| format!("canonicalize project: {error}"))?;
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from);
+        let startup_project = project_display_path(&project, home.as_deref());
         let repository =
             ConfigRepository::open(paths.clone()).map_err(|error| error.to_string())?;
         let store = Arc::new(
@@ -209,8 +213,10 @@ impl App {
             if args.profile.is_some() || args.resume.is_some() {
                 return Err("Kurama is not configured; create ~/.kurama/config.toml first".into());
             }
+            let mut state = TuiState::onboarding(project.display().to_string());
+            state.prepend_startup(env!("CARGO_PKG_VERSION"), startup_project.clone());
             return Ok(Self::disconnected(
-                TuiState::onboarding(project.display().to_string()),
+                state,
                 AppControl {
                     project,
                     paths,
@@ -224,8 +230,10 @@ impl App {
             ));
         };
         if config.profiles.is_empty() {
+            let mut state = TuiState::onboarding(project.display().to_string());
+            state.prepend_startup(env!("CARGO_PKG_VERSION"), startup_project.clone());
             return Ok(Self::disconnected(
-                TuiState::onboarding(project.display().to_string()),
+                state,
                 AppControl {
                     project,
                     paths,
@@ -310,6 +318,7 @@ impl App {
             let mut state =
                 TuiState::credential(project.display().to_string(), active_profile.clone());
             state.mode = mode;
+            state.prepend_startup(env!("CARGO_PKG_VERSION"), startup_project.clone());
             return Ok(Self::disconnected(
                 state,
                 AppControl {
@@ -445,6 +454,7 @@ impl App {
             mode,
         );
         state.hydrate_replay(&transcript_replay);
+        state.prepend_startup(env!("CARGO_PKG_VERSION"), startup_project);
         if resumed_yolo {
             state.push_notice(
                 Some("MODE".into()),
@@ -1424,6 +1434,27 @@ pub fn prompt_bundle() -> String {
     )
 }
 
+fn project_display_path(project: &Path, home: Option<&Path>) -> String {
+    let Some(relative) = home.and_then(|home| {
+        project
+            .strip_prefix(home)
+            .ok()
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                home.canonicalize()
+                    .ok()
+                    .and_then(|home| project.strip_prefix(home).ok().map(Path::to_path_buf))
+            })
+    }) else {
+        return project.display().to_string();
+    };
+    if relative.as_os_str().is_empty() {
+        "~".into()
+    } else {
+        format!("~/{}", relative.display())
+    }
+}
+
 pub async fn run_with<B>(
     mut app: App,
     terminal: &mut Terminal<B>,
@@ -2112,6 +2143,32 @@ mod tests {
             exit_requested: false,
             control: None,
         }
+    }
+
+    #[test]
+    fn startup_project_path_collapses_the_home_prefix() {
+        assert_eq!(
+            project_display_path(
+                Path::new("/Users/tester/src/kurama"),
+                Some(Path::new("/Users/tester")),
+            ),
+            "~/src/kurama"
+        );
+        assert_eq!(
+            project_display_path(Path::new("/Users/tester"), Some(Path::new("/Users/tester"))),
+            "~"
+        );
+
+        let home = tempfile::tempdir().expect("home");
+        let project = home.path().join("project");
+        std::fs::create_dir(&project).expect("project");
+        assert_eq!(
+            project_display_path(
+                &project.canonicalize().expect("canonical project"),
+                Some(home.path()),
+            ),
+            "~/project"
+        );
     }
 
     #[test]

@@ -81,7 +81,14 @@ fn missing_configuration_opens_onboarding_without_a_runtime() {
 
     assert_eq!(app.state.overlay(), Overlay::Onboarding);
     assert_eq!(app.state.onboarding.prompt(), "Profile name");
-    assert!(app.state.transcript.is_empty());
+    assert!(matches!(
+        app.state.transcript.as_slice(),
+        [TranscriptEntry::Startup {
+            version,
+            project,
+            mode: ExecutionMode::Supervised,
+        }] if version == env!("CARGO_PKG_VERSION") && project.ends_with("/project")
+    ));
 }
 
 #[tokio::test]
@@ -98,6 +105,14 @@ async fn configured_profile_composes_the_real_four_tool_runtime() {
     assert!(app.is_connected());
     assert_eq!(app.state.profile, "work");
     assert_eq!(app.state.model, "frontier");
+    assert!(matches!(
+        app.state.transcript.first(),
+        Some(TranscriptEntry::Startup {
+            version,
+            project,
+            mode: ExecutionMode::Supervised,
+        }) if version == env!("CARGO_PKG_VERSION") && project.ends_with("/project")
+    ));
     assert_eq!(App::tool_names(), ["bash", "read", "web-search", "write"]);
 }
 
@@ -306,11 +321,18 @@ async fn resume_hydrates_the_visible_transcript_once() {
     assert!(matches!(
         &app.state.transcript[..],
         [
+            TranscriptEntry::Startup {
+                version,
+                project,
+                mode: ExecutionMode::Supervised,
+            },
             TranscriptEntry::UserTurn { body: user },
             TranscriptEntry::AssistantMessage { body: assistant },
             TranscriptEntry::ToolCall(tool),
             TranscriptEntry::Error { body: error },
-        ] if user == "inspect the parser"
+        ] if version == env!("CARGO_PKG_VERSION")
+            && project.ends_with("/project")
+            && user == "inspect the parser"
             && assistant == "checking it"
             && tool.name == "read"
             && tool.output == "head\nfull middle output\ntail\n"
