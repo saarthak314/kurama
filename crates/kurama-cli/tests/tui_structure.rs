@@ -680,6 +680,32 @@ fn wide_markdown_lists_keep_inline_code_and_punctuation_together() {
 }
 
 #[test]
+fn nested_fenced_code_blocks_render_with_a_visible_frame() {
+    let lines = transcript_lines(
+        &[TranscriptEntry::AssistantMessage {
+            body: concat!(
+                "2. Paste this output:\n",
+                "   ```bash\n",
+                "   grep -rln '#[cfg(test)]' crates tools\n",
+                "   ```"
+            )
+            .into(),
+        }],
+        100,
+        TranscriptDetail::Compact,
+    );
+    let text = plain(lines);
+
+    assert!(text.contains("┌ bash"), "{text}");
+    assert!(
+        text.contains("│ grep -rln '#[cfg(test)]' crates tools"),
+        "{text}"
+    );
+    assert!(text.contains('└'), "{text}");
+    assert!(!text.lines().any(|line| line.trim() == "bash"), "{text}");
+}
+
+#[test]
 fn assistant_markdown_renders_blocks_lists_code_quotes_rules_and_tables() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.push_assistant(concat!(

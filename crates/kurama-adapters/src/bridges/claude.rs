@@ -5,7 +5,7 @@ use kurama_protocol::{
     model::{BackendCapabilities, BackendCursor, FinishReason, ModelEvent, ModelRequest, Usage},
     traits::{BoxFuture, CancelSignal, ModelBackend, ModelStream},
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::{
     BridgeCommand,
@@ -13,6 +13,7 @@ use super::{
 };
 
 const BACKEND: &str = "claude_cli";
+const CORE_TOOL_INSTRUCTION: &str = "Operate only through the supplied tools.";
 
 #[derive(Clone)]
 pub struct ClaudeBridge {
@@ -57,7 +58,8 @@ impl ClaudeBridge {
         let mut args = vec![
             "-p".into(),
             "--output-format".into(),
-            "json".into(),
+            "stream-json".into(),
+            "--verbose".into(),
             "--safe-mode".into(),
             "--tools".into(),
             "".into(),
@@ -65,7 +67,7 @@ impl ClaudeBridge {
             "--permission-mode".into(),
             "manual".into(),
             "--system-prompt".into(),
-            bridge_system_prompt(request),
+            claude_system_prompt(request),
             "--model".into(),
             request.profile.model.clone(),
             "--json-schema".into(),
@@ -86,6 +88,17 @@ impl ClaudeBridge {
     pub fn parse_fixture(fixture: &str) -> Result<Vec<ModelEvent>, KuramaError> {
         parse_lines(fixture.lines(), false)
     }
+}
+
+fn claude_system_prompt(request: &ModelRequest) -> String {
+    let mut prompt = bridge_system_prompt(request).replace(
+        CORE_TOOL_INSTRUCTION,
+        "Request external actions only through the returned control object.",
+    );
+    prompt.push_str(
+        "\n\nThe only Claude tool you may invoke is StructuredOutput. Never invoke read, write, bash, or web-search as Claude tools. Encode those Kurama operations only inside the control object's calls array.",
+    );
+    prompt
 }
 
 impl ModelBackend for ClaudeBridge {
@@ -133,6 +146,7 @@ fn parse_lines<'a>(
     let mut events = Vec::new();
     let mut session_id = None;
     let mut control = None;
+    let mut protocol_calls = Vec::new();
     let mut partial = String::new();
     let mut completed = false;
     for line in lines {
@@ -170,6 +184,40 @@ fn parse_lines<'a>(
                         .collect::<String>();
                     if !text.is_empty() {
                         control = Some(text);
+                    }
+                    for block in content {
+                        let Some(name) = block.get("name").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        if !matches!(name, "read" | "write" | "bash" | "web-search") {
+                            continue;
+                        }
+                        let Some(input) = block.get("input").filter(|input| input.is_object())
+                        else {
+                            continue;
+                        };
+                        let Some(call_id) = input
+                            .get("call_id")
+                            .or_else(|| block.get("id"))
+                            .and_then(Value::as_str)
+                        else {
+                            continue;
+                        };
+                        let Some(arguments) = input.get("arguments") else {
+                            continue;
+                        };
+                        let encoded = json!({
+                            "kind": "tool_calls",
+                            "text": "",
+                            "calls": [{
+                                "call_id": call_id,
+                                "name": name,
+                                "arguments": arguments
+                            }],
+                            "agents": []
+                        })
+                        .to_string();
+                        protocol_calls.extend(parse_control(&encoded, delegation_enabled)?);
                     }
                 }
             }
@@ -218,7 +266,11 @@ fn parse_lines<'a>(
                     .or_else(|| control.take())
                     .filter(|text| !text.is_empty())
                     .unwrap_or(partial.clone());
-                let normalized = parse_control(&control_value, delegation_enabled)?;
+                let normalized = if protocol_calls.is_empty() {
+                    parse_control(&control_value, delegation_enabled)?
+                } else {
+                    std::mem::take(&mut protocol_calls)
+                };
                 let tool_calls = normalized.iter().any(|event| {
                     matches!(
                         event,

@@ -147,7 +147,7 @@ fn codex_resume_command_preserves_thread_cursor() {
 }
 
 #[test]
-fn claude_command_uses_single_result_json_and_disables_builtin_tools() {
+fn claude_command_uses_stream_json_and_disables_builtin_tools() {
     let command = ClaudeBridge::command_for(&request(), None, Path::new("/tmp/control.json"));
 
     assert_eq!(command.program, "claude");
@@ -162,9 +162,9 @@ fn claude_command_uses_single_result_json_and_disables_builtin_tools() {
         command
             .args
             .windows(2)
-            .any(|pair| pair == ["--output-format", "json"])
+            .any(|pair| pair == ["--output-format", "stream-json"])
     );
-    assert!(!command.args.iter().any(|argument| argument == "--verbose"));
+    assert!(command.args.iter().any(|argument| argument == "--verbose"));
     assert!(
         !command
             .args
@@ -184,6 +184,8 @@ fn claude_command_uses_single_result_json_and_disables_builtin_tools() {
         .map(|pair| pair[1].as_str())
         .expect("Claude bridge system prompt");
     assert!(system_prompt.contains("You are a model bridge"));
+    assert!(!system_prompt.contains("Operate only through the supplied tools"));
+    assert!(system_prompt.contains("only Claude tool you may invoke is StructuredOutput"));
     assert!(system_prompt.contains("Every listed Kurama tool is available"));
     assert!(system_prompt.contains("Kurama executes it after this response"));
     assert!(command.stdin.starts_with("Active context:\n"));
@@ -209,6 +211,32 @@ fn claude_single_result_json_normalizes_tool_calls() {
             ..
         }
     )));
+}
+
+#[test]
+fn claude_recovers_protocol_calls_misrouted_as_native_tool_use() {
+    let events = ClaudeBridge::parse_fixture(concat!(
+        r#"{"type":"system","subtype":"init","session_id":"session-1"}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"bash","input":{"call_id":"c1","arguments":"{\"command\":\"pwd\",\"cwd\":\"/workspace/project\",\"timeout_ms\":10000}"}}]}}"#,
+        "\n",
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"<tool_use_error>Error: No such tool available: bash</tool_use_error>","is_error":true,"tool_use_id":"toolu_1"}]}}"#,
+        "\n",
+        r#"{"type":"result","subtype":"success","session_id":"session-1","structured_output":{"kind":"final","text":"bash is unavailable","calls":[],"agents":[]}}"#,
+    ))
+    .expect("Claude stream JSON");
+
+    assert!(matches!(
+        events.as_slice(),
+        [
+            ModelEvent::ResponseStarted { .. },
+            ModelEvent::ToolCall { name, .. },
+            ModelEvent::ResponseCompleted {
+                finish_reason: kurama_protocol::model::FinishReason::ToolCalls,
+                ..
+            }
+        ] if name == "bash"
+    ));
 }
 
 #[test]

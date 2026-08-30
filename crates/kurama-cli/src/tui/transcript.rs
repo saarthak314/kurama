@@ -445,20 +445,20 @@ fn render_markdown_block(
             render_markdown_blocks(blocks, width, nested, true, lines);
         }
         MarkdownBlock::Code { language, content } => {
-            if let Some(language) = language {
-                render_fragments(
-                    &[StyledFragment {
-                        content: language.clone(),
-                        style: Style::default().fg(DIM).add_modifier(Modifier::BOLD),
-                    }],
-                    width,
-                    context,
-                    marker,
-                    None,
-                    lines,
-                );
-            }
-            let code_marker = if language.is_some() { None } else { marker };
+            let frame_label = language
+                .as_ref()
+                .map_or_else(|| "┌".to_owned(), |language| format!("┌ {language}"));
+            render_fragments(
+                &[StyledFragment {
+                    content: frame_label,
+                    style: Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+                }],
+                width,
+                context,
+                marker,
+                None,
+                lines,
+            );
             render_hard_fragments(
                 &[StyledFragment {
                     content: content.clone(),
@@ -466,8 +466,19 @@ fn render_markdown_block(
                 }],
                 width,
                 context,
-                code_marker,
+                None,
                 Some(("│ ", "│ ", Style::default().fg(DIM))),
+                lines,
+            );
+            render_fragments(
+                &[StyledFragment {
+                    content: "└".to_owned(),
+                    style: Style::default().fg(DIM),
+                }],
+                width,
+                context,
+                None,
+                None,
                 lines,
             );
         }
