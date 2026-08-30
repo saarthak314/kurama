@@ -1,6 +1,7 @@
 mod activity;
 mod agents;
 mod approval;
+mod backend;
 mod composer;
 mod input;
 mod layout;
@@ -12,6 +13,7 @@ mod transcript;
 pub use activity::activity_line;
 pub use agents::{AgentRow, sort_agents};
 pub use approval::ApprovalState;
+pub(crate) use backend::CursorTrackingBackend;
 pub use input::{TerminalGuard, spawn_input_thread};
 pub use layout::ResponsiveLayout;
 pub(crate) use layout::visible_activity_rect;

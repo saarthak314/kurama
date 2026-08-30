@@ -43,8 +43,9 @@ use crate::{
     args::{Args, ResumeChoice},
     commands::{Command, parse_command},
     tui::{
-        OnboardingState, OnboardingSubmission, Overlay, SURFACE, TerminalGuard, TranscriptDetail,
-        TuiState, render, spawn_input_thread, transcript_lines, visible_activity_rect,
+        CursorTrackingBackend, OnboardingState, OnboardingSubmission, Overlay, SURFACE,
+        TerminalGuard, TranscriptDetail, TuiState, render, spawn_input_thread, transcript_lines,
+        visible_activity_rect,
     },
 };
 
@@ -434,7 +435,7 @@ impl App {
 
     pub async fn run(mut self) -> Result<(), String> {
         let _guard = TerminalGuard::enter().map_err(|error| error.to_string())?;
-        let backend = CrosstermBackend::new(io::stdout());
+        let backend = CursorTrackingBackend::new(CrosstermBackend::new(io::stdout()));
         let rows = crossterm::terminal::size()
             .map_err(|error| error.to_string())?
             .1;
