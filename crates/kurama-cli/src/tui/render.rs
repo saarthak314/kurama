@@ -1760,7 +1760,7 @@ pub(crate) fn transcript_lines(entries: &[TranscriptEntry], width: usize) -> Vec
             TranscriptEntry::ToolCall(tool) => {
                 push_prefixed_lines(
                     &mut lines,
-                    &format!("Ran {}", tool.name),
+                    &format!("Ran {}", tool_name(&tool.name)),
                     "• ",
                     "  ",
                     Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
@@ -1791,27 +1791,15 @@ pub(crate) fn transcript_lines(entries: &[TranscriptEntry], width: usize) -> Vec
                 width,
             ),
             TranscriptEntry::Notice { label, body } => {
-                if let Some(label) = label {
-                    push_prefixed_lines(
-                        &mut lines,
-                        &format!("{label} · {body}"),
-                        "• ",
-                        "  ",
-                        Style::default().fg(DIM),
-                        Style::default().fg(DIM),
-                        width,
-                    );
-                } else {
-                    push_prefixed_lines(
-                        &mut lines,
-                        body,
-                        "• ",
-                        "  ",
-                        Style::default().fg(DIM),
-                        Style::default().fg(DIM),
-                        width,
-                    );
-                }
+                push_prefixed_lines(
+                    &mut lines,
+                    &format!("{} · {body}", label.as_deref().unwrap_or("NOTICE")),
+                    "• ",
+                    "  ",
+                    Style::default().fg(DIM),
+                    Style::default().fg(DIM),
+                    width,
+                );
             }
         }
         lines.push(Line::from(""));
@@ -1931,6 +1919,17 @@ fn editor_preview(editor: &str, width: usize, max_lines: usize) -> Vec<String> {
             .take(max_lines.saturating_sub(1)),
     );
     visible
+}
+
+fn tool_name(label: &str) -> String {
+    let mut parts = label.split('/').map(str::trim);
+    let first = parts.next().unwrap_or("tool");
+    let name = if first.eq_ignore_ascii_case("tool") {
+        parts.next().unwrap_or(first)
+    } else {
+        first
+    };
+    name.to_ascii_lowercase()
 }
 
 fn approval_height(state: &TuiState, terminal_width: u16) -> u16 {

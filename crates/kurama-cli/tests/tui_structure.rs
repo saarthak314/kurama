@@ -137,6 +137,27 @@ fn transcript_uses_compact_codex_style_hierarchy() {
 }
 
 #[test]
+fn typed_tool_transcript_preserves_normalized_tool_name() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_tool("TOOL / Bash", "done");
+
+    let text = buffer_text(&rendered(&state, 80, 20));
+
+    assert!(text.contains("Ran bash"));
+    assert!(!text.contains("Ran Bash"));
+}
+
+#[test]
+fn unlabeled_notice_preserves_notice_fallback_label() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_notice(None, "runtime resumed");
+
+    let text = buffer_text(&rendered(&state, 80, 20));
+
+    assert!(text.contains("NOTICE · runtime resumed"));
+}
+
+#[test]
 fn committed_transcript_is_not_redrawn_in_the_live_viewport() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.push_user("committed question");
