@@ -2117,7 +2117,7 @@ mod tests {
     #[test]
     fn exit_command_requests_shutdown_and_returns_resume_details() {
         let mut app = test_app();
-        app.session_id = Some(SessionId::from("s_exit"));
+        app.session_id = Some(SessionId::from("ses_deadbeef"));
         app.state.composer = "/exit".into();
         app.state.cursor = app.state.composer.len();
 
@@ -2136,15 +2136,15 @@ mod tests {
         assert_eq!(
             app.exit_summary().expect("exit summary").to_string(),
             "Token usage: total=0 input=0 output=0\n\
-Resume with kurama resume s_exit\n\
-Session ID: s_exit"
+Resume with kurama resume ses_deadbeef\n\
+Session ID: ses_deadbeef"
         );
     }
 
     #[test]
     fn exit_summary_includes_cached_usage() {
         let summary = ExitSummary {
-            session_id: SessionId::from("s_cached"),
+            session_id: SessionId::from("ses_cafebabe"),
             usage: Usage {
                 input_tokens: 120,
                 output_tokens: 30,
@@ -2155,8 +2155,8 @@ Session ID: s_exit"
         assert_eq!(
             summary.to_string(),
             "Token usage: total=150 input=120 (+ 80 cached) output=30\n\
-Resume with kurama resume s_cached\n\
-Session ID: s_cached"
+Resume with kurama resume ses_cafebabe\n\
+Session ID: ses_cafebabe"
         );
     }
 

@@ -35,7 +35,7 @@ Common launches:
 ```bash
 kurama
 kurama --profile work
-kurama resume s_1234
+kurama resume ses_deadbeef
 kurama --continue
 kurama --yolo
 ```

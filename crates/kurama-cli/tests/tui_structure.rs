@@ -101,8 +101,8 @@ fn parses_all_product_commands_without_restart() {
         Command::Model(Some("openai-main".into()))
     );
     assert_eq!(
-        parse_command("/resume s_123").unwrap(),
-        Command::Resume(SessionId::from("s_123"))
+        parse_command("/resume ses_deadbeef").unwrap(),
+        Command::Resume(SessionId::from("ses_deadbeef"))
     );
     assert_eq!(
         parse_command("/mode auto").unwrap(),
