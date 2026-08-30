@@ -87,3 +87,36 @@ Mandated workspace verification passed:
 - Normal transcript/code foregrounds use `Color::Reset`; active metadata uses cyan; yellow remains on approval/cancellation decisions; red is confined to failures.
 - No commands or dependencies were added. No release-size or visual-gallery command was run, per the brief.
 - Final diff audit found no staging-file leftovers, command-surface changes, dependency-manifest changes, or unrelated edits.
+
+## Residual Fix: Truncated Staging Failure
+
+### Status
+
+Complete. Residual implementation commit: `6fe67923b91bcb3bcffdd2f50c46b8cc645d1df5`.
+
+### Root Cause
+
+`take_truncated_staging` checked `staged_path` before `staging_error`. When `BoundedOutput::finish` discarded the path after a staging write, flush, or sync failure, truncated read and web-open output therefore returned `Ok(None)` instead of failing without a complete display source.
+
+### RED Evidence
+
+- `cargo test --locked -p kurama-adapters --features tools tools::limits::tests::take_truncated_staging_rejects_staging_failures -- --exact`
+  - Failed because `take_truncated_staging` returned `Ok(None)` for truncated output with `staging_error: Some("staging write failed")`.
+
+### GREEN Evidence
+
+- The focused RED command passed after the correction — 1 passed.
+- `cargo test --locked -p kurama-adapters --features tools,http` — 27 passed.
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` — passed.
+
+### Changed Files
+
+- `crates/kurama-adapters/src/tools/limits.rs`
+- `.superpowers/sdd/2026-08-30-codex-inspired-responsive-tui/final-fix-report.md`
+
+### Self-Review
+
+- The new failure path is gated by `bounded.truncated`, so a staging failure remains non-fatal when the complete output is already present in `BoundedText.text`.
+- Read and web-open callers now propagate the recorded staging I/O failure rather than returning truncated output without a display blob source.
+- The correction changes no commands, dependencies, durable output limits, or successful staging behavior.
