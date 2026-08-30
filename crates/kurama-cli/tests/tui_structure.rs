@@ -148,6 +148,23 @@ fn main_screen_is_transcript_first_without_tool_statistics() {
 }
 
 #[test]
+fn slash_palette_filters_commands_and_keeps_descriptions_readable() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.composer = "/res".into();
+    state.cursor = state.composer.len();
+
+    let wide = buffer_text(&rendered(&state, 80, 24));
+    assert!(wide.contains("/resume"));
+    assert!(wide.contains("resume a saved session"));
+    assert!(!wide.contains("select or list profiles"));
+
+    let narrow = rendered(&state, 24, 10);
+    let narrow_text = buffer_text(&narrow);
+    assert!(narrow_text.contains("/resume"));
+    assert!(narrow.content().iter().all(|cell| cell.bg == Color::Reset));
+}
+
+#[test]
 fn responsive_layout_regions_stay_inside_the_requested_area() {
     for (area, input_height, activity_visible) in [
         (Rect::new(3, 5, 120, 32), 2, false),
@@ -303,6 +320,18 @@ fn measured_footer_collapses_low_priority_context_before_mode() {
     let tiny = buffer_text(&rendered(&state, 12, 6));
     assert!(tiny.contains("yolo"));
     assert!(!tiny.contains("work/model"));
+}
+
+#[test]
+fn queued_follow_ups_are_visible_without_becoming_fake_user_turns() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.set_thinking();
+    state.submit_turn("check the failing test", false);
+
+    let text = buffer_text(&rendered(&state, 80, 12));
+
+    assert!(text.contains("1 queued"));
+    assert!(!text.contains("› check the failing test"));
 }
 
 #[test]

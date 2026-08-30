@@ -43,11 +43,12 @@ use tokio::sync::mpsc;
 
 use crate::{
     args::{Args, ResumeChoice},
-    commands::{Command, parse_command},
+    commands::{Command, command_missing_required_arguments, parse_command},
     tui::{
         CursorTrackingBackend, OnboardingState, OnboardingSubmission, Overlay, SURFACE,
-        SharedBackend, TerminalGuard, TranscriptDetail, TuiState, approval_height, composer_height,
-        main_area, render, spawn_input_thread, transcript_lines, visible_activity_rect,
+        SharedBackend, TerminalGuard, TranscriptDetail, TuiState, approval_height,
+        command_palette_height, composer_height, main_area, render, spawn_input_thread,
+        transcript_lines, visible_activity_rect,
     },
 };
 
@@ -539,6 +540,7 @@ impl App {
                 if self.state.overlay == Overlay::None && !self.state.transcript_view_expanded() {
                     self.state.composer.insert_str(self.state.cursor, &text);
                     self.state.cursor = self.state.cursor.saturating_add(text.len());
+                    self.state.composer_edited();
                 }
                 return Ok(false);
             }
@@ -582,6 +584,7 @@ impl App {
             KeyCode::Char(character) => {
                 self.state.composer.insert(self.state.cursor, character);
                 self.state.cursor += character.len_utf8();
+                self.state.composer_edited();
             }
             KeyCode::Backspace if self.state.cursor > 0 => {
                 let previous = self.state.composer[..self.state.cursor]
@@ -591,6 +594,7 @@ impl App {
                     .unwrap_or(0);
                 self.state.composer.drain(previous..self.state.cursor);
                 self.state.cursor = previous;
+                self.state.composer_edited();
             }
             KeyCode::Delete if self.state.cursor < self.state.composer.len() => {
                 let next = self.state.cursor
@@ -600,6 +604,7 @@ impl App {
                         .map(char::len_utf8)
                         .unwrap_or(0);
                 self.state.composer.drain(self.state.cursor..next);
+                self.state.composer_edited();
             }
             KeyCode::Left => {
                 self.state.cursor = self.state.composer[..self.state.cursor]
@@ -618,19 +623,40 @@ impl App {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.state.composer.insert(self.state.cursor, '\n');
                 self.state.cursor += 1;
+                self.state.composer_edited();
             }
-            KeyCode::Enter => self.submit_composer()?,
-            KeyCode::Esc => {
+            KeyCode::Up if self.state.select_previous_command() => {}
+            KeyCode::Down if self.state.select_next_command() => {}
+            KeyCode::Tab if self.state.selected_command().is_some() => {
+                self.state.complete_selected_command();
+            }
+            KeyCode::Enter => {
+                if let Some(selected) = self.state.selected_command() {
+                    self.state.complete_selected_command();
+                    if selected.requires_arguments
+                        && command_missing_required_arguments(&self.state.composer)
+                    {
+                        return Ok(());
+                    }
+                }
+                self.submit_composer()?;
+            }
+            KeyCode::Esc if !self.state.dismiss_command_palette() => {
                 self.state.interrupt_active();
             }
+            KeyCode::Esc => {}
             _ => {}
         }
         Ok(())
     }
 
     fn submit_composer(&mut self) -> Result<(), String> {
+        if command_missing_required_arguments(&self.state.composer) {
+            return Ok(());
+        }
         let text = std::mem::take(&mut self.state.composer);
         self.state.cursor = 0;
+        self.state.composer_edited();
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return Ok(());
@@ -742,16 +768,11 @@ impl App {
             self.state
                 .push_error("not connected; configure ~/.kurama/config.toml");
         } else {
-            self.state.push_user(trimmed);
             let explicit_delegation = self
                 .orchestrator
                 .as_ref()
                 .is_some_and(|orchestrator| orchestrator.explicit_delegation(trimmed));
-            self.state.queue_command(EngineCommand::SubmitTurn {
-                text: trimmed.to_owned(),
-                explicit_delegation,
-            });
-            self.state.set_thinking();
+            self.state.submit_turn(trimmed, explicit_delegation);
         }
         Ok(())
     }
@@ -1170,10 +1191,15 @@ fn desired_inline_viewport_height(state: &TuiState, width: u16, height: u16) -> 
         state.overlay() == Overlay::None && state.activity().is_animated() && input_height < height,
     );
     let footer_height = u16::from(input_height.saturating_add(activity_height) < height);
+    let chrome_height = input_height
+        .saturating_add(activity_height)
+        .saturating_add(footer_height);
+    let palette_height = command_palette_height(state, height.saturating_sub(chrome_height));
     let transcript_capacity = height.saturating_sub(
         input_height
             .saturating_add(activity_height)
-            .saturating_add(footer_height),
+            .saturating_add(footer_height)
+            .saturating_add(palette_height),
     );
     let transcript_height = transcript_lines(
         state.live_transcript(),
@@ -1186,6 +1212,7 @@ fn desired_inline_viewport_height(state: &TuiState, width: u16, height: u16) -> 
     input_height
         .saturating_add(activity_height)
         .saturating_add(footer_height)
+        .saturating_add(palette_height)
         .saturating_add(transcript_height)
         .min(height)
 }
@@ -1509,7 +1536,6 @@ where
                     }
                     Some(event) => {
                         exit = app.handle_event(event)?;
-                        app.flush_commands().await?;
                         state_changed = true;
                         force_redraw = true;
                     }
@@ -1570,6 +1596,9 @@ where
                 animation_tick = true;
                 force_redraw = true;
             }
+        }
+        if !app.state.sent_commands().is_empty() {
+            app.flush_commands().await?;
         }
         redraw_pending |= state_changed;
         let now = tokio::time::Instant::now();
@@ -2498,6 +2527,21 @@ Session ID: s_cached"
         state.toggle_transcript_view();
         state.overlay = Overlay::Agents;
         assert_eq!(desired_inline_viewport_height(&state, 80, 24), 24);
+    }
+
+    #[test]
+    fn filtering_the_slash_palette_keeps_the_inline_viewport_stable() {
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        state.composer = "/".into();
+        state.cursor = state.composer.len();
+        let open_height = desired_inline_viewport_height(&state, 80, 24);
+
+        state.composer = "/res".into();
+        state.cursor = state.composer.len();
+        let filtered_height = desired_inline_viewport_height(&state, 80, 24);
+
+        assert_eq!(open_height, 10);
+        assert_eq!(filtered_height, open_height);
     }
 
     #[test]

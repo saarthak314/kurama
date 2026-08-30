@@ -412,6 +412,36 @@ async fn invalid_slash_commands_append_error_without_exiting() {
 }
 
 #[tokio::test]
+async fn slash_palette_completes_selection_and_waits_for_required_arguments() {
+    let (_temp, paths, project) = fixture();
+    let repository = ConfigRepository::open(paths.clone()).expect("repository");
+    repository
+        .write_config(&bridge_config())
+        .expect("write config");
+    let mut app =
+        App::bootstrap_with_paths(&Args::default(), project, paths, SessionSecrets::default())
+            .expect("bootstrap");
+
+    type_command(&mut app, "/res");
+    app.handle_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+        .expect("complete command");
+    assert_eq!(app.state.composer, "/resume ");
+
+    press_enter(&mut app);
+    assert_eq!(app.state.composer, "/resume ");
+    assert!(!transcript_has_error(&app, "unknown or invalid command"));
+
+    app.state.composer.clear();
+    app.state.cursor = 0;
+    type_command(&mut app, "/");
+    app.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
+        .expect("select next command");
+    app.handle_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+        .expect("complete selected command");
+    assert_eq!(app.state.composer, "/agents");
+}
+
+#[tokio::test]
 async fn live_controls_list_context_persist_mode_and_switch_profile() {
     let (_temp, paths, project) = fixture();
     let repository = ConfigRepository::open(paths.clone()).expect("repository");
@@ -473,6 +503,45 @@ async fn normal_submit_queues_the_turn_and_sets_thinking() {
     assert!(matches!(
         app.state.sent_commands().last(),
         Some(EngineCommand::SubmitTurn { text, .. }) if text == "inspect the repository"
+    ));
+}
+
+#[tokio::test]
+async fn follow_up_turns_wait_for_the_active_turn_and_dispatch_in_order() {
+    let (_temp, paths, project) = fixture();
+    let repository = ConfigRepository::open(paths.clone()).expect("repository");
+    repository
+        .write_config(&bridge_config())
+        .expect("write config");
+    let mut app =
+        App::bootstrap_with_paths(&Args::default(), project, paths, SessionSecrets::default())
+            .expect("bootstrap");
+    app.state.set_thinking();
+
+    submit_command(&mut app, "second turn");
+    submit_command(&mut app, "third turn");
+
+    assert_eq!(app.state.pending_turn_count(), 2);
+    assert!(app.state.sent_commands().is_empty());
+    assert!(
+        !app.state.transcript.iter().any(
+            |entry| matches!(entry, TranscriptEntry::UserTurn { body } if body == "second turn")
+        )
+    );
+
+    app.state.apply_runtime_event(RuntimeEvent::TurnCompleted);
+    assert_eq!(app.state.pending_turn_count(), 1);
+    assert!(matches!(
+        app.state.sent_commands().last(),
+        Some(EngineCommand::SubmitTurn { text, .. }) if text == "second turn"
+    ));
+
+    app.state.take_commands();
+    app.state.apply_runtime_event(RuntimeEvent::TurnCompleted);
+    assert_eq!(app.state.pending_turn_count(), 0);
+    assert!(matches!(
+        app.state.sent_commands().last(),
+        Some(EngineCommand::SubmitTurn { text, .. }) if text == "third turn"
     ));
 }
 

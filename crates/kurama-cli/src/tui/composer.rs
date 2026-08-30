@@ -134,7 +134,18 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect,
 
     let profile = FooterItem::dim(format!("{}/{}", state.profile, state.model));
     let project = FooterItem::dim(project_label(&state.project));
-    let mode = FooterItem::new(mode_label(state.mode), mode_style(state.mode));
+    let mode = FooterItem::new(
+        if state.pending_turn_count() == 0 {
+            mode_label(state.mode).to_owned()
+        } else {
+            format!(
+                "{} · {} queued",
+                mode_label(state.mode),
+                state.pending_turn_count()
+            )
+        },
+        mode_style(state.mode),
+    );
     let mut items = vec![profile, project, mode];
     if footer_width(&items) > area.width as usize {
         items.remove(1);

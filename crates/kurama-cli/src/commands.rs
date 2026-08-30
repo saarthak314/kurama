@@ -1,5 +1,76 @@
 use kurama_protocol::{id::SessionId, policy::ExecutionMode};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandSpec {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub accepts_arguments: bool,
+    pub requires_arguments: bool,
+}
+
+const COMMAND_SPECS: [CommandSpec; 10] = [
+    CommandSpec {
+        name: "model",
+        description: "select or list profiles",
+        accepts_arguments: true,
+        requires_arguments: false,
+    },
+    CommandSpec {
+        name: "agents",
+        description: "inspect and control sub-agents",
+        accepts_arguments: false,
+        requires_arguments: false,
+    },
+    CommandSpec {
+        name: "mode",
+        description: "switch supervised or auto mode",
+        accepts_arguments: true,
+        requires_arguments: true,
+    },
+    CommandSpec {
+        name: "connect",
+        description: "add a provider profile",
+        accepts_arguments: false,
+        requires_arguments: false,
+    },
+    CommandSpec {
+        name: "sessions",
+        description: "list recent project sessions",
+        accepts_arguments: false,
+        requires_arguments: false,
+    },
+    CommandSpec {
+        name: "resume",
+        description: "resume a saved session",
+        accepts_arguments: true,
+        requires_arguments: true,
+    },
+    CommandSpec {
+        name: "new",
+        description: "start a new session",
+        accepts_arguments: false,
+        requires_arguments: false,
+    },
+    CommandSpec {
+        name: "context",
+        description: "show context and session details",
+        accepts_arguments: false,
+        requires_arguments: false,
+    },
+    CommandSpec {
+        name: "compact",
+        description: "compact the current context",
+        accepts_arguments: false,
+        requires_arguments: false,
+    },
+    CommandSpec {
+        name: "exit",
+        description: "exit and print resume details",
+        accepts_arguments: false,
+        requires_arguments: false,
+    },
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Agents,
@@ -12,6 +83,38 @@ pub enum Command {
     Compact,
     Mode(ExecutionMode),
     Exit,
+}
+
+pub fn command_suggestions(input: &str) -> Vec<CommandSpec> {
+    let Some(first_line) = input.lines().next() else {
+        return Vec::new();
+    };
+    let Some(command) = first_line.strip_prefix('/') else {
+        return Vec::new();
+    };
+    let filter = command.split_whitespace().next().unwrap_or("");
+    let mut exact = Vec::new();
+    let mut prefixes = Vec::new();
+    for spec in COMMAND_SPECS.iter().copied() {
+        if spec.name == filter {
+            exact.push(spec);
+        } else if spec.name.starts_with(filter) {
+            prefixes.push(spec);
+        }
+    }
+    exact.extend(prefixes);
+    exact
+}
+
+pub fn command_missing_required_arguments(input: &str) -> bool {
+    let mut parts = input.split_whitespace();
+    let Some(name) = parts.next().and_then(|name| name.strip_prefix('/')) else {
+        return false;
+    };
+    parts.next().is_none()
+        && COMMAND_SPECS
+            .iter()
+            .any(|spec| spec.name == name && spec.requires_arguments)
 }
 
 pub fn parse_command(input: &str) -> Result<Command, String> {

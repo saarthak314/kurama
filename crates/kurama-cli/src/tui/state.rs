@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use kurama_protocol::{
@@ -9,6 +9,8 @@ use kurama_protocol::{
     session::{EventEnvelope, SessionEvent},
     tool::ToolResult,
 };
+
+use crate::commands::{CommandSpec, command_suggestions};
 
 use super::{AgentRow, ApprovalState, OnboardingState, sort_agents};
 
@@ -72,6 +74,12 @@ pub struct ToolTranscript {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingTurn {
+    text: String,
+    explicit_delegation: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptEntry {
     UserTurn { body: String },
     AssistantMessage { body: String },
@@ -97,6 +105,9 @@ pub struct TuiState {
     pub agents: Vec<AgentRow>,
     pub selected_agent: usize,
     pub agent_message: String,
+    command_selection: usize,
+    command_palette_dismissed: bool,
+    pending_turns: VecDeque<PendingTurn>,
     activity: ActivityState,
     transcript_view_expanded: bool,
     active_assistant_entry: Option<usize>,
@@ -131,6 +142,9 @@ impl TuiState {
             agents: Vec::new(),
             selected_agent: 0,
             agent_message: String::new(),
+            command_selection: 0,
+            command_palette_dismissed: false,
+            pending_turns: VecDeque::new(),
             activity: ActivityState::Idle,
             transcript_view_expanded: false,
             active_assistant_entry: None,
@@ -140,6 +154,84 @@ impl TuiState {
             committed_transcript_entries: 0,
             sent_commands: Vec::new(),
         }
+    }
+
+    pub fn command_suggestions(&self) -> Vec<CommandSpec> {
+        if self.command_palette_dismissed
+            || self.overlay != Overlay::None
+            || self.transcript_view_expanded
+        {
+            return Vec::new();
+        }
+        command_suggestions(&self.composer)
+    }
+
+    pub const fn command_selection(&self) -> usize {
+        self.command_selection
+    }
+
+    pub fn composer_edited(&mut self) {
+        self.command_selection = 0;
+        self.command_palette_dismissed = false;
+    }
+
+    pub fn dismiss_command_palette(&mut self) -> bool {
+        if self.command_suggestions().is_empty() {
+            return false;
+        }
+        self.command_palette_dismissed = true;
+        true
+    }
+
+    pub fn select_previous_command(&mut self) -> bool {
+        let len = self.command_suggestions().len();
+        if len == 0 {
+            return false;
+        }
+        self.command_selection = if self.command_selection == 0 {
+            len - 1
+        } else {
+            self.command_selection - 1
+        };
+        true
+    }
+
+    pub fn select_next_command(&mut self) -> bool {
+        let len = self.command_suggestions().len();
+        if len == 0 {
+            return false;
+        }
+        self.command_selection = (self.command_selection + 1) % len;
+        true
+    }
+
+    pub fn selected_command(&self) -> Option<CommandSpec> {
+        let suggestions = self.command_suggestions();
+        suggestions
+            .get(
+                self.command_selection
+                    .min(suggestions.len().saturating_sub(1)),
+            )
+            .copied()
+    }
+
+    pub fn complete_selected_command(&mut self) -> Option<CommandSpec> {
+        let selected = self.selected_command()?;
+        let first_line_end = self.composer.find('\n').unwrap_or(self.composer.len());
+        let token_end = self.composer[..first_line_end]
+            .find(char::is_whitespace)
+            .unwrap_or(first_line_end);
+        let tail = self.composer[token_end..].to_owned();
+        self.composer = format!("/{}", selected.name);
+        if tail.is_empty() && selected.accepts_arguments {
+            self.composer.push(' ');
+        } else {
+            self.composer.push_str(&tail);
+        }
+        self.cursor = self.composer.len();
+        self.command_selection = 0;
+        self.command_palette_dismissed = true;
+        Some(selected)
     }
 
     pub fn onboarding(project: impl Into<String>) -> Self {
@@ -174,6 +266,22 @@ impl TuiState {
         self.activity = ActivityState::Thinking {
             started_at: Instant::now(),
         };
+    }
+
+    pub fn submit_turn(&mut self, text: impl Into<String>, explicit_delegation: bool) {
+        let text = text.into();
+        if !matches!(self.activity, ActivityState::Idle) {
+            self.pending_turns.push_back(PendingTurn {
+                text,
+                explicit_delegation,
+            });
+            return;
+        }
+        self.start_turn(text, explicit_delegation);
+    }
+
+    pub fn pending_turn_count(&self) -> usize {
+        self.pending_turns.len()
     }
 
     pub fn toggle_transcript_view(&mut self) {
@@ -557,6 +665,10 @@ impl TuiState {
     }
 
     pub fn apply_runtime_event(&mut self, event: RuntimeEvent) {
+        let advances_pending_turn = matches!(
+            &event,
+            RuntimeEvent::TurnCompleted | RuntimeEvent::Error { .. }
+        );
         let completes_active_streams = matches!(
             &event,
             RuntimeEvent::TurnCompleted | RuntimeEvent::Error { .. } | RuntimeEvent::Shutdown
@@ -620,6 +732,25 @@ impl TuiState {
             self.active_tool_entries.clear();
             self.active_tool_streams.clear();
         }
+        if advances_pending_turn {
+            self.start_next_pending_turn();
+        }
+    }
+
+    fn start_turn(&mut self, text: String, explicit_delegation: bool) {
+        self.push_user(text.clone());
+        self.sent_commands.push(EngineCommand::SubmitTurn {
+            text,
+            explicit_delegation,
+        });
+        self.set_thinking();
+    }
+
+    fn start_next_pending_turn(&mut self) {
+        let Some(turn) = self.pending_turns.pop_front() else {
+            return;
+        };
+        self.start_turn(turn.text, turn.explicit_delegation);
     }
 
     fn append_assistant_delta(&mut self, text: String) {

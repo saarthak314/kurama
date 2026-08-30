@@ -11,9 +11,10 @@ use ratatui::{
 use kurama_protocol::agent::AgentState;
 
 use super::{
-    Overlay, ResponsiveLayout, TuiState, activity_line,
+    Overlay, ResponsiveLayout, TuiState, activity_line, command_palette_height,
     composer::{approval_height, composer_height, render_approval, render_composer, render_footer},
     layout::{main_area, visible_activity_rect},
+    render_command_palette,
     transcript::{TranscriptDetail, render_transcript_view, transcript_lines, truncate_display},
 };
 
@@ -108,6 +109,20 @@ fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
         layout.footer,
         !approval_visible && state.overlay == Overlay::None,
     );
+
+    let palette_height = command_palette_height(state, layout.input.y.saturating_sub(area.y));
+    if palette_height > 0 {
+        render_command_palette(
+            frame,
+            state,
+            Rect::new(
+                area.x,
+                layout.input.y.saturating_sub(palette_height),
+                area.width,
+                palette_height,
+            ),
+        );
+    }
 }
 
 fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) {
