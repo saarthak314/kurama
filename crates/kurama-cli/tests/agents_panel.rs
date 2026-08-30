@@ -9,7 +9,11 @@ use kurama_protocol::{
 use ratatui::{Terminal, backend::TestBackend};
 
 fn rendered(state: &TuiState) -> String {
-    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    rendered_at(state, 120, 30)
+}
+
+fn rendered_at(state: &TuiState, width: u16, height: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal.draw(|frame| render(frame, state)).unwrap();
     terminal
         .backend()
@@ -70,6 +74,39 @@ fn panel_shows_control_fields_but_not_tool_statistics() {
     assert!(!text.contains("SCOPE"));
     assert!(!text.contains("TIME"));
     assert!(text.contains("ID        ROLE          PROFILE      TASK                  STATE"));
+}
+
+#[test]
+fn short_agent_panel_keeps_the_selected_row_visible() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.set_agents(
+        (0..12)
+            .map(|index| row(&format!("a_{index:02}"), AgentState::Queued))
+            .collect(),
+    );
+    state.open_agents();
+    for _ in 0..11 {
+        state.select_next_agent();
+    }
+
+    let text = rendered_at(&state, 80, 16);
+
+    assert!(text.contains("a_11"), "selected agent was clipped: {text}");
+    assert!(!text.contains("a_00"), "panel did not scroll: {text}");
+    assert!(text.contains("enter  inspect"));
+}
+
+#[test]
+fn narrow_agent_panel_uses_a_compact_row_layout() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.set_agents(vec![row("a_compact", AgentState::Running)]);
+    state.open_agents();
+
+    let text = rendered_at(&state, 34, 14);
+
+    assert!(text.contains("a_compact"));
+    assert!(text.contains("RUNNING"));
+    assert!(!text.contains("ID        ROLE"));
 }
 
 #[test]

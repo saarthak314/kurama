@@ -231,96 +231,138 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) {
 
 fn render_agents(frame: &mut Frame<'_>, state: &TuiState) {
     frame.render_widget(Clear, frame.area());
-    let area = inset(frame.area(), 3, 2);
+    let frame_area = frame.area();
+    let area = inset(
+        frame_area,
+        if frame_area.width >= 60 { 3 } else { 1 },
+        if frame_area.height >= 20 { 2 } else { 1 },
+    );
     if area.is_empty() {
         return;
     }
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "/AGENTS",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(
-                    "    {} running · {} queued",
-                    state.running_agents, state.queued_agents
-                ),
-                Style::default().fg(DIM),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Sub-agents",
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            "Explicitly delegated children. No nested agents.",
+    let horizontal_padding = if area.width >= 48 { 2 } else { 1 };
+    let vertical_padding = if area.height >= 10 { 1 } else { 0 };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER))
+        .padding(Padding::new(
+            horizontal_padding,
+            horizontal_padding,
+            vertical_padding,
+            vertical_padding,
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+
+    let width = inner.width as usize;
+    let height = inner.height as usize;
+    let show_summary = height >= 9;
+    let show_columns = width >= 72 && height >= 7;
+    let fixed_lines = 2 + usize::from(show_summary) + usize::from(show_columns);
+    let list_height = height.saturating_sub(fixed_lines).max(1);
+    let selected = state
+        .selected_agent
+        .min(state.agents.len().saturating_sub(1));
+    let start = selected
+        .saturating_sub(list_height / 2)
+        .min(state.agents.len().saturating_sub(list_height));
+    let end = state.agents.len().min(start.saturating_add(list_height));
+
+    let title = truncate(
+        &format!(
+            "/AGENTS    {} running · {} queued",
+            state.running_agents, state.queued_agents
+        ),
+        width,
+    );
+    let mut lines = vec![Line::from(Span::styled(
+        title,
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    ))];
+    if show_summary {
+        lines.push(Line::from(Span::styled(
+            "Explicitly delegated children · no nested agents",
             Style::default().fg(DIM),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
+        )));
+    }
+    if show_columns {
+        lines.push(Line::from(Span::styled(
             "ID        ROLE          PROFILE      TASK                  STATE",
             Style::default().fg(DIM),
-        )),
-    ];
-    for (index, agent) in state.agents.iter().enumerate() {
-        let selected = index == state.selected_agent;
-        let state_text = format!("{:?}", agent.state).to_uppercase();
-        let state_color = match agent.state {
-            AgentState::Running => ACCENT,
-            AgentState::Queued => DIM,
-            AgentState::Completed => GREEN,
-            AgentState::Failed | AgentState::Cancelled => DIM,
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                if selected { "▶ " } else { "  " },
-                Style::default().fg(ACCENT),
-            ),
-            Span::styled(
-                format!(
-                    "{:<10}{:<14}{:<13}{:<22}",
-                    agent.id,
-                    truncate(&agent.role, 12),
-                    truncate(&agent.profile, 11),
-                    truncate(&agent.task, 20)
-                ),
-                Style::default().fg(if selected { TEXT } else { DIM }),
-            ),
-            Span::styled(
-                state_text,
-                Style::default()
-                    .fg(state_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
-    }
-    lines.push(Line::from(""));
-    if let Some(agent) = state.selected_agent() {
-        lines.push(Line::from(Span::styled(
-            format!("SELECTED  {}", agent.id),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(Span::styled(
-            agent.activity.as_str(),
-            Style::default().fg(TEXT),
         )));
     }
-    lines.push(Line::from(""));
+    if state.agents.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No sub-agents",
+            Style::default().fg(DIM),
+        )));
+    } else {
+        lines.extend(
+            state.agents[start..end]
+                .iter()
+                .enumerate()
+                .map(|(offset, agent)| agent_row(agent, start + offset == selected, width)),
+        );
+    }
+    while lines.len() + 1 < height {
+        lines.push(Line::from(""));
+    }
+    let controls = if width >= 68 {
+        "enter  inspect     m  message     x  cancel     ↑↓  select     esc  close"
+    } else if width >= 36 {
+        "enter  inspect   ↑↓  select   esc  close"
+    } else {
+        "↵ inspect  ↑↓  esc"
+    };
     lines.push(Line::from(Span::styled(
-        "enter  inspect     m  message     x  cancel     ↑↓  select     esc  close",
+        truncate(controls, width),
         Style::default().fg(DIM),
     )));
-    frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(BORDER))
-                .padding(Padding::new(2, 2, 1, 1)),
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn agent_row(agent: &crate::tui::AgentRow, selected: bool, width: usize) -> Line<'static> {
+    let state_text = format!("{:?}", agent.state).to_uppercase();
+    let state_color = match agent.state {
+        AgentState::Running => ACCENT,
+        AgentState::Queued => DIM,
+        AgentState::Completed => GREEN,
+        AgentState::Failed | AgentState::Cancelled => DIM,
+    };
+    let marker = if selected { "▶ " } else { "  " };
+    let body = if width >= 72 {
+        format!(
+            "{:<10}{:<14}{:<13}{:<22}",
+            agent.id,
+            truncate(&agent.role, 12),
+            truncate(&agent.profile, 11),
+            truncate(&agent.task, 20)
+        )
+    } else if width >= 42 {
+        let reserved = marker.len() + state_text.len() + 4;
+        let detail = truncate(
+            &format!("{} · {} · {}", agent.id, agent.role, agent.task),
+            width.saturating_sub(reserved),
+        );
+        format!("{detail}  ")
+    } else {
+        let reserved = marker.len() + state_text.len() + 2;
+        let id = truncate(agent.id.as_ref(), width.saturating_sub(reserved));
+        format!("{id}  ")
+    };
+    Line::from(vec![
+        Span::styled(marker, Style::default().fg(ACCENT)),
+        Span::styled(body, Style::default().fg(if selected { TEXT } else { DIM })),
+        Span::styled(
+            state_text,
+            Style::default()
+                .fg(state_color)
+                .add_modifier(Modifier::BOLD),
         ),
-        area,
-    );
+    ])
 }
 
 fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) {
