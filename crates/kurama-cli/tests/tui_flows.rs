@@ -8,6 +8,7 @@ use kurama_protocol::{
     session::{EventEnvelope, SessionEvent},
     tool::{Operation, ToolResult},
 };
+use std::{thread, time::Duration};
 
 #[test]
 fn onboarding_offers_only_supported_connection_types() {
@@ -88,6 +89,29 @@ fn runtime_status_and_shutdown_return_to_idle() {
 
     state.apply_runtime_event(RuntimeEvent::Shutdown);
     assert_eq!(state.activity(), &ActivityState::Idle);
+}
+
+#[test]
+fn repeated_status_updates_preserve_activity_start_time() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.apply_runtime_event(RuntimeEvent::Status {
+        message: "indexing".into(),
+    });
+    let started_at = match state.activity() {
+        ActivityState::Working { started_at, .. } => *started_at,
+        activity => panic!("expected working activity, got {activity:?}"),
+    };
+
+    thread::sleep(Duration::from_millis(2));
+    state.apply_runtime_event(RuntimeEvent::Status {
+        message: "indexing".into(),
+    });
+
+    assert!(matches!(
+        state.activity(),
+        ActivityState::Working { label, started_at: repeated }
+            if label == "indexing" && *repeated == started_at
+    ));
 }
 
 #[test]

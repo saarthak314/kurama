@@ -2,8 +2,8 @@ use kurama_cli::{
     app::App,
     commands::{Command, parse_command},
     tui::{
-        AgentRow, Overlay, ToolLifecycle, ToolTranscript, TranscriptDetail, TranscriptEntry,
-        TuiState, render, transcript_lines,
+        ActivityState, AgentRow, Overlay, ResponsiveLayout, ToolLifecycle, ToolTranscript,
+        TranscriptDetail, TranscriptEntry, TuiState, activity_line, render, transcript_lines,
     },
 };
 use kurama_protocol::{
@@ -17,9 +17,11 @@ use ratatui::{
     Terminal,
     backend::{Backend, TestBackend},
     buffer::{Buffer, Cell},
-    layout::Position,
+    layout::{Position, Rect},
     style::{Color, Modifier},
+    text::Line,
 };
+use std::time::{Duration, Instant};
 
 fn buffer_text(buffer: &Buffer) -> String {
     let mut text = String::new();
@@ -119,12 +121,116 @@ fn main_screen_is_transcript_first_without_tool_statistics() {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| render(frame, &state)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
-        assert!(text.contains("KURAMA"));
+        assert!(!text.contains("KURAMA"));
         assert!(text.contains("SUPERVISED"));
-        assert!(text.contains("agents 1 running · 1 queued"));
         assert!(!text.contains("tool calls"));
         assert!(!text.contains("tokens/sec"));
     }
+
+    let wide = buffer_text(&rendered(&state, 160, 30));
+    assert!(wide.contains("agents 1 running · 1 queued"));
+    assert!(wide.contains("Ctrl+O details"));
+}
+
+#[test]
+fn responsive_layout_regions_stay_inside_the_requested_area() {
+    for (area, input_height, activity_visible) in [
+        (Rect::new(3, 5, 120, 32), 2, false),
+        (Rect::new(3, 5, 80, 24), 3, true),
+        (Rect::new(3, 5, 48, 16), 5, true),
+        (Rect::new(3, 5, 32, 10), 6, false),
+        (Rect::new(3, 5, 0, 0), 6, true),
+        (Rect::new(3, 5, 1, 1), 6, true),
+    ] {
+        let layout = ResponsiveLayout::for_area(area, input_height, activity_visible);
+        let regions = [
+            layout.transcript,
+            layout.activity,
+            layout.input,
+            layout.footer,
+        ];
+
+        for region in regions {
+            assert!(region.x >= area.x);
+            assert!(region.y >= area.y);
+            assert!(region.right() <= area.right());
+            assert!(region.bottom() <= area.bottom());
+        }
+        assert!(layout.transcript.bottom() <= layout.activity.y || layout.activity.is_empty());
+        assert!(layout.activity.bottom() <= layout.input.y || layout.activity.is_empty());
+        assert!(layout.transcript.bottom() <= layout.input.y);
+        assert!(layout.input.bottom() <= layout.footer.y || layout.footer.is_empty());
+    }
+}
+
+#[test]
+fn activity_line_formats_elapsed_time_and_measures_the_interrupt_hint() {
+    let now = Instant::now();
+    let seconds = ActivityState::Thinking {
+        started_at: now - Duration::from_secs(59),
+    };
+    let minutes = ActivityState::Working {
+        label: "tests".into(),
+        started_at: now - Duration::from_secs(60),
+    };
+    let hours = ActivityState::RunningTool {
+        name: "cargo test".into(),
+        started_at: now - Duration::from_secs(3_600),
+    };
+
+    let seconds = plain(vec![
+        activity_line(&seconds, 80, now).expect("thinking line"),
+    ]);
+    let minutes = plain(vec![
+        activity_line(&minutes, 80, now).expect("working line"),
+    ]);
+    let hours = plain(vec![activity_line(&hours, 80, now).expect("tool line")]);
+    let narrow = plain(vec![
+        activity_line(&hours_state(now), 24, now).expect("narrow activity line"),
+    ]);
+
+    assert!(seconds.contains("Thinking · 59s"));
+    assert!(minutes.contains("Working tests · 1m 00s"));
+    assert!(hours.contains("Running cargo test · 1h 00m 00s"));
+    assert!(hours.contains("Esc to interrupt"));
+    assert!(!narrow.contains("Esc to interrupt"));
+    assert!(activity_line(&ActivityState::Idle, 80, now).is_none());
+    assert!(activity_line(&ActivityState::AwaitingApproval, 80, now).is_none());
+}
+
+fn hours_state(now: Instant) -> ActivityState {
+    ActivityState::RunningTool {
+        name: "cargo test with a deliberately long Unicode label 界".into(),
+        started_at: now - Duration::from_secs(3_600),
+    }
+}
+
+#[test]
+fn measured_footer_collapses_low_priority_context_before_mode() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Yolo);
+    state.set_agent_counts(2, 1);
+
+    let wide = buffer_text(&rendered(&state, 120, 32));
+    assert!(wide.contains("Ctrl+O details"));
+    assert!(wide.contains("agents 2 running · 1 queued"));
+    assert!(wide.contains("."));
+    assert!(wide.contains("work/model"));
+    assert!(wide.contains("YOLO"));
+
+    let medium = buffer_text(&rendered(&state, 48, 16));
+    assert!(!medium.contains("Ctrl+O details"));
+    assert!(!medium.contains("agents 2 running · 1 queued"));
+    assert!(medium.contains("work/model"));
+    assert!(medium.contains("YOLO"));
+
+    let narrow = buffer_text(&rendered(&state, 32, 10));
+    assert!(!narrow.contains("Ctrl+O details"));
+    assert!(!narrow.contains("agents 2 running · 1 queued"));
+    assert!(narrow.contains("YOLO"));
+
+    let tiny = buffer_text(&rendered(&state, 12, 6));
+    assert!(tiny.contains("YOLO"));
+    assert!(!tiny.contains("work/model"));
 }
 
 #[test]
@@ -337,10 +443,8 @@ fn runtime_errors_render_in_the_transcript_instead_of_the_status_line() {
     let text = buffer_text(&buffer);
 
     assert!(text.contains("Error: protocol error: malformed bridge output"));
-    assert!(
-        text.lines()
-            .any(|line| line.contains("work/model") && line.contains("ready"))
-    );
+    assert!(text.lines().any(|line| line.contains("work/model")));
+    assert!(!text.contains("ready"));
     assert_eq!(cell_at_text(&buffer, "Error").fg, Color::Rgb(255, 92, 82));
 }
 
@@ -704,17 +808,17 @@ fn approvals_render_inline_without_hiding_the_main_screen() {
     state.begin_approval(approval_request());
 
     let pending = buffer_text(&rendered(&state, 100, 30));
-    assert!(pending.contains("KURAMA"));
+    assert!(!pending.contains("KURAMA"));
     assert!(pending.contains("› Run the CLI tests."));
-    assert!(pending.contains("• Approval required"));
+    assert!(pending.contains("Action required"));
     assert!(pending.contains("Run the focused CLI tests"));
-    assert!(pending.contains("a approve once · d deny · e edit"));
+    assert!(pending.contains("a approve once  d deny  e edit"));
     assert!(!pending.contains("Message Kurama or type / for commands"));
-    assert!(pending.contains("approval pending"));
+    assert!(!pending.contains("approval pending"));
     let pending_lines = pending.lines().collect::<Vec<_>>();
     let approval_line = pending_lines
         .iter()
-        .position(|line| line.contains("• Approval required"))
+        .position(|line| line.contains("Action required"))
         .expect("inline approval line");
     assert!(!pending_lines[approval_line.saturating_sub(1)].contains('┌'));
 
@@ -722,11 +826,11 @@ fn approvals_render_inline_without_hiding_the_main_screen() {
     let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
     terminal.draw(|frame| render(frame, &state)).unwrap();
     let editing = buffer_text(terminal.backend().buffer());
-    assert!(editing.contains("KURAMA"));
+    assert!(!editing.contains("KURAMA"));
     assert!(editing.contains("› Run the CLI tests."));
-    assert!(editing.contains("• Edit arguments"));
+    assert!(editing.contains("Action required · Edit arguments"));
     assert!(editing.contains(r#""command": "cargo test -p kurama-cli""#));
-    assert!(editing.contains("Enter submit · Esc return"));
+    assert!(editing.contains("Enter submit  Esc return"));
     assert!(!editing.contains("Message Kurama or type / for commands"));
     assert!(format!("{:?}", terminal.backend()).contains("cursor: true"));
 }
@@ -739,12 +843,31 @@ fn narrow_pending_approval_keeps_all_controls_visible() {
     let text = buffer_text(&rendered(&state, 40, 24));
     let lines = text.lines().map(str::trim).collect::<Vec<_>>();
 
-    assert!(text.contains("• Approval required"));
+    assert!(text.contains("Action required"));
     assert!(text.contains("a approve once"));
     assert!(text.contains("d deny"));
     assert!(text.contains("e edit"));
     assert!(lines.contains(&"Run the focused CLI tests before"));
     assert!(lines.contains(&"accepting this narrow terminal"));
+}
+
+#[test]
+fn narrow_layout_preserves_action_and_stacks_approval_choices() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_user("Run the CLI tests.");
+    state.apply_runtime_event(RuntimeEvent::ApprovalRequired {
+        request: approval_request(),
+    });
+
+    let text = buffer_text(&rendered(&state, 32, 10));
+    let lines = text.lines().map(str::trim).collect::<Vec<_>>();
+
+    assert!(text.contains("Action required"));
+    assert!(text.contains("$ cargo test -p kurama-cli"));
+    assert!(lines.contains(&"a approve once"));
+    assert!(lines.contains(&"d deny"));
+    assert!(lines.contains(&"e edit"));
+    assert!(!text.contains("Esc to interrupt"));
 }
 
 #[test]
@@ -763,7 +886,7 @@ fn narrow_approval_edit_cursor_follows_wrapped_context() {
         .expect("last editor line remains visible");
     let controls = lines
         .iter()
-        .position(|line| line.contains("Enter submit · Esc return"))
+        .position(|line| line.contains("Enter submit"))
         .expect("edit controls remain visible");
     let cursor = terminal.backend_mut().get_cursor_position().unwrap();
     let editor_end_column = lines[editor_end].find('}').unwrap() as u16 + 1;
@@ -773,7 +896,7 @@ fn narrow_approval_edit_cursor_follows_wrapped_context() {
 }
 
 #[test]
-fn every_tui_view_uses_a_readable_dark_surface() {
+fn every_tui_view_preserves_the_terminal_default_background() {
     let main = TuiState::new("work", "model", ".", ExecutionMode::Yolo);
 
     let mut approval = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
@@ -801,11 +924,8 @@ fn every_tui_view_uses_a_readable_dark_surface() {
     for state in [&main, &approval, &agents, &inspect, &onboarding] {
         let buffer = rendered(state, 100, 30);
         assert!(
-            buffer
-                .content()
-                .iter()
-                .all(|cell| cell.bg == Color::Rgb(13, 16, 22)),
-            "view left inconsistent background cells: {:?}",
+            buffer.content().iter().all(|cell| cell.bg == Color::Reset),
+            "view painted a background cell: {:?}",
             state.overlay
         );
     }
@@ -833,19 +953,56 @@ fn composer_cursor_tracks_the_visual_insertion_point() {
         "~/src/kurama",
         ExecutionMode::Supervised,
     );
-    state.composer = "kurama".into();
-    state.cursor = 2;
+    state.composer = "first line\n界界second line".into();
+    state.cursor = state.composer.len();
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal.draw(|frame| render(frame, &state)).unwrap();
 
     let cursor = terminal.backend_mut().get_cursor_position().unwrap();
-    assert_eq!(cursor, Position::new(9, 21));
+    let text = buffer_text(terminal.backend().buffer());
+    assert_eq!(text.matches('›').count(), 1);
+    assert!(text.contains("› first line"));
+    let second_line = text
+        .lines()
+        .find(|line| line.contains("second line"))
+        .expect("second composer line");
+    assert_eq!(second_line.chars().take(2).collect::<String>(), "  ");
     assert_eq!(
-        terminal.backend().buffer().cell(cursor).unwrap().symbol(),
-        "r"
+        terminal
+            .backend()
+            .buffer()
+            .cell((4, cursor.y))
+            .unwrap()
+            .symbol(),
+        "界"
     );
+    assert_eq!(
+        terminal
+            .backend()
+            .buffer()
+            .cell((6, cursor.y))
+            .unwrap()
+            .symbol(),
+        "界"
+    );
+    assert_eq!(cursor.x, 4 + Line::from("界界second line").width() as u16);
     assert!(format!("{:?}", terminal.backend()).contains("cursor: true"));
+}
+
+#[test]
+fn composer_cursor_handles_char_boundary_inside_combining_grapheme() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.composer = "e\u{301}x".into();
+    state.cursor = "e".len();
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &state)).unwrap();
+
+    assert_eq!(
+        terminal.backend_mut().get_cursor_position().unwrap(),
+        Position::new(5, 22)
+    );
 }
 
 #[test]

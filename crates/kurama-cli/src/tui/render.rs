@@ -1,33 +1,33 @@
+use std::time::Instant;
+
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Position, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
 };
 
-use kurama_protocol::{agent::AgentState, policy::ExecutionMode, tool::Operation};
+use kurama_protocol::agent::AgentState;
 
 use super::{
-    Overlay, TuiState,
-    transcript::{
-        TranscriptDetail, hard_wrap, render_transcript_view, transcript_lines, truncate_display,
-        word_wrap,
-    },
+    Overlay, ResponsiveLayout, TuiState, activity_line,
+    composer::{approval_height, composer_height, render_approval, render_composer, render_footer},
+    transcript::{TranscriptDetail, render_transcript_view, transcript_lines, truncate_display},
 };
 
-const BORDER: Color = Color::Rgb(48, 53, 64);
-const DIM: Color = Color::Rgb(126, 132, 146);
-const TEXT: Color = Color::Rgb(224, 226, 232);
-pub(crate) const SURFACE: Color = Color::Rgb(13, 16, 22);
-const RED: Color = Color::Rgb(255, 92, 82);
-const AMBER: Color = Color::Rgb(220, 178, 73);
-const GREEN: Color = Color::Rgb(111, 207, 151);
-const APPROVAL_MAX_HEIGHT: usize = 14;
-const APPROVAL_EDITOR_MIN_LINES: usize = 4;
+const BORDER: Color = Color::DarkGray;
+const DIM: Color = Color::DarkGray;
+const TEXT: Color = Color::Reset;
+pub(crate) const SURFACE: Color = Color::Reset;
+const RED: Color = Color::Red;
+const AMBER: Color = Color::Yellow;
+const GREEN: Color = Color::Cyan;
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
-    paint_surface(frame);
+    if frame.area().is_empty() {
+        return;
+    }
     if state.transcript_view_expanded() {
         render_transcript_view(frame, state);
         return;
@@ -43,170 +43,86 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
     }
 }
 
-fn paint_surface(frame: &mut Frame<'_>) {
-    let area = frame.area();
-    frame.render_widget(Clear, area);
-    frame.render_widget(Block::default().style(surface_style()), area);
-}
-
 fn render_main(frame: &mut Frame<'_>, state: &TuiState) {
-    let approval_height = approval_height(state, frame.area().width);
-    let input_height = if approval_height > 0 {
-        approval_height
+    let area = main_area(frame.area());
+    if area.is_empty() {
+        return;
+    }
+    let approval_visible = matches!(state.overlay, Overlay::Approval | Overlay::ApprovalEdit);
+    let input_height = if approval_visible {
+        approval_height(state, area.width)
     } else {
-        composer_height(state)
+        composer_height(state, area.width)
     };
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Min(4),
-            Constraint::Length(input_height),
-            Constraint::Length(1),
-        ])
-        .split(frame.area());
+    let now = Instant::now();
+    let activity = (!approval_visible)
+        .then(|| activity_line(state.activity(), area.width as usize, now))
+        .flatten();
+    let layout = ResponsiveLayout::for_area(area, input_height, activity.is_some());
 
-    let header = Line::from(vec![
-        Span::styled("●  ", Style::default().fg(RED)),
-        Span::styled(
-            "KURAMA",
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(
-                "  {} · {}/{} · {}",
-                state.project,
-                state.profile,
-                state.model,
-                mode_label(state.mode)
-            ),
-            Style::default().fg(DIM),
-        ),
-    ]);
-    frame.render_widget(
-        Paragraph::new(header).block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(BORDER))
-                .padding(Padding::new(2, 1, 0, 0)),
-        ),
-        chunks[0],
-    );
-
-    let transcript_block = Block::default().padding(Padding::new(2, 2, 1, 0));
-    let transcript_area = transcript_block.inner(chunks[1]);
-    let transcript_width = transcript_area.width as usize;
-    let transcript = transcript_lines(
-        state.live_transcript(),
-        transcript_width,
-        TranscriptDetail::Compact,
-    );
-    let viewport_height = transcript_area.height as usize;
-    let scroll = state
-        .scroll
-        .min(transcript.len().saturating_sub(viewport_height));
-    let start = transcript
-        .len()
-        .saturating_sub(viewport_height.saturating_add(scroll));
-    let transcript = transcript
-        .into_iter()
-        .skip(start)
-        .take(viewport_height)
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(Text::from(transcript)).block(transcript_block),
-        chunks[1],
-    );
-
-    if approval_height > 0 {
-        if let Some(position) = render_approval(frame, state, chunks[2]) {
-            frame.set_cursor_position(position);
-        }
-    } else {
-        let composer = if state.composer.is_empty() {
-            Text::from(Line::from(vec![
-                Span::styled("›  ", Style::default().fg(RED).add_modifier(Modifier::BOLD)),
-                Span::styled(
-                    "Message Kurama or type / for commands",
-                    Style::default().fg(DIM),
-                ),
-            ]))
-        } else {
-            Text::from(
-                state
-                    .composer
-                    .split('\n')
-                    .map(|line| {
-                        Line::from(vec![
-                            Span::styled(
-                                "›  ",
-                                Style::default().fg(RED).add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(line, Style::default().fg(TEXT)),
-                        ])
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        };
-        let composer_area = inset(chunks[2], 2, 0);
-        let composer_block = panel_block();
-        let composer_inner = composer_block.inner(composer_area);
-        frame.render_widget(
-            Paragraph::new(composer)
-                .wrap(Wrap { trim: false })
-                .block(composer_block),
-            composer_area,
+    if !layout.transcript.is_empty() {
+        let transcript = transcript_lines(
+            state.live_transcript(),
+            layout.transcript.width as usize,
+            TranscriptDetail::Compact,
         );
-        if state.overlay == Overlay::None
-            && let Some(position) = composer_cursor_position(state, composer_inner)
-        {
-            frame.set_cursor_position(position);
-        }
+        let viewport_height = layout.transcript.height as usize;
+        let scroll = state
+            .scroll
+            .min(transcript.len().saturating_sub(viewport_height));
+        let start = transcript
+            .len()
+            .saturating_sub(viewport_height.saturating_add(scroll));
+        let transcript = transcript
+            .into_iter()
+            .skip(start)
+            .take(viewport_height)
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(Text::from(transcript)), layout.transcript);
     }
 
-    let agents = format!(
-        "agents {} running · {} queued",
-        state.running_agents, state.queued_agents
-    );
-    let footer = if chunks[3].width < 100 {
-        Line::from(vec![
-            Span::styled(
-                format!("  {}/{}", state.profile, state.model),
-                Style::default().fg(DIM),
-            ),
-            Span::raw("  "),
-            Span::styled(mode_label(state.mode), mode_style(state.mode)),
-            Span::raw("  "),
-            Span::styled(
-                agents,
-                Style::default().fg(if state.running_agents > 0 { RED } else { DIM }),
-            ),
-        ])
+    if let Some(activity) = activity
+        && !layout.activity.is_empty()
+    {
+        frame.render_widget(Paragraph::new(activity), layout.activity);
+    }
+
+    if approval_visible {
+        if let Some(position) = render_approval(frame, state, layout.input) {
+            frame.set_cursor_position(position);
+        }
+    } else if state.overlay == Overlay::None
+        && let Some(position) = render_composer(frame, state, layout.input)
+    {
+        frame.set_cursor_position(position);
     } else {
-        Line::from(vec![
-            Span::styled(format!("  {}", state.project), Style::default().fg(DIM)),
-            Span::raw("    "),
-            Span::styled(
-                format!("{}/{}", state.profile, state.model),
-                Style::default().fg(DIM),
-            ),
-            Span::raw("    "),
-            Span::styled(mode_label(state.mode), mode_style(state.mode)),
-            Span::raw("    "),
-            Span::styled(
-                agents,
-                Style::default().fg(if state.running_agents > 0 { RED } else { DIM }),
-            ),
-            Span::raw("    "),
-            Span::styled(state.status.as_str(), Style::default().fg(DIM)),
-        ])
-    };
-    frame.render_widget(Paragraph::new(footer), chunks[3]);
+        render_composer(frame, state, layout.input);
+    }
+
+    render_footer(
+        frame,
+        state,
+        layout.footer,
+        !approval_visible && state.overlay == Overlay::None,
+    );
+}
+
+fn main_area(area: Rect) -> Rect {
+    let horizontal = if area.width > 4 { 2 } else { 0 };
+    Rect::new(
+        area.x.saturating_add(horizontal),
+        area.y,
+        area.width.saturating_sub(horizontal.saturating_mul(2)),
+        area.height,
+    )
 }
 
 fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) {
-    paint_surface(frame);
+    frame.render_widget(Clear, frame.area());
     let area = inset(frame.area(), 4, 2);
+    if area.is_empty() {
+        return;
+    }
     if !state.onboarding.is_selecting_connection() {
         let input = state.onboarding.display_input();
         let lines = vec![
@@ -317,165 +233,12 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) {
     );
 }
 
-fn render_approval(frame: &mut Frame<'_>, state: &TuiState, area: Rect) -> Option<Position> {
-    let Some(approval) = &state.approval else {
-        return None;
-    };
-    let area = inset(area, 2, 0);
-    let layout = approval_layout(approval, area.width as usize, area.height as usize);
-    frame.render_widget(Paragraph::new(layout.lines), area);
-    layout.cursor.map(|(row, column)| {
-        Position::new(
-            area.x
-                .saturating_add(column.min(area.width.saturating_sub(1))),
-            area.y
-                .saturating_add(row.min(area.height.saturating_sub(1))),
-        )
-    })
-}
-
-struct ApprovalLayout {
-    lines: Vec<Line<'static>>,
-    cursor: Option<(u16, u16)>,
-}
-
-fn approval_layout(
-    approval: &super::ApprovalState,
-    width: usize,
-    max_height: usize,
-) -> ApprovalLayout {
-    let title = if approval.editing {
-        "Edit arguments"
-    } else {
-        "Approval required"
-    };
-    let title = Line::from(vec![
-        Span::styled("• ", Style::default().fg(RED).add_modifier(Modifier::BOLD)),
-        Span::styled(
-            title,
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-        ),
-    ]);
-    let summary = indented_prose_lines(&approval.request.summary, width, Style::default().fg(TEXT));
-    let detail = indented_lines(
-        &approval_detail(&approval.request.operation),
-        width,
-        Style::default().fg(DIM),
-    );
-    let controls = if approval.editing {
-        indented_prose_lines("Enter submit · Esc return", width, Style::default().fg(DIM))
-    } else {
-        indented_prose_lines(
-            "a approve once · d deny · e edit",
-            width,
-            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
-        )
-    };
-    let max_height = max_height.max(1);
-    let body_height = max_height.saturating_sub(1 + controls.len());
-    let mut lines = vec![title];
-
-    if approval.editing {
-        let context_height = summary.len().saturating_add(detail.len());
-        let editor_height = hard_wrap(&approval.editor, width.saturating_sub(2).max(1)).len();
-        let context_budget = if context_height.saturating_add(editor_height) <= body_height {
-            context_height
-        } else {
-            context_height.min(
-                body_height.saturating_sub(
-                    editor_height
-                        .min(APPROVAL_EDITOR_MIN_LINES)
-                        .min(body_height),
-                ),
-            )
-        };
-        lines.extend(bounded_approval_context(summary, detail, context_budget));
-        let editor_budget = body_height.saturating_sub(context_budget);
-        let editor_lines = editor_preview(
-            &approval.editor,
-            width.saturating_sub(2).max(1),
-            editor_budget,
-        );
-        let cursor_row = lines
-            .len()
-            .saturating_add(editor_lines.len().saturating_sub(1)) as u16;
-        let cursor_column = editor_lines
-            .last()
-            .map_or(2, |line| 2 + Line::from(line.as_str()).width() as u16);
-        lines.extend(editor_lines.into_iter().map(|line| {
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled(line, Style::default().fg(TEXT)),
-            ])
-        }));
-        lines.extend(controls);
-        ApprovalLayout {
-            lines,
-            cursor: Some((cursor_row, cursor_column)),
-        }
-    } else {
-        lines.extend(bounded_approval_context(summary, detail, body_height));
-        lines.extend(controls);
-        ApprovalLayout {
-            lines,
-            cursor: None,
-        }
-    }
-}
-
-fn approval_detail(operation: &Operation) -> String {
-    match operation {
-        Operation::Read { path, .. } => format!("read  {}", path.display()),
-        Operation::Write { paths, .. } => format!(
-            "write  {}",
-            paths
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        Operation::Bash { command, .. } => format!("$ {command}"),
-        Operation::WebSearch { query, .. } => format!("search  {query}"),
-        Operation::WebOpen { url, .. } => format!("open  {url}"),
-    }
-}
-
-fn indented_lines(value: &str, width: usize, style: Style) -> Vec<Line<'static>> {
-    hard_wrap(value, width.saturating_sub(2).max(1))
-        .into_iter()
-        .map(|line| Line::from(vec![Span::raw("  "), Span::styled(line, style)]))
-        .collect()
-}
-
-fn indented_prose_lines(value: &str, width: usize, style: Style) -> Vec<Line<'static>> {
-    word_wrap(value, width.saturating_sub(2).max(1))
-        .into_iter()
-        .map(|line| Line::from(vec![Span::raw("  "), Span::styled(line, style)]))
-        .collect()
-}
-
-fn bounded_approval_context(
-    summary: Vec<Line<'static>>,
-    detail: Vec<Line<'static>>,
-    height: usize,
-) -> Vec<Line<'static>> {
-    if summary.len().saturating_add(detail.len()) <= height {
-        return summary.into_iter().chain(detail).collect();
-    }
-
-    let detail_reserve = usize::from(!detail.is_empty() && height > 1);
-    let summary_height = summary.len().min(height.saturating_sub(detail_reserve));
-    let detail_height = detail.len().min(height.saturating_sub(summary_height));
-    summary
-        .into_iter()
-        .take(summary_height)
-        .chain(detail.into_iter().take(detail_height))
-        .collect()
-}
-
 fn render_agents(frame: &mut Frame<'_>, state: &TuiState) {
-    paint_surface(frame);
+    frame.render_widget(Clear, frame.area());
     let area = inset(frame.area(), 3, 2);
+    if area.is_empty() {
+        return;
+    }
     let mut lines = vec![
         Line::from(vec![
             Span::styled(
@@ -562,8 +325,11 @@ fn render_agents(frame: &mut Frame<'_>, state: &TuiState) {
 }
 
 fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) {
-    paint_surface(frame);
+    frame.render_widget(Clear, frame.area());
     let area = inset(frame.area(), 3, 2);
+    if area.is_empty() {
+        return;
+    }
     let Some(agent) = state.selected_agent() else {
         return;
     };
@@ -633,109 +399,6 @@ fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) {
     );
 }
 
-fn panel_block() -> Block<'static> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(BORDER))
-        .padding(Padding::new(1, 1, 0, 0))
-}
-
-fn surface_style() -> Style {
-    Style::default().bg(SURFACE)
-}
-
-fn editor_preview(editor: &str, width: usize, max_lines: usize) -> Vec<String> {
-    if max_lines == 0 {
-        return Vec::new();
-    }
-    let wrapped = hard_wrap(editor, width);
-    if wrapped.len() <= max_lines {
-        return wrapped;
-    }
-
-    let omitted = wrapped.len() - max_lines.saturating_sub(1);
-    let mut visible = vec![format!("… {omitted} lines above …")];
-    visible.extend(
-        wrapped
-            .into_iter()
-            .skip(omitted)
-            .take(max_lines.saturating_sub(1)),
-    );
-    visible
-}
-
-fn approval_height(state: &TuiState, terminal_width: u16) -> u16 {
-    if !matches!(state.overlay, Overlay::Approval | Overlay::ApprovalEdit) {
-        return 0;
-    }
-
-    state.approval.as_ref().map_or(0, |approval| {
-        approval_layout(
-            approval,
-            terminal_width.saturating_sub(4) as usize,
-            APPROVAL_MAX_HEIGHT,
-        )
-        .lines
-        .len() as u16
-    })
-}
-
-fn composer_height(state: &TuiState) -> u16 {
-    (state.composer.lines().count().max(1) as u16 + 2).clamp(3, 8)
-}
-
-fn composer_cursor_position(state: &TuiState, area: Rect) -> Option<Position> {
-    if area.is_empty() {
-        return None;
-    }
-
-    let mut cursor = state.cursor.min(state.composer.len());
-    while !state.composer.is_char_boundary(cursor) {
-        cursor = cursor.saturating_sub(1);
-    }
-
-    let prefix_width = Line::from("›  ").width() as u16;
-    let mut row = 0_u16;
-    let mut lines = state.composer[..cursor].split('\n').peekable();
-    while let Some(line) = lines.next() {
-        let line_width = prefix_width.saturating_add(Line::from(line).width() as u16);
-        if lines.peek().is_some() {
-            row = row.saturating_add(line_width.div_ceil(area.width).max(1));
-            continue;
-        }
-
-        row = row.saturating_add(line_width / area.width);
-        let column = line_width % area.width;
-        return Some(Position::new(
-            area.x.saturating_add(column),
-            area.y
-                .saturating_add(row.min(area.height.saturating_sub(1))),
-        ));
-    }
-
-    Some(Position::new(
-        area.x
-            .saturating_add(prefix_width.min(area.width.saturating_sub(1))),
-        area.y,
-    ))
-}
-
-fn mode_label(mode: ExecutionMode) -> &'static str {
-    match mode {
-        ExecutionMode::Supervised => "SUPERVISED",
-        ExecutionMode::Auto => "AUTO",
-        ExecutionMode::Yolo => "YOLO",
-    }
-}
-
-fn mode_style(mode: ExecutionMode) -> Style {
-    Style::default().fg(match mode {
-        ExecutionMode::Supervised => GREEN,
-        ExecutionMode::Auto => AMBER,
-        ExecutionMode::Yolo => RED,
-    })
-}
-
 fn connection_note(index: usize) -> &'static str {
     match index {
         0 => "     Use the installed codex CLI · credentials stay inside Codex",
@@ -751,6 +414,8 @@ fn truncate(value: &str, width: usize) -> String {
 }
 
 fn inset(area: Rect, horizontal: u16, vertical: u16) -> Rect {
+    let horizontal = horizontal.min(area.width / 2);
+    let vertical = vertical.min(area.height / 2);
     Rect {
         x: area.x.saturating_add(horizontal),
         y: area.y.saturating_add(vertical),

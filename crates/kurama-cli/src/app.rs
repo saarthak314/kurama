@@ -1617,7 +1617,7 @@ mod tests {
                 .cell((x, 4))
                 .expect("inserted background")
                 .bg
-                == Color::Rgb(13, 16, 22)
+                == Color::Reset
         }));
         assert!(app.state.live_transcript().is_empty());
     }

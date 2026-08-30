@@ -519,9 +519,13 @@ impl TuiState {
         match event {
             RuntimeEvent::Status { message } => {
                 self.status = message.clone();
+                let started_at = match self.activity {
+                    ActivityState::Working { started_at, .. } => started_at,
+                    _ => Instant::now(),
+                };
                 self.activity = ActivityState::Working {
                     label: message,
-                    started_at: Instant::now(),
+                    started_at,
                 };
             }
             RuntimeEvent::AssistantDelta { text } => {
