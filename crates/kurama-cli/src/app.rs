@@ -508,8 +508,16 @@ impl App {
     }
 
     pub fn handle_event(&mut self, event: Event) -> Result<bool, String> {
-        let Event::Key(key) = event else {
-            return Ok(false);
+        let key = match event {
+            Event::Paste(text) => {
+                if self.state.overlay == Overlay::None && !self.state.transcript_view_expanded() {
+                    self.state.composer.insert_str(self.state.cursor, &text);
+                    self.state.cursor = self.state.cursor.saturating_add(text.len());
+                }
+                return Ok(false);
+            }
+            Event::Key(key) => key,
+            _ => return Ok(false),
         };
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.exit_requested = true;
@@ -1061,7 +1069,13 @@ where
 {
     let viewport_height = height.min(INLINE_VIEWPORT_MAX_HEIGHT);
     let viewport_top = height.saturating_sub(viewport_height);
-    terminal.backend_mut().clear_region(ClearType::All)?;
+    let current_viewport_top = terminal.get_frame().area().top();
+    terminal
+        .backend_mut()
+        .set_cursor_position(Position::new(0, current_viewport_top))?;
+    terminal
+        .backend_mut()
+        .clear_region(ClearType::AfterCursor)?;
     terminal.backend_mut().flush()?;
     replace_inline_terminal(
         terminal,
@@ -1101,7 +1115,7 @@ fn desired_inline_viewport_height(state: &TuiState, width: u16, height: u16) -> 
                 | Overlay::ConfirmAgentCancel
         )
     {
-        return height.min(INLINE_VIEWPORT_MAX_HEIGHT);
+        return height;
     }
 
     let area = main_area(Rect::new(0, 0, width, height));
@@ -1135,7 +1149,6 @@ fn desired_inline_viewport_height(state: &TuiState, width: u16, height: u16) -> 
         .saturating_add(footer_height)
         .saturating_add(transcript_height)
         .min(height)
-        .min(INLINE_VIEWPORT_MAX_HEIGHT)
 }
 
 fn set_inline_viewport_height<B>(
@@ -1328,8 +1341,6 @@ where
             event = input.recv(), if input_open => {
                 match event {
                     Some(Event::Resize(width, height)) if commit_to_scrollback => {
-                        purge_terminal_history().map_err(|error| error.to_string())?;
-                        app.state.reset_transcript_commit();
                         resize_inline_terminal(terminal, width, height)
                             .map_err(|error| error.to_string())?;
                     }
@@ -1802,6 +1813,19 @@ Session ID: s_cached"
     }
 
     #[test]
+    fn paste_inserts_multiline_text_at_the_composer_cursor() {
+        let mut app = test_app();
+        app.state.composer = "before after".into();
+        app.state.cursor = "before ".len();
+
+        app.handle_event(Event::Paste("one\ntwo".into()))
+            .expect("paste composer text");
+
+        assert_eq!(app.state.composer, "before one\ntwoafter");
+        assert_eq!(app.state.cursor, "before one\ntwo".len());
+    }
+
+    #[test]
     fn animation_wakes_only_for_visible_active_work() {
         let mut app = test_app();
         assert_eq!(ACTIVITY_FRAME_INTERVAL, Duration::from_millis(100));
@@ -1972,6 +1996,27 @@ Session ID: s_cached"
     }
 
     #[test]
+    fn active_and_expanded_views_use_the_available_terminal_height() {
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        state.push_assistant(
+            (0..40)
+                .map(|line| format!("- line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        state.set_thinking();
+
+        assert_eq!(desired_inline_viewport_height(&state, 80, 24), 24);
+
+        state.toggle_transcript_view();
+        assert_eq!(desired_inline_viewport_height(&state, 80, 24), 24);
+
+        state.toggle_transcript_view();
+        state.overlay = Overlay::Agents;
+        assert_eq!(desired_inline_viewport_height(&state, 80, 24), 24);
+    }
+
+    #[test]
     fn committed_history_sits_directly_above_the_idle_composer() {
         let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
         state.push_user("hi");
@@ -2134,6 +2179,36 @@ Session ID: s_cached"
                 == Color::Reset
         }));
         assert!(app.state.live_transcript().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inline_resize_preserves_committed_history_without_reinserting_it() {
+        let mut app = test_app();
+        app.state.push_user("committed question");
+        app.state.push_assistant("committed answer");
+        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24))
+            .expect("initialize inline terminal");
+        let (input_sender, mut input) = mpsc::channel(2);
+        input_sender
+            .send(Event::Resize(60, 18))
+            .await
+            .expect("queue resize");
+        drop(input_sender);
+
+        run_loop(&mut app, &mut terminal, &mut input, None, None, true)
+            .await
+            .expect("run resized inline terminal");
+
+        let text = terminal
+            .backend()
+            .scrollback()
+            .content()
+            .iter()
+            .chain(terminal.backend().buffer().content().iter())
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert_eq!(text.matches("committed question").count(), 1, "{text}");
+        assert_eq!(text.matches("committed answer").count(), 1, "{text}");
     }
 
     #[tokio::test]

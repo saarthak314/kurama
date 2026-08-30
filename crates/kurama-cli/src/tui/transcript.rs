@@ -1182,7 +1182,7 @@ fn inline_code_style() -> Style {
 pub fn transcript_lines(
     entries: &[TranscriptEntry],
     width: usize,
-    _detail: TranscriptDetail,
+    detail: TranscriptDetail,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for entry in entries {
@@ -1225,25 +1225,11 @@ pub fn transcript_lines(
                 );
                 let output_width = width.saturating_sub(4).max(1);
                 let output = tool.output.trim_end_matches(['\r', '\n']);
-                let output = if output.is_empty() {
-                    vec!["(no output)".to_owned()]
-                } else {
-                    word_wrap(output, output_width)
+                let output = match detail {
+                    TranscriptDetail::Compact => compact_tool_output(tool, output, output_width),
+                    TranscriptDetail::Expanded => expanded_tool_output(output, output_width),
                 };
-                let output_len = output.len();
-                for (index, line) in output.into_iter().enumerate() {
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            if index + 1 == output_len {
-                                "  └ "
-                            } else {
-                                "  │ "
-                            },
-                            Style::default().fg(DIM),
-                        ),
-                        Span::styled(line, Style::default().fg(DIM)),
-                    ]));
-                }
+                push_tool_output_lines(&mut lines, output);
             }
             TranscriptEntry::Error { body } => push_prefixed_lines(
                 &mut lines,
@@ -1278,6 +1264,77 @@ pub fn transcript_lines(
         }
     }
     lines
+}
+
+fn compact_tool_output(tool: &super::ToolTranscript, output: &str, width: usize) -> Vec<String> {
+    const RUNNING_TAIL_LINES: usize = 2;
+
+    if tool.lifecycle == ToolLifecycle::Running {
+        if output.is_empty() {
+            return vec!["waiting for output".into()];
+        }
+        let output = hard_wrap(output, width);
+        let omitted = output.len().saturating_sub(RUNNING_TAIL_LINES);
+        let mut visible = Vec::with_capacity(RUNNING_TAIL_LINES + usize::from(omitted > 0));
+        if omitted > 0 {
+            visible.push(format!(
+                "… {omitted} earlier {}",
+                pluralize(omitted, "line")
+            ));
+        }
+        visible.extend(output.into_iter().skip(omitted));
+        return visible;
+    }
+
+    let line_count = output_line_count(output);
+    let status = if tool.lifecycle == ToolLifecycle::Failed {
+        "failure"
+    } else {
+        "success"
+    };
+    let summary = if line_count == 0 {
+        format!("{status} · no output")
+    } else {
+        format!("{status} · {line_count} {}", pluralize(line_count, "line"))
+    };
+    vec![summary]
+}
+
+fn expanded_tool_output(output: &str, width: usize) -> Vec<String> {
+    if output.is_empty() {
+        vec!["(no output)".into()]
+    } else {
+        hard_wrap(output, width)
+    }
+}
+
+fn output_line_count(output: &str) -> usize {
+    if output.is_empty() {
+        0
+    } else {
+        output.split('\n').count()
+    }
+}
+
+fn pluralize(count: usize, singular: &'static str) -> &'static str {
+    if count == 1 { singular } else { "lines" }
+}
+
+fn push_tool_output_lines(lines: &mut Vec<Line<'static>>, output: Vec<String>) {
+    let output_len = output.len();
+    for (index, line) in output.into_iter().enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                if index + 1 == output_len {
+                    "  └ "
+                } else {
+                    "  │ "
+                },
+                Style::default().fg(DIM),
+            ),
+            Span::styled(line, Style::default().fg(DIM)),
+        ]));
+    }
 }
 
 pub(crate) fn render_transcript_view(frame: &mut Frame<'_>, state: &TuiState) {

@@ -1,7 +1,7 @@
 use std::{io, thread};
 
 use crossterm::{
-    event::{self, Event},
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode},
 };
@@ -12,9 +12,9 @@ pub struct TerminalGuard;
 impl TerminalGuard {
     pub fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        if let Err(error) = execute!(io::stdout(), crossterm::cursor::Hide) {
+        if let Err(error) = execute!(io::stdout(), crossterm::cursor::Hide, EnableBracketedPaste) {
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), crossterm::cursor::Show);
+            let _ = execute!(io::stdout(), DisableBracketedPaste, crossterm::cursor::Show);
             return Err(error);
         }
         Ok(Self)
@@ -24,7 +24,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), crossterm::cursor::Show);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, crossterm::cursor::Show);
     }
 }
 

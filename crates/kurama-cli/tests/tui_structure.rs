@@ -348,7 +348,8 @@ fn transcript_uses_compact_codex_style_hierarchy() {
     assert!(text.contains("I’ll inspect the parser and its focused tests."));
     assert!(text.contains("• I’ll inspect the parser and its focused tests."));
     assert!(text.contains("• Ran bash"));
-    assert!(text.contains("└ cargo test -p kurama-cli"));
+    assert!(text.contains("└ success · 1 line"));
+    assert!(!text.contains("cargo test -p kurama-cli"));
     assert!(text.contains("• MODE · supervised"));
     assert!(!text.contains("│ YOU"));
     assert!(!text.contains("│ KURAMA"));
@@ -356,7 +357,7 @@ fn transcript_uses_compact_codex_style_hierarchy() {
 }
 
 #[test]
-fn transcript_groups_turns_and_shows_complete_tool_output() {
+fn compact_tool_rows_hide_output_while_expanded_preserves_it() {
     let entries = vec![
         TranscriptEntry::UserTurn {
             body: "inspect".into(),
@@ -374,8 +375,9 @@ fn transcript_groups_turns_and_shows_complete_tool_output() {
 
     assert!(compact.contains("› inspect"));
     assert!(compact.contains("• Ran bash"));
-    assert!(compact.contains("line one"));
-    assert!(compact.contains("line two"));
+    assert!(compact.contains("success · 2 lines"));
+    assert!(!compact.contains("line one"));
+    assert!(!compact.contains("line two"));
     assert!(expanded.contains("line one"));
     assert!(expanded.contains("line two"));
 }
@@ -455,26 +457,43 @@ fn transcript_tool_summaries_follow_lifecycle_without_truncating_expanded_output
         }),
     ];
 
-    let compact = plain(transcript_lines(&entries, 20, TranscriptDetail::Compact));
-    let expanded = plain(transcript_lines(&entries, 20, TranscriptDetail::Expanded));
+    let compact = plain(transcript_lines(&entries, 40, TranscriptDetail::Compact));
+    let expanded = plain(transcript_lines(&entries, 40, TranscriptDetail::Expanded));
 
     assert!(compact.contains("• Ran bash"));
     assert!(compact.contains("× write failed"));
-    assert!(compact.contains("  │ abcdefghijklmnop"));
-    assert!(compact.contains("  └ line two"));
-    assert!(compact.contains("  │ permission"));
-    assert!(compact.contains("  └ denied"));
-    assert!(expanded.contains("  │ abcdefghijklmnop"));
-    assert!(expanded.contains("  │ qrstuvwxyz012345"));
-    assert!(expanded.contains("  │ 6789ABCDEFGHIJ"));
-    assert!(expanded.contains("line two"));
-    assert!(expanded.contains("  │ permission"));
-    assert!(expanded.contains("  └ denied"));
+    assert!(compact.contains("  └ success · 2 lines"));
+    assert!(compact.contains("  └ failure · 1 line"));
+    assert!(!compact.contains("abcdefghijklmnopqrstuvwxyz"));
+    assert!(!compact.contains("permission denied"));
+    assert!(expanded.contains("  │ abcdefghijklmnopqrstuvwxyz0123456789"));
+    assert!(expanded.contains("  │ ABCDEFGHIJ"));
+    assert!(expanded.contains("  └ line two"));
+    assert!(expanded.contains("  └ permission denied"));
     assert!(!expanded.contains('…'));
 }
 
 #[test]
-fn tool_output_drops_terminal_trailing_line_breaks() {
+fn running_tool_output_shows_only_a_bounded_tail() {
+    let entries = vec![TranscriptEntry::ToolCall(ToolTranscript {
+        call_id: None,
+        name: "bash".into(),
+        output: "first\nsecond\nthird\nfourth".into(),
+        lifecycle: ToolLifecycle::Running,
+    })];
+
+    let text = plain(transcript_lines(&entries, 80, TranscriptDetail::Compact));
+
+    assert!(text.contains("• Running bash"));
+    assert!(text.contains("… 2 earlier lines"));
+    assert!(text.contains("  │ third"));
+    assert!(text.contains("  └ fourth"));
+    assert!(!text.contains("first"));
+    assert!(!text.contains("second"));
+}
+
+#[test]
+fn expanded_tool_output_drops_terminal_trailing_line_breaks() {
     let entries = vec![TranscriptEntry::ToolCall(ToolTranscript {
         call_id: None,
         name: "bash".into(),
@@ -482,7 +501,7 @@ fn tool_output_drops_terminal_trailing_line_breaks() {
         lifecycle: ToolLifecycle::Completed,
     })];
 
-    let text = plain(transcript_lines(&entries, 80, TranscriptDetail::Compact));
+    let text = plain(transcript_lines(&entries, 80, TranscriptDetail::Expanded));
 
     assert!(text.contains("  │ line one"));
     assert!(text.contains("  └ line two"));
@@ -490,19 +509,19 @@ fn tool_output_drops_terminal_trailing_line_breaks() {
 }
 
 #[test]
-fn tool_output_wraps_prose_at_word_boundaries() {
+fn expanded_tool_output_preserves_whitespace_and_code_layout() {
     let entries = vec![TranscriptEntry::ToolCall(ToolTranscript {
         call_id: None,
         name: "read".into(),
-        output: "bounded context keeps terminal output readable".into(),
+        output: "fn main() {\n    let value  = 1;\n}".into(),
         lifecycle: ToolLifecycle::Completed,
     })];
 
-    let text = plain(transcript_lines(&entries, 24, TranscriptDetail::Compact));
+    let text = plain(transcript_lines(&entries, 80, TranscriptDetail::Expanded));
 
-    assert!(text.contains("  │ bounded context"), "{text}");
-    assert!(text.contains("  │ keeps terminal"), "{text}");
-    assert!(!text.contains("bounded context kee"), "{text}");
+    assert!(text.contains("  │ fn main() {"), "{text}");
+    assert!(text.contains("  │     let value  = 1;"), "{text}");
+    assert!(text.contains("  └ }"), "{text}");
 }
 
 #[test]
@@ -574,7 +593,8 @@ fn expanded_transcript_view_renders_committed_canonical_history() {
 
     let compact = buffer_text(&rendered(&state, 80, 20));
     assert!(!compact.contains("committed question"));
-    assert!(compact.contains("complete output"));
+    assert!(compact.contains("success · 1 line"));
+    assert!(!compact.contains("complete output"));
 
     state.toggle_transcript_view();
     let expanded = buffer_text(&rendered(&state, 80, 20));
