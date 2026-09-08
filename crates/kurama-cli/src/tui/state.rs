@@ -123,6 +123,9 @@ pub struct TuiState {
     command_selection: usize,
     command_palette_dismissed: bool,
     pending_turns: VecDeque<PendingTurn>,
+    composer_history: Vec<String>,
+    history_index: Option<usize>,
+    history_draft: String,
     activity: ActivityState,
     turn_started_at: Option<Instant>,
     last_turn_elapsed: Option<Duration>,
@@ -164,6 +167,9 @@ impl TuiState {
             command_selection: 0,
             command_palette_dismissed: false,
             pending_turns: VecDeque::new(),
+            composer_history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
             activity: ActivityState::Idle,
             turn_started_at: None,
             last_turn_elapsed: None,
@@ -196,6 +202,94 @@ impl TuiState {
     pub fn composer_edited(&mut self) {
         self.command_selection = 0;
         self.command_palette_dismissed = false;
+        self.history_index = None;
+    }
+
+    pub fn clear_composer(&mut self) {
+        self.composer.clear();
+        self.cursor = 0;
+        self.composer_edited();
+    }
+
+    pub fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn cursor_end(&mut self) {
+        self.cursor = self.composer.len();
+    }
+
+    pub fn kill_to_end(&mut self) {
+        self.composer.truncate(self.cursor);
+        self.composer_edited();
+    }
+
+    pub fn kill_to_start(&mut self) {
+        self.composer.replace_range(..self.cursor, "");
+        self.cursor = 0;
+        self.composer_edited();
+    }
+
+    pub fn kill_previous_word(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let before = &self.composer[..self.cursor];
+        let trimmed = before.trim_end();
+        let word_start = trimmed
+            .char_indices()
+            .rev()
+            .find(|(_, character)| character.is_whitespace())
+            .map(|(index, character)| index + character.len_utf8())
+            .unwrap_or(0);
+        self.composer.replace_range(word_start..self.cursor, "");
+        self.cursor = word_start;
+        self.composer_edited();
+    }
+
+    pub fn remember_prompt(&mut self, text: &str) {
+        if text.is_empty() || text.starts_with('/') {
+            return;
+        }
+        if self.composer_history.last().map(String::as_str) != Some(text) {
+            self.composer_history.push(text.to_owned());
+        }
+        self.history_index = None;
+        self.history_draft.clear();
+    }
+
+    pub fn history_previous(&mut self) -> bool {
+        if self.composer_history.is_empty() {
+            return false;
+        }
+        match self.history_index {
+            None => {
+                self.history_draft.clone_from(&self.composer);
+                self.history_index = Some(self.composer_history.len() - 1);
+            }
+            Some(0) => return false,
+            Some(index) => self.history_index = Some(index - 1),
+        }
+        if let Some(index) = self.history_index {
+            self.composer.clone_from(&self.composer_history[index]);
+            self.cursor = self.composer.len();
+        }
+        true
+    }
+
+    pub fn history_next(&mut self) -> bool {
+        let Some(index) = self.history_index else {
+            return false;
+        };
+        if index + 1 < self.composer_history.len() {
+            self.history_index = Some(index + 1);
+            self.composer.clone_from(&self.composer_history[index + 1]);
+        } else {
+            self.history_index = None;
+            self.composer.clone_from(&self.history_draft);
+        }
+        self.cursor = self.composer.len();
+        true
     }
 
     pub fn dismiss_command_palette(&mut self) -> bool {
@@ -379,6 +473,13 @@ impl TuiState {
     }
 
     pub fn interrupt_active(&mut self) -> bool {
+        if matches!(self.overlay, Overlay::Approval | Overlay::ApprovalEdit) {
+            self.approval = None;
+            self.overlay = Overlay::None;
+            self.sent_commands.push(EngineCommand::CancelTurn);
+            self.activity = ActivityState::Interrupted;
+            return true;
+        }
         if !self.activity.is_animated() {
             return false;
         }

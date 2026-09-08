@@ -170,6 +170,7 @@ fn parses_all_product_commands_without_restart() {
         parse_command("/mode auto").unwrap(),
         Command::Mode(ExecutionMode::Auto)
     );
+    assert_eq!(parse_command("/help").unwrap(), Command::Help);
     assert_eq!(parse_command("/exit").unwrap(), Command::Exit);
     assert!(parse_command("/restart").is_err());
     assert!(parse_command("/mode yolo").is_err());
