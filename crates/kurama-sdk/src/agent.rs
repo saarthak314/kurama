@@ -140,14 +140,19 @@ pub struct Turn<'a> {
     events: &'a mut Events,
     text: String,
     session_id: SessionId,
+    finished: bool,
 }
 
 impl Turn<'_> {
     pub async fn next(&mut self) -> Result<Option<Event>, KuramaError> {
+        if self.finished {
+            return Ok(None);
+        }
         let Some(event) = self.events.recv().await else {
+            self.finished = true;
             return Ok(None);
         };
-        Ok(Some(match event {
+        let event = match event {
             RuntimeEvent::Status { message } => Event::Status(message),
             RuntimeEvent::AssistantDelta { text } => {
                 self.text.push_str(&text);
@@ -193,7 +198,11 @@ impl Turn<'_> {
             }),
             RuntimeEvent::Error { message } => Event::Error(message),
             RuntimeEvent::Shutdown => Event::Shutdown,
-        }))
+        };
+        if matches!(event, Event::Done(_) | Event::Error(_) | Event::Shutdown) {
+            self.finished = true;
+        }
+        Ok(Some(event))
     }
 
     pub async fn approve_once(&self, operation_id: OperationId) -> Result<(), KuramaError> {
@@ -262,8 +271,12 @@ impl Agent {
         self.runtime.parts().orchestrator.clone()
     }
 
-    pub fn session_id(&self) -> SessionId {
+    pub fn allocate_session_id(&self) -> SessionId {
         self.runtime.parts().ids.session_id()
+    }
+
+    pub fn session_id(&self) -> Option<&SessionId> {
+        self.live.as_ref().map(|live| &live.metadata.id)
     }
 
     pub fn launch(
@@ -280,6 +293,11 @@ impl Agent {
     }
 
     pub async fn delegate(&mut self, text: impl Into<String>) -> Result<TurnOutcome, KuramaError> {
+        if self.runtime.parts().orchestration.is_none() {
+            return Err(KuramaError::Configuration(
+                "delegate() requires .orchestrate()".into(),
+            ));
+        }
         self.run_turn(text, true).await
     }
 
@@ -289,7 +307,7 @@ impl Agent {
         if replay.is_empty() {
             return Err(KuramaError::NotFound(format!("session {id}")));
         }
-        let metadata = replay
+        let mut metadata = replay
             .iter()
             .find_map(|event| match &event.event {
                 SessionEvent::SessionStarted { metadata } => Some(metadata.clone()),
@@ -298,6 +316,20 @@ impl Agent {
             .ok_or_else(|| {
                 KuramaError::Session("resumed session has no durable session metadata".into())
             })?;
+        if !same_workspace(Path::new(&metadata.project_root), &self.workspace) {
+            return Err(KuramaError::Session(format!(
+                "session {id} belongs to another project"
+            )));
+        }
+        if metadata.profile != self.runtime.active_profile() {
+            return Err(KuramaError::Session(format!(
+                "session {id} is pinned to profile {}; start a new session to switch profiles",
+                metadata.profile
+            )));
+        }
+        metadata.mode = self.mode;
+        metadata.redaction_best_effort = self.mode == ExecutionMode::Yolo;
+        metadata.project_root = self.workspace.display().to_string();
         let (handle, events) = self.runtime.start(metadata.clone(), replay)?;
         self.live = Some(Live {
             handle: Handle::from_engine(handle),
@@ -317,6 +349,7 @@ impl Agent {
             events: &mut live.events,
             text: String::new(),
             session_id,
+            finished: false,
         })
     }
 
@@ -696,6 +729,7 @@ async fn collect_turn(
             RuntimeEvent::Error { message } => return Err(KuramaError::Model(message)),
             RuntimeEvent::ApprovalRequired { request } => {
                 let _ = handle.cancel_turn().await;
+                drain_until_terminal(events).await;
                 return Err(KuramaError::Policy(format!(
                     "approval required: {}",
                     request.summary
@@ -704,6 +738,24 @@ async fn collect_turn(
             RuntimeEvent::Shutdown => return Err(KuramaError::Cancelled),
             _ => {}
         }
+    }
+}
+
+async fn drain_until_terminal(events: &mut Events) {
+    while let Some(event) = events.recv().await {
+        if matches!(
+            event,
+            RuntimeEvent::Error { .. } | RuntimeEvent::TurnCompleted | RuntimeEvent::Shutdown
+        ) {
+            break;
+        }
+    }
+}
+
+fn same_workspace(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
     }
 }
 

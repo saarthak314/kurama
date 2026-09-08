@@ -849,6 +849,7 @@ dependencies = [
  "getrandom 0.4.3",
  "kurama-protocol",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 

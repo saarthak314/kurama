@@ -373,7 +373,7 @@ impl App {
             .map_err(|error| error.to_string())?;
         let orchestrator = agent.orchestrator();
 
-        let session_id = resume_id.unwrap_or_else(|| agent.session_id());
+        let session_id = resume_id.unwrap_or_else(|| agent.allocate_session_id());
         let created_at_ms = previous_metadata
             .as_ref()
             .map_or_else(now_ms, |metadata| metadata.created_at_ms);

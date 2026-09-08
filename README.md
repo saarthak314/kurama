@@ -23,6 +23,7 @@ use kurama::prelude::*;
 
 let reply = Kurama::openai(std::env::var("OPENAI_API_KEY")?)
     .workspace(".")
+    .yolo()
     .prompt("fix the failing tests")
     .await?;
 ```
