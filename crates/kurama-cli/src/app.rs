@@ -574,6 +574,10 @@ impl App {
             return Ok(self.handle_ctrl_c());
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
+            if self.state.overlay() == Overlay::Shortcuts {
+                self.state.close_overlay();
+                return Ok(false);
+            }
             self.state.toggle_transcript_view();
             return Ok(false);
         }
@@ -1333,6 +1337,7 @@ fn uses_full_inline_viewport(state: &TuiState) -> bool {
                 | Overlay::AgentInspect
                 | Overlay::AgentMessage
                 | Overlay::ConfirmAgentCancel
+                | Overlay::Shortcuts
         )
 }
 
@@ -1564,6 +1569,7 @@ fn requires_immediate_redraw(event: &RuntimeEvent) -> bool {
         RuntimeEvent::ApprovalRequired { .. }
             | RuntimeEvent::ToolCompleted { .. }
             | RuntimeEvent::TurnCompleted
+            | RuntimeEvent::Usage { .. }
             | RuntimeEvent::Error { .. }
             | RuntimeEvent::Shutdown
     )
@@ -2809,6 +2815,9 @@ Session ID: ses_cafebabe"
 
         state.toggle_transcript_view();
         state.overlay = Overlay::Agents;
+        assert_eq!(desired_inline_viewport_height(&state, 80, 24), 24);
+
+        state.overlay = Overlay::Shortcuts;
         assert_eq!(desired_inline_viewport_height(&state, 80, 24), 24);
     }
 

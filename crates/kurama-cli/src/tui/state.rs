@@ -590,14 +590,7 @@ impl TuiState {
                     self.push_notice(Some("MODE".into()), mode_label(*mode).to_owned());
                 }
                 SessionEvent::ModelUsage { usage } => {
-                    self.usage.input_tokens =
-                        self.usage.input_tokens.saturating_add(usage.input_tokens);
-                    self.usage.output_tokens =
-                        self.usage.output_tokens.saturating_add(usage.output_tokens);
-                    self.usage.cached_input_tokens = self
-                        .usage
-                        .cached_input_tokens
-                        .saturating_add(usage.cached_input_tokens);
+                    self.usage = *usage;
                 }
                 SessionEvent::TurnFailed { error } => self.push_error(error.clone()),
                 SessionEvent::RecoveryRepair { removed_bytes } => self.push_notice(
@@ -885,7 +878,11 @@ impl TuiState {
             &event,
             RuntimeEvent::Error { message } if is_non_terminal_runtime_error(message)
         );
-        if !matches!(&event, RuntimeEvent::AssistantDelta { .. }) && !preserves_active_streams {
+        if !matches!(
+            &event,
+            RuntimeEvent::AssistantDelta { .. } | RuntimeEvent::Usage { .. }
+        ) && !preserves_active_streams
+        {
             self.active_assistant_entry = None;
         }
         match event {
@@ -943,6 +940,7 @@ impl TuiState {
                     agent.transcript = transcript;
                 }
             }
+            RuntimeEvent::Usage { usage } => self.usage = usage,
             RuntimeEvent::TurnCompleted => self.finish_turn(),
             RuntimeEvent::Error { message } => {
                 if terminal_turn_event {

@@ -366,7 +366,8 @@ impl ChildRunner for RuntimeChildRunner {
                             RuntimeEvent::Status { .. }
                             | RuntimeEvent::ToolOutputDelta { .. }
                             | RuntimeEvent::AgentUpdated { .. }
-                            | RuntimeEvent::AgentInspection { .. } => {}
+                            | RuntimeEvent::AgentInspection { .. }
+                            | RuntimeEvent::Usage { .. } => {}
                         }
                     }
                 }

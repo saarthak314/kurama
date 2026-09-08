@@ -1,6 +1,7 @@
 use crate::{
     agent::AgentSnapshot,
     id::{AgentId, CallId, OperationId},
+    model::Usage,
     policy::{ApprovalRequest, ApprovalResponse, ExecutionMode},
     tool::ToolResult,
 };
@@ -63,6 +64,9 @@ pub enum RuntimeEvent {
     AgentInspection {
         snapshot: AgentSnapshot,
         transcript: Vec<String>,
+    },
+    Usage {
+        usage: Usage,
     },
     TurnCompleted,
     Error {

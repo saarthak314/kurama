@@ -935,6 +935,7 @@ impl EngineActor {
                                     ModelEvent::Delegation { request } => round.delegations.push(request),
                                     ModelEvent::Usage { usage } => {
                                         self.append(SessionEvent::ModelUsage { usage })?;
+                                        self.emit(RuntimeEvent::Usage { usage }).await?;
                                     }
                                     ModelEvent::ResponseCompleted { cursor, finish_reason } => {
                                         if let Some(cursor) = cursor {

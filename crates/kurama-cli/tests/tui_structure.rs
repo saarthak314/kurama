@@ -10,8 +10,10 @@ use kurama_cli::{
 use kurama_protocol::{
     agent::AgentState,
     id::{AgentId, CallId, OperationId, SessionId},
+    model::Usage,
     policy::{ApprovalRequest, ExecutionMode},
     runtime::RuntimeEvent,
+    session::{EventEnvelope, SessionEvent},
     tool::Operation,
 };
 use ratatui::{
@@ -473,6 +475,70 @@ fn footer_shows_context_window_before_usage_then_as_a_percent() {
     let used = buffer_text(&rendered(&state, 80, 12));
     assert!(used.contains("50%"));
     assert!(!used.contains("128k"));
+}
+
+#[test]
+fn live_usage_replaces_the_footer_fraction_instead_of_summing() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.max_input_tokens = 100_000;
+
+    state.apply_runtime_event(RuntimeEvent::Usage {
+        usage: Usage {
+            input_tokens: 10_000,
+            output_tokens: 1,
+            cached_input_tokens: 0,
+        },
+    });
+    assert!(buffer_text(&rendered(&state, 80, 12)).contains("10%"));
+
+    state.apply_runtime_event(RuntimeEvent::Usage {
+        usage: Usage {
+            input_tokens: 25_000,
+            output_tokens: 2,
+            cached_input_tokens: 0,
+        },
+    });
+    let text = buffer_text(&rendered(&state, 80, 12));
+    assert!(text.contains("25%"));
+    assert!(!text.contains("35%"));
+}
+
+#[test]
+fn replay_usage_keeps_the_latest_window_fill() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.max_input_tokens = 100_000;
+    state.hydrate_replay(&[
+        EventEnvelope::new(
+            1,
+            1,
+            SessionId::from("session_1"),
+            None,
+            SessionEvent::ModelUsage {
+                usage: Usage {
+                    input_tokens: 10_000,
+                    output_tokens: 1,
+                    cached_input_tokens: 0,
+                },
+            },
+        ),
+        EventEnvelope::new(
+            2,
+            2,
+            SessionId::from("session_1"),
+            None,
+            SessionEvent::ModelUsage {
+                usage: Usage {
+                    input_tokens: 40_000,
+                    output_tokens: 2,
+                    cached_input_tokens: 0,
+                },
+            },
+        ),
+    ]);
+
+    let text = buffer_text(&rendered(&state, 80, 12));
+    assert!(text.contains("40%"));
+    assert!(!text.contains("50%"));
 }
 
 #[test]
@@ -1366,18 +1432,28 @@ fn narrow_approval_edit_cursor_follows_wrapped_context() {
     terminal.draw(|frame| render(frame, &state)).unwrap();
     let text = buffer_text(terminal.backend().buffer());
     let lines = text.lines().collect::<Vec<_>>();
-    let editor_end = lines.iter().position(|line| line.contains('}'));
-    let controls = lines.iter().position(|line| {
-        line.contains("Enter submit") || line.contains("Enter") || line.contains("↵")
-    });
-    assert!(
-        text.contains("Action required") || text.contains("Edit arguments") || editor_end.is_some()
-    );
-    if let (Some(editor_end), Some(controls)) = (editor_end, controls) {
-        let cursor = terminal.backend_mut().get_cursor_position().unwrap();
-        assert!(editor_end < controls);
-        assert_eq!(cursor.y, editor_end as u16);
-    }
+    let editor_end = lines
+        .iter()
+        .position(|line| line.contains('}'))
+        .expect("last editor line remains visible");
+    let controls = lines
+        .iter()
+        .position(|line| line.contains("Enter submit"))
+        .expect("edit controls remain visible");
+    let cursor = terminal.backend_mut().get_cursor_position().unwrap();
+    let brace_x = (0..terminal.backend().buffer().area.width)
+        .find(|x| {
+            terminal
+                .backend()
+                .buffer()
+                .cell((*x, editor_end as u16))
+                .is_some_and(|cell| cell.symbol() == "}")
+        })
+        .expect("editor closing brace");
+
+    assert!(editor_end < controls);
+    assert_eq!(cursor.y, editor_end as u16);
+    assert_eq!(cursor.x, brace_x + 1);
 }
 
 #[test]
