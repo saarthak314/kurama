@@ -4,14 +4,15 @@ use kurama_protocol::{policy::ExecutionMode, tool::Operation};
 use ratatui::{
     Frame,
     layout::{Position, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::Paragraph,
+    widgets::{Block, BorderType, Borders, Paragraph},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::{
     ApprovalState, Overlay, TuiState,
+    theme::{ACCENT, AMBER, BORDER, DIM, RED, TEXT},
     transcript::{hard_wrap, truncate_display, word_wrap},
 };
 
@@ -19,12 +20,22 @@ const PROMPT: &str = "› ";
 const PROMPT_WIDTH: usize = 2;
 const MAX_COMPOSER_HEIGHT: usize = 8;
 const MAX_APPROVAL_HEIGHT: usize = 14;
+const BOX_BORDERS: u16 = 2;
+
+fn boxed(width: u16, height: u16) -> bool {
+    width >= 4 && height >= 3
+}
+
+fn inner_width(width: u16) -> usize {
+    width.saturating_sub(BOX_BORDERS).max(1) as usize
+}
 
 pub(crate) fn composer_height(state: &TuiState, width: u16) -> u16 {
-    composer_visual(&state.composer, state.cursor, width as usize)
+    let inner = composer_visual(&state.composer, state.cursor, inner_width(width))
         .lines
         .len()
-        .clamp(1, MAX_COMPOSER_HEIGHT) as u16
+        .clamp(1, MAX_COMPOSER_HEIGHT) as u16;
+    inner.saturating_add(BOX_BORDERS)
 }
 
 pub(crate) fn approval_height(state: &TuiState, width: u16) -> u16 {
@@ -32,9 +43,10 @@ pub(crate) fn approval_height(state: &TuiState, width: u16) -> u16 {
         return 0;
     }
     state.approval.as_ref().map_or(0, |approval| {
-        approval_layout(approval, width as usize, MAX_APPROVAL_HEIGHT)
+        let inner = approval_layout(approval, inner_width(width), MAX_APPROVAL_HEIGHT)
             .lines
-            .len() as u16
+            .len() as u16;
+        inner.saturating_add(BOX_BORDERS).max(3)
     })
 }
 
@@ -47,9 +59,33 @@ pub(crate) fn render_composer(
         return None;
     }
 
+    let (content, origin) = if boxed(area.width, area.height) {
+        let mut block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(BORDER));
+        if state.composer.is_empty() && area.width >= 42 {
+            block = block.title_bottom(
+                Line::from(Span::styled(
+                    " enter send · shift+enter newline · ? shortcuts ",
+                    Style::default().fg(DIM),
+                ))
+                .right_aligned(),
+            );
+        }
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        (inner, inner)
+    } else {
+        (area, area)
+    };
+    if content.is_empty() {
+        return None;
+    }
+
     if state.composer.is_empty() {
         let placeholder = "Ask Kurama to do anything";
-        let available = area.width.saturating_sub(PROMPT_WIDTH as u16) as usize;
+        let available = content.width.saturating_sub(PROMPT_WIDTH as u16) as usize;
         let placeholder = if Line::from(placeholder).width() <= available {
             placeholder
         } else {
@@ -57,20 +93,21 @@ pub(crate) fn render_composer(
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(PROMPT, Style::default().fg(Color::Cyan)),
-                Span::styled(placeholder, Style::default().add_modifier(Modifier::DIM)),
+                Span::styled(PROMPT, Style::default().fg(ACCENT)),
+                Span::styled(placeholder, Style::default().fg(DIM)),
             ])),
-            area,
+            content,
         );
         return Some(Position::new(
-            area.x
-                .saturating_add((PROMPT_WIDTH as u16).min(area.width.saturating_sub(1))),
-            area.y,
+            origin
+                .x
+                .saturating_add((PROMPT_WIDTH as u16).min(origin.width.saturating_sub(1))),
+            origin.y,
         ));
     }
 
-    let visual = composer_visual(&state.composer, state.cursor, area.width as usize);
-    let visible_height = area.height as usize;
+    let visual = composer_visual(&state.composer, state.cursor, content.width as usize);
+    let visible_height = content.height as usize;
     let start = visual
         .cursor_row
         .saturating_add(1)
@@ -86,23 +123,24 @@ pub(crate) fn render_composer(
             Line::from(vec![
                 Span::styled(
                     if index == 0 { PROMPT } else { "  " },
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(ACCENT),
                 ),
-                Span::raw(line.clone()),
+                Span::styled(line.clone(), Style::default().fg(TEXT)),
             ])
         })
         .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+    frame.render_widget(Paragraph::new(Text::from(lines)), content);
 
     let cursor_row = visual.cursor_row.saturating_sub(start) as u16;
     Some(Position::new(
-        area.x.saturating_add(
+        origin.x.saturating_add(
             (PROMPT_WIDTH as u16)
                 .saturating_add(visual.cursor_column as u16)
-                .min(area.width.saturating_sub(1)),
+                .min(origin.width.saturating_sub(1)),
         ),
-        area.y
-            .saturating_add(cursor_row.min(area.height.saturating_sub(1))),
+        origin
+            .y
+            .saturating_add(cursor_row.min(origin.height.saturating_sub(1))),
     ))
 }
 
@@ -115,16 +153,50 @@ pub(crate) fn render_approval(
     if area.is_empty() {
         return None;
     }
-    let layout = approval_layout(approval, area.width as usize, area.height as usize);
-    frame.render_widget(Paragraph::new(layout.lines), area);
+    let (content, origin) = if boxed(area.width, area.height) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(AMBER));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        (inner, inner)
+    } else {
+        (area, area)
+    };
+    if content.is_empty() {
+        return None;
+    }
+    let layout = approval_layout(approval, content.width as usize, content.height as usize);
+    frame.render_widget(Paragraph::new(layout.lines), content);
     layout.cursor.map(|(row, column)| {
         Position::new(
-            area.x
-                .saturating_add(column.min(area.width.saturating_sub(1))),
-            area.y
-                .saturating_add(row.min(area.height.saturating_sub(1))),
+            origin
+                .x
+                .saturating_add(column.min(origin.width.saturating_sub(1))),
+            origin
+                .y
+                .saturating_add(row.min(origin.height.saturating_sub(1))),
         )
     })
+}
+
+pub(crate) fn render_queue(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
+    if area.is_empty() {
+        return;
+    }
+    let width = area.width as usize;
+    let lines = state
+        .pending_prompts()
+        .take(area.height as usize)
+        .map(|prompt| {
+            Line::from(Span::styled(
+                truncate_display(&format!("queued  {prompt}"), width),
+                Style::default().fg(DIM),
+            ))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, _show_help: bool) {
@@ -134,19 +206,13 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect,
 
     let profile = FooterItem::dim(format!("{}/{}", state.profile, state.model));
     let project = FooterItem::dim(project_label(&state.project));
-    let mode = FooterItem::new(
-        if state.pending_turn_count() == 0 {
-            mode_label(state.mode).to_owned()
-        } else {
-            format!(
-                "{} · {} queued",
-                mode_label(state.mode),
-                state.pending_turn_count()
-            )
-        },
-        mode_style(state.mode),
-    );
-    let mut items = vec![profile, project, mode];
+    let mode = FooterItem::new(mode_label(state.mode).to_owned(), mode_style(state.mode));
+    let context = state.context_label().map(FooterItem::dim);
+    let mut items = vec![profile, project];
+    if let Some(context) = context {
+        items.push(context);
+    }
+    items.push(mode);
     if footer_width(&items) > area.width as usize {
         items.remove(1);
     }
@@ -262,9 +328,7 @@ fn approval_layout(approval: &ApprovalState, width: usize, max_height: usize) ->
     );
     let mut title_spans = vec![Span::styled(
         "Action required",
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
     )];
     if approval.editing && width >= 31 {
         title_spans.push(Span::styled(
@@ -350,9 +414,7 @@ fn approval_controls(editing: bool, width: usize, max_lines: usize) -> Vec<Line<
     let style = if editing {
         Style::default().add_modifier(Modifier::DIM)
     } else {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(AMBER).add_modifier(Modifier::BOLD)
     };
     let full_combined = full_labels.join("  ");
     if Line::from(full_combined.as_str()).width().saturating_add(2) <= width {
@@ -591,7 +653,7 @@ fn approval_validation_line(error: &str, width: usize) -> Line<'static> {
         Span::raw("  "),
         Span::styled(
             truncate_display(&message, width.saturating_sub(2)),
-            Style::default().fg(Color::Red),
+            Style::default().fg(RED),
         ),
     ])
 }
@@ -662,9 +724,9 @@ fn mode_label(mode: ExecutionMode) -> &'static str {
 
 fn mode_style(mode: ExecutionMode) -> Style {
     Style::default().fg(match mode {
-        ExecutionMode::Supervised => Color::Cyan,
-        ExecutionMode::Auto => Color::Cyan,
-        ExecutionMode::Yolo => Color::Cyan,
+        ExecutionMode::Supervised => ACCENT,
+        ExecutionMode::Auto => ACCENT,
+        ExecutionMode::Yolo => AMBER,
     })
 }
 

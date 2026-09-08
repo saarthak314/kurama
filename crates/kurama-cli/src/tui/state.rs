@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use kurama_protocol::{
     agent::{AgentSnapshot, AgentState},
     id::{AgentId, CallId, OperationId},
+    model::Usage,
     policy::{ApprovalRequest, ApprovalResponse, ExecutionMode},
     runtime::{AgentCommand, EngineCommand, RuntimeEvent},
     session::{EventEnvelope, SessionEvent},
@@ -28,6 +29,7 @@ pub enum Overlay {
     AgentInspect,
     AgentMessage,
     ConfirmAgentCancel,
+    Shortcuts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -108,6 +110,8 @@ pub struct TuiState {
     pub model: String,
     pub project: String,
     pub mode: ExecutionMode,
+    pub max_input_tokens: u64,
+    pub usage: Usage,
     pub transcript: Vec<TranscriptEntry>,
     pub composer: String,
     pub cursor: usize,
@@ -152,6 +156,8 @@ impl TuiState {
             model: model.into(),
             project: project.into(),
             mode,
+            max_input_tokens: 0,
+            usage: Usage::default(),
             transcript: Vec::new(),
             composer: String::new(),
             cursor: 0,
@@ -419,6 +425,26 @@ impl TuiState {
         self.pending_turns.len()
     }
 
+    pub fn pending_prompts(&self) -> impl Iterator<Item = &str> {
+        self.pending_turns.iter().map(|turn| turn.text.as_str())
+    }
+
+    pub fn context_label(&self) -> Option<String> {
+        if self.max_input_tokens == 0 {
+            return None;
+        }
+        if self.usage.input_tokens == 0 {
+            return Some(compact_tokens(self.max_input_tokens));
+        }
+        let percent =
+            (self.usage.input_tokens.saturating_mul(100) / self.max_input_tokens.max(1)).min(100);
+        Some(format!("{percent}%"))
+    }
+
+    pub fn open_shortcuts(&mut self) {
+        self.overlay = Overlay::Shortcuts;
+    }
+
     pub fn toggle_transcript_view(&mut self) {
         self.transcript_view_expanded = !self.transcript_view_expanded;
         self.scroll = 0;
@@ -534,6 +560,7 @@ impl TuiState {
         self.committed_transcript_entries = 0;
         self.transcript.clear();
         self.agents.clear();
+        self.usage = Usage::default();
         let mut replayed_tool_contexts = HashMap::new();
         for envelope in replay {
             match &envelope.event {
@@ -561,6 +588,16 @@ impl TuiState {
                 }
                 SessionEvent::ModeSelected { mode } => {
                     self.push_notice(Some("MODE".into()), mode_label(*mode).to_owned());
+                }
+                SessionEvent::ModelUsage { usage } => {
+                    self.usage.input_tokens =
+                        self.usage.input_tokens.saturating_add(usage.input_tokens);
+                    self.usage.output_tokens =
+                        self.usage.output_tokens.saturating_add(usage.output_tokens);
+                    self.usage.cached_input_tokens = self
+                        .usage
+                        .cached_input_tokens
+                        .saturating_add(usage.cached_input_tokens);
                 }
                 SessionEvent::TurnFailed { error } => self.push_error(error.clone()),
                 SessionEvent::RecoveryRepair { removed_bytes } => self.push_notice(
@@ -1174,5 +1211,13 @@ fn mode_label(mode: ExecutionMode) -> &'static str {
         ExecutionMode::Supervised => "supervised",
         ExecutionMode::Auto => "auto",
         ExecutionMode::Yolo => "yolo",
+    }
+}
+
+fn compact_tokens(tokens: u64) -> String {
+    if tokens >= 1000 {
+        format!("{}k", (tokens + 500) / 1000)
+    } else {
+        tokens.to_string()
     }
 }

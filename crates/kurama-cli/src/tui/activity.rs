@@ -1,11 +1,15 @@
 use std::time::{Duration, Instant};
 
 use ratatui::{
-    style::{Color, Modifier, Style},
+    style::Style,
     text::{Line, Span},
 };
 
-use super::{ActivityState, transcript::truncate_display};
+use super::{
+    ActivityState,
+    theme::{ACCENT, DIM},
+    transcript::truncate_display,
+};
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const INTERRUPT_HINT: &str = "esc to interrupt";
@@ -50,7 +54,7 @@ pub fn activity_line(
     let available = width.saturating_sub(2);
     let action = truncate_display(&action, available);
     Some(Line::from(vec![
-        Span::styled(format!("{spinner} "), Style::default().fg(Color::Cyan)),
+        Span::styled(format!("{spinner} "), Style::default().fg(ACCENT)),
         Span::raw(action),
     ]))
 }
@@ -61,7 +65,7 @@ pub fn worked_for_line(elapsed: Duration, width: usize) -> Option<Line<'static>>
     }
 
     let label = format!("Worked for {}", compact_elapsed(elapsed.as_secs()));
-    let style = Style::default().fg(Color::DarkGray);
+    let style = Style::default().fg(DIM);
     let decorated_width = display_width(&label).saturating_add(3);
     if decorated_width > width {
         return Some(Line::from(Span::styled(
@@ -82,9 +86,9 @@ pub fn worked_for_line(elapsed: Duration, width: usize) -> Option<Line<'static>>
 
 fn styled_activity(spinner: &str, action: String, suffix: String) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{spinner} "), Style::default().fg(Color::Cyan)),
+        Span::styled(format!("{spinner} "), Style::default().fg(ACCENT)),
         Span::raw(action),
-        Span::styled(suffix, Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(suffix, Style::default().fg(DIM)),
     ])
 }
 

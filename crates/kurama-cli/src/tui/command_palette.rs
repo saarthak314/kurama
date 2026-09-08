@@ -1,12 +1,16 @@
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Clear, Paragraph},
 };
 
-use super::{TuiState, transcript::truncate_display};
+use super::{
+    TuiState,
+    theme::{ACCENT, DIM, TEXT},
+    transcript::truncate_display,
+};
 
 pub(crate) const MAX_COMMAND_PALETTE_ROWS: usize = 8;
 
@@ -62,20 +66,12 @@ pub(crate) fn render_command_palette(frame: &mut Frame<'_>, state: &TuiState, ar
             let mut spans = vec![
                 Span::styled(
                     marker,
-                    Style::default().fg(if is_selected {
-                        Color::Cyan
-                    } else {
-                        Color::Reset
-                    }),
+                    Style::default().fg(if is_selected { ACCENT } else { TEXT }),
                 ),
                 Span::styled(
                     command,
                     Style::default()
-                        .fg(if is_selected {
-                            Color::Cyan
-                        } else {
-                            Color::Reset
-                        })
+                        .fg(if is_selected { ACCENT } else { TEXT })
                         .add_modifier(if is_selected {
                             Modifier::BOLD
                         } else {
@@ -85,10 +81,7 @@ pub(crate) fn render_command_palette(frame: &mut Frame<'_>, state: &TuiState, ar
             ];
             if !description.is_empty() {
                 spans.push(Span::raw("  "));
-                spans.push(Span::styled(
-                    description,
-                    Style::default().add_modifier(Modifier::DIM),
-                ));
+                spans.push(Span::styled(description, Style::default().fg(DIM)));
             }
             Line::from(spans)
         })

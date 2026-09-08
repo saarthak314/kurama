@@ -3,32 +3,27 @@ use std::time::Instant;
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
 };
 
 use kurama_protocol::agent::AgentState;
 
 use super::{
     Overlay, ResponsiveLayout, TranscriptEntry, TuiState, activity_line, command_palette_height,
-    composer::{approval_height, composer_height, render_approval, render_composer, render_footer},
-    layout::main_area,
+    composer::{
+        approval_height, composer_height, render_approval, render_composer, render_footer,
+        render_queue,
+    },
+    layout::{main_area, queue_height},
     render_command_palette,
+    theme::{ACCENT, AMBER, BORDER, DIM, GREEN, RED, TEXT},
     transcript::{
         TranscriptDetail, render_transcript_view, startup_lines, transcript_lines, truncate_display,
     },
     worked_for_line,
 };
-
-const BORDER: Color = Color::DarkGray;
-const DIM: Color = Color::DarkGray;
-const TEXT: Color = Color::Reset;
-pub(crate) const SURFACE: Color = Color::Reset;
-const ACCENT: Color = Color::Cyan;
-const AMBER: Color = Color::Yellow;
-const GREEN: Color = Color::Rgb(111, 207, 151);
-const RED: Color = Color::Rgb(255, 92, 82);
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
     render_with_transcript(frame, state, None);
@@ -49,6 +44,7 @@ pub(crate) fn render_with_transcript(
     render_main(frame, state, prepared_transcript);
     match state.overlay {
         Overlay::None | Overlay::Approval | Overlay::ApprovalEdit => {}
+        Overlay::Shortcuts => render_shortcuts(frame, state),
         Overlay::Onboarding => render_onboarding(frame, state),
         Overlay::Agents => render_agents(frame, state),
         Overlay::AgentInspect | Overlay::AgentMessage | Overlay::ConfirmAgentCancel => {
@@ -83,7 +79,12 @@ fn render_main(
     } else {
         None
     };
-    let layout = ResponsiveLayout::for_area(area, input_height, activity.is_some());
+    let layout = ResponsiveLayout::for_area(
+        area,
+        input_height,
+        activity.is_some(),
+        queue_height(state, area.width),
+    );
 
     if !layout.transcript.is_empty() {
         let transcript_width = layout.transcript.width as usize;
@@ -120,6 +121,10 @@ fn render_main(
         frame.render_widget(Paragraph::new(activity), layout.activity);
     }
 
+    if !layout.queue.is_empty() {
+        render_queue(frame, state, layout.queue);
+    }
+
     if approval_visible {
         if let Some(position) = render_approval(frame, state, layout.input) {
             frame.set_cursor_position(position);
@@ -152,6 +157,43 @@ fn render_main(
             ),
         );
     }
+}
+
+fn render_shortcuts(frame: &mut Frame<'_>, state: &TuiState) {
+    let _ = state;
+    let area = inset(frame.area(), 6, 4);
+    if area.is_empty() {
+        return;
+    }
+    let lines = [
+        ("ctrl+c", "interrupt, then clear, then exit"),
+        ("esc", "interrupt a running turn"),
+        ("enter", "send"),
+        ("shift+enter", "newline"),
+        ("ctrl+o", "expand transcript"),
+        ("up/down", "prompt history"),
+        ("/help", "slash commands"),
+        ("?", "this overlay"),
+    ]
+    .into_iter()
+    .map(|(key, hint)| {
+        Line::from(vec![
+            Span::styled(format!(" {key:<12} "), Style::default().fg(ACCENT)),
+            Span::styled(hint, Style::default().fg(DIM)),
+        ])
+    })
+    .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(" shortcuts ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(BORDER))
+                .padding(Padding::new(1, 1, 0, 0)),
+        ),
+        area,
+    );
 }
 
 fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) {
@@ -256,13 +298,12 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) {
                 format!("  {option}"),
                 Style::default()
                     .fg(if selected { TEXT } else { DIM })
-                    .add_modifier(Modifier::BOLD),
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
             ),
-            if selected {
-                Span::styled("   SELECTED", Style::default().fg(ACCENT))
-            } else {
-                Span::raw("")
-            },
         ]));
     }
     lines.push(Line::from(""));
@@ -270,17 +311,6 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) {
         connection_note(state.onboarding.selected()).trim_start(),
         Style::default().fg(DIM),
     )));
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled(
-            "REMOTE-FIRST",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "   Kurama ships no model runtime. Local models connect through an existing endpoint.",
-            Style::default().fg(DIM),
-        ),
-    ]));
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
