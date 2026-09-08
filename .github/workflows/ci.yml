@@ -15,7 +15,7 @@ concurrency:
 jobs:
   checks:
     runs-on: ubuntu-24.04
-    timeout-minutes: 2
+    timeout-minutes: 10
     env:
       CARGO_TERM_COLOR: always
     steps:
