@@ -86,6 +86,51 @@ impl ApprovalState {
             .map_or(self.editor.len(), |offset| self.editor_cursor + offset);
     }
 
+    pub fn move_up(&mut self) {
+        self.clamp_cursor();
+        let column = self.column();
+        self.move_home();
+        if self.editor_cursor == 0 {
+            return;
+        }
+        self.editor_cursor -= 1;
+        self.move_home();
+        self.move_to_column(column);
+    }
+
+    pub fn move_down(&mut self) {
+        self.clamp_cursor();
+        let column = self.column();
+        self.move_end();
+        if self.editor_cursor >= self.editor.len() {
+            return;
+        }
+        self.editor_cursor += 1;
+        self.move_to_column(column);
+    }
+
+    fn column(&self) -> usize {
+        self.editor_cursor
+            - self.editor[..self.editor_cursor]
+                .rfind('\n')
+                .map_or(0, |index| index + 1)
+    }
+
+    fn move_to_column(&mut self, column: usize) {
+        let start = self.editor_cursor;
+        let end = self.editor[start..]
+            .find('\n')
+            .map_or(self.editor.len(), |offset| start + offset);
+        let mut index = start;
+        for (used, character) in self.editor[start..end].chars().enumerate() {
+            if used >= column {
+                break;
+            }
+            index += character.len_utf8();
+        }
+        self.editor_cursor = index;
+    }
+
     fn clamp_cursor(&mut self) {
         self.editor_cursor = self.editor_cursor.min(self.editor.len());
         while !self.editor.is_char_boundary(self.editor_cursor) {

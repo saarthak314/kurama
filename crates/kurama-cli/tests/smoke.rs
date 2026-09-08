@@ -294,12 +294,18 @@ fn scripted_input(
             }
         }
         tokio::time::sleep(Duration::from_millis(shutdown_after_ms)).await;
-        let _ = sender
-            .send(Event::Key(KeyEvent::new(
-                KeyCode::Char('c'),
-                KeyModifiers::CONTROL,
-            )))
-            .await;
+        for _ in 0..3 {
+            if sender
+                .send(Event::Key(KeyEvent::new(
+                    KeyCode::Char('c'),
+                    KeyModifiers::CONTROL,
+                )))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
     });
     receiver
 }

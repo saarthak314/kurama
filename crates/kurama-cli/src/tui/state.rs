@@ -124,6 +124,7 @@ pub struct TuiState {
     pub agents: Vec<AgentRow>,
     pub selected_agent: usize,
     pub agent_message: String,
+    pub agent_message_cursor: usize,
     command_selection: usize,
     command_palette_dismissed: bool,
     pending_turns: VecDeque<PendingTurn>,
@@ -170,6 +171,7 @@ impl TuiState {
             agents: Vec::new(),
             selected_agent: 0,
             agent_message: String::new(),
+            agent_message_cursor: 0,
             command_selection: 0,
             command_palette_dismissed: false,
             pending_turns: VecDeque::new(),
@@ -725,12 +727,23 @@ impl TuiState {
     pub fn begin_agent_message(&mut self) {
         if self.selected_agent().is_some() {
             self.agent_message.clear();
+            self.agent_message_cursor = 0;
             self.overlay = Overlay::AgentMessage;
         }
     }
 
     pub fn set_agent_message(&mut self, message: impl Into<String>) {
         self.agent_message = message.into();
+        self.agent_message_cursor = self.agent_message.len();
+    }
+
+    pub fn insert_agent_message(&mut self, text: &str) {
+        self.agent_message
+            .insert_str(self.agent_message_cursor, text);
+        self.agent_message_cursor = self
+            .agent_message_cursor
+            .saturating_add(text.len())
+            .min(self.agent_message.len());
     }
 
     pub fn submit_agent_message(&mut self) {
@@ -770,9 +783,8 @@ impl TuiState {
                 }
                 Overlay::Approval
             }
-            Overlay::AgentInspect | Overlay::AgentMessage | Overlay::ConfirmAgentCancel => {
-                Overlay::Agents
-            }
+            Overlay::AgentMessage | Overlay::ConfirmAgentCancel => Overlay::AgentInspect,
+            Overlay::AgentInspect => Overlay::Agents,
             _ => Overlay::None,
         };
     }

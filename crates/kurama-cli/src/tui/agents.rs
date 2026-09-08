@@ -63,7 +63,7 @@ pub fn sort_agents(agents: &mut [AgentRow]) {
     });
 }
 
-fn state_label(state: &AgentState) -> &'static str {
+pub(crate) fn state_label(state: &AgentState) -> &'static str {
     match state {
         AgentState::Queued => "queued",
         AgentState::Running => "running",
