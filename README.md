@@ -16,6 +16,17 @@ kurama
 
 Connect a Codex or Claude subscription, an OpenAI or Anthropic API key, or any OpenAI-compatible endpoint on first launch.
 
+Embed the same runtime without the TUI:
+
+```rust
+use kurama::prelude::*;
+
+let reply = Kurama::openai(std::env::var("OPENAI_API_KEY")?)
+    .workspace(".")
+    .prompt("fix the failing tests")
+    .await?;
+```
+
 Useful commands:
 
 ```bash

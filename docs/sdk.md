@@ -1,15 +1,71 @@
 # Rust SDK
 
-Kurama's public `0.x` SDK is a compile-time composition boundary. It re-exports the dependency-light protocol contracts and provides `AgentBuilder`; it is not a dynamic plugin system or stable binary ABI.
+Kurama's public `0.x` SDK is a compile-time composition boundary. `Agent` is the product API. `AgentBuilder` remains the explicit wiring harness used by tests and by embedders who want every seam. It is not a dynamic plugin system or stable binary ABI.
 
 ```text
-kurama-cli ──────▶ kurama-sdk ─────▶ kurama-core ─────▶ kurama-protocol
-kurama-adapters ──────────────────────────────────────▶ kurama-protocol
+kurama          ──────▶ kurama-sdk ─────▶ kurama-core ─────▶ kurama-protocol
+kurama-cli      ──────▶ kurama-sdk
+kurama-adapters ──────────────────────────────────────────▶ kurama-protocol
 ```
 
-## Composition
+## Simple
 
-Applications supply trait implementations and assemble one runtime through the same path used by the Kurama CLI:
+`kurama` ships first-party backends and the four standard tools:
+
+```rust
+use kurama::prelude::*;
+
+let reply = Kurama::openai(std::env::var("OPENAI_API_KEY")?)
+    .model("gpt-5.6")
+    .workspace(".")
+    .prompt("fix the failing tests")
+    .await?;
+println!("{reply}");
+```
+
+`prompt` returns `TurnOutcome`. It displays as the assistant text. If the policy needs approval, it returns an error instead of blocking on stdin. Use `Agent` / `Turn` when you can resolve approvals.
+
+`Kurama::from_backend` takes any `ModelBackend`. `.ephemeral()` keeps the session in memory. `.no_tools()` is chat-only. `.yolo()` is launch-only, same rule as the CLI.
+
+## Agent
+
+`Agent` fills in the rest. An embedder implements at most `ModelBackend` and maybe `Tool`:
+
+```rust
+use kurama_sdk::Agent;
+
+let mut agent = Agent::new()
+    .backend(my_backend)
+    .tool(my_tool)
+    .workspace(".")
+    .build()?;
+
+let reply = agent.prompt("fix the tests").await?;
+agent.resume("ses_deadbeef").await?;
+agent.prompt("continue from there").await?;
+```
+
+Defaults: `DefaultPolicy` in supervised mode, `MemoryStore`, a no-op event sink, `NoDelegation`, and `RandomIds`. `.orchestrate()` installs `SmartOrchestrator` and builds the orchestration context from the active profile, workspace write scope, and configured roles. `.config(&kurama_config)` copies role routes, escalations, auto boundaries, and concurrency from `~/.kurama/config.toml`.
+
+Streaming, approvals, and children stay one method down:
+
+```rust
+let mut turn = agent.turn("use sub-agents to split the work").await?;
+while let Some(event) = turn.next().await? {
+    match event {
+        Event::Text(text) => print!("{text}"),
+        Event::Approval(req) => turn.approve_once(req.operation_id).await?,
+        Event::Done(done) => println!("\n{}", done.text),
+        _ => {}
+    }
+}
+```
+
+Event-driven UIs (the Kurama CLI) call `agent.launch(metadata, replay)` and drive `Handle` plus the typed event stream.
+
+## Explicit composition
+
+`AgentBuilder` still requires every component:
 
 ```rust
 use std::sync::Arc;
@@ -26,9 +82,7 @@ let runtime = AgentBuilder::new()
     .build()?;
 ```
 
-The custom types implement the re-exported `ModelBackend`, `Tool`, `ApprovalPolicy`, `SessionStore`, `EventSink`, `Orchestrator`, and `IdGenerator` traits. Builder registration is explicit: duplicate model profile or tool names, missing required components, an unavailable active profile, and zero channel limits are errors.
-
-`AgentRuntime::start(session_metadata, replay)` returns an engine handle and typed runtime event stream. Embedded consumers may replace model backends, tools, policies, stores, event sinks, orchestrators, ID generation, or the user interface without forking the engine.
+Duplicate model profile or tool names, missing required components, an unavailable active profile, and zero channel limits are errors.
 
 ## Providers and Tools
 

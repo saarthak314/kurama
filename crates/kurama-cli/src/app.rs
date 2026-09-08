@@ -10,17 +10,11 @@ use std::{
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use kurama_adapters::{
     AppPaths, BashTool, ConfigRepository, CredentialResolver, FsSessionStore, HttpClient,
-    JsonSearchBackend, OpenAiNativeSearch, ProviderFactory, RandomIds, ReadTool, SearchBackend,
-    SecretValue, SessionSecrets, WebSearchTool, WriteTool,
-};
-use kurama_core::{
-    engine::{EngineHandle, RuntimeEvents},
-    orchestrator::SmartOrchestrator,
-    policy::DefaultPolicy,
+    JsonSearchBackend, OpenAiNativeSearch, ProviderFactory, ReadTool, SearchBackend, SecretValue,
+    SessionSecrets, WebSearchTool, WriteTool,
 };
 use kurama_protocol::{
     KuramaError,
-    agent::{OrchestrationContext, WriteScope},
     config::{
         AuthRef, KuramaConfig, OrchestrationConfig, ProfileConfig, ProfileKind, SearchConfig,
     },
@@ -29,9 +23,9 @@ use kurama_protocol::{
     policy::{ApprovalResponse, AutoBoundaries, ExecutionMode},
     runtime::{EngineCommand, RuntimeEvent},
     session::{BlobRef, EventEnvelope, SessionEvent, SessionMetadata},
-    traits::{EventSink, IdGenerator, Orchestrator, SessionStore, Tool},
+    traits::{EventSink, Orchestrator, SessionStore, Tool},
 };
-use kurama_sdk::AgentBuilder;
+use kurama_sdk::{Agent, Events, Handle};
 use ratatui::{
     Terminal, TerminalOptions, Viewport,
     backend::{Backend, ClearType, CrosstermBackend},
@@ -119,8 +113,8 @@ impl ResizeMode {
 
 pub struct App {
     pub state: TuiState,
-    engine: Option<EngineHandle>,
-    runtime_events: Option<RuntimeEvents>,
+    engine: Option<Handle>,
+    runtime_events: Option<Events>,
     tool_events: Option<mpsc::Receiver<RuntimeEvent>>,
     orchestrator: Option<Arc<dyn Orchestrator>>,
     session_id: Option<SessionId>,
@@ -337,8 +331,13 @@ impl App {
         let http = HttpClient::try_new().map_err(|error| error.to_string())?;
         let credentials = CredentialResolver;
         let provider_factory = ProviderFactory::new(http.clone(), paths.clone(), credentials);
-        let mut profiles = BTreeMap::new();
-        let mut builder = AgentBuilder::new();
+        let mut agent = Agent::new()
+            .workspace(project.clone())
+            .mode(mode)
+            .active_profile(active_profile.clone())
+            .store(store.clone())
+            .config(&config)
+            .orchestrate();
         let secrets = session_secrets
             .lock()
             .map_err(|_| "session credential store is unavailable".to_owned())?;
@@ -355,23 +354,8 @@ impl App {
             let backend = provider_factory
                 .build(name, profile, &secrets)
                 .map_err(|error| error.to_string())?;
-            profiles.insert(name.clone(), model_profile.clone());
-            builder = builder.profile(model_profile, backend);
+            agent = agent.profile(model_profile, backend);
         }
-
-        let ids = Arc::new(RandomIds);
-        let orchestrator = Arc::new(SmartOrchestrator::new(ids.clone()));
-        let write_scope = WriteScope {
-            roots: vec![project.clone()],
-            files: Vec::new(),
-        };
-        let orchestration = orchestration_context(
-            &config,
-            active_profile.as_str(),
-            &profiles,
-            write_scope.clone(),
-            mode,
-        )?;
         let search_backend = search_backend(
             &config,
             active_profile.as_str(),
@@ -383,24 +367,13 @@ impl App {
         drop(secrets);
         let (tool_tx, tool_rx) = mpsc::channel(TOOL_EVENT_CAPACITY);
         let tool_sink: Arc<dyn EventSink> = Arc::new(ToolEventSink { sender: tool_tx });
-        let tools = standard_tools(http, search_backend, Some(tool_sink));
-        let sink: Arc<dyn EventSink> = Arc::new(NoopSink);
-        builder = builder
-            .active_profile(active_profile.clone())
-            .policy(Arc::new(DefaultPolicy::new(mode, config.auto.clone())))
-            .store(store.clone())
-            .sink(sink)
-            .orchestrator(orchestrator.clone())
-            .ids(ids.clone())
-            .write_scope(write_scope)
-            .auto_boundaries(config.auto.clone())
-            .orchestration_context(orchestration);
-        for tool in tools {
-            builder = builder.tool(tool);
-        }
-        let runtime = builder.build().map_err(|error| error.to_string())?;
+        let agent = agent
+            .tools(standard_tools(http, search_backend, Some(tool_sink)))
+            .build()
+            .map_err(|error| error.to_string())?;
+        let orchestrator = agent.orchestrator();
 
-        let session_id = resume_id.unwrap_or_else(|| ids.session_id());
+        let session_id = resume_id.unwrap_or_else(|| agent.session_id());
         let created_at_ms = previous_metadata
             .as_ref()
             .map_or_else(now_ms, |metadata| metadata.created_at_ms);
@@ -431,8 +404,8 @@ impl App {
             redaction_best_effort: mode == ExecutionMode::Yolo,
         };
         let transcript_replay = replay_for_transcript(&replay, store.as_ref());
-        let (engine, runtime_events) = runtime
-            .start(metadata, replay)
+        let (engine, runtime_events) = agent
+            .launch(metadata, replay)
             .map_err(|error| error.to_string())?;
 
         repository
@@ -485,7 +458,7 @@ impl App {
 
     pub fn from_runtime(
         state: TuiState,
-        engine: EngineHandle,
+        engine: Handle,
         orchestrator: Arc<dyn Orchestrator>,
         session_id: SessionId,
     ) -> Self {
@@ -1899,65 +1872,6 @@ fn search_backend(
     }
 }
 
-fn orchestration_context(
-    config: &KuramaConfig,
-    active_profile: &str,
-    profiles: &BTreeMap<String, ModelProfile>,
-    parent_write_scope: WriteScope,
-    mode: ExecutionMode,
-) -> Result<OrchestrationContext, String> {
-    let parent_profile = profiles
-        .get(active_profile)
-        .cloned()
-        .ok_or_else(|| format!("unknown active profile: {active_profile}"))?;
-    Ok(OrchestrationContext {
-        parent_profile,
-        profiles: profiles.clone(),
-        role_routes: config
-            .roles
-            .iter()
-            .filter(|(_, route)| profiles.contains_key(&route.profile))
-            .map(|(role, route)| (role.clone(), route.profile.clone()))
-            .collect(),
-        role_escalations: config
-            .roles
-            .iter()
-            .filter(|(_, route)| profiles.contains_key(&route.profile))
-            .map(|(role, route)| {
-                (
-                    role.clone(),
-                    route
-                        .escalation_profiles
-                        .iter()
-                        .filter(|profile| profiles.contains_key(*profile))
-                        .cloned()
-                        .collect(),
-                )
-            })
-            .collect(),
-        profile_escalations: config
-            .profiles
-            .iter()
-            .filter(|(name, _)| profiles.contains_key(*name))
-            .map(|(name, profile)| {
-                (
-                    name.clone(),
-                    profile
-                        .escalation_profiles
-                        .iter()
-                        .filter(|profile| profiles.contains_key(*profile))
-                        .cloned()
-                        .collect(),
-                )
-            })
-            .collect(),
-        parent_write_scope,
-        max_concurrency: config.orchestration.max_concurrency,
-        depth: 0,
-        yolo: mode == ExecutionMode::Yolo,
-    })
-}
-
 fn empty_config() -> KuramaConfig {
     KuramaConfig {
         version: 1,
@@ -2017,14 +1931,6 @@ fn execution_mode_label(mode: ExecutionMode) -> &'static str {
         ExecutionMode::Supervised => "supervised",
         ExecutionMode::Auto => "auto",
         ExecutionMode::Yolo => "yolo",
-    }
-}
-
-struct NoopSink;
-
-impl EventSink for NoopSink {
-    fn emit(&self, _event: RuntimeEvent) -> Result<(), KuramaError> {
-        Ok(())
     }
 }
 

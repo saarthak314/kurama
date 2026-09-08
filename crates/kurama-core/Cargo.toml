@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 futures-core.workspace = true
 futures-util.workspace = true
+getrandom.workspace = true
 kurama-protocol = { path = "../kurama-protocol" }
 serde_json.workspace = true
 tokio.workspace = true

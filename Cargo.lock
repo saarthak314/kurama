@@ -787,6 +787,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kurama"
+version = "0.1.0"
+dependencies = [
+ "kurama-adapters",
+ "kurama-core",
+ "kurama-protocol",
+ "kurama-sdk",
+ "tokio",
+]
+
+[[package]]
 name = "kurama-adapters"
 version = "0.1.0"
 dependencies = [
@@ -835,6 +846,7 @@ version = "0.1.0"
 dependencies = [
  "futures-core",
  "futures-util",
+ "getrandom 0.4.3",
  "kurama-protocol",
  "serde_json",
  "tokio",

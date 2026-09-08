@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use kurama_adapters::{BashTool, HttpClient, ReadTool, WebSearchTool, WriteTool};
@@ -6,19 +6,15 @@ use kurama_cli::{
     app::{App, run_with},
     tui::{TranscriptEntry, TuiState},
 };
-use kurama_core::{
-    orchestrator::SmartOrchestrator,
-    policy::DefaultPolicy,
-    testing::{CollectingSink, MemoryStore, ScriptedBackend, SequenceIds},
-};
+use kurama_core::testing::{MemoryStore, ScriptedBackend, SequenceIds};
 use kurama_protocol::{
-    agent::{AgentBudget, AgentSpec, DelegationRequest, OrchestrationContext, WriteScope},
+    agent::{AgentBudget, AgentSpec, DelegationRequest, WriteScope},
     model::{FinishReason, ModelEvent, ModelProfile},
-    policy::{AutoBoundaries, ExecutionMode},
+    policy::ExecutionMode,
     session::{SessionEvent, SessionMetadata},
     traits::{Orchestrator, SessionStore, Tool},
 };
-use kurama_sdk::AgentBuilder;
+use kurama_sdk::Agent;
 use ratatui::{Terminal, backend::TestBackend};
 use tokio::sync::mpsc;
 
@@ -96,48 +92,27 @@ async fn fake_provider_runs_tools_approval_child_panel_and_exact_once_resume() {
     let store = Arc::new(MemoryStore::default());
     let ids = Arc::new(SequenceIds::new(1));
     let profile = ModelProfile::new("fixture", "frontier", 32_000, 4_000);
-    let orchestrator = Arc::new(SmartOrchestrator::new(ids.clone()));
     let workspace_root = workspace.path().to_path_buf();
-    let write_scope = WriteScope {
-        roots: vec![workspace_root.clone()],
-        files: Vec::new(),
-    };
-    let orchestration = OrchestrationContext {
-        parent_profile: profile.clone(),
-        profiles: BTreeMap::from([("fixture".into(), profile.clone())]),
-        role_routes: BTreeMap::new(),
-        role_escalations: BTreeMap::new(),
-        profile_escalations: BTreeMap::new(),
-        parent_write_scope: write_scope.clone(),
-        max_concurrency: 2,
-        depth: 0,
-        yolo: false,
-    };
     let tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(BashTool::default()),
         Arc::new(ReadTool::default()),
         Arc::new(WebSearchTool::new(HttpClient::new(), None)),
         Arc::new(WriteTool::default()),
     ];
-    let mut builder = AgentBuilder::new()
+    let agent = Agent::new()
         .profile(profile.clone(), backend)
         .active_profile("fixture")
-        .policy(Arc::new(DefaultPolicy::new(
-            ExecutionMode::Supervised,
-            AutoBoundaries::default(),
-        )))
         .store(store.clone())
-        .sink(Arc::new(CollectingSink::default()))
-        .orchestrator(orchestrator.clone())
         .ids(ids)
-        .write_scope(write_scope)
-        .orchestration_context(orchestration);
-    for tool in tools {
-        builder = builder.tool(tool);
-    }
-    let runtime = builder.build().expect("runtime");
+        .workspace(workspace_root.clone())
+        .max_concurrency(2)
+        .orchestrate()
+        .tools(tools)
+        .build()
+        .expect("runtime");
+    let orchestrator = agent.orchestrator();
     assert_eq!(
-        runtime.registered_tools(),
+        agent.registered_tools(),
         ["bash", "read", "web-search", "write"]
     );
     let metadata = SessionMetadata {
@@ -149,8 +124,8 @@ async fn fake_provider_runs_tools_approval_child_panel_and_exact_once_resume() {
         redaction_best_effort: false,
     };
 
-    let (handle, runtime_events) = runtime
-        .start(metadata.clone(), Vec::new())
+    let (handle, runtime_events) = agent
+        .launch(metadata.clone(), Vec::new())
         .expect("start runtime");
     let state = TuiState::new(
         "fixture",
@@ -201,8 +176,8 @@ async fn fake_provider_runs_tools_approval_child_panel_and_exact_once_resume() {
 
     tokio::time::sleep(Duration::from_millis(20)).await;
     let replay = store.replay(&metadata.id).expect("replay");
-    let (handle, runtime_events) = runtime
-        .start(metadata.clone(), replay)
+    let (handle, runtime_events) = agent
+        .launch(metadata.clone(), replay)
         .expect("resume runtime");
     let state = TuiState::new(
         "fixture",
