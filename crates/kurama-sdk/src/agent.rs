@@ -148,61 +148,64 @@ impl Turn<'_> {
         if self.finished {
             return Ok(None);
         }
-        let Some(event) = self.events.recv().await else {
-            self.finished = true;
-            return Ok(None);
-        };
-        let event = match event {
-            RuntimeEvent::Status { message } => Event::Status(message),
-            RuntimeEvent::AssistantDelta { text } => {
-                self.text.push_str(&text);
-                Event::Text(text)
+        loop {
+            let Some(event) = self.events.recv().await else {
+                self.finished = true;
+                return Ok(None);
+            };
+            let event = match event {
+                RuntimeEvent::Usage { .. } => continue,
+                RuntimeEvent::Status { message } => Event::Status(message),
+                RuntimeEvent::AssistantDelta { text } => {
+                    self.text.push_str(&text);
+                    Event::Text(text)
+                }
+                RuntimeEvent::ApprovalRequired { request } => Event::Approval(request),
+                RuntimeEvent::ToolStarted {
+                    operation_id,
+                    name,
+                    context,
+                } => Event::ToolStarted {
+                    operation_id,
+                    name,
+                    context,
+                },
+                RuntimeEvent::ToolOutputDelta {
+                    call_id,
+                    stream,
+                    chunk,
+                } => Event::ToolOutput {
+                    call_id,
+                    stream,
+                    chunk,
+                },
+                RuntimeEvent::ToolCompleted {
+                    operation_id,
+                    result,
+                } => Event::ToolCompleted {
+                    operation_id,
+                    result,
+                },
+                RuntimeEvent::AgentUpdated { snapshot } => Event::AgentUpdated(snapshot),
+                RuntimeEvent::AgentInspection {
+                    snapshot,
+                    transcript,
+                } => Event::AgentInspection {
+                    snapshot,
+                    transcript,
+                },
+                RuntimeEvent::TurnCompleted => Event::Done(TurnOutcome {
+                    text: self.text.clone(),
+                    session_id: self.session_id.clone(),
+                }),
+                RuntimeEvent::Error { message } => Event::Error(message),
+                RuntimeEvent::Shutdown => Event::Shutdown,
+            };
+            if matches!(event, Event::Done(_) | Event::Error(_) | Event::Shutdown) {
+                self.finished = true;
             }
-            RuntimeEvent::ApprovalRequired { request } => Event::Approval(request),
-            RuntimeEvent::ToolStarted {
-                operation_id,
-                name,
-                context,
-            } => Event::ToolStarted {
-                operation_id,
-                name,
-                context,
-            },
-            RuntimeEvent::ToolOutputDelta {
-                call_id,
-                stream,
-                chunk,
-            } => Event::ToolOutput {
-                call_id,
-                stream,
-                chunk,
-            },
-            RuntimeEvent::ToolCompleted {
-                operation_id,
-                result,
-            } => Event::ToolCompleted {
-                operation_id,
-                result,
-            },
-            RuntimeEvent::AgentUpdated { snapshot } => Event::AgentUpdated(snapshot),
-            RuntimeEvent::AgentInspection {
-                snapshot,
-                transcript,
-            } => Event::AgentInspection {
-                snapshot,
-                transcript,
-            },
-            RuntimeEvent::TurnCompleted => Event::Done(TurnOutcome {
-                text: self.text.clone(),
-                session_id: self.session_id.clone(),
-            }),
-            RuntimeEvent::Error { message } => Event::Error(message),
-            RuntimeEvent::Shutdown => Event::Shutdown,
-        };
-        if matches!(event, Event::Done(_) | Event::Error(_) | Event::Shutdown) {
-            self.finished = true;
+            return Ok(Some(event));
         }
-        Ok(Some(event))
     }
 
     pub async fn approve_once(&self, operation_id: OperationId) -> Result<(), KuramaError> {

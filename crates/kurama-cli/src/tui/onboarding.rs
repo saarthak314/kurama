@@ -120,11 +120,11 @@ impl OnboardingState {
 
     pub fn step_label(&self) -> &'static str {
         match self.stage {
-            OnboardingStage::Connection => "STEP 1 / SETUP",
-            OnboardingStage::Profile => "PROFILE / SETUP",
-            OnboardingStage::Endpoint => "ENDPOINT / SETUP",
-            OnboardingStage::Model => "MODEL / SETUP",
-            OnboardingStage::Secret | OnboardingStage::Credential => "CREDENTIAL / SETUP",
+            OnboardingStage::Connection => "setup",
+            OnboardingStage::Profile => "profile",
+            OnboardingStage::Endpoint => "endpoint",
+            OnboardingStage::Model => "model",
+            OnboardingStage::Secret | OnboardingStage::Credential => "credential",
         }
     }
 

@@ -11,15 +11,11 @@ use unicode_segmentation::UnicodeSegmentation;
 #[cfg(test)]
 use std::cell::Cell;
 
-use super::{ToolLifecycle, TranscriptEntry, TuiState, syntax::highlight_code};
-
-const DIM: Color = Color::Rgb(126, 132, 146);
-const TEXT: Color = Color::Reset;
-const BORDER: Color = Color::Rgb(48, 53, 64);
-const RED: Color = Color::Rgb(255, 92, 82);
-const GREEN: Color = Color::Rgb(111, 207, 151);
-const BLUE: Color = Color::Rgb(116, 177, 255);
-const ACCENT: Color = Color::Cyan;
+use super::{
+    ToolLifecycle, TranscriptEntry, TuiState,
+    syntax::highlight_code,
+    theme::{ACCENT, BLUE, BORDER, DIM, GREEN, RED, TEXT},
+};
 
 #[cfg(test)]
 thread_local! {
@@ -1425,18 +1421,27 @@ fn compact_tool_output(tool: &super::ToolTranscript, output: &str, width: usize)
         return visible;
     }
 
-    let line_count = output_line_count(output);
-    let status = if tool.lifecycle == ToolLifecycle::Failed {
-        "failure"
-    } else {
-        "success"
-    };
-    let summary = if line_count == 0 {
-        format!("{status} · no output")
-    } else {
-        format!("{status} · {line_count} {}", pluralize(line_count, "line"))
-    };
-    vec![summary]
+    if output.is_empty() {
+        let status = if tool.lifecycle == ToolLifecycle::Failed {
+            "failure"
+        } else {
+            "success"
+        };
+        return vec![format!("{status} · no output")];
+    }
+
+    const PREVIEW_LINES: usize = 2;
+    let wrapped = hard_wrap(output, width);
+    let omitted = wrapped.len().saturating_sub(PREVIEW_LINES);
+    let mut visible = Vec::new();
+    if omitted > 0 {
+        visible.push(format!(
+            "… {omitted} earlier {}",
+            pluralize(omitted, "line")
+        ));
+    }
+    visible.extend(wrapped.into_iter().skip(omitted));
+    visible
 }
 
 fn expanded_tool_output(output: &str, width: usize) -> Vec<String> {
@@ -1444,14 +1449,6 @@ fn expanded_tool_output(output: &str, width: usize) -> Vec<String> {
         vec!["(no output)".into()]
     } else {
         hard_wrap(output, width)
-    }
-}
-
-fn output_line_count(output: &str) -> usize {
-    if output.is_empty() {
-        0
-    } else {
-        output.split('\n').count()
     }
 }
 
