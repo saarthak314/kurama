@@ -570,9 +570,7 @@ impl App {
             _ => return Ok(false),
         };
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.exit_requested = true;
-            self.state.queue_command(EngineCommand::Shutdown);
-            return Ok(true);
+            return Ok(self.handle_ctrl_c());
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
             self.state.toggle_transcript_view();
@@ -601,8 +599,49 @@ impl App {
         Ok(self.exit_requested || (self.restart_args.is_some() && self.engine.is_none()))
     }
 
+    fn handle_ctrl_c(&mut self) -> bool {
+        if self.state.interrupt_active() {
+            return false;
+        }
+        if !self.state.composer.is_empty() {
+            self.state.clear_composer();
+            return false;
+        }
+        self.exit_requested = true;
+        self.state.queue_command(EngineCommand::Shutdown);
+        true
+    }
+
     fn handle_main_key(&mut self, key: KeyEvent) -> Result<(), String> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('a') => self.state.cursor_home(),
+                KeyCode::Char('e') => self.state.cursor_end(),
+                KeyCode::Char('k') => self.state.kill_to_end(),
+                KeyCode::Char('u') => self.state.kill_to_start(),
+                KeyCode::Char('w') => self.state.kill_previous_word(),
+                KeyCode::Char('d') => {
+                    if self.state.composer.is_empty() {
+                        self.exit_requested = true;
+                        self.state.queue_command(EngineCommand::Shutdown);
+                    } else if self.state.cursor < self.state.composer.len() {
+                        let next = self.state.cursor
+                            + self.state.composer[self.state.cursor..]
+                                .chars()
+                                .next()
+                                .map(char::len_utf8)
+                                .unwrap_or(0);
+                        self.state.composer.drain(self.state.cursor..next);
+                        self.state.composer_edited();
+                    }
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
         match key.code {
+            KeyCode::Home => self.state.cursor_home(),
+            KeyCode::End => self.state.cursor_end(),
             KeyCode::Char(character) => {
                 self.state.composer.insert(self.state.cursor, character);
                 self.state.cursor += character.len_utf8();
@@ -648,7 +687,13 @@ impl App {
                 self.state.composer_edited();
             }
             KeyCode::Up if self.state.select_previous_command() => {}
+            KeyCode::Up => {
+                self.state.history_previous();
+            }
             KeyCode::Down if self.state.select_next_command() => {}
+            KeyCode::Down => {
+                self.state.history_next();
+            }
             KeyCode::Tab if self.state.selected_command().is_some() => {
                 self.state.complete_selected_command();
             }
@@ -781,6 +826,14 @@ impl App {
                         format!("mode {}", execution_mode_label(mode)),
                     );
                 }
+                Command::Help => {
+                    let body = crate::commands::COMMAND_SPECS
+                        .iter()
+                        .map(|spec| format!("/{} — {}", spec.name, spec.description))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.state.push_notice(Some("HELP".into()), body);
+                }
                 Command::Exit => {
                     self.exit_requested = true;
                     self.state.queue_command(EngineCommand::Shutdown);
@@ -794,6 +847,7 @@ impl App {
                 .orchestrator
                 .as_ref()
                 .is_some_and(|orchestrator| orchestrator.explicit_delegation(trimmed));
+            self.state.remember_prompt(trimmed);
             self.state.submit_turn(trimmed, explicit_delegation);
         }
         Ok(())
@@ -2257,6 +2311,89 @@ Session ID: ses_cafebabe"
             app.state.sent_commands().last(),
             Some(EngineCommand::CancelTurn)
         ));
+    }
+
+    #[test]
+    fn ctrl_c_interrupts_before_exiting() {
+        let mut app = test_app();
+        app.state.set_thinking();
+
+        let exit = app
+            .handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            )))
+            .expect("interrupt");
+        assert!(!exit);
+        assert_eq!(app.state.activity(), &ActivityState::Interrupted);
+        assert!(matches!(
+            app.state.sent_commands().last(),
+            Some(EngineCommand::CancelTurn)
+        ));
+
+        app.state.composer = "draft".into();
+        app.state.cursor = 5;
+        let exit = app
+            .handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            )))
+            .expect("clear composer");
+        assert!(!exit);
+        assert!(app.state.composer.is_empty());
+
+        let exit = app
+            .handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            )))
+            .expect("exit");
+        assert!(exit);
+        assert!(matches!(
+            app.state.sent_commands().last(),
+            Some(EngineCommand::Shutdown)
+        ));
+    }
+
+    #[test]
+    fn ctrl_a_and_ctrl_k_edit_the_composer() {
+        let mut app = test_app();
+        app.state.composer = "hello world".into();
+        app.state.cursor = app.state.composer.len();
+
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("home");
+        assert_eq!(app.state.cursor, 0);
+        assert_eq!(app.state.composer, "hello world");
+
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('k'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("kill");
+        assert!(app.state.composer.is_empty());
+    }
+
+    #[test]
+    fn up_recalls_previous_prompts() {
+        let mut app = test_app();
+        app.state.remember_prompt("first turn");
+        app.state.remember_prompt("second turn");
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)))
+            .expect("newer history");
+        assert_eq!(app.state.composer, "second turn");
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)))
+            .expect("older history");
+        assert_eq!(app.state.composer, "first turn");
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
+            .expect("forward history");
+        assert_eq!(app.state.composer, "second turn");
     }
 
     #[test]

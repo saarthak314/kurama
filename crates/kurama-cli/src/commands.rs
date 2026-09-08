@@ -8,7 +8,7 @@ pub struct CommandSpec {
     pub requires_arguments: bool,
 }
 
-const COMMAND_SPECS: [CommandSpec; 10] = [
+pub const COMMAND_SPECS: [CommandSpec; 11] = [
     CommandSpec {
         name: "model",
         description: "select or list profiles",
@@ -64,6 +64,12 @@ const COMMAND_SPECS: [CommandSpec; 10] = [
         requires_arguments: false,
     },
     CommandSpec {
+        name: "help",
+        description: "list slash commands",
+        accepts_arguments: false,
+        requires_arguments: false,
+    },
+    CommandSpec {
         name: "exit",
         description: "exit and print resume details",
         accepts_arguments: false,
@@ -82,6 +88,7 @@ pub enum Command {
     Context,
     Compact,
     Mode(ExecutionMode),
+    Help,
     Exit,
 }
 
@@ -132,6 +139,7 @@ pub fn parse_command(input: &str) -> Result<Command, String> {
         ("/new", []) => Ok(Command::New),
         ("/context", []) => Ok(Command::Context),
         ("/compact", []) => Ok(Command::Compact),
+        ("/help", []) => Ok(Command::Help),
         ("/mode", ["supervised"]) => Ok(Command::Mode(ExecutionMode::Supervised)),
         ("/mode", ["auto"]) => Ok(Command::Mode(ExecutionMode::Auto)),
         ("/exit", []) => Ok(Command::Exit),

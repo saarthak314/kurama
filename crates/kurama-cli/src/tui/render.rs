@@ -27,7 +27,8 @@ const TEXT: Color = Color::Reset;
 pub(crate) const SURFACE: Color = Color::Reset;
 const ACCENT: Color = Color::Cyan;
 const AMBER: Color = Color::Yellow;
-const GREEN: Color = Color::Cyan;
+const GREEN: Color = Color::Rgb(111, 207, 151);
+const RED: Color = Color::Rgb(255, 92, 82);
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
     render_with_transcript(frame, state, None);
@@ -392,7 +393,8 @@ fn agent_row(agent: &crate::tui::AgentRow, selected: bool, width: usize) -> Line
         AgentState::Running => ACCENT,
         AgentState::Queued => DIM,
         AgentState::Completed => GREEN,
-        AgentState::Failed | AgentState::Cancelled => DIM,
+        AgentState::Failed => RED,
+        AgentState::Cancelled => DIM,
     };
     let marker = if selected { "▶ " } else { "  " };
     let body = if width >= 72 {
