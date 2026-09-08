@@ -460,3 +460,33 @@ impl IdGenerator for LocalIds {
         self.next("c").into()
     }
 }
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoDelegation;
+
+impl Orchestrator for NoDelegation {
+    fn explicit_delegation(&self, _user_text: &str) -> bool {
+        false
+    }
+
+    fn resolve(
+        &self,
+        _request: DelegationRequest,
+        _context: &OrchestrationContext,
+    ) -> Result<SchedulePlan, KuramaError> {
+        Ok(SchedulePlan {
+            ready: Vec::new(),
+            queued: Vec::new(),
+            blocked: Vec::new(),
+        })
+    }
+
+    fn escalate(
+        &self,
+        _agent: &AgentSnapshot,
+        _reason: &str,
+        _context: &OrchestrationContext,
+    ) -> Result<Option<String>, KuramaError> {
+        Ok(None)
+    }
+}

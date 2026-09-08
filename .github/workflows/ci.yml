@@ -15,7 +15,7 @@ concurrency:
 jobs:
   checks:
     runs-on: ubuntu-24.04
-    timeout-minutes: 2
+    timeout-minutes: 10
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -43,5 +43,9 @@ jobs:
         run: cargo test --locked -p kurama-core --tests
       - name: Test adapters
         run: cargo test --locked -p kurama-adapters --all-features --tests
+      - name: Test SDK
+        run: cargo test --locked -p kurama-sdk --tests
+      - name: Test kurama
+        run: cargo test --locked -p kurama --tests
       - name: Test CLI
         run: cargo test --locked -p kurama-cli --tests

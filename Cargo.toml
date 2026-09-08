@@ -5,6 +5,7 @@ members = [
   "crates/kurama-core",
   "crates/kurama-adapters",
   "crates/kurama-sdk",
+  "crates/kurama",
   "crates/kurama-cli",
 ]
 default-members = ["crates/kurama-cli"]

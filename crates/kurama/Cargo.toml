@@ -1,0 +1,15 @@
+[package]
+name = "kurama"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+kurama-adapters = { path = "../kurama-adapters", features = ["http", "openai", "anthropic", "openai-compatible", "codex-bridge", "claude-bridge", "tools", "fs-store"] }
+kurama-protocol = { path = "../kurama-protocol" }
+kurama-sdk = { path = "../kurama-sdk" }
+
+[dev-dependencies]
+kurama-core = { path = "../kurama-core" }
+tokio.workspace = true

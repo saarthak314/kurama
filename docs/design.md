@@ -3,11 +3,12 @@
 Kurama is one Rust process organized as a small dependency-directed workspace:
 
 ```text
-kurama-cli ──────▶ kurama-sdk ─────▶ kurama-core ─────▶ kurama-protocol
-kurama-adapters ──────────────────────────────────────▶ kurama-protocol
+kurama          ──────▶ kurama-sdk ─────▶ kurama-core ─────▶ kurama-protocol
+kurama-cli      ──────▶ kurama-sdk
+kurama-adapters ──────────────────────────────────────────▶ kurama-protocol
 ```
 
-`kurama-protocol` defines dependency-light public events, commands, model requests, tools, policies, sessions, and extension traits. `kurama-core` owns the event-driven model/tool loop, bounded context, approvals, recovery, and depth-one child scheduling. `kurama-adapters` contains providers, official CLI bridges, filesystem storage, credentials, and the four environment tools. `kurama-sdk` composes those interfaces for embedders. `kurama-cli` renders the TUI and translates user input into engine commands; it never executes tools directly.
+`kurama-protocol` defines dependency-light public events, commands, model requests, tools, policies, sessions, and extension traits. `kurama-core` owns the event-driven model/tool loop, bounded context, approvals, recovery, and depth-one child scheduling. `kurama-adapters` contains providers, official CLI bridges, filesystem storage, credentials, and the four environment tools. `kurama-sdk` composes those interfaces for embedders and supplies `Agent` with production defaults. `kurama` is the batteries-included crate (`Kurama::openai`, standard tools, filesystem sessions). `kurama-cli` renders the TUI and translates user input into engine commands; it never executes tools directly.
 
 The runtime uses a Tokio current-thread scheduler. Terminal input blocks in one named OS thread and enters the async coordinator through a bounded channel. Model streams, tool output, approvals, persistence, and child progress are typed events. Nothing polls in the background, and there is no daemon or database.
 
