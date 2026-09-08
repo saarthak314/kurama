@@ -62,7 +62,10 @@ fn http_client_is_cloneable_and_disables_redirects() {
     let client = HttpClient::default();
     let cloned = client.clone();
 
-    assert_eq!(client.user_agent(), "kurama/0.1.0");
+    assert_eq!(
+        client.user_agent(),
+        format!("kurama/{}", env!("CARGO_PKG_VERSION"))
+    );
     let _ = cloned.client();
     assert_eq!(HttpClient::classify_status(429), HttpErrorClass::Transient);
     assert_eq!(
