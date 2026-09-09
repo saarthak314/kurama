@@ -3,7 +3,10 @@ use std::{io, thread};
 use crossterm::{
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
     execute,
-    terminal::{DisableLineWrap, EnableLineWrap, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        DisableLineWrap, EnableLineWrap, LeaveAlternateScreen,
+        disable_raw_mode, enable_raw_mode,
+    },
 };
 use tokio::sync::mpsc;
 
@@ -40,6 +43,7 @@ fn write_enter_commands<W: io::Write>(mut writer: W) -> io::Result<()> {
 fn write_exit_commands<W: io::Write>(mut writer: W) -> io::Result<()> {
     execute!(
         writer,
+        LeaveAlternateScreen,
         EnableLineWrap,
         DisableBracketedPaste,
         crossterm::cursor::Show
@@ -74,5 +78,9 @@ mod tests {
 
         assert!(enter.windows(5).any(|window| window == b"\x1b[?7l"));
         assert!(exit.windows(5).any(|window| window == b"\x1b[?7h"));
+        assert!(
+            exit.windows(8).any(|window| window == b"\x1b[?1049l"),
+            "leave alternate screen on exit"
+        );
     }
 }
