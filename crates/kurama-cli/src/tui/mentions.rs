@@ -121,47 +121,77 @@ pub fn image_extension(bytes: &[u8]) -> Option<&'static str> {
 
 pub fn decode_pasted_image(paste: &str) -> Option<(Vec<u8>, &'static str)> {
     let trimmed = paste.trim();
-    if let Some(path) = trimmed.strip_prefix("file://") {
-        let path = PathBuf::from(path);
-        let bytes = std::fs::read(&path).ok()?;
-        let ext = image_extension(&bytes).or_else(|| {
-            path.extension()
-                .and_then(|ext| ext.to_str())
-                .and_then(known_ext)
-        })?;
-        return Some((bytes, ext));
+    if trimmed.starts_with("file://") {
+        let path = path_from_file_url(trimmed)?;
+        return image_from_path(&path);
     }
     let path = Path::new(trimmed);
     if path.is_file() {
-        if let Some(ext) = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .and_then(known_ext)
-        {
-            let bytes = std::fs::read(path).ok()?;
-            return Some((bytes, ext));
-        }
-        if let Ok(bytes) = std::fs::read(path)
-            && let Some(ext) = image_extension(&bytes)
-        {
-            return Some((bytes, ext));
-        }
+        return image_from_path(path);
     }
     let payload = trimmed
         .strip_prefix("data:image/png;base64,")
         .or_else(|| trimmed.strip_prefix("data:image/jpeg;base64,"))
         .or_else(|| trimmed.strip_prefix("data:image/gif;base64,"))
-        .or_else(|| trimmed.strip_prefix("data:image/webp;base64,"))
-        .unwrap_or(trimmed);
-    if payload.starts_with("iVBORw0KGgo")
-        || payload.starts_with("/9j/")
-        || payload.starts_with("R0lGOD")
-    {
+        .or_else(|| trimmed.strip_prefix("data:image/webp;base64,"));
+    if let Some(payload) = payload {
         let bytes = decode_base64(payload)?;
         let ext = image_extension(&bytes)?;
         return Some((bytes, ext));
     }
+    if trimmed.starts_with("iVBORw0KGgo")
+        || trimmed.starts_with("/9j/")
+        || trimmed.starts_with("R0lGOD")
+        || trimmed.starts_with("UklGR")
+    {
+        let bytes = decode_base64(trimmed)?;
+        let ext = image_extension(&bytes)?;
+        return Some((bytes, ext));
+    }
     None
+}
+
+fn image_from_path(path: &Path) -> Option<(Vec<u8>, &'static str)> {
+    let bytes = std::fs::read(path).ok()?;
+    let ext = image_extension(&bytes).or_else(|| {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .and_then(known_ext)
+    })?;
+    Some((bytes, ext))
+}
+
+fn path_from_file_url(url: &str) -> Option<PathBuf> {
+    let rest = url.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    Some(PathBuf::from(percent_decode(rest)?))
+}
+
+fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hi = from_hex(bytes.get(index + 1).copied()?)?;
+            let lo = from_hex(bytes.get(index + 2).copied()?)?;
+            out.push((hi << 4) | lo);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn from_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn known_ext(ext: &str) -> Option<&'static str> {
@@ -243,5 +273,47 @@ mod tests {
         let decoded = decode_pasted_image(path.to_str().expect("utf8")).expect("png");
         assert_eq!(decoded.1, "png");
         assert!(decoded.0.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[test]
+    fn file_url_percent_decoding_loads_png() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("my shot.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nrest").expect("write");
+        let encoded = path.to_str().expect("utf8").replace(' ', "%20");
+        let decoded = decode_pasted_image(&format!("file://{encoded}")).expect("png");
+        assert_eq!(decoded.1, "png");
+    }
+
+    #[test]
+    fn webp_data_uri_decodes() {
+        let bytes = b"RIFF\x18\0\0\0WEBP rest";
+        let mut encoded = String::new();
+        encode_base64(bytes, &mut encoded);
+        let decoded =
+            decode_pasted_image(&format!("data:image/webp;base64,{encoded}")).expect("webp");
+        assert_eq!(decoded.1, "webp");
+        assert!(decoded.0.starts_with(b"RIFF"));
+    }
+
+    fn encode_base64(bytes: &[u8], out: &mut String) {
+        const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for chunk in bytes.chunks(3) {
+            let a = chunk[0];
+            let b = chunk.get(1).copied().unwrap_or(0);
+            let c = chunk.get(2).copied().unwrap_or(0);
+            out.push(TABLE[(a >> 2) as usize] as char);
+            out.push(TABLE[(((a & 0x03) << 4) | (b >> 4)) as usize] as char);
+            if chunk.len() > 1 {
+                out.push(TABLE[(((b & 0x0f) << 2) | (c >> 6)) as usize] as char);
+            } else {
+                out.push('=');
+            }
+            if chunk.len() > 2 {
+                out.push(TABLE[(c & 0x3f) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
     }
 }

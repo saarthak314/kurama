@@ -330,7 +330,15 @@ impl TuiState {
     }
 
     pub fn dismiss_command_palette(&mut self) -> bool {
-        if self.command_suggestions().is_empty() {
+        if self.command_palette_dismissed || self.history_search.is_some() {
+            return false;
+        }
+        let showing_files = super::mention_at_cursor(&self.composer, self.cursor).is_some()
+            && !self.file_suggestions().is_empty();
+        let showing_commands = !command_suggestions(&self.composer).is_empty()
+            && self.overlay == Overlay::None
+            && !self.transcript_view_expanded;
+        if !showing_files && !showing_commands {
             return false;
         }
         self.command_palette_dismissed = true;
@@ -389,7 +397,10 @@ impl TuiState {
     }
 
     pub fn file_mention(&self) -> Option<(usize, String)> {
-        if self.history_search.is_some() || self.overlay != Overlay::None {
+        if self.history_search.is_some()
+            || self.overlay != Overlay::None
+            || self.command_palette_dismissed
+        {
             return None;
         }
         super::mention_at_cursor(&self.composer, self.cursor)

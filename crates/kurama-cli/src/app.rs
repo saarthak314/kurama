@@ -58,6 +58,7 @@ const TRANSCRIPT_HORIZONTAL_PADDING: usize = 2;
 const MAX_TRANSCRIPT_INSERT_HEIGHT: usize = 1_024;
 const INLINE_VIEWPORT_MAX_HEIGHT: u16 = 12;
 const TOOL_EVENT_CAPACITY: usize = 64;
+const MAX_PASTE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const READY_EVENT_BATCH_LIMIT: usize = 128;
 const STREAM_REDRAW_INTERVAL: Duration = Duration::from_millis(33);
 const ACTIVITY_FRAME_INTERVAL: Duration = Duration::from_millis(100);
@@ -568,6 +569,13 @@ impl App {
         let key = match event {
             Event::Paste(text) => {
                 match self.state.overlay {
+                    Overlay::None if self.state.history_search_active() => {
+                        for character in text.chars() {
+                            if !character.is_control() {
+                                self.state.push_history_search_char(character);
+                            }
+                        }
+                    }
                     Overlay::None if !self.state.transcript_view_expanded() => {
                         self.ingest_composer_paste(&text);
                     }
@@ -673,6 +681,12 @@ impl App {
 
     fn handle_main_key(&mut self, key: KeyEvent) -> Result<(), String> {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if self.state.history_search_active() {
+                if key.code == KeyCode::Char('r') {
+                    self.state.start_history_search();
+                }
+                return Ok(());
+            }
             match key.code {
                 KeyCode::Char('a') => self.state.cursor_home(),
                 KeyCode::Char('e') => self.state.cursor_end(),
@@ -1323,12 +1337,19 @@ impl App {
     }
 
     fn ingest_composer_paste(&mut self, text: &str) {
-        if let Some((bytes, ext)) = crate::tui::decode_pasted_image(text)
-            && let Ok(path) = save_pasted_image(&self.state.project, &bytes, ext)
-        {
-            self.state.insert_mention(&path);
-            self.state
-                .push_notice(Some("PASTE".into()), format!("attached {path}"));
+        if let Some((bytes, ext)) = crate::tui::decode_pasted_image(text) {
+            if bytes.len() > MAX_PASTE_IMAGE_BYTES {
+                self.state.push_error("pasted image is too large");
+                return;
+            }
+            match save_pasted_image(&self.state.project, &bytes, ext) {
+                Ok(path) => {
+                    self.state.insert_mention(&path);
+                    self.state
+                        .push_notice(Some("PASTE".into()), format!("attached {path}"));
+                }
+                Err(error) => self.state.push_error(error),
+            }
             return;
         }
         self.state.composer.insert_str(self.state.cursor, text);
