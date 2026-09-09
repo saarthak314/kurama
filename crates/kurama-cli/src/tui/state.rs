@@ -598,10 +598,12 @@ impl TuiState {
                     operation_id,
                     result,
                 } => {
-                    self.push_transcript_entry(TranscriptEntry::ToolCall(tool_transcript(
-                        result,
-                        replayed_tool_contexts.remove(operation_id),
-                    )));
+                    if todo_items(result).is_none() {
+                        self.push_transcript_entry(TranscriptEntry::ToolCall(tool_transcript(
+                            result,
+                            replayed_tool_contexts.remove(operation_id),
+                        )));
+                    }
                 }
                 SessionEvent::ToolUnknown { reason, .. } => {
                     self.push_notice(Some("TOOL".into()), reason.clone());
@@ -1045,6 +1047,12 @@ impl TuiState {
     }
 
     fn append_tool_delta(&mut self, call_id: CallId, stream: String, chunk: String) {
+        if matches!(
+            &self.activity,
+            ActivityState::RunningTool { name, .. } if name == "todo"
+        ) {
+            return;
+        }
         if let Some(index) = self.active_tool_entries.get(&call_id).copied() {
             let stream_changed = self
                 .active_tool_streams
@@ -1098,6 +1106,13 @@ impl TuiState {
             .or(pending_context);
 
         self.active_tool_streams.remove(&result.call_id);
+        if name == "todo" && lifecycle != ToolLifecycle::Failed {
+            if let Some(index) = self.active_tool_entries.remove(&result.call_id) {
+                self.transcript.remove(index);
+                self.reindex_active_tool_entries(index);
+            }
+            return;
+        }
         if let Some(index) = self.active_tool_entries.remove(&result.call_id)
             && let Some(TranscriptEntry::ToolCall(tool)) = self.transcript.get_mut(index)
         {
@@ -1132,13 +1147,28 @@ impl TuiState {
         }));
     }
 
+    fn reindex_active_tool_entries(&mut self, removed: usize) {
+        for index in self.active_tool_entries.values_mut() {
+            if *index > removed {
+                *index -= 1;
+            }
+        }
+    }
+
     fn replace_todos(&mut self, items: Vec<TodoItem>) {
         self.todos.clone_from(&items);
-        if let Some(entry) = self.transcript[self.committed_transcript_entries..]
-            .iter_mut()
-            .find(|entry| matches!(entry, TranscriptEntry::Todos { .. }))
-        {
-            *entry = TranscriptEntry::Todos { items };
+        let live_start = self.committed_transcript_entries;
+        let existing = self.transcript[live_start..]
+            .iter()
+            .position(|entry| matches!(entry, TranscriptEntry::Todos { .. }));
+        if items.is_empty() {
+            if let Some(offset) = existing {
+                self.transcript.remove(live_start + offset);
+            }
+            return;
+        }
+        if let Some(offset) = existing {
+            self.transcript[live_start + offset] = TranscriptEntry::Todos { items };
         } else {
             self.push_transcript_entry(TranscriptEntry::Todos { items });
         }

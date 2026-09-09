@@ -1362,28 +1362,56 @@ pub fn transcript_lines(
                 push_tool_output_lines(&mut lines, output);
             }
             TranscriptEntry::Todos { items } => {
-                let completed = items
-                    .iter()
-                    .filter(|item| {
-                        matches!(item.status, TodoStatus::Completed | TodoStatus::Cancelled)
-                    })
-                    .count();
-                let next = items
-                    .iter()
-                    .find(|item| item.status == TodoStatus::InProgress)
-                    .or_else(|| items.iter().find(|item| item.status == TodoStatus::Pending));
-                let mut summary = format!("todo  {completed}/{}", items.len());
-                if let Some(item) = next {
-                    summary.push_str("  next: ");
-                    summary.push_str(&item.content);
+                if items.is_empty() {
+                    continue;
+                }
+                if !lines.is_empty() {
+                    lines.push(Line::from(""));
                 }
                 lines.push(Line::from(vec![
                     Span::styled("• ", Style::default().fg(DIM)),
                     Span::styled(
-                        truncate_display(&summary, width.saturating_sub(2).max(1)),
-                        Style::default().fg(DIM),
+                        "todo",
+                        Style::default().fg(DIM).add_modifier(Modifier::BOLD),
                     ),
                 ]));
+                for item in items {
+                    let (marker, continuation, marker_style, body_style) = match item.status {
+                        TodoStatus::Completed => (
+                            "  [x] ",
+                            "      ",
+                            Style::default().fg(DIM),
+                            Style::default().fg(DIM),
+                        ),
+                        TodoStatus::InProgress => (
+                            "  [>] ",
+                            "      ",
+                            Style::default().fg(ACCENT),
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        ),
+                        TodoStatus::Pending => (
+                            "  [ ] ",
+                            "      ",
+                            Style::default().fg(TEXT),
+                            Style::default().fg(TEXT),
+                        ),
+                        TodoStatus::Cancelled => (
+                            "  [-] ",
+                            "      ",
+                            Style::default().fg(DIM),
+                            Style::default().fg(DIM),
+                        ),
+                    };
+                    push_prefixed_lines(
+                        &mut lines,
+                        &item.content,
+                        marker,
+                        continuation,
+                        marker_style,
+                        body_style,
+                        width,
+                    );
+                }
             }
             TranscriptEntry::Error { body } => push_prefixed_lines(
                 &mut lines,
