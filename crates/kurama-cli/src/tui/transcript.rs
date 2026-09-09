@@ -2,6 +2,7 @@ use kurama_protocol::policy::ExecutionMode;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::{
     Frame,
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Padding, Paragraph},
@@ -14,7 +15,7 @@ use std::cell::Cell;
 use super::{
     ToolLifecycle, TranscriptEntry, TuiState,
     syntax::highlight_code,
-    theme::{ACCENT, BLUE, BORDER, DIM, GREEN, RED, TEXT},
+    theme::{ACCENT, BLUE, BORDER, DIM, GREEN, RED, TEXT, USER_BAND},
 };
 
 #[cfg(test)]
@@ -1315,8 +1316,11 @@ pub fn transcript_lines(
                     body,
                     "› ",
                     "  ",
-                    Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
-                    Style::default().fg(TEXT),
+                    Style::default()
+                        .fg(BLUE)
+                        .bg(USER_BAND)
+                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(TEXT).bg(USER_BAND),
                     width,
                 );
             }
@@ -1475,11 +1479,13 @@ pub(crate) fn render_transcript_view(frame: &mut Frame<'_>, state: &TuiState) {
     }
 
     let block = Block::default().padding(Padding::new(2, 2, 0, 0));
-    let transcript_area = block.inner(area);
+    let mut transcript_area = block.inner(area);
     if transcript_area.is_empty() {
         frame.render_widget(block, area);
         return;
     }
+    let hint_height = u16::from(transcript_area.height > 1);
+    transcript_area.height = transcript_area.height.saturating_sub(hint_height);
 
     let transcript = transcript_lines(
         &state.transcript,
@@ -1499,24 +1505,36 @@ pub(crate) fn render_transcript_view(frame: &mut Frame<'_>, state: &TuiState) {
         .take(viewport_height)
         .collect::<Vec<_>>();
 
-    frame.render_widget(Paragraph::new(Text::from(visible)).block(block), area);
+    frame.render_widget(
+        Paragraph::new(Text::from(visible)).block(block.clone()),
+        area,
+    );
+    if hint_height > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "esc close · ↑↓ scroll",
+                Style::default().fg(DIM),
+            ))),
+            Rect::new(
+                transcript_area.x,
+                transcript_area.bottom(),
+                transcript_area.width,
+                1,
+            ),
+        );
+    }
 }
 
 fn push_markdown_lines(lines: &mut Vec<Line<'static>>, body: &str, width: usize) {
-    let prefix_width = display_width("• ");
+    let prefix_width = display_width("  ");
     let mut markdown = markdown_lines(body, width.saturating_sub(prefix_width).max(1));
     if markdown.is_empty() {
         markdown.push(Line::default());
     }
     for (index, mut line) in markdown.into_iter().enumerate() {
-        if !line_starts_with_list_marker(&line) {
-            line.spans.insert(
-                0,
-                Span::styled(
-                    if index == 0 { "• " } else { "  " },
-                    Style::default().fg(DIM),
-                ),
-            );
+        if !line_starts_with_list_marker(&line) && index > 0 {
+            line.spans
+                .insert(0, Span::styled("  ", Style::default().fg(DIM)));
         }
         lines.push(line);
     }

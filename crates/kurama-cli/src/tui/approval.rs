@@ -8,6 +8,7 @@ pub struct ApprovalState {
     pub editor_cursor: usize,
     pub validation_error: Option<String>,
     pub editing: bool,
+    pub selected: usize,
 }
 
 impl ApprovalState {
@@ -21,7 +22,16 @@ impl ApprovalState {
             editor,
             validation_error: None,
             editing: false,
+            selected: 0,
         }
+    }
+
+    pub fn select_next(&mut self) {
+        self.selected = (self.selected + 1).min(3);
+    }
+
+    pub fn select_previous(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
     }
 
     pub fn set_editor(&mut self, editor: impl Into<String>) {

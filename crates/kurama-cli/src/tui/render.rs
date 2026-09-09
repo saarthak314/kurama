@@ -46,7 +46,7 @@ pub(crate) fn render_with_transcript(
     render_main(frame, state, prepared_transcript);
     match state.overlay {
         Overlay::None | Overlay::Approval | Overlay::ApprovalEdit => {}
-        Overlay::Shortcuts => render_shortcuts(frame, state),
+        Overlay::Shortcuts => {}
         Overlay::Onboarding => {
             if let Some(position) = render_onboarding(frame, state) {
                 frame.set_cursor_position(position);
@@ -72,8 +72,11 @@ fn render_main(
         return;
     }
     let approval_visible = matches!(state.overlay, Overlay::Approval | Overlay::ApprovalEdit);
+    let shortcuts_visible = state.overlay == Overlay::Shortcuts;
     let input_height = if approval_visible {
         approval_height(state, area.width)
+    } else if shortcuts_visible {
+        10.min(area.height).max(5)
     } else {
         composer_height(state, area.width)
     };
@@ -137,6 +140,8 @@ fn render_main(
         if let Some(position) = render_approval(frame, state, layout.input) {
             frame.set_cursor_position(position);
         }
+    } else if shortcuts_visible {
+        render_shortcuts(frame, state, layout.input);
     } else if state.overlay == Overlay::None
         && let Some(position) = render_composer(frame, state, layout.input)
     {
@@ -167,24 +172,15 @@ fn render_main(
     }
 }
 
-fn render_shortcuts(frame: &mut Frame<'_>, state: &TuiState) {
+fn render_shortcuts(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
     let _ = state;
-    let frame_area = frame.area();
-    if frame_area.is_empty() {
+    if area.is_empty() {
         return;
     }
-    let width = 52.min(frame_area.width.saturating_sub(2)).max(24);
-    let height = 12.min(frame_area.height.saturating_sub(2)).max(5);
-    let area = Rect::new(
-        frame_area.x + (frame_area.width.saturating_sub(width)) / 2,
-        frame_area.y + (frame_area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    );
     frame.render_widget(Clear, area);
     let lines = [
         ("ctrl+c", "interrupt, then clear, then exit"),
-        ("esc", "interrupt a running turn"),
+        ("esc", "close overlay, then interrupt"),
         ("enter", "send"),
         ("shift+enter", "newline"),
         ("ctrl+o", "expand transcript"),

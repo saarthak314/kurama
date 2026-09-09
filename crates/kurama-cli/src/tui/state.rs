@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -114,6 +115,7 @@ pub struct TuiState {
     pub usage: Usage,
     pub transcript: Vec<TranscriptEntry>,
     pub composer: String,
+    pub composer_inner_width: Cell<u16>,
     pub cursor: usize,
     pub scroll: usize,
     pub running_agents: usize,
@@ -161,6 +163,7 @@ impl TuiState {
             usage: Usage::default(),
             transcript: Vec::new(),
             composer: String::new(),
+            composer_inner_width: Cell::new(72),
             cursor: 0,
             scroll: 0,
             running_agents: 0,
@@ -449,7 +452,9 @@ impl TuiState {
 
     pub fn toggle_transcript_view(&mut self) {
         self.transcript_view_expanded = !self.transcript_view_expanded;
-        self.scroll = 0;
+        if self.transcript_view_expanded {
+            self.scroll = 0;
+        }
     }
 
     pub const fn transcript_view_expanded(&self) -> bool {
@@ -506,6 +511,7 @@ impl TuiState {
             self.overlay = Overlay::None;
             self.sent_commands.push(EngineCommand::CancelTurn);
             self.activity = ActivityState::Interrupted;
+            self.pending_turns.clear();
             return true;
         }
         if !self.activity.is_animated() {
@@ -513,7 +519,12 @@ impl TuiState {
         }
         self.sent_commands.push(EngineCommand::CancelTurn);
         self.activity = ActivityState::Interrupted;
+        self.pending_turns.clear();
         true
+    }
+
+    pub fn pop_queued_follow_up(&mut self) -> bool {
+        self.pending_turns.pop_back().is_some()
     }
 
     fn push_transcript_entry(&mut self, entry: TranscriptEntry) {

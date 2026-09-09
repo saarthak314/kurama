@@ -82,6 +82,7 @@ pub(crate) fn render_composer(
     if content.is_empty() {
         return None;
     }
+    state.composer_inner_width.set(content.width);
 
     if state.composer.is_empty() {
         let placeholder = "Ask Kurama to do anything";
@@ -199,9 +200,29 @@ pub(crate) fn render_queue(frame: &mut Frame<'_>, state: &TuiState, area: Rect) 
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, _show_help: bool) {
+pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, show_help: bool) {
     if area.is_empty() {
         return;
+    }
+
+    if show_help {
+        let hint = if state.activity().is_animated() && !state.composer.is_empty() {
+            "enter queues · esc interrupt"
+        } else if state.composer.is_empty() {
+            "enter send · ctrl+j newline · ? shortcuts"
+        } else {
+            ""
+        };
+        if !hint.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    truncate_display(hint, area.width as usize),
+                    Style::default().fg(DIM),
+                ))),
+                area,
+            );
+            return;
+        }
     }
 
     let profile = FooterItem::dim(format!("{}/{}", state.profile, state.model));
@@ -235,8 +256,39 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect,
 
 struct ComposerVisual {
     lines: Vec<String>,
+    starts: Vec<usize>,
     cursor_row: usize,
     cursor_column: usize,
+}
+
+pub(crate) fn composer_cursor_vertical(
+    input: &str,
+    cursor: usize,
+    width: usize,
+    delta: i32,
+) -> Option<usize> {
+    let visual = composer_visual(input, cursor, width);
+    let target = visual.cursor_row as i32 + delta;
+    if target < 0 || target >= visual.lines.len() as i32 {
+        return None;
+    }
+    Some(offset_at(&visual, target as usize, visual.cursor_column))
+}
+
+fn offset_at(visual: &ComposerVisual, row: usize, column: usize) -> usize {
+    let start = visual.starts.get(row).copied().unwrap_or(0);
+    let line = visual.lines.get(row).map(String::as_str).unwrap_or("");
+    let mut used = 0_usize;
+    let mut offset = start;
+    for grapheme in line.graphemes(true) {
+        let grapheme_width = Line::from(grapheme).width();
+        if used + grapheme_width > column {
+            break;
+        }
+        used += grapheme_width;
+        offset += grapheme.len();
+    }
+    offset
 }
 
 fn composer_visual(input: &str, cursor: usize, width: usize) -> ComposerVisual {
@@ -247,6 +299,7 @@ fn composer_visual(input: &str, cursor: usize, width: usize) -> ComposerVisual {
     }
 
     let mut lines = Vec::new();
+    let mut starts = vec![0_usize];
     let mut line = String::new();
     let mut line_width = 0_usize;
     let mut cursor_row = 0_usize;
@@ -260,6 +313,7 @@ fn composer_visual(input: &str, cursor: usize, width: usize) -> ComposerVisual {
             && line_width.saturating_add(grapheme_width) > content_width
         {
             lines.push(std::mem::take(&mut line));
+            starts.push(index);
             line_width = 0;
         }
         if index == cursor {
@@ -274,6 +328,7 @@ fn composer_visual(input: &str, cursor: usize, width: usize) -> ComposerVisual {
         }
         if grapheme == "\n" {
             lines.push(std::mem::take(&mut line));
+            starts.push(index.saturating_add(grapheme.len()));
             line_width = 0;
         } else {
             line.push_str(grapheme);
@@ -284,6 +339,7 @@ fn composer_visual(input: &str, cursor: usize, width: usize) -> ComposerVisual {
     if !cursor_recorded {
         if cursor == input.len() && line_width >= content_width && !line.is_empty() {
             lines.push(std::mem::take(&mut line));
+            starts.push(input.len());
             line_width = 0;
         }
         cursor_row = lines.len();
@@ -293,6 +349,7 @@ fn composer_visual(input: &str, cursor: usize, width: usize) -> ComposerVisual {
 
     ComposerVisual {
         lines,
+        starts,
         cursor_row,
         cursor_column,
     }
@@ -316,7 +373,7 @@ fn approval_layout(approval: &ApprovalState, width: usize, max_height: usize) ->
     } else {
         max_height.saturating_sub(1)
     };
-    let controls = approval_controls(approval.editing, width, control_height);
+    let controls = approval_controls(approval.editing, approval.selected, width, control_height);
     let body_height = max_height.saturating_sub(controls.len());
     let detail_text = approval_detail(&approval.request.operation);
     let detail = indented_lines(&detail_text, width, Style::default(), false);
@@ -401,9 +458,36 @@ fn approval_layout(approval: &ApprovalState, width: usize, max_height: usize) ->
     }
 }
 
-fn approval_controls(editing: bool, width: usize, max_lines: usize) -> Vec<Line<'static>> {
+fn approval_controls(
+    editing: bool,
+    selected: usize,
+    width: usize,
+    max_lines: usize,
+) -> Vec<Line<'static>> {
     if width == 0 || max_lines == 0 {
         return Vec::new();
+    }
+
+    if !editing && max_lines >= 4 {
+        let choices = ["Approve once", "Approve session", "Deny", "Edit"];
+        return choices
+            .into_iter()
+            .enumerate()
+            .map(|(index, label)| {
+                let active = index == selected.min(3);
+                Line::from(vec![
+                    Span::styled(if active { "› " } else { "  " }, Style::default().fg(AMBER)),
+                    Span::styled(
+                        label,
+                        if active {
+                            Style::default().fg(AMBER).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(DIM)
+                        },
+                    ),
+                ])
+            })
+            .collect();
     }
 
     let full_labels = if editing {
@@ -585,8 +669,10 @@ fn approval_editor_visual(editor: &str, cursor: usize, width: usize) -> Composer
         if let Some(column) = line.find(CURSOR_MARKER) {
             let cursor_column = Line::from(&line[..column]).width();
             line.remove(column);
+            let starts = vec![0; lines.len()];
             return ComposerVisual {
                 lines,
+                starts,
                 cursor_row: row,
                 cursor_column,
             };
@@ -594,6 +680,7 @@ fn approval_editor_visual(editor: &str, cursor: usize, width: usize) -> Composer
     }
     ComposerVisual {
         lines,
+        starts: Vec::new(),
         cursor_row: 0,
         cursor_column: 0,
     }

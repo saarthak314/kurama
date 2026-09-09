@@ -727,7 +727,9 @@ async fn reopening_connect_resets_a_cancelled_wizard() {
     press_enter(&mut app);
     type_command(&mut app, "discarded");
     app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
-        .expect("cancel wizard");
+        .expect("back to connection");
+    app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .expect("close wizard");
     submit_command(&mut app, "/connect");
 
     assert!(app.state.onboarding.is_selecting_connection());
