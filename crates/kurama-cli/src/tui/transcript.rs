@@ -1406,7 +1406,7 @@ fn compact_tool_output(tool: &super::ToolTranscript, output: &str, width: usize)
 
     if tool.lifecycle == ToolLifecycle::Running {
         if output.is_empty() {
-            return vec!["waiting for output".into()];
+            return Vec::new();
         }
         let output = hard_wrap(output, width);
         let omitted = output.len().saturating_sub(RUNNING_TAIL_LINES);
@@ -1422,12 +1422,7 @@ fn compact_tool_output(tool: &super::ToolTranscript, output: &str, width: usize)
     }
 
     if output.is_empty() {
-        let status = if tool.lifecycle == ToolLifecycle::Failed {
-            "failure"
-        } else {
-            "success"
-        };
-        return vec![format!("{status} · no output")];
+        return Vec::new();
     }
 
     const PREVIEW_LINES: usize = 2;
@@ -1446,7 +1441,7 @@ fn compact_tool_output(tool: &super::ToolTranscript, output: &str, width: usize)
 
 fn expanded_tool_output(output: &str, width: usize) -> Vec<String> {
     if output.is_empty() {
-        vec!["(no output)".into()]
+        Vec::new()
     } else {
         hard_wrap(output, width)
     }
@@ -1479,7 +1474,7 @@ pub(crate) fn render_transcript_view(frame: &mut Frame<'_>, state: &TuiState) {
         return;
     }
 
-    let block = Block::default().padding(Padding::new(2, 2, 1, 1));
+    let block = Block::default().padding(Padding::new(2, 2, 0, 0));
     let transcript_area = block.inner(area);
     if transcript_area.is_empty() {
         frame.render_widget(block, area);
