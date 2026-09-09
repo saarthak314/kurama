@@ -178,3 +178,23 @@ fn live_todo_tool_completion_updates_state_and_transcript() {
         "• todo\n  [x] ship the fix\n  [>] write tests"
     );
 }
+
+#[test]
+fn ctrl_t_toggles_todo_overlay() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.todos = vec![item("one", "ship the fix", TodoStatus::Pending)];
+    state.toggle_todos();
+    assert_eq!(state.overlay(), Overlay::Todos);
+    state.toggle_todos();
+    assert_eq!(state.overlay(), Overlay::None);
+}
+
+#[test]
+fn last_assistant_text_is_the_latest_reply() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    assert!(state.last_assistant_text().is_none());
+    state.push_assistant("first");
+    state.push_user("again");
+    state.push_assistant("second");
+    assert_eq!(state.last_assistant_text(), Some("second"));
+}

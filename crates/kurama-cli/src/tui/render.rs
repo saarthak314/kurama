@@ -112,6 +112,7 @@ fn render_main(
             &rendered_transcript
         };
         let viewport_height = layout.transcript.height as usize;
+        state.viewport_height.set(layout.transcript.height);
         let scroll = state
             .scroll
             .min(transcript.len().saturating_sub(viewport_height));
@@ -183,10 +184,10 @@ fn render_shortcuts(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
         ("ctrl+c", "interrupt, then clear, then exit"),
         ("esc", "close overlay, then interrupt"),
         ("enter", "send"),
-        ("shift+enter", "newline"),
+        ("ctrl+j", "newline"),
         ("ctrl+o", "expand transcript"),
-        ("up/down", "prompt history"),
-        ("/help", "slash commands"),
+        ("ctrl+t", "todo list"),
+        ("shift+tab", "cycle supervised/auto"),
         ("?", "this overlay"),
     ]
     .into_iter()

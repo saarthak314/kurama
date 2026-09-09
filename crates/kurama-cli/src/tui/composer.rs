@@ -230,6 +230,9 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect,
     let mode = FooterItem::new(mode_label(state.mode).to_owned(), mode_style(state.mode));
     let context = state.context_label().map(FooterItem::dim);
     let mut items = vec![profile, project];
+    if let Some(branch) = &state.git_branch {
+        items.push(FooterItem::dim(branch.clone()));
+    }
     if let Some(context) = context {
         items.push(context);
     }

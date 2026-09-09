@@ -1546,6 +1546,7 @@ pub(crate) fn render_transcript_view(frame: &mut Frame<'_>, state: &TuiState) {
         TranscriptDetail::Expanded,
     );
     let viewport_height = transcript_area.height as usize;
+    state.viewport_height.set(transcript_area.height);
     let scroll = state
         .scroll
         .min(transcript.len().saturating_sub(viewport_height));
@@ -1565,7 +1566,7 @@ pub(crate) fn render_transcript_view(frame: &mut Frame<'_>, state: &TuiState) {
     if hint_height > 0 {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "esc close · ↑↓ scroll",
+                "esc close · ↑↓ scroll · { } prompts",
                 Style::default().fg(DIM),
             ))),
             Rect::new(

@@ -129,6 +129,8 @@ pub struct TuiState {
     pub approval: Option<ApprovalState>,
     pub agents: Vec<AgentRow>,
     pub todos: Vec<TodoItem>,
+    pub git_branch: Option<String>,
+    pub viewport_height: Cell<u16>,
     pub selected_agent: usize,
     pub agent_message: String,
     pub agent_message_cursor: usize,
@@ -178,6 +180,8 @@ impl TuiState {
             approval: None,
             agents: Vec::new(),
             todos: Vec::new(),
+            git_branch: None,
+            viewport_height: Cell::new(12),
             selected_agent: 0,
             agent_message: String::new(),
             agent_message_cursor: 0,
@@ -714,6 +718,77 @@ impl TuiState {
 
     pub fn open_todos(&mut self) {
         self.overlay = Overlay::Todos;
+    }
+
+    pub fn toggle_todos(&mut self) {
+        if self.overlay == Overlay::Todos {
+            self.close_overlay();
+        } else if self.overlay == Overlay::None {
+            self.open_todos();
+        }
+    }
+
+    pub fn last_assistant_text(&self) -> Option<&str> {
+        self.transcript.iter().rev().find_map(|entry| match entry {
+            TranscriptEntry::AssistantMessage { body } => Some(body.as_str()),
+            _ => None,
+        })
+    }
+
+    pub fn refresh_git_branch(&mut self) {
+        self.git_branch = std::process::Command::new("git")
+            .args(["-C", &self.project, "rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|branch| branch.trim().to_owned())
+            .filter(|branch| !branch.is_empty() && branch != "HEAD");
+    }
+
+    pub fn jump_user_turn(&mut self, direction: i32, width: usize) {
+        let width = width.max(8);
+        let viewport = self.viewport_height.get().max(1) as usize;
+        let rendered =
+            super::transcript_lines(&self.transcript, width, super::TranscriptDetail::Compact);
+        if rendered.len() <= viewport {
+            self.scroll = 0;
+            return;
+        }
+        let mut starts = Vec::new();
+        for (index, entry) in self.transcript.iter().enumerate() {
+            if matches!(entry, TranscriptEntry::UserTurn { .. }) {
+                starts.push(
+                    super::transcript_lines(
+                        &self.transcript[..index],
+                        width,
+                        super::TranscriptDetail::Compact,
+                    )
+                    .len(),
+                );
+            }
+        }
+        if starts.is_empty() {
+            return;
+        }
+        let max_scroll = rendered.len().saturating_sub(viewport);
+        let current_start = rendered
+            .len()
+            .saturating_sub(viewport.saturating_add(self.scroll));
+        let current = starts
+            .iter()
+            .rposition(|start| *start <= current_start)
+            .unwrap_or(0);
+        let next = if direction < 0 {
+            current.saturating_sub(1)
+        } else {
+            (current + 1).min(starts.len().saturating_sub(1))
+        };
+        let target = starts[next];
+        self.scroll = rendered
+            .len()
+            .saturating_sub(viewport.saturating_add(target))
+            .min(max_scroll);
     }
 
     pub const fn overlay(&self) -> Overlay {

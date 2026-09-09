@@ -438,6 +438,7 @@ impl App {
         );
         state.max_input_tokens = active.max_input_tokens;
         state.hydrate_replay(&transcript_replay);
+        state.refresh_git_branch();
         state.prepend_startup(env!("CARGO_PKG_VERSION"), startup_project);
         if resumed_yolo {
             state.push_notice(
@@ -599,6 +600,23 @@ impl App {
                 KeyCode::Down => self.state.scroll = self.state.scroll.saturating_sub(1),
                 KeyCode::PageUp => self.state.scroll = self.state.scroll.saturating_add(5),
                 KeyCode::PageDown => self.state.scroll = self.state.scroll.saturating_sub(5),
+                KeyCode::Home => {
+                    let width = self.state.composer_inner_width.get().max(8) as usize;
+                    let rendered = crate::tui::transcript_lines(
+                        &self.state.transcript,
+                        width,
+                        crate::tui::TranscriptDetail::Expanded,
+                    );
+                    let viewport = self.state.viewport_height.get().max(1) as usize;
+                    self.state.scroll = rendered.len().saturating_sub(viewport);
+                }
+                KeyCode::End => self.state.scroll = 0,
+                KeyCode::Char('{') => self
+                    .state
+                    .jump_user_turn(-1, self.state.composer_inner_width.get().max(8) as usize),
+                KeyCode::Char('}') => self
+                    .state
+                    .jump_user_turn(1, self.state.composer_inner_width.get().max(8) as usize),
                 _ => {}
             }
             return Ok(false);
@@ -668,6 +686,8 @@ impl App {
                     self.state.cursor += 1;
                     self.state.composer_edited();
                 }
+                KeyCode::Char('l') => self.state.scroll = 0,
+                KeyCode::Char('t') => self.state.toggle_todos(),
                 KeyCode::Char('d') => {
                     if self.state.composer.is_empty() {
                         self.exit_requested = true;
@@ -688,6 +708,7 @@ impl App {
             return Ok(());
         }
         match key.code {
+            KeyCode::BackTab => self.cycle_mode()?,
             KeyCode::Home => self.state.cursor_home(),
             KeyCode::End => self.state.cursor_end(),
             KeyCode::Char('?') if self.state.composer.is_empty() => {
@@ -879,6 +900,9 @@ impl App {
                         self.state.push_error("context details are unavailable");
                     }
                 }
+                Command::Status => self.push_status_notice(),
+                Command::Copy => self.copy_last_assistant(),
+                Command::Diff => self.push_diff_notice(),
                 Command::Compact => {
                     self.state.queue_command(EngineCommand::Compact);
                     self.state
@@ -1262,6 +1286,86 @@ impl App {
                 self.state.close_overlay()
             }
             _ => {}
+        }
+    }
+
+    fn cycle_mode(&mut self) -> Result<(), String> {
+        if self.state.mode == ExecutionMode::Yolo {
+            self.state
+                .push_notice(Some("MODE".into()), "YOLO is launch-only");
+            return Ok(());
+        }
+        let mode = if self.state.mode == ExecutionMode::Supervised {
+            ExecutionMode::Auto
+        } else {
+            ExecutionMode::Supervised
+        };
+        if let Some(control) = &self.control {
+            control
+                .repository
+                .remember_mode(mode)
+                .map_err(|error| error.to_string())?;
+        }
+        self.state.mode = mode;
+        self.state.queue_command(EngineCommand::SetMode(mode));
+        self.state.push_notice(
+            Some("MODE".into()),
+            format!("mode {}", execution_mode_label(mode)),
+        );
+        Ok(())
+    }
+
+    fn push_status_notice(&mut self) {
+        let session = self.session_id.as_ref().map_or("none", AsRef::as_ref);
+        let todos = self.state.todos.len();
+        let branch = self.state.git_branch.as_deref().unwrap_or("-");
+        let max_input = self
+            .control
+            .as_ref()
+            .map(|control| control.max_input_tokens)
+            .unwrap_or(self.state.max_input_tokens);
+        let usage = if max_input == 0 {
+            "n/a".into()
+        } else if self.state.usage.input_tokens == 0 {
+            format!("{max_input} input")
+        } else {
+            format!(
+                "{}% of {max_input}",
+                (self.state.usage.input_tokens.saturating_mul(100) / max_input.max(1)).min(100)
+            )
+        };
+        self.state.push_notice(
+            Some("STATUS".into()),
+            format!(
+                "{}/{}  {}  session {session}  todos {todos}  git {branch}  context {usage}",
+                self.state.profile,
+                self.state.model,
+                execution_mode_label(self.state.mode),
+            ),
+        );
+    }
+
+    fn copy_last_assistant(&mut self) {
+        let Some(text) = self.state.last_assistant_text().map(str::to_owned) else {
+            self.state.push_error("no assistant reply to copy");
+            return;
+        };
+        match copy_to_clipboard(&text) {
+            Ok(()) => self.state.push_notice(
+                Some("COPY".into()),
+                format!("copied {} characters", text.chars().count()),
+            ),
+            Err(error) => self.state.push_error(error),
+        }
+    }
+
+    fn push_diff_notice(&mut self) {
+        match git_diff_stat(&self.state.project) {
+            Ok(diff) if diff.trim().is_empty() => self
+                .state
+                .push_notice(Some("DIFF".into()), "working tree is clean"),
+            Ok(diff) => self.state.push_notice(Some("DIFF".into()), diff),
+            Err(error) => self.state.push_error(error),
         }
     }
 
@@ -2217,6 +2321,90 @@ fn now_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+fn copy_to_clipboard(_text: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    let mut copied = false;
+    for command in ["pbcopy", "wl-copy", "xclip"] {
+        let mut child = match std::process::Command::new(command)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => continue,
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        if child.wait().map(|status| status.success()).unwrap_or(false) {
+            copied = true;
+            break;
+        }
+    }
+    if io::IsTerminal::is_terminal(&io::stdout()) {
+        let mut encoded = String::new();
+        base64_encode(text.as_bytes(), &mut encoded);
+        let mut stdout = io::stdout();
+        let _ = write!(stdout, "\x1b]52;c;{encoded}\x07");
+        let _ = stdout.flush();
+        copied = true;
+    }
+    if copied {
+        Ok(())
+    } else {
+        Err("no clipboard command available".into())
+    }
+}
+
+#[cfg(not(test))]
+fn base64_encode(bytes: &[u8], out: &mut String) {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for chunk in bytes.chunks(3) {
+        let a = chunk[0];
+        let b = chunk.get(1).copied().unwrap_or(0);
+        let c = chunk.get(2).copied().unwrap_or(0);
+        out.push(TABLE[(a >> 2) as usize] as char);
+        out.push(TABLE[(((a & 0x03) << 4) | (b >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(((b & 0x0f) << 2) | (c >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(c & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+}
+
+fn git_diff_stat(project: &str) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .args(["-C", project, "diff", "--stat"])
+        .output()
+        .map_err(|error| format!("git diff failed: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    let mut diff = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if diff.chars().count() > 800 {
+        let end = diff
+            .char_indices()
+            .nth(800)
+            .map(|(index, _)| index)
+            .unwrap_or(diff.len());
+        diff.truncate(end);
+        diff.push('…');
+    }
+    Ok(diff)
 }
 
 fn execution_mode_label(mode: ExecutionMode) -> &'static str {

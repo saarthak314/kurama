@@ -173,6 +173,9 @@ fn parses_all_product_commands_without_restart() {
         Command::Mode(ExecutionMode::Auto)
     );
     assert_eq!(parse_command("/help").unwrap(), Command::Help);
+    assert_eq!(parse_command("/copy").unwrap(), Command::Copy);
+    assert_eq!(parse_command("/diff").unwrap(), Command::Diff);
+    assert_eq!(parse_command("/status").unwrap(), Command::Status);
     assert_eq!(parse_command("/exit").unwrap(), Command::Exit);
     assert!(parse_command("/restart").is_err());
     assert!(parse_command("/mode yolo").is_err());
@@ -464,7 +467,8 @@ fn question_mark_opens_a_shortcuts_overlay() {
 
     assert!(text.contains("shortcuts"));
     assert!(text.contains("ctrl+c"));
-    assert!(text.contains("shift+enter"));
+    assert!(text.contains("ctrl+j"));
+    assert!(text.contains("ctrl+t"));
     assert!(text.contains("close overlay") || text.contains("interrupt"));
 }
 
