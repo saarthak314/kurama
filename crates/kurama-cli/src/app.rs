@@ -1481,6 +1481,7 @@ fn uses_full_inline_viewport(state: &TuiState) -> bool {
             state.overlay(),
             Overlay::Onboarding
                 | Overlay::Agents
+                | Overlay::Todos
                 | Overlay::AgentInspect
                 | Overlay::AgentMessage
                 | Overlay::ConfirmAgentCancel
@@ -3034,7 +3035,7 @@ Session ID: ses_cafebabe"
 
         state.overlay = Overlay::Todos;
         assert_eq!(desired_inline_viewport_height(&state, 80, 24), 24);
-        assert!(!uses_full_inline_viewport(&state));
+        assert!(uses_full_inline_viewport(&state));
     }
 
     #[test]

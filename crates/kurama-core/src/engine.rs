@@ -1224,15 +1224,11 @@ impl EngineActor {
                 result: result.clone(),
             })?;
         }
-        let todo_items = if tool_name == "todo" && !result.is_error {
-            Some(items_from_result_or_arguments(&result, &arguments)?)
-        } else {
-            None
-        };
-        let result = self.complete_tool(operation_id, result).await?;
-        if let Some(items) = todo_items {
+        if tool_name == "todo" && !result.is_error {
+            let items = items_from_result_or_arguments(&result, &arguments)?;
             self.append(SessionEvent::TodoUpdated { items })?;
         }
+        let result = self.complete_tool(operation_id, result).await?;
         Ok(result)
     }
 

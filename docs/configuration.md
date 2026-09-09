@@ -58,7 +58,7 @@ Plaintext keys are invalid. Kurama never reads Codex or Claude credential stores
 
 ## Auto Boundaries
 
-Auto mode approves only operations contained by `write_roots`, commands whose executable is listed in `allowed_commands`, and network requests to `allowed_hosts`. A boundary violation is denied rather than converted into an approval prompt. Concurrency defaults to four and must remain between one and eight; children cannot create further children.
+Auto mode approves only operations contained by `write_roots`, commands whose executable is listed in `allowed_commands`, and network requests to `allowed_hosts`. A boundary violation is denied rather than converted into an approval prompt. Concurrency defaults to four and must remain between one and eight; children cannot create further children. The parent may run up to three delegation waves per user turn. A child is asked to wrap up at 80% of its turn, token, or time budget; the hard limit cancels unless the child already produced a summary, which is kept.
 
 ## Resolution and State
 

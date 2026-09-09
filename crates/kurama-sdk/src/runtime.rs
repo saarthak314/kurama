@@ -329,7 +329,7 @@ impl ChildRunner for RuntimeChildRunner {
                                         ..ChildProgress::default()
                                     }).await;
                                 }
-                                if pending_messages.is_empty() {
+                                if pending_messages.is_empty() && !over_budget {
                                     let _ = context.progress.send(ChildProgress {
                                         phase: Some("completed turn".into()),
                                         completed_turns,
@@ -399,6 +399,13 @@ impl ChildRunner for RuntimeChildRunner {
                                     return Err(KuramaError::Cancelled);
                                 }
                                 let next_profile = next_profile.expect("queued work has budget");
+                                if wrapping_up
+                                    && !pending_messages
+                                        .iter()
+                                        .any(|message| message == CHILD_BUDGET_WRAP_UP)
+                                {
+                                    pending_messages.insert(0, CHILD_BUDGET_WRAP_UP.into());
+                                }
                                 let message = pending_messages.join("\n");
                                 pending_messages.clear();
                                 last_assistant_text.clear();

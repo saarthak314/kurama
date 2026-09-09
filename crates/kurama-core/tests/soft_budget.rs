@@ -140,6 +140,76 @@ impl ChildRunner for TimeBudgetRunner {
     }
 }
 
+struct TokenBudgetRunner {
+    warning: mpsc::UnboundedSender<String>,
+}
+
+impl ChildRunner for TokenBudgetRunner {
+    fn run(
+        &self,
+        mut context: ChildRunContext,
+    ) -> BoxFuture<'static, Result<AgentResult, KuramaError>> {
+        let warning = self.warning.clone();
+        Box::pin(async move {
+            context
+                .progress
+                .send(ChildProgress {
+                    usage: kurama_protocol::model::Usage {
+                        input_tokens: 64_000,
+                        output_tokens: 0,
+                        cached_input_tokens: 0,
+                    },
+                    completed_turns: 1,
+                    ..ChildProgress::default()
+                })
+                .await
+                .expect("progress");
+            let message = context.messages.recv().await.expect("wrap-up message");
+            warning.send(message).expect("warning observation");
+            Ok(AgentResult {
+                agent_id: context.agent_id,
+                summary: "wrapped".into(),
+                changed_files: Vec::new(),
+                evidence_refs: Vec::new(),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn token_budget_warns_at_eighty_percent() {
+    let manager = Arc::new(AgentManager::new(
+        "token-soft-budget".into(),
+        None,
+        1,
+        Arc::new(MemoryStore::default()),
+        Arc::new(CollectingSink::default()),
+    ));
+    let (warning_tx, mut warning_rx) = mpsc::unbounded_channel();
+    let executing = {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            manager
+                .execute(
+                    plan(12, 60),
+                    "project".into(),
+                    Arc::new(TokenBudgetRunner {
+                        warning: warning_tx,
+                    }),
+                )
+                .await
+        })
+    };
+
+    let warning = warning_rx.recv().await.expect("warning");
+    assert!(warning.contains("wrap up"));
+    let results = executing.await.expect("execution task").expect("execute");
+    assert_eq!(results.len(), 1);
+    let inspection = manager.inspect(&"child".into()).await.expect("inspection");
+    assert_eq!(inspection.snapshot.state, AgentState::Completed);
+    assert_eq!(inspection.snapshot.phase.as_deref(), Some("wrapping up"));
+}
+
 #[tokio::test]
 async fn time_budget_warns_before_the_existing_hard_timeout() {
     let manager = Arc::new(AgentManager::new(

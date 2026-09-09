@@ -638,8 +638,12 @@ impl AgentManager {
                 || progress.usage.output_tokens > agent.spec.budget.max_output_tokens
                 || progress.completed_turns > agent.spec.budget.max_turns;
             let should_warn = !agent.budget_warned
-                && progress.completed_turns.saturating_mul(5)
-                    >= agent.spec.budget.max_turns.saturating_mul(4);
+                && (progress.completed_turns.saturating_mul(5)
+                    >= agent.spec.budget.max_turns.saturating_mul(4)
+                    || progress.usage.input_tokens.saturating_mul(5)
+                        >= agent.spec.budget.max_input_tokens.saturating_mul(4)
+                    || progress.usage.output_tokens.saturating_mul(5)
+                        >= agent.spec.budget.max_output_tokens.saturating_mul(4));
             let wrap_up_sender = if should_warn && !budget_exhausted {
                 agent.budget_warned = true;
                 snapshot.phase = Some("wrapping up".into());
