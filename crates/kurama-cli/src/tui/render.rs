@@ -169,10 +169,18 @@ fn render_main(
 
 fn render_shortcuts(frame: &mut Frame<'_>, state: &TuiState) {
     let _ = state;
-    let area = inset(frame.area(), 6, 4);
-    if area.is_empty() {
+    let frame_area = frame.area();
+    if frame_area.is_empty() {
         return;
     }
+    let width = 52.min(frame_area.width.saturating_sub(2)).max(24);
+    let height = 12.min(frame_area.height.saturating_sub(2)).max(5);
+    let area = Rect::new(
+        frame_area.x + (frame_area.width.saturating_sub(width)) / 2,
+        frame_area.y + (frame_area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    );
     frame.render_widget(Clear, area);
     let lines = [
         ("ctrl+c", "interrupt, then clear, then exit"),
@@ -238,11 +246,7 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) -> Option<Position
             .padding(Padding::new(1, 1, 0, 0));
         let inner = block.inner(area);
         let field_width = inner.width.saturating_sub(2).max(1) as usize;
-        let shown = if input.is_empty() {
-            " ".to_owned()
-        } else {
-            truncate_display(&input, field_width)
-        };
+        let shown = truncate_display(&input, field_width);
         let mut lines = vec![
             Line::from(Span::styled(
                 state.onboarding.step_label(),
@@ -301,17 +305,11 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) -> Option<Position
         let selected = index == state.onboarding.selected();
         lines.push(Line::from(vec![
             Span::styled(
-                format!(" {} ", index + 1),
-                Style::default()
-                    .fg(if selected { TEXT } else { DIM })
-                    .add_modifier(if selected {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
+                if selected { "› " } else { "  " },
+                Style::default().fg(ACCENT),
             ),
             Span::styled(
-                format!("  {option}"),
+                format!("{}  {option}", index + 1),
                 Style::default()
                     .fg(if selected { TEXT } else { DIM })
                     .add_modifier(if selected {

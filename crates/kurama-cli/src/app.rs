@@ -7,7 +7,11 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::{
+    event::{Event, KeyCode, KeyEvent, KeyModifiers},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen},
+};
 use kurama_adapters::{
     AppPaths, BashTool, ConfigRepository, CredentialResolver, FsSessionStore, HttpClient,
     JsonSearchBackend, OpenAiNativeSearch, ProviderFactory, ReadTool, SearchBackend, SecretValue,
@@ -93,6 +97,12 @@ impl TranscriptRenderCache {
 struct ResizeMode {
     replay: bool,
     purge_history: bool,
+}
+
+#[derive(Default)]
+struct AltOverlay {
+    active: bool,
+    saved: Option<Rect>,
 }
 
 impl ResizeMode {
@@ -1346,13 +1356,10 @@ fn prepare_inline_frame<B>(
 where
     B: Backend + Clone,
 {
-    if !state.stable_transcript().is_empty() {
+    if !state.stable_transcript().is_empty() && !uses_full_inline_viewport(state) {
         let size = terminal.size().map_err(|error| error.to_string())?;
-        let viewport_height = if uses_full_inline_viewport(state) {
-            size.height
-        } else {
-            desired_inline_viewport_height_for_transcript(state, size.width, size.height, 0)
-        };
+        let viewport_height =
+            desired_inline_viewport_height_for_transcript(state, size.width, size.height, 0);
         set_inline_viewport_height(terminal, viewport_height).map_err(|error| error.to_string())?;
         commit_stable_transcript(state, terminal)?;
         transcript_cache.invalidate();
@@ -1469,6 +1476,56 @@ fn desired_inline_viewport_height_for_transcript(
         .saturating_add(palette_height)
         .saturating_add(transcript_height)
         .min(height)
+}
+
+fn sync_alt_overlay<B>(
+    want: bool,
+    alt: &mut AltOverlay,
+    terminal: &mut Terminal<B>,
+) -> Result<(), String>
+where
+    B: Backend + Clone,
+{
+    if want == alt.active {
+        return Ok(());
+    }
+    if want {
+        alt.saved = Some(terminal.get_frame().area());
+        terminal
+            .backend_mut()
+            .flush()
+            .map_err(|error| error.to_string())?;
+        execute!(io::stdout(), EnterAlternateScreen).map_err(|error| error.to_string())?;
+        alt.active = true;
+        let size = terminal.size().map_err(|error| error.to_string())?;
+        replace_inline_terminal(
+            terminal,
+            Rect::new(0, 0, size.width, size.height),
+            0,
+            size.height,
+        )
+        .map_err(|error| error.to_string())?;
+    } else {
+        terminal
+            .backend_mut()
+            .flush()
+            .map_err(|error| error.to_string())?;
+        execute!(io::stdout(), LeaveAlternateScreen).map_err(|error| error.to_string())?;
+        alt.active = false;
+        let size = terminal.size().map_err(|error| error.to_string())?;
+        let saved = alt.saved.take().unwrap_or_else(|| {
+            let height = 8.min(size.height).max(1);
+            Rect::new(0, size.height.saturating_sub(height), size.width, height)
+        });
+        replace_inline_terminal(
+            terminal,
+            Rect::new(0, 0, size.width, size.height),
+            saved.y.min(size.height.saturating_sub(1)),
+            saved.height.max(1).min(size.height),
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn set_inline_viewport_height<B>(
@@ -1762,7 +1819,13 @@ where
     };
     let mut input_open = true;
     let mut transcript_cache = TranscriptRenderCache::default();
+    let mut alt_overlay = AltOverlay::default();
     if commit_to_scrollback {
+        sync_alt_overlay(
+            uses_full_inline_viewport(&app.state),
+            &mut alt_overlay,
+            terminal,
+        )?;
         prepare_inline_frame(&mut app.state, terminal, &mut transcript_cache)?;
     } else {
         prepare_fullscreen_frame(&app.state, terminal, &mut transcript_cache)?;
@@ -1896,6 +1959,11 @@ where
         let channels_closed = !input_open && !runtime_open && !tool_open;
         if force_redraw || stream_redraw_due(last_draw, now, redraw_pending, channels_closed) {
             if commit_to_scrollback && !animation_tick {
+                sync_alt_overlay(
+                    uses_full_inline_viewport(&app.state),
+                    &mut alt_overlay,
+                    terminal,
+                )?;
                 prepare_inline_frame(&mut app.state, terminal, &mut transcript_cache)?;
             } else if !commit_to_scrollback {
                 prepare_fullscreen_frame(&app.state, terminal, &mut transcript_cache)?;
@@ -1912,6 +1980,9 @@ where
         if exit {
             break;
         }
+    }
+    if commit_to_scrollback {
+        sync_alt_overlay(false, &mut alt_overlay, terminal)?;
     }
     Ok(())
 }
