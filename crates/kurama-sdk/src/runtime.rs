@@ -1,7 +1,9 @@
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use kurama_core::{
-    agent_manager::{ChildApproval, ChildProgress, ChildRunContext, ChildRunner},
+    agent_manager::{
+        CHILD_BUDGET_WRAP_UP, ChildApproval, ChildProgress, ChildRunContext, ChildRunner,
+    },
     engine::{EngineConfig, EngineOrchestration},
 };
 use kurama_protocol::{
@@ -178,6 +180,14 @@ impl ChildRunner for RuntimeChildRunner {
             let child_profile = context.launch.profile.clone();
             let child_budget = context.launch.budget.clone();
             let write_scope = context.launch.write_scope.clone();
+            let tools = if write_scope.is_read_only() {
+                tools
+                    .into_iter()
+                    .filter(|tool| !matches!(tool.descriptor().name.as_str(), "write" | "todo"))
+                    .collect()
+            } else {
+                tools
+            };
             let spawn_engine = |profile: ModelProfile, replay: Vec<EventEnvelope>| {
                 kurama_core::engine::Engine::spawn(
                     EngineConfig {
@@ -209,6 +219,7 @@ impl ChildRunner for RuntimeChildRunner {
             };
             let replay = store.replay_agent(&session.id, &child_id)?;
             let (initial_usage, mut completed_turns) = child_budget_state(&replay);
+            let mut wrapping_up = false;
             let initial_profile = if completed_turns < child_budget.max_turns {
                 remaining_budgeted_profile(&child_profile, &child_budget, &initial_usage)
             } else {
@@ -231,6 +242,7 @@ impl ChildRunner for RuntimeChildRunner {
             handle.submit(child_prompt(&context), false).await?;
 
             let mut summary = String::new();
+            let mut last_assistant_text = String::new();
             let mut pending_messages = Vec::new();
             let mut messages_open = true;
             loop {
@@ -238,6 +250,24 @@ impl ChildRunner for RuntimeChildRunner {
                     biased;
                     () = context.cancel.cancelled() => {
                         let _ = handle.cancel_turn().await;
+                        let replay = store.replay_agent(&session.id, &child_id)?;
+                        let (usage, turns) = child_budget_state(&replay);
+                        if budget_overrun(&child_budget, &usage, turns)
+                            && let Some(summary) =
+                                salvage_summary(&last_assistant_text, &summary)
+                        {
+                            let (changed_files, evidence_refs) = child_artifacts(
+                                store.as_ref(),
+                                &session.id,
+                                &child_id,
+                            )?;
+                            return Ok(AgentResult {
+                                agent_id: child_id,
+                                summary,
+                                changed_files,
+                                evidence_refs,
+                            });
+                        }
                         return Err(KuramaError::Cancelled);
                     }
                     message = context.messages.recv(), if messages_open => {
@@ -250,6 +280,7 @@ impl ChildRunner for RuntimeChildRunner {
                         match event.ok_or(KuramaError::Cancelled)? {
                             RuntimeEvent::AssistantDelta { text } => {
                                 summary.push_str(&text);
+                                last_assistant_text.push_str(&text);
                                 let _ = context.progress.send(ChildProgress {
                                     phase: Some("responding".into()),
                                     transcript_line: Some(text),
@@ -276,7 +307,29 @@ impl ChildRunner for RuntimeChildRunner {
                                 let replay = store.replay_agent(&session.id, &child_id)?;
                                 let (usage, replay_completed_turns) = child_budget_state(&replay);
                                 completed_turns = replay_completed_turns;
-                                if pending_messages.is_empty() {
+                                let over_budget = budget_overrun(
+                                    &child_budget,
+                                    &usage,
+                                    completed_turns,
+                                );
+                                if !wrapping_up
+                                    && budget_nearly_exhausted(
+                                        &child_budget,
+                                        &usage,
+                                        completed_turns,
+                                    )
+                                    && !over_budget
+                                {
+                                    wrapping_up = true;
+                                    let _ = context.progress.send(ChildProgress {
+                                        phase: Some("wrapping up".into()),
+                                        transcript_line: Some(CHILD_BUDGET_WRAP_UP.into()),
+                                        usage,
+                                        completed_turns,
+                                        ..ChildProgress::default()
+                                    }).await;
+                                }
+                                if pending_messages.is_empty() && !over_budget {
                                     let _ = context.progress.send(ChildProgress {
                                         phase: Some("completed turn".into()),
                                         completed_turns,
@@ -299,9 +352,6 @@ impl ChildRunner for RuntimeChildRunner {
                                         evidence_refs,
                                     });
                                 }
-                                let over_budget = usage.input_tokens > child_budget.max_input_tokens
-                                    || usage.output_tokens > child_budget.max_output_tokens
-                                    || completed_turns > child_budget.max_turns;
                                 let next_profile = if over_budget
                                     || completed_turns >= child_budget.max_turns {
                                     None
@@ -331,11 +381,34 @@ impl ChildRunner for RuntimeChildRunner {
                                     .await;
                                 if budget_exhausted {
                                     let _ = handle.shutdown().await;
+                                    if let Some(summary) =
+                                        salvage_summary(&last_assistant_text, &summary)
+                                    {
+                                        let (changed_files, evidence_refs) = child_artifacts(
+                                            store.as_ref(),
+                                            &session.id,
+                                            &child_id,
+                                        )?;
+                                        return Ok(AgentResult {
+                                            agent_id: child_id,
+                                            summary,
+                                            changed_files,
+                                            evidence_refs,
+                                        });
+                                    }
                                     return Err(KuramaError::Cancelled);
                                 }
                                 let next_profile = next_profile.expect("queued work has budget");
+                                if wrapping_up
+                                    && !pending_messages
+                                        .iter()
+                                        .any(|message| message == CHILD_BUDGET_WRAP_UP)
+                                {
+                                    pending_messages.insert(0, CHILD_BUDGET_WRAP_UP.into());
+                                }
                                 let message = pending_messages.join("\n");
                                 pending_messages.clear();
+                                last_assistant_text.clear();
                                 let _ = handle.shutdown().await;
                                 (handle, events) = spawn_engine(next_profile, replay)?;
                                 handle.submit(message, false).await?;
@@ -376,6 +449,19 @@ impl ChildRunner for RuntimeChildRunner {
     }
 }
 
+fn salvage_summary(last_assistant_text: &str, summary: &str) -> Option<String> {
+    let last = last_assistant_text.trim();
+    if !last.is_empty() {
+        return Some(last.to_owned());
+    }
+    let summary = summary.trim();
+    if summary.is_empty() {
+        None
+    } else {
+        Some(summary.to_owned())
+    }
+}
+
 fn remaining_budgeted_profile(
     profile: &ModelProfile,
     budget: &kurama_protocol::agent::AgentBudget,
@@ -392,6 +478,26 @@ fn remaining_budgeted_profile(
         max_input_tokens: profile.max_input_tokens.min(remaining_input_tokens),
         max_output_tokens: profile.max_output_tokens.min(remaining_output_tokens),
     })
+}
+
+fn budget_nearly_exhausted(
+    budget: &kurama_protocol::agent::AgentBudget,
+    usage: &kurama_protocol::model::Usage,
+    completed_turns: u32,
+) -> bool {
+    completed_turns.saturating_mul(5) >= budget.max_turns.saturating_mul(4)
+        || usage.input_tokens.saturating_mul(5) >= budget.max_input_tokens.saturating_mul(4)
+        || usage.output_tokens.saturating_mul(5) >= budget.max_output_tokens.saturating_mul(4)
+}
+
+fn budget_overrun(
+    budget: &kurama_protocol::agent::AgentBudget,
+    usage: &kurama_protocol::model::Usage,
+    completed_turns: u32,
+) -> bool {
+    usage.input_tokens > budget.max_input_tokens
+        || usage.output_tokens > budget.max_output_tokens
+        || completed_turns > budget.max_turns
 }
 
 fn child_budget_state(replay: &[EventEnvelope]) -> (kurama_protocol::model::Usage, u32) {

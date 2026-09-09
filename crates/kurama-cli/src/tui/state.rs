@@ -8,7 +8,7 @@ use kurama_protocol::{
     model::Usage,
     policy::{ApprovalRequest, ApprovalResponse, ExecutionMode},
     runtime::{AgentCommand, EngineCommand, RuntimeEvent},
-    session::{EventEnvelope, SessionEvent},
+    session::{EventEnvelope, SessionEvent, TodoItem},
     tool::ToolResult,
 };
 
@@ -27,6 +27,7 @@ pub enum Overlay {
     Approval,
     ApprovalEdit,
     Agents,
+    Todos,
     AgentInspect,
     AgentMessage,
     ConfirmAgentCancel,
@@ -97,6 +98,9 @@ pub enum TranscriptEntry {
         body: String,
     },
     ToolCall(ToolTranscript),
+    Todos {
+        items: Vec<TodoItem>,
+    },
     Error {
         body: String,
     },
@@ -124,6 +128,7 @@ pub struct TuiState {
     pub onboarding: OnboardingState,
     pub approval: Option<ApprovalState>,
     pub agents: Vec<AgentRow>,
+    pub todos: Vec<TodoItem>,
     pub selected_agent: usize,
     pub agent_message: String,
     pub agent_message_cursor: usize,
@@ -172,6 +177,7 @@ impl TuiState {
             onboarding: OnboardingState::new(),
             approval: None,
             agents: Vec::new(),
+            todos: Vec::new(),
             selected_agent: 0,
             agent_message: String::new(),
             agent_message_cursor: 0,
@@ -573,6 +579,7 @@ impl TuiState {
         self.committed_transcript_entries = 0;
         self.transcript.clear();
         self.agents.clear();
+        self.todos.clear();
         self.usage = Usage::default();
         let mut replayed_tool_contexts = HashMap::new();
         for envelope in replay {
@@ -634,6 +641,7 @@ impl TuiState {
                             .unwrap_or_else(|| "cancelled".into()),
                     );
                 }
+                SessionEvent::TodoUpdated { items } => self.replace_todos(items.clone()),
                 _ => {}
             }
         }
@@ -700,6 +708,10 @@ impl TuiState {
 
     pub fn open_agents(&mut self) {
         self.overlay = Overlay::Agents;
+    }
+
+    pub fn open_todos(&mut self) {
+        self.overlay = Overlay::Todos;
     }
 
     pub const fn overlay(&self) -> Overlay {
@@ -950,7 +962,11 @@ impl TuiState {
                 operation_id,
                 result,
             } => {
+                let todo_items = todo_items(&result);
                 self.complete_tool(operation_id, result);
+                if let Some(items) = todo_items {
+                    self.replace_todos(items);
+                }
                 self.set_thinking();
             }
             RuntimeEvent::AgentUpdated { snapshot } => self.upsert_agent(snapshot),
@@ -1115,6 +1131,18 @@ impl TuiState {
             lifecycle,
         }));
     }
+
+    fn replace_todos(&mut self, items: Vec<TodoItem>) {
+        self.todos.clone_from(&items);
+        if let Some(entry) = self.transcript[self.committed_transcript_entries..]
+            .iter_mut()
+            .find(|entry| matches!(entry, TranscriptEntry::Todos { .. }))
+        {
+            *entry = TranscriptEntry::Todos { items };
+        } else {
+            self.push_transcript_entry(TranscriptEntry::Todos { items });
+        }
+    }
 }
 
 fn is_non_terminal_runtime_error(message: &str) -> bool {
@@ -1184,6 +1212,20 @@ fn tool_name(result: &ToolResult) -> &str {
         .get("tool_name")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("tool")
+}
+
+fn todo_items(result: &ToolResult) -> Option<Vec<TodoItem>> {
+    if tool_name(result) != "todo" || result.is_error {
+        return None;
+    }
+    let items: Vec<TodoItem> = result
+        .metadata
+        .get("items")
+        .cloned()
+        .and_then(|items| serde_json::from_value(items).ok())
+        .or_else(|| serde_json::from_str(&result.output).ok())?;
+    TodoItem::validate_list(&items).ok()?;
+    Some(items)
 }
 
 fn tool_lifecycle(result: &ToolResult) -> ToolLifecycle {

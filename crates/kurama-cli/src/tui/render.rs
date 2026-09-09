@@ -8,7 +8,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
 };
 
-use kurama_protocol::agent::AgentState;
+use kurama_protocol::{agent::AgentState, session::TodoStatus};
 
 use super::{
     Overlay, ResponsiveLayout, TranscriptEntry, TuiState, activity_line,
@@ -53,6 +53,7 @@ pub(crate) fn render_with_transcript(
             }
         }
         Overlay::Agents => render_agents(frame, state),
+        Overlay::Todos => render_todos(frame, state),
         Overlay::AgentInspect | Overlay::AgentMessage | Overlay::ConfirmAgentCancel => {
             if let Some(position) = render_agent_inspect(frame, state) {
                 frame.set_cursor_position(position);
@@ -425,6 +426,84 @@ fn render_agents(frame: &mut Frame<'_>, state: &TuiState) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+fn render_todos(frame: &mut Frame<'_>, state: &TuiState) {
+    let frame_area = frame.area();
+    if frame_area.is_empty() {
+        return;
+    }
+    let desired_height = (state.todos.len() as u16).saturating_add(4).max(5);
+    let height = desired_height.min(frame_area.height);
+    let horizontal = 1.min(frame_area.width / 2);
+    let area = Rect::new(
+        frame_area.x.saturating_add(horizontal),
+        frame_area
+            .y
+            .saturating_add(frame_area.height.saturating_sub(height) / 2),
+        frame_area
+            .width
+            .saturating_sub(horizontal.saturating_mul(2)),
+        height,
+    );
+    if area.is_empty() {
+        return;
+    }
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER))
+        .padding(Padding::new(1, 1, 0, 0));
+    let inner = block.inner(area);
+    let width = inner.width as usize;
+    let completed = state
+        .todos
+        .iter()
+        .filter(|item| matches!(item.status, TodoStatus::Completed | TodoStatus::Cancelled))
+        .count();
+    let mut lines = vec![Line::from(Span::styled(
+        truncate(
+            &format!("/TODO    {completed}/{} complete", state.todos.len()),
+            width,
+        ),
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    ))];
+    let list_height = inner.height.saturating_sub(2) as usize;
+    if state.todos.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No todo items",
+            Style::default().fg(DIM),
+        )));
+    } else {
+        lines.extend(state.todos.iter().take(list_height).map(|item| {
+            let (status, color) = match item.status {
+                TodoStatus::Pending => ("pending    ", TEXT),
+                TodoStatus::InProgress => ("in progress", ACCENT),
+                TodoStatus::Completed => ("completed  ", DIM),
+                TodoStatus::Cancelled => ("cancelled  ", DIM),
+            };
+            let dimmed = matches!(item.status, TodoStatus::Completed | TodoStatus::Cancelled);
+            Line::from(vec![
+                Span::styled(status, Style::default().fg(color)),
+                Span::raw("  "),
+                Span::styled(
+                    truncate(&item.content, width.saturating_sub(13)),
+                    Style::default().fg(if dimmed { DIM } else { TEXT }),
+                ),
+            ])
+        }));
+    }
+    while lines.len() + 1 < inner.height as usize {
+        lines.push(Line::from(""));
+    }
+    if inner.height > 0 {
+        lines.push(Line::from(Span::styled(
+            truncate("esc  close", width),
+            Style::default().fg(DIM),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn agent_row(agent: &crate::tui::AgentRow, selected: bool, width: usize) -> Line<'static> {
     let state_text = format!("{:?}", agent.state).to_uppercase();
     let state_color = match agent.state {
@@ -435,28 +514,39 @@ fn agent_row(agent: &crate::tui::AgentRow, selected: bool, width: usize) -> Line
         AgentState::Cancelled => DIM,
     };
     let marker = if selected { "▶ " } else { "  " };
+    let marker_width = Line::from(marker).width();
+    let read_only = agent.is_read_only();
+    let show_read_only = read_only && width >= 42;
+    let read_only_width = usize::from(show_read_only) * "  read-only".len();
+    let wrapping_up = agent.activity.eq_ignore_ascii_case("wrapping up");
+    let wrapping_up_width = usize::from(wrapping_up) * "  wrapping up".len();
     let body = if width >= 72 {
         let id = truncate(agent.id.as_ref(), 8);
+        let task_width = width
+            .saturating_sub(
+                marker_width + state_text.len() + read_only_width + wrapping_up_width + 37,
+            )
+            .min(22);
         format!(
-            "{:<10}{:<14}{:<13}{:<22}",
+            "{:<10}{:<14}{:<13}{:<task_width$}",
             id,
             truncate(&agent.role, 12),
             truncate(&agent.profile, 11),
-            truncate(&agent.task, 20)
+            truncate(&agent.task, task_width.saturating_sub(2))
         )
     } else if width >= 42 {
-        let reserved = marker.len() + state_text.len() + 4;
+        let reserved = marker_width + state_text.len() + read_only_width + wrapping_up_width + 2;
         let detail = truncate(
             &format!("{} · {} · {}", agent.id, agent.role, agent.task),
             width.saturating_sub(reserved),
         );
         format!("{detail}  ")
     } else {
-        let reserved = marker.len() + state_text.len() + 2;
+        let reserved = marker_width + state_text.len() + read_only_width + wrapping_up_width + 2;
         let id = truncate(agent.id.as_ref(), width.saturating_sub(reserved));
         format!("{id}  ")
     };
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(marker, Style::default().fg(ACCENT)),
         Span::styled(body, Style::default().fg(if selected { TEXT } else { DIM })),
         Span::styled(
@@ -465,7 +555,14 @@ fn agent_row(agent: &crate::tui::AgentRow, selected: bool, width: usize) -> Line
                 .fg(state_color)
                 .add_modifier(Modifier::BOLD),
         ),
-    ])
+    ];
+    if wrapping_up {
+        spans.push(Span::styled("  wrapping up", Style::default().fg(AMBER)));
+    }
+    if show_read_only {
+        spans.push(Span::styled("  read-only", Style::default().fg(DIM)));
+    }
+    Line::from(spans)
 }
 
 fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) -> Option<Position> {
@@ -493,10 +590,20 @@ fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) -> Option<Posit
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             ),
         ]),
-        Line::from(Span::styled(
-            agent.role.as_str(),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )),
+        Line::from(vec![
+            Span::styled(
+                agent.role.as_str(),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if agent.is_read_only() {
+                    "  read-only"
+                } else {
+                    ""
+                },
+                Style::default().fg(DIM),
+            ),
+        ]),
         Line::from(Span::styled(agent.task.as_str(), Style::default().fg(TEXT))),
         Line::from(vec![
             Span::styled(agent.profile.as_str(), Style::default().fg(DIM)),

@@ -1,5 +1,6 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -9,8 +10,9 @@ use std::{
 use futures_util::stream;
 use kurama_protocol::{
     KuramaError,
+    agent::{AgentResult, OrchestrationContext, WriteScope},
     id::{AgentId, CallId, OperationId, SessionId},
-    model::{BackendCapabilities, ModelEvent, ModelRequest},
+    model::{BackendCapabilities, ModelEvent, ModelProfile, ModelRequest},
     policy::{PolicyContext, PolicyDecision},
     runtime::RuntimeEvent,
     session::SessionMetadata,
@@ -20,6 +22,8 @@ use kurama_protocol::{
         SessionStore, Tool,
     },
 };
+
+use crate::agent_manager::{ChildRunContext, ChildRunner};
 
 pub use crate::orchestrator::NoDelegation;
 pub use crate::store::MemoryStore;
@@ -168,6 +172,45 @@ impl Tool for EchoTool {
         _cancel: &'a dyn CancelSignal,
     ) -> BoxFuture<'a, Result<ToolResult, KuramaError>> {
         Box::pin(async move { Ok(ToolResult::success(invocation.call_id, "ok")) })
+    }
+}
+
+pub struct ImmediateChildRunner {
+    pub summary: String,
+}
+
+impl ChildRunner for ImmediateChildRunner {
+    fn run(
+        &self,
+        context: ChildRunContext,
+    ) -> BoxFuture<'static, Result<AgentResult, KuramaError>> {
+        let summary = self.summary.clone();
+        Box::pin(async move {
+            Ok(AgentResult {
+                agent_id: context.agent_id,
+                summary,
+                changed_files: Vec::new(),
+                evidence_refs: Vec::new(),
+            })
+        })
+    }
+}
+
+pub fn orchestration_context() -> OrchestrationContext {
+    let parent_profile = ModelProfile::new("parent", "p", 100_000, 10_000);
+    OrchestrationContext {
+        profiles: BTreeMap::from([("parent".into(), parent_profile.clone())]),
+        parent_profile,
+        role_routes: BTreeMap::new(),
+        role_escalations: BTreeMap::new(),
+        profile_escalations: BTreeMap::new(),
+        parent_write_scope: WriteScope {
+            roots: vec![PathBuf::from(".")],
+            files: Vec::new(),
+        },
+        max_concurrency: 4,
+        depth: 0,
+        yolo: false,
     }
 }
 

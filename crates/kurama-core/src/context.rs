@@ -3,7 +3,7 @@ use kurama_protocol::{
     agent::AgentBudget,
     id::{AgentId, SessionId},
     model::{DelegationSchema, ModelItem, ModelProfile, ModelRequest},
-    session::{EventEnvelope, SessionEvent},
+    session::{EventEnvelope, SessionEvent, latest_todos},
     tool::ToolDescriptor,
 };
 
@@ -273,6 +273,18 @@ impl ContextManager {
             &mut used,
             &mut report.current_turn_tokens,
         )?;
+
+        let todos = latest_todos(&self.canonical);
+        if !todos.is_empty() {
+            let mut todo_tokens = 0;
+            push_if_fits(
+                &mut items,
+                ModelItem::TodoList { items: todos },
+                &mut used,
+                usable_tokens,
+                &mut todo_tokens,
+            )?;
+        }
 
         for evidence in self.evidence_items() {
             if !push_if_fits(

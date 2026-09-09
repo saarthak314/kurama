@@ -10,7 +10,7 @@ kurama-adapters ─────────────────────�
 
 ## Simple
 
-`kurama` ships first-party backends and the four standard tools. Coding work that writes files or runs mutating commands needs `.yolo()` (launch-only, same rule as the CLI) or a `Turn` loop that resolves approvals. Supervised `prompt` returns an error on the first `Ask` instead of blocking on stdin.
+`kurama` ships first-party backends and the four environment tools (`read`, `write`, `bash`, `web-search`). The engine also injects a parent-only `todo` tool for a session list; children do not get it. Coding work that writes files or runs mutating commands needs `.yolo()` (launch-only, same rule as the CLI) or a `Turn` loop that resolves approvals. Supervised `prompt` returns an error on the first `Ask` instead of blocking on stdin.
 
 ```rust
 use kurama::prelude::*;
@@ -56,7 +56,7 @@ agent.prompt("continue from there").await?;
 
 `resume` refuses a session from another workspace or profile, and it does not restore YOLO unless this Agent was built with `.yolo()` / `ExecutionMode::Yolo`.
 
-Defaults: `DefaultPolicy` in supervised mode, `MemoryStore`, a no-op event sink, `NoDelegation`, and `RandomIds`. `.orchestrate()` installs `SmartOrchestrator` and builds the orchestration context from the active profile, workspace write scope, and configured roles. `.delegate()` requires `.orchestrate()`. `.config(&kurama_config)` copies role routes, escalations, auto boundaries, and concurrency from `~/.kurama/config.toml`.
+Defaults: `DefaultPolicy` in supervised mode, `MemoryStore`, a no-op event sink, `NoDelegation`, and `RandomIds`. `.orchestrate()` installs `SmartOrchestrator` and builds the orchestration context from the active profile, workspace write scope, and configured roles. Researcher, planner, and reviewer children are forced read-only; an implementer with an empty scope inherits the parent write scope. The parent may run up to three delegation waves in one user turn. Children wrap up at 80% of budget; a hard limit cancels unless a summary can be salvaged. `.delegate()` requires `.orchestrate()`. `.config(&kurama_config)` copies role routes, escalations, auto boundaries, and concurrency from `~/.kurama/config.toml`.
 
 Streaming, approvals, and children stay one method down. Break on `Done` (and `Error`); a later `next()` returns `None`:
 
@@ -103,7 +103,7 @@ Duplicate model profile or tool names, missing required components, an unavailab
 
 First-party adapters cover OpenAI, Anthropic, OpenAI-compatible HTTP endpoints, Codex CLI, and Claude CLI. The provider factory consumes non-secret profile configuration plus credentials resolved outside the protocol boundary.
 
-Custom SDK tools do not enter the standard Kurama CLI automatically. The CLI registers exactly `read`, `write`, `bash`, and `web-search`; another tool affects its schema and binary only when it is explicitly compiled and registered.
+Custom SDK tools do not enter the standard Kurama CLI automatically. The CLI registers exactly `read`, `write`, `bash`, and `web-search`. The engine adds `todo` for the parent session only; it is not an environment tool and does not change that CLI registry.
 
 ## Compatibility
 

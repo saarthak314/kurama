@@ -1,7 +1,7 @@
 use crate::{
     agent::DelegationRequest,
     id::{AgentId, CallId, SessionId},
-    session::BlobRef,
+    session::{BlobRef, TodoItem},
     tool::ToolDescriptor,
 };
 
@@ -92,6 +92,9 @@ pub enum ModelItem {
         summary: String,
         changed_files: Vec<String>,
         evidence_refs: Vec<BlobRef>,
+    },
+    TodoList {
+        items: Vec<TodoItem>,
     },
 }
 

@@ -1,4 +1,5 @@
 use kurama_protocol::policy::ExecutionMode;
+use kurama_protocol::session::TodoStatus;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::{
     Frame,
@@ -1359,6 +1360,30 @@ pub fn transcript_lines(
                     TranscriptDetail::Expanded => expanded_tool_output(output, output_width),
                 };
                 push_tool_output_lines(&mut lines, output);
+            }
+            TranscriptEntry::Todos { items } => {
+                let completed = items
+                    .iter()
+                    .filter(|item| {
+                        matches!(item.status, TodoStatus::Completed | TodoStatus::Cancelled)
+                    })
+                    .count();
+                let next = items
+                    .iter()
+                    .find(|item| item.status == TodoStatus::InProgress)
+                    .or_else(|| items.iter().find(|item| item.status == TodoStatus::Pending));
+                let mut summary = format!("todo  {completed}/{}", items.len());
+                if let Some(item) = next {
+                    summary.push_str("  next: ");
+                    summary.push_str(&item.content);
+                }
+                lines.push(Line::from(vec![
+                    Span::styled("• ", Style::default().fg(DIM)),
+                    Span::styled(
+                        truncate_display(&summary, width.saturating_sub(2).max(1)),
+                        Style::default().fg(DIM),
+                    ),
+                ]));
             }
             TranscriptEntry::Error { body } => push_prefixed_lines(
                 &mut lines,

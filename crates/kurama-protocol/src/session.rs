@@ -8,6 +8,71 @@ use crate::{
     tool::{Operation, ToolInvocation, ToolResult},
 };
 
+pub const MAX_TODO_ITEMS: usize = 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TodoItem {
+    pub id: String,
+    pub content: String,
+    pub status: TodoStatus,
+}
+
+impl TodoItem {
+    pub fn validate_list(items: &[Self]) -> Result<(), crate::KuramaError> {
+        if items.len() > MAX_TODO_ITEMS {
+            return Err(crate::KuramaError::Protocol(format!(
+                "todo list cannot exceed {MAX_TODO_ITEMS} items"
+            )));
+        }
+        let in_progress = items
+            .iter()
+            .filter(|item| item.status == TodoStatus::InProgress)
+            .count();
+        if in_progress > 1 {
+            return Err(crate::KuramaError::Protocol(
+                "todo list can have at most one in_progress item".into(),
+            ));
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for item in items {
+            if item.id.trim().is_empty() || item.content.trim().is_empty() {
+                return Err(crate::KuramaError::Protocol(
+                    "todo items need a non-empty id and content".into(),
+                ));
+            }
+            if !ids.insert(&item.id) {
+                return Err(crate::KuramaError::Protocol(format!(
+                    "duplicate todo id {}",
+                    item.id
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn latest_todos<'a, I>(events: I) -> Vec<TodoItem>
+where
+    I: IntoIterator<Item = &'a EventEnvelope>,
+{
+    let mut todos = Vec::new();
+    for event in events {
+        if let SessionEvent::TodoUpdated { items } = &event.event {
+            todos.clone_from(items);
+        }
+    }
+    todos
+}
+
 pub const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -160,6 +225,9 @@ pub enum SessionEvent {
     AgentMessage {
         agent_id: AgentId,
         text: String,
+    },
+    TodoUpdated {
+        items: Vec<TodoItem>,
     },
     TurnCompleted,
     TurnFailed {

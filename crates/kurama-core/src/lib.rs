@@ -12,5 +12,6 @@ pub mod recovery;
 pub mod sink;
 pub mod store;
 pub mod testing;
+pub mod todo;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
