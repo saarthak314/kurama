@@ -4,8 +4,7 @@ use crossterm::{
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
     execute,
     terminal::{
-        DisableLineWrap, EnableLineWrap, LeaveAlternateScreen,
-        disable_raw_mode, enable_raw_mode,
+        DisableLineWrap, EnableLineWrap, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     },
 };
 use tokio::sync::mpsc;
