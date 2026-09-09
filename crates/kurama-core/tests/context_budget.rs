@@ -3,7 +3,7 @@ use kurama_protocol::{
     id::{CallId, OperationId, SessionId},
     model::{ModelItem, ModelProfile},
     policy::ExecutionMode,
-    session::{EventEnvelope, SessionEvent, SessionMetadata},
+    session::{EventEnvelope, GoalStatus, SessionEvent, SessionGoal, SessionMetadata},
     tool::ToolResult,
 };
 use serde_json::json;
@@ -414,6 +414,153 @@ fn context_reserves_space_for_provider_request_envelopes() {
         .expect("assemble context");
 
     assert!(assembled.estimated_tokens >= 512);
+}
+
+#[test]
+fn goal_continuation_turns_stay_in_recent_history() {
+    let metadata = SessionMetadata {
+        id: SessionId::from("session"),
+        created_at_ms: 0,
+        project_root: ".".into(),
+        profile: "test".into(),
+        mode: ExecutionMode::Supervised,
+        redaction_best_effort: false,
+    };
+    let objective = "Keep the original goalpost intact across many turns.";
+    let mut events = vec![
+        event(0, SessionEvent::SessionStarted { metadata }),
+        event(
+            1,
+            SessionEvent::GoalUpdated {
+                goal: SessionGoal {
+                    objective: objective.into(),
+                    status: GoalStatus::Pursuing,
+                    turns: 1,
+                    blocked_streak: 0,
+                },
+            },
+        ),
+        event(
+            2,
+            SessionEvent::UserMessage {
+                text: objective.into(),
+            },
+        ),
+        event(
+            3,
+            SessionEvent::AssistantMessage {
+                text: "checkpoint-0".into(),
+            },
+        ),
+        event(4, SessionEvent::TurnCompleted),
+    ];
+    for turn in 1..6 {
+        events.push(event(
+            events.len() as u64,
+            SessionEvent::AssistantMessage {
+                text: format!("checkpoint-{turn}"),
+            },
+        ));
+        events.push(event(events.len() as u64, SessionEvent::TurnCompleted));
+    }
+    let mut manager = ContextManager::new(ContextPolicy {
+        max_input_tokens: 4_000,
+        reserve_output_tokens: 200,
+        compact_at_percent: 75,
+        recent_turns: 3,
+    });
+    manager.replay(events);
+    let items = manager
+        .assemble(
+            &ModelProfile::new("test", "frontier", 4_000, 200),
+            Vec::new(),
+            false,
+            ".",
+        )
+        .expect("assemble")
+        .request
+        .items;
+    assert!(items.iter().any(
+        |item| matches!(item, ModelItem::Goal { goal, continuation: true } if goal.objective == objective)
+    ));
+    assert!(
+        items
+            .iter()
+            .any(|item| matches!(item, ModelItem::Assistant { text } if text == "checkpoint-5"))
+    );
+    assert!(
+        items
+            .iter()
+            .any(|item| matches!(item, ModelItem::Assistant { text } if text == "checkpoint-3"))
+    );
+    assert!(
+        !items
+            .iter()
+            .any(|item| matches!(item, ModelItem::Assistant { text } if text == "checkpoint-0"))
+    );
+}
+
+#[test]
+fn tight_budget_still_keeps_the_active_goal() {
+    let metadata = SessionMetadata {
+        id: SessionId::from("session"),
+        created_at_ms: 0,
+        project_root: ".".into(),
+        profile: "test".into(),
+        mode: ExecutionMode::Supervised,
+        redaction_best_effort: false,
+    };
+    let objective = "Do not drop this goal when history is large.";
+    let padding = "progress ".repeat(80);
+    let mut events = vec![event(0, SessionEvent::SessionStarted { metadata })];
+    for turn in 0..6 {
+        events.push(event(
+            events.len() as u64,
+            SessionEvent::UserMessage {
+                text: format!("turn {turn} {padding}"),
+            },
+        ));
+        events.push(event(
+            events.len() as u64,
+            SessionEvent::AssistantMessage {
+                text: format!("answer {turn} {padding}"),
+            },
+        ));
+        events.push(event(events.len() as u64, SessionEvent::TurnCompleted));
+    }
+    events.push(event(
+        events.len() as u64,
+        SessionEvent::GoalUpdated {
+            goal: SessionGoal {
+                objective: objective.into(),
+                status: GoalStatus::Pursuing,
+                turns: 6,
+                blocked_streak: 0,
+            },
+        },
+    ));
+    let mut manager = ContextManager::new(ContextPolicy {
+        max_input_tokens: 900,
+        reserve_output_tokens: 100,
+        compact_at_percent: 75,
+        recent_turns: 4,
+    });
+    manager.replay(events);
+    let items = manager
+        .assemble(
+            &ModelProfile::new("test", "frontier", 900, 100),
+            Vec::new(),
+            false,
+            ".",
+        )
+        .expect("assemble")
+        .request
+        .items;
+    assert!(
+        items.iter().any(
+            |item| matches!(item, ModelItem::Goal { goal, .. } if goal.objective == objective)
+        )
+    );
 }
 
 fn schema_is_valid(schema: &serde_json::Value, value: &serde_json::Value) -> bool {

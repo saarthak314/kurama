@@ -227,7 +227,15 @@ impl ContextManager {
             .find(|turn| !turn.complete)
             .map_or_else(Vec::new, |turn| self.items_for_events(&turn.events));
         let current_tokens = estimate_items(&current_items)?;
-        if fixed_tokens.saturating_add(current_tokens) > usable_tokens {
+        let goal_item = latest_goal(&self.canonical).map(|goal| ModelItem::Goal {
+            continuation: goal.status.is_active(),
+            goal,
+        });
+        let goal_tokens = goal_item
+            .as_ref()
+            .map_or(Ok(0), |item| estimate_serialized(serde_json::to_vec(item)))?;
+        let reserved_tail = current_tokens.saturating_add(goal_tokens);
+        if fixed_tokens.saturating_add(reserved_tail) > usable_tokens {
             return Err(KuramaError::Session(
                 "current turn exceeds the model input context budget; tool output was preserved"
                     .into(),
@@ -244,7 +252,7 @@ impl ContextManager {
                 &mut items,
                 item,
                 &mut used,
-                usable_tokens.saturating_sub(current_tokens),
+                usable_tokens.saturating_sub(reserved_tail),
                 &mut report.summary_tokens,
             )?;
         }
@@ -262,7 +270,7 @@ impl ContextManager {
                 &mut items,
                 turn_items,
                 &mut used,
-                usable_tokens.saturating_sub(current_tokens),
+                usable_tokens.saturating_sub(reserved_tail),
                 &mut report.recent_turn_tokens,
             )?;
         }
@@ -273,6 +281,14 @@ impl ContextManager {
             &mut used,
             &mut report.current_turn_tokens,
         )?;
+        if let Some(goal_item) = goal_item {
+            push_required_items(
+                &mut items,
+                vec![goal_item],
+                &mut used,
+                &mut report.current_turn_tokens,
+            )?;
+        }
 
         let todos = latest_todos(&self.canonical);
         if !todos.is_empty() {
@@ -283,20 +299,6 @@ impl ContextManager {
                 &mut used,
                 usable_tokens,
                 &mut todo_tokens,
-            )?;
-        }
-
-        if let Some(goal) = latest_goal(&self.canonical) {
-            let mut goal_tokens = 0;
-            push_if_fits(
-                &mut items,
-                ModelItem::Goal {
-                    continuation: goal.status.is_active(),
-                    goal,
-                },
-                &mut used,
-                usable_tokens,
-                &mut goal_tokens,
             )?;
         }
 
@@ -432,6 +434,24 @@ struct Turn<'a> {
     complete: bool,
 }
 
+fn opens_context_turn(event: &SessionEvent) -> bool {
+    matches!(
+        event,
+        SessionEvent::UserMessage { .. }
+            | SessionEvent::AssistantMessage { .. }
+            | SessionEvent::ToolProposed { .. }
+            | SessionEvent::ToolInvocationRecorded { .. }
+            | SessionEvent::ToolCompleted { .. }
+            | SessionEvent::AgentQueued { .. }
+            | SessionEvent::AgentStarted { .. }
+            | SessionEvent::AgentProgress { .. }
+            | SessionEvent::AgentCompleted { .. }
+            | SessionEvent::AgentFailed { .. }
+            | SessionEvent::AgentCancelled { .. }
+            | SessionEvent::AgentMessage { .. }
+    )
+}
+
 fn split_turns(events: &[EventEnvelope]) -> Vec<Turn<'_>> {
     let mut turns = Vec::new();
     let mut current: Option<Turn<'_>> = None;
@@ -440,6 +460,12 @@ fn split_turns(events: &[EventEnvelope]) -> Vec<Turn<'_>> {
             if let Some(turn) = current.take() {
                 turns.push(turn);
             }
+            current = Some(Turn {
+                start: index,
+                events: Vec::new(),
+                complete: false,
+            });
+        } else if current.is_none() && opens_context_turn(&event.event) {
             current = Some(Turn {
                 start: index,
                 events: Vec::new(),

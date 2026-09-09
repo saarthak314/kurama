@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -148,6 +149,147 @@ async fn goal_continues_until_update_goal_complete() {
     assert_eq!(goal.objective, "keep tests green");
     assert_eq!(goal.status, GoalStatus::Achieved);
     assert!(goal.turns >= 1);
+}
+
+struct HorizonBackend {
+    requests: Arc<Mutex<Vec<ModelRequest>>>,
+    streams: Mutex<VecDeque<Vec<Result<ModelEvent, KuramaError>>>>,
+}
+
+impl ModelBackend for HorizonBackend {
+    fn backend_name(&self) -> &'static str {
+        "horizon"
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::remote_default()
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: ModelRequest,
+        _cancel: &'a dyn CancelSignal,
+    ) -> BoxFuture<'a, Result<ModelStream, KuramaError>> {
+        Box::pin(async move {
+            self.requests
+                .lock()
+                .expect("recorded requests lock")
+                .push(request);
+            let events = self
+                .streams
+                .lock()
+                .expect("horizon streams lock")
+                .pop_front()
+                .unwrap_or_default();
+            Ok(Box::pin(stream::iter(events)) as ModelStream)
+        })
+    }
+}
+
+fn stop_round(label: &str) -> Vec<Result<ModelEvent, KuramaError>> {
+    vec![
+        Ok(ModelEvent::TextDelta { text: label.into() }),
+        Ok(ModelEvent::ResponseCompleted {
+            cursor: None,
+            finish_reason: FinishReason::Stop,
+        }),
+    ]
+}
+
+fn goal_item(request: &ModelRequest) -> Option<(&SessionGoal, bool)> {
+    request.items.iter().find_map(|item| match item {
+        ModelItem::Goal { goal, continuation } => Some((goal, *continuation)),
+        _ => None,
+    })
+}
+
+#[tokio::test]
+async fn long_horizon_goal_keeps_objective_and_recent_progress() {
+    const OBJECTIVE: &str = "Migrate auth from sessions to JWT, keep /login and /logout green, and do not shrink this goal.";
+    let checkpoints = 8_usize;
+    let mut streams = (0..checkpoints)
+        .map(|index| stop_round(&format!("checkpoint-{index}")))
+        .collect::<Vec<_>>();
+    streams.push(vec![
+        Ok(ModelEvent::ToolCall {
+            call_id: "goal-complete".into(),
+            name: "update_goal".into(),
+            arguments: serde_json::json!({
+                "status": "complete",
+                "reason": "login and logout tests pass"
+            }),
+        }),
+        Ok(ModelEvent::ResponseCompleted {
+            cursor: None,
+            finish_reason: FinishReason::ToolCalls,
+        }),
+    ]);
+    streams.push(vec![Ok(ModelEvent::ResponseCompleted {
+        cursor: None,
+        finish_reason: FinishReason::Stop,
+    })]);
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let backend = Arc::new(HorizonBackend {
+        requests: Arc::clone(&requests),
+        streams: Mutex::new(streams.into()),
+    });
+    let store = Arc::new(MemoryStore::default());
+    let mut engine_config = config(backend, Arc::clone(&store), None);
+    engine_config.context_policy.recent_turns = 4;
+    let (handle, mut events) = Engine::spawn(engine_config, Vec::new()).expect("spawn engine");
+
+    handle.set_goal(OBJECTIVE).await.expect("set goal");
+    wait_for_turn(&mut events).await;
+
+    let recorded = requests.lock().expect("recorded requests lock").clone();
+    assert!(
+        recorded.len() > checkpoints,
+        "expected continuation rounds, got {}",
+        recorded.len()
+    );
+    for (index, request) in recorded.iter().enumerate() {
+        let (goal, continuation) = goal_item(request).expect("goal item in every request");
+        assert_eq!(goal.objective, OBJECTIVE);
+        if index < checkpoints {
+            assert!(continuation, "request {index} dropped continuation");
+            assert_eq!(goal.status, GoalStatus::Pursuing);
+        }
+    }
+
+    let last_progress_request = &recorded[checkpoints - 1];
+    assert!(
+        last_progress_request.items.iter().any(|item| matches!(
+            item,
+            ModelItem::Assistant { text } if text.contains("checkpoint-6")
+        )),
+        "latest continuation work missing from context: {:?}",
+        last_progress_request.items
+    );
+    assert!(
+        last_progress_request.items.iter().any(|item| matches!(
+            item,
+            ModelItem::Assistant { text } if text.contains("checkpoint-3")
+        )),
+        "recent continuation history missing from context: {:?}",
+        last_progress_request.items
+    );
+    assert!(
+        !last_progress_request.items.iter().any(|item| matches!(
+            item,
+            ModelItem::Assistant { text } if text.contains("checkpoint-0")
+        )),
+        "history older than recent_turns should drop, but the goal item must still carry the objective"
+    );
+
+    let goal = latest_goal(
+        &store
+            .replay(&SessionId::from("goal-session"))
+            .expect("replay"),
+    )
+    .expect("persisted goal");
+    assert_eq!(goal.objective, OBJECTIVE);
+    assert_eq!(goal.status, GoalStatus::Achieved);
 }
 
 #[tokio::test]
