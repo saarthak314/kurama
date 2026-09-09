@@ -1356,13 +1356,10 @@ fn prepare_inline_frame<B>(
 where
     B: Backend + Clone,
 {
-    if !state.stable_transcript().is_empty() {
+    if !state.stable_transcript().is_empty() && !uses_full_inline_viewport(state) {
         let size = terminal.size().map_err(|error| error.to_string())?;
-        let viewport_height = if uses_full_inline_viewport(state) {
-            size.height
-        } else {
-            desired_inline_viewport_height_for_transcript(state, size.width, size.height, 0)
-        };
+        let viewport_height =
+            desired_inline_viewport_height_for_transcript(state, size.width, size.height, 0);
         set_inline_viewport_height(terminal, viewport_height).map_err(|error| error.to_string())?;
         commit_stable_transcript(state, terminal)?;
         transcript_cache.invalidate();
@@ -1494,6 +1491,10 @@ where
     }
     if want {
         alt.saved = Some(terminal.get_frame().area());
+        terminal
+            .backend_mut()
+            .flush()
+            .map_err(|error| error.to_string())?;
         execute!(io::stdout(), EnterAlternateScreen).map_err(|error| error.to_string())?;
         alt.active = true;
         let size = terminal.size().map_err(|error| error.to_string())?;
@@ -1505,6 +1506,10 @@ where
         )
         .map_err(|error| error.to_string())?;
     } else {
+        terminal
+            .backend_mut()
+            .flush()
+            .map_err(|error| error.to_string())?;
         execute!(io::stdout(), LeaveAlternateScreen).map_err(|error| error.to_string())?;
         alt.active = false;
         let size = terminal.size().map_err(|error| error.to_string())?;
@@ -1538,7 +1543,7 @@ where
     let size = terminal.size()?;
     let viewport_height = viewport_height.min(size.height);
     let growth = viewport_height.saturating_sub(current_area.height);
-    if growth > 0 && viewport_height < size.height {
+    if growth > 0 {
         terminal.insert_before(growth, |_| {})?;
         current_area = terminal.get_frame().area();
     }
@@ -1975,6 +1980,9 @@ where
         if exit {
             break;
         }
+    }
+    if commit_to_scrollback {
+        sync_alt_overlay(false, &mut alt_overlay, terminal)?;
     }
     Ok(())
 }
@@ -3125,25 +3133,6 @@ Session ID: ses_cafebabe"
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(!visible.contains("stale terminal content"), "{visible}");
-    }
-
-    #[test]
-    fn full_height_viewport_does_not_insert_blank_history_rows() {
-        let state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24))
-            .expect("initialize inline terminal");
-        terminal
-            .draw(|frame| render(frame, &state))
-            .expect("draw compact viewport");
-        let before = terminal.backend().scrollback().content().len();
-
-        set_inline_viewport_height(&mut terminal, 24).expect("expand to full height");
-
-        assert_eq!(
-            terminal.backend().scrollback().content().len(),
-            before,
-            "full-height expand must not flush blank lines into scrollback"
-        );
     }
 
     #[test]
