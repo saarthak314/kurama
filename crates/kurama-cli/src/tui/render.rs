@@ -184,7 +184,7 @@ fn render_shortcuts(frame: &mut Frame<'_>, state: &TuiState) {
     frame.render_widget(Clear, area);
     let lines = [
         ("ctrl+c", "interrupt, then clear, then exit"),
-        ("esc", "interrupt a running turn"),
+        ("esc", "close overlay, then interrupt"),
         ("enter", "send"),
         ("shift+enter", "newline"),
         ("ctrl+o", "expand transcript"),

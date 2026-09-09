@@ -449,7 +449,9 @@ impl TuiState {
 
     pub fn toggle_transcript_view(&mut self) {
         self.transcript_view_expanded = !self.transcript_view_expanded;
-        self.scroll = 0;
+        if self.transcript_view_expanded {
+            self.scroll = 0;
+        }
     }
 
     pub const fn transcript_view_expanded(&self) -> bool {
@@ -506,6 +508,7 @@ impl TuiState {
             self.overlay = Overlay::None;
             self.sent_commands.push(EngineCommand::CancelTurn);
             self.activity = ActivityState::Interrupted;
+            self.pending_turns.clear();
             return true;
         }
         if !self.activity.is_animated() {
@@ -513,7 +516,12 @@ impl TuiState {
         }
         self.sent_commands.push(EngineCommand::CancelTurn);
         self.activity = ActivityState::Interrupted;
+        self.pending_turns.clear();
         true
+    }
+
+    pub fn pop_queued_follow_up(&mut self) -> bool {
+        self.pending_turns.pop_back().is_some()
     }
 
     fn push_transcript_entry(&mut self, entry: TranscriptEntry) {

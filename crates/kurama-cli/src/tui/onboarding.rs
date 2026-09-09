@@ -177,6 +177,38 @@ impl OnboardingState {
         self.error = None;
     }
 
+    pub fn go_back(&mut self) -> bool {
+        self.error = None;
+        match self.stage {
+            OnboardingStage::Connection | OnboardingStage::Credential => false,
+            OnboardingStage::Profile => {
+                self.stage = OnboardingStage::Connection;
+                self.input.clear();
+                true
+            }
+            OnboardingStage::Endpoint => {
+                self.stage = OnboardingStage::Profile;
+                self.input = self.profile_name.clone();
+                true
+            }
+            OnboardingStage::Model if self.selected == 4 => {
+                self.stage = OnboardingStage::Endpoint;
+                self.input = self.endpoint.clone().unwrap_or_default();
+                true
+            }
+            OnboardingStage::Model => {
+                self.stage = OnboardingStage::Profile;
+                self.input = self.profile_name.clone();
+                true
+            }
+            OnboardingStage::Secret => {
+                self.stage = OnboardingStage::Model;
+                self.input = self.model.clone();
+                true
+            }
+        }
+    }
+
     pub fn begin(&mut self) {
         if self.stage != OnboardingStage::Connection {
             return;

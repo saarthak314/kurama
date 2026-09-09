@@ -18,7 +18,7 @@ pub use agents::{AgentRow, sort_agents};
 pub use approval::ApprovalState;
 pub(crate) use backend::{CursorTrackingBackend, SharedBackend};
 pub(crate) use command_palette::{command_palette_height, render_command_palette};
-pub(crate) use composer::{approval_height, composer_height};
+pub(crate) use composer::{approval_height, composer_cursor_vertical, composer_height};
 pub use input::{TerminalGuard, spawn_input_thread};
 pub use layout::ResponsiveLayout;
 pub(crate) use layout::{main_area, queue_height, visible_activity_rect};
