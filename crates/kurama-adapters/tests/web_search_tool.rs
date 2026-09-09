@@ -7,7 +7,7 @@ use kurama_protocol::{
     agent::WriteScope,
     id::{CallId, SessionId},
     policy::ExecutionMode,
-    tool::{ToolContext, ToolInvocation, ToolLimits},
+    tool::{Operation, ToolContext, ToolInvocation, ToolLimits},
     traits::{BoxFuture, CancelSignal, Tool},
 };
 use tokio::{
@@ -126,6 +126,30 @@ async fn yolo_open_keeps_limits_but_allows_private_http() {
         "alpha\nmiddle content\nomega"
     );
     std::fs::remove_file(staged_path).expect("remove staged web output");
+}
+
+#[test]
+fn web_search_ignores_unknown_fields_and_defaults_limit() {
+    let context = context(ExecutionMode::Supervised);
+    let extra = ToolInvocation {
+        call_id: CallId::from("search-extra"),
+        name: "web-search".into(),
+        arguments: serde_json::json!({
+            "operation": "search",
+            "query": "ratatui",
+            "items": [{"id": "track", "status": "pending"}]
+        }),
+    };
+    let operation = WebSearchTool::default()
+        .classify(&context, &extra)
+        .expect("ignore extra fields and default limit");
+    assert!(matches!(
+        operation,
+        Operation::WebSearch {
+            query,
+            contains_workspace_data: false
+        } if query == "ratatui"
+    ));
 }
 
 #[test]

@@ -2525,7 +2525,26 @@ fn git_diff_stat(project: &str) -> Result<String, String> {
         .output()
         .map_err(|error| format!("git diff failed: {error}"))?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let first = stderr
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("git diff failed");
+        if first.contains("not a git repository") || first.contains("Not a git repository") {
+            return Err("not a git repository".into());
+        }
+        let mut message = first.to_owned();
+        if message.chars().count() > 200 {
+            let end = message
+                .char_indices()
+                .nth(200)
+                .map(|(index, _)| index)
+                .unwrap_or(message.len());
+            message.truncate(end);
+            message.push('…');
+        }
+        return Err(message);
     }
     let mut diff = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if diff.chars().count() > 800 {
@@ -3458,6 +3477,58 @@ Session ID: ses_cafebabe"
             1,
             "{text}"
         );
+    }
+
+    #[test]
+    fn growing_viewport_does_not_leave_blank_rows_between_committed_tools() {
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        state.prepend_startup("0.1.9", "~/project");
+        state.push_user("inspect");
+        state.push_tool(
+            "bash",
+            (0..80)
+                .map(|index| format!("path-{index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24))
+            .expect("initialize inline terminal");
+        let mut transcript_cache = TranscriptRenderCache::default();
+        prepare_inline_frame(&mut state, &mut terminal, &mut transcript_cache)
+            .expect("commit first tool");
+        terminal
+            .draw(|frame| render_with_transcript(frame, &state, transcript_cache.lines()))
+            .expect("draw first tool");
+
+        state.push_tool("read", "line\n".repeat(40));
+        state.set_thinking();
+        prepare_inline_frame(&mut state, &mut terminal, &mut transcript_cache)
+            .expect("grow for live tool");
+        terminal
+            .draw(|frame| render_with_transcript(frame, &state, transcript_cache.lines()))
+            .expect("draw live tool");
+
+        let text = terminal
+            .backend()
+            .scrollback()
+            .content()
+            .iter()
+            .chain(terminal.backend().buffer().content().iter())
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let rows = text
+            .as_bytes()
+            .chunks(80)
+            .map(|row| std::str::from_utf8(row).unwrap_or("").trim().is_empty())
+            .collect::<Vec<_>>();
+        let start = rows.iter().position(|blank| !blank).unwrap_or(0);
+        let end = rows.iter().rposition(|blank| !blank).unwrap_or(rows.len());
+        let blank_run = rows[start..=end]
+            .windows(5)
+            .any(|window| window.iter().all(|blank| *blank));
+        assert!(!blank_run, "{text}");
+        assert!(text.contains("Ran bash"), "{text}");
+        assert!(text.contains("Ran read"), "{text}");
     }
 
     #[test]

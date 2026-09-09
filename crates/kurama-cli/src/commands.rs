@@ -212,10 +212,15 @@ fn parse_goal(input: &str) -> Result<Command, String> {
         return Ok(Command::Goal(GoalAction::View));
     }
     let action = match rest.split_once(char::is_whitespace) {
+        Some(("set", objective)) => GoalAction::Set(validate_goal_objective(objective)?),
         Some(("edit", objective)) => GoalAction::Edit(validate_goal_objective(objective)?),
+        None if rest == "set" => {
+            return Err("usage: /goal set <objective>".into());
+        }
         None if rest == "edit" => {
             return Err("usage: /goal edit <objective>".into());
         }
+        None if rest == "view" => GoalAction::View,
         None if rest == "pause" => GoalAction::Pause,
         None if rest == "resume" => GoalAction::Resume,
         None if rest == "clear" => GoalAction::Clear,

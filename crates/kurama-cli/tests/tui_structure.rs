@@ -185,9 +185,18 @@ fn parses_all_product_commands_without_restart() {
         Command::Goal(GoalAction::Set("keep tests green".into()))
     );
     assert_eq!(
+        parse_command("/goal set ship the e2e pass").unwrap(),
+        Command::Goal(GoalAction::Set("ship the e2e pass".into()))
+    );
+    assert_eq!(
+        parse_command("/goal view").unwrap(),
+        Command::Goal(GoalAction::View)
+    );
+    assert_eq!(
         parse_command("/goal pause").unwrap(),
         Command::Goal(GoalAction::Pause)
     );
+    assert!(parse_command("/goal set").is_err());
     assert_eq!(parse_command("/exit").unwrap(), Command::Exit);
     assert!(parse_command("/restart").is_err());
     assert!(parse_command("/mode yolo").is_err());
@@ -657,6 +666,45 @@ fn compact_tool_rows_preview_output_while_expanded_preserves_it() {
     assert!(!compact.contains("success ·"));
     assert!(expanded.contains("line one"));
     assert!(expanded.contains("line two"));
+}
+
+#[test]
+fn transcript_squeezes_blank_padding_between_tool_rows() {
+    let entries = vec![
+        TranscriptEntry::UserTurn {
+            body: "inspect".into(),
+        },
+        TranscriptEntry::AssistantMessage {
+            body: "\n\n \n\nlooking".into(),
+        },
+        TranscriptEntry::ToolCall(ToolTranscript {
+            call_id: Some(CallId::from("call_1")),
+            name: "bash".into(),
+            context: Some("ls".into()),
+            output: (0..40)
+                .map(|index| format!("file-{index}"))
+                .collect::<Vec<_>>()
+                .join("\n\n\n"),
+            lifecycle: ToolLifecycle::Completed,
+        }),
+        TranscriptEntry::ToolCall(ToolTranscript {
+            call_id: Some(CallId::from("call_2")),
+            name: "read".into(),
+            context: Some("README.md".into()),
+            output: "title\n\n\n\n\nbody".into(),
+            lifecycle: ToolLifecycle::Running,
+        }),
+    ];
+    let text = plain(transcript_lines(&entries, 80, TranscriptDetail::Compact));
+    let blank_run = text
+        .lines()
+        .map(|line| line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .windows(3)
+        .any(|window| window.iter().all(|blank| *blank));
+    assert!(!blank_run, "{text}");
+    assert!(text.contains("• Ran bash"));
+    assert!(text.contains("• Running read"));
 }
 
 #[test]

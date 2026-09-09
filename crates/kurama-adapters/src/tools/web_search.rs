@@ -354,16 +354,22 @@ impl Tool for WebSearchTool {
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "operation", rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(tag = "operation", rename_all = "kebab-case")]
 enum WebArguments {
     Search {
         query: String,
+        #[serde(default = "default_search_limit")]
         limit: usize,
+        #[serde(default)]
         contains_workspace_data: bool,
     },
     Open {
         url: String,
     },
+}
+
+fn default_search_limit() -> usize {
+    5
 }
 
 #[derive(Deserialize)]

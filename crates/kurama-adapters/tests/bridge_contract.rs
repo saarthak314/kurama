@@ -398,13 +398,12 @@ fn strict_control_parser_normalizes_tools_and_delegation() {
         )
         .is_err()
     );
-    assert!(
-        parse_control(
-            r#"{"kind":"tool_calls","text":"stale","calls":[{"call_id":"c1","name":"read","arguments":"{\"files\":[]}"}],"agents":[]}"#,
-            true,
-        )
-        .is_err()
-    );
+    let commentary = parse_control(
+        r#"{"kind":"tool_calls","text":"I'll read it","calls":[{"call_id":"c1","name":"read","arguments":"{\"files\":[]}"}],"agents":[]}"#,
+        true,
+    )
+    .expect("ignore commentary text on tool_calls");
+    assert!(matches!(commentary.as_slice(), [ModelEvent::ToolCall { name, .. }] if name == "read"));
 }
 
 #[test]
