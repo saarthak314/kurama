@@ -235,6 +235,16 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect,
     if let Some(branch) = &state.git_branch {
         items.push(FooterItem::dim(branch.clone()));
     }
+    if let Some(goal) = &state.goal {
+        items.push(FooterItem::new(
+            format!("goal {}", goal.status.as_str()),
+            if goal.status.is_active() {
+                Style::default().fg(ACCENT)
+            } else {
+                Style::default().fg(DIM)
+            },
+        ));
+    }
     if let Some(context) = context {
         items.push(context);
     }

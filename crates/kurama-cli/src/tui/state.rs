@@ -9,7 +9,7 @@ use kurama_protocol::{
     model::Usage,
     policy::{ApprovalRequest, ApprovalResponse, ExecutionMode},
     runtime::{AgentCommand, EngineCommand, RuntimeEvent},
-    session::{EventEnvelope, SessionEvent, TodoItem},
+    session::{EventEnvelope, GoalStatus, SessionEvent, SessionGoal, TodoItem},
     tool::ToolResult,
 };
 
@@ -136,6 +136,7 @@ pub struct TuiState {
     pub approval: Option<ApprovalState>,
     pub agents: Vec<AgentRow>,
     pub todos: Vec<TodoItem>,
+    pub goal: Option<SessionGoal>,
     pub git_branch: Option<String>,
     pub viewport_height: Cell<u16>,
     pub selected_agent: usize,
@@ -190,6 +191,7 @@ impl TuiState {
             approval: None,
             agents: Vec::new(),
             todos: Vec::new(),
+            goal: None,
             git_branch: None,
             viewport_height: Cell::new(12),
             selected_agent: 0,
@@ -867,6 +869,8 @@ impl TuiState {
                     );
                 }
                 SessionEvent::TodoUpdated { items } => self.replace_todos(items.clone()),
+                SessionEvent::GoalUpdated { goal } => self.apply_goal(Some(goal.clone()), false),
+                SessionEvent::GoalCleared => self.apply_goal(None, false),
                 _ => {}
             }
         }
@@ -1277,6 +1281,19 @@ impl TuiState {
                 }
             }
             RuntimeEvent::Usage { usage } => self.usage = usage,
+            RuntimeEvent::GoalUpdated { goal } => {
+                let pursuing = goal.status.is_active();
+                self.apply_goal(Some(goal), true);
+                if pursuing
+                    && matches!(
+                        self.activity,
+                        ActivityState::Idle | ActivityState::Interrupted
+                    )
+                {
+                    self.set_thinking();
+                }
+            }
+            RuntimeEvent::GoalCleared => self.apply_goal(None, true),
             RuntimeEvent::TurnCompleted => self.finish_turn(),
             RuntimeEvent::Error { message } => {
                 if terminal_turn_event {
@@ -1447,6 +1464,83 @@ impl TuiState {
                 *index -= 1;
             }
         }
+    }
+
+    pub fn submit_goal(&mut self, objective: String) -> bool {
+        if !matches!(self.activity, ActivityState::Idle) {
+            return false;
+        }
+        self.apply_goal(
+            Some(SessionGoal {
+                objective: objective.clone(),
+                status: GoalStatus::Pursuing,
+                turns: 1,
+                blocked_streak: 0,
+            }),
+            true,
+        );
+        self.push_user(objective.clone());
+        self.sent_commands
+            .push(EngineCommand::SetGoal { objective });
+        let now = Instant::now();
+        self.turn_started_at = Some(now);
+        self.last_turn_elapsed = None;
+        self.activity = ActivityState::Thinking { started_at: now };
+        true
+    }
+
+    pub fn resume_goal(&mut self) -> bool {
+        let Some(goal) = &self.goal else {
+            return false;
+        };
+        if !matches!(
+            goal.status,
+            GoalStatus::Paused | GoalStatus::Blocked | GoalStatus::BudgetLimited
+        ) {
+            return false;
+        }
+        if !matches!(self.activity, ActivityState::Idle) {
+            return false;
+        }
+        self.sent_commands.push(EngineCommand::ResumeGoal);
+        let now = Instant::now();
+        self.turn_started_at = Some(now);
+        self.last_turn_elapsed = None;
+        self.activity = ActivityState::Thinking { started_at: now };
+        true
+    }
+
+    pub fn push_goal_status(&mut self) {
+        match &self.goal {
+            None => self.push_notice(
+                Some("GOAL".into()),
+                "no active goal; /goal <objective> to start",
+            ),
+            Some(goal) => self.push_notice(
+                Some("GOAL".into()),
+                format!("{}  {}", goal.status.as_str(), goal.objective),
+            ),
+        }
+    }
+
+    fn apply_goal(&mut self, goal: Option<SessionGoal>, notify: bool) {
+        let changed = match (&self.goal, &goal) {
+            (None, None) => false,
+            (None, Some(_)) | (Some(_), None) => true,
+            (Some(previous), Some(next)) => {
+                previous.status != next.status || previous.objective != next.objective
+            }
+        };
+        if notify && changed {
+            match &goal {
+                Some(goal) => self.push_notice(
+                    Some("GOAL".into()),
+                    format!("{}  {}", goal.status.as_str(), goal.objective),
+                ),
+                None => self.push_notice(Some("GOAL".into()), "cleared"),
+            }
+        }
+        self.goal = goal;
     }
 
     fn replace_todos(&mut self, items: Vec<TodoItem>) {

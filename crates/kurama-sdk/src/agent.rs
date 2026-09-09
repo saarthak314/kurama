@@ -82,6 +82,26 @@ impl Handle {
         self.inner.set_mode(mode).await
     }
 
+    pub async fn set_goal(&self, objective: impl Into<String>) -> Result<(), KuramaError> {
+        self.inner.set_goal(objective).await
+    }
+
+    pub async fn edit_goal(&self, objective: impl Into<String>) -> Result<(), KuramaError> {
+        self.inner.edit_goal(objective).await
+    }
+
+    pub async fn pause_goal(&self) -> Result<(), KuramaError> {
+        self.inner.pause_goal().await
+    }
+
+    pub async fn resume_goal(&self) -> Result<(), KuramaError> {
+        self.inner.resume_goal().await
+    }
+
+    pub async fn clear_goal(&self) -> Result<(), KuramaError> {
+        self.inner.clear_goal().await
+    }
+
     pub async fn agent_command(
         &self,
         command: kurama_protocol::runtime::AgentCommand,
@@ -154,7 +174,9 @@ impl Turn<'_> {
                 return Ok(None);
             };
             let event = match event {
-                RuntimeEvent::Usage { .. } => continue,
+                RuntimeEvent::Usage { .. }
+                | RuntimeEvent::GoalUpdated { .. }
+                | RuntimeEvent::GoalCleared => continue,
                 RuntimeEvent::Status { message } => Event::Status(message),
                 RuntimeEvent::AssistantDelta { text } => {
                     self.text.push_str(&text);

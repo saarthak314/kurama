@@ -4,6 +4,7 @@ pub mod agent_manager;
 pub mod cancel;
 pub mod context;
 pub mod engine;
+pub mod goal;
 pub mod ids;
 pub mod orchestrator;
 pub mod policy;

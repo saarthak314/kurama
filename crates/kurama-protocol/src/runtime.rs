@@ -3,6 +3,7 @@ use crate::{
     id::{AgentId, CallId, OperationId},
     model::Usage,
     policy::{ApprovalRequest, ApprovalResponse, ExecutionMode},
+    session::SessionGoal,
     tool::ToolResult,
 };
 
@@ -20,6 +21,15 @@ pub enum EngineCommand {
     CancelTurn,
     Compact,
     SetMode(ExecutionMode),
+    SetGoal {
+        objective: String,
+    },
+    EditGoal {
+        objective: String,
+    },
+    PauseGoal,
+    ResumeGoal,
+    ClearGoal,
     Agent(AgentCommand),
     Shutdown,
 }
@@ -69,6 +79,10 @@ pub enum RuntimeEvent {
         usage: Usage,
     },
     TurnCompleted,
+    GoalUpdated {
+        goal: SessionGoal,
+    },
+    GoalCleared,
     Error {
         message: String,
     },

@@ -883,6 +883,51 @@ async fn paste_during_history_search_extends_the_query() {
     assert_eq!(app.state.history_matches(), ["fix the failing tests"]);
 }
 
+#[tokio::test]
+async fn goal_command_sets_pauses_and_clears() {
+    let (_temp, paths, project) = fixture();
+    let repository = ConfigRepository::open(paths.clone()).expect("repository");
+    repository
+        .write_config(&bridge_config())
+        .expect("write config");
+    let mut app =
+        App::bootstrap_with_paths(&Args::default(), project, paths, SessionSecrets::default())
+            .expect("bootstrap");
+
+    submit_command(&mut app, "/goal keep tests green");
+    assert_eq!(
+        app.state.goal.as_ref().map(|goal| goal.objective.as_str()),
+        Some("keep tests green")
+    );
+    assert!(
+        app.state
+            .sent_commands()
+            .iter()
+            .any(|command| matches!(command, EngineCommand::SetGoal { objective } if objective == "keep tests green"))
+    );
+
+    app.state.apply_runtime_event(RuntimeEvent::TurnCompleted);
+    submit_command(&mut app, "/goal pause");
+    assert!(
+        app.state
+            .sent_commands()
+            .iter()
+            .any(|command| matches!(command, EngineCommand::PauseGoal))
+    );
+
+    app.state.take_commands();
+    submit_command(&mut app, "/goal");
+    assert!(transcript_has_notice(&app, "pursuing  keep tests green"));
+
+    submit_command(&mut app, "/goal clear");
+    assert!(
+        app.state
+            .sent_commands()
+            .iter()
+            .any(|command| matches!(command, EngineCommand::ClearGoal))
+    );
+}
+
 fn type_command(app: &mut App, command: &str) {
     for character in command.chars() {
         app.handle_event(Event::Key(KeyEvent::new(
