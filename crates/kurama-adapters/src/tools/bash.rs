@@ -25,6 +25,7 @@ use super::{BoundedText, PathGuard, limits::staged_output};
 
 const MAX_COMMAND_BYTES: usize = 32_768;
 const MAX_TIMEOUT_MS: u64 = 3_600_000;
+const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
 const EVENT_CHUNK_BYTES: usize = 4 * 1024;
 const CAPTURE_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
@@ -60,8 +61,18 @@ impl Default for BashTool {
 #[derive(Debug, Deserialize)]
 struct BashArguments {
     command: String,
+    #[serde(default = "default_cwd")]
     cwd: String,
+    #[serde(default = "default_timeout_ms")]
     timeout_ms: u64,
+}
+
+fn default_cwd() -> String {
+    ".".into()
+}
+
+fn default_timeout_ms() -> u64 {
+    DEFAULT_TIMEOUT_MS
 }
 
 impl Tool for BashTool {

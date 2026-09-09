@@ -185,9 +185,18 @@ fn parses_all_product_commands_without_restart() {
         Command::Goal(GoalAction::Set("keep tests green".into()))
     );
     assert_eq!(
+        parse_command("/goal set ship the e2e pass").unwrap(),
+        Command::Goal(GoalAction::Set("ship the e2e pass".into()))
+    );
+    assert_eq!(
+        parse_command("/goal view").unwrap(),
+        Command::Goal(GoalAction::View)
+    );
+    assert_eq!(
         parse_command("/goal pause").unwrap(),
         Command::Goal(GoalAction::Pause)
     );
+    assert!(parse_command("/goal set").is_err());
     assert_eq!(parse_command("/exit").unwrap(), Command::Exit);
     assert!(parse_command("/restart").is_err());
     assert!(parse_command("/mode yolo").is_err());

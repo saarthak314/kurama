@@ -149,7 +149,7 @@ pub fn parse_control(text: &str, delegation_enabled: bool) -> Result<Vec<ModelEv
             Ok(vec![ModelEvent::TextDelta { text: control.text }])
         }
         ControlKind::ToolCalls => {
-            if !control.text.is_empty() || !control.agents.is_empty() {
+            if !control.agents.is_empty() {
                 return Err(KuramaError::Protocol(
                     "bridge returned contaminated tool-call control".into(),
                 ));

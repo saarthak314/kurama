@@ -546,6 +546,13 @@ async fn bash_ignores_unknown_fields_and_rejects_symlink_cwds() {
         .expect("ignore extra fields");
     assert!(!result.is_error);
 
+    let omitted = invocation(serde_json::json!({ "command": "pwd" }));
+    let result = BashTool::default()
+        .execute(fixture.context(limits()), omitted, &NeverCancel)
+        .await
+        .expect("default cwd and timeout");
+    assert!(!result.is_error);
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;

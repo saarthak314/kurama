@@ -2525,7 +2525,26 @@ fn git_diff_stat(project: &str) -> Result<String, String> {
         .output()
         .map_err(|error| format!("git diff failed: {error}"))?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let first = stderr
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("git diff failed");
+        if first.contains("not a git repository") || first.contains("Not a git repository") {
+            return Err("not a git repository".into());
+        }
+        let mut message = first.to_owned();
+        if message.chars().count() > 200 {
+            let end = message
+                .char_indices()
+                .nth(200)
+                .map(|(index, _)| index)
+                .unwrap_or(message.len());
+            message.truncate(end);
+            message.push('…');
+        }
+        return Err(message);
     }
     let mut diff = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if diff.chars().count() > 800 {
