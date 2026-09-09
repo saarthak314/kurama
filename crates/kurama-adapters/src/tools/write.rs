@@ -23,7 +23,6 @@ pub struct WriteTool {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct WriteArguments {
     path: String,
     expected_sha256: Option<String>,

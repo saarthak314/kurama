@@ -1445,7 +1445,33 @@ pub fn transcript_lines(
             ),
         }
     }
-    lines
+    squeeze_blank_lines(lines)
+}
+
+fn squeeze_blank_lines(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let mut squeezed = Vec::with_capacity(lines.len());
+    let mut last_blank = true;
+    for line in lines {
+        let blank = line.width() == 0
+            || line
+                .spans
+                .iter()
+                .all(|span| span.content.as_ref().trim().is_empty());
+        if blank {
+            if last_blank {
+                continue;
+            }
+            last_blank = true;
+            squeezed.push(Line::from(""));
+        } else {
+            last_blank = false;
+            squeezed.push(line);
+        }
+    }
+    while squeezed.last().is_some_and(|line| line.width() == 0) {
+        squeezed.pop();
+    }
+    squeezed
 }
 
 #[cfg(test)]
@@ -1465,17 +1491,7 @@ fn compact_tool_output(tool: &super::ToolTranscript, output: &str, width: usize)
         if output.is_empty() {
             return Vec::new();
         }
-        let output = hard_wrap(output, width);
-        let omitted = output.len().saturating_sub(RUNNING_TAIL_LINES);
-        let mut visible = Vec::with_capacity(RUNNING_TAIL_LINES + usize::from(omitted > 0));
-        if omitted > 0 {
-            visible.push(format!(
-                "… {omitted} earlier {}",
-                pluralize(omitted, "line")
-            ));
-        }
-        visible.extend(output.into_iter().skip(omitted));
-        return visible;
+        return compact_wrapped_tail(hard_wrap(output, width), RUNNING_TAIL_LINES);
     }
 
     if output.is_empty() {
@@ -1483,8 +1499,18 @@ fn compact_tool_output(tool: &super::ToolTranscript, output: &str, width: usize)
     }
 
     const PREVIEW_LINES: usize = 2;
-    let wrapped = hard_wrap(output, width);
-    let omitted = wrapped.len().saturating_sub(PREVIEW_LINES);
+    compact_wrapped_tail(hard_wrap(output, width), PREVIEW_LINES)
+}
+
+fn compact_wrapped_tail(wrapped: Vec<String>, tail: usize) -> Vec<String> {
+    let wrapped = wrapped
+        .into_iter()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    if wrapped.is_empty() {
+        return Vec::new();
+    }
+    let omitted = wrapped.len().saturating_sub(tail);
     let mut visible = Vec::new();
     if omitted > 0 {
         visible.push(format!(

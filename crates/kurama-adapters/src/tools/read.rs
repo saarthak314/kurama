@@ -20,13 +20,11 @@ pub struct ReadTool {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ReadArguments {
     files: Vec<ReadFile>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ReadFile {
     path: String,
     start_line: Option<usize>,

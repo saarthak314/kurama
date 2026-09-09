@@ -1539,7 +1539,7 @@ async fn duplicate_model_call_ids_in_one_round_are_rejected_before_execution() {
 }
 
 #[tokio::test]
-async fn reused_model_call_id_cannot_alias_a_different_invocation() {
+async fn reused_model_call_id_is_remapped_instead_of_failing_the_turn() {
     let backend: Arc<dyn ModelBackend> = Arc::new(ScriptedBackend::new(vec![
         vec![
             Ok(ModelEvent::ToolCall {
@@ -1563,6 +1563,10 @@ async fn reused_model_call_id_cannot_alias_a_different_invocation() {
                 finish_reason: FinishReason::ToolCalls,
             }),
         ],
+        vec![Ok(ModelEvent::ResponseCompleted {
+            cursor: None,
+            finish_reason: FinishReason::Stop,
+        })],
     ]));
     let tool = Arc::new(CountingTool::default());
     let executions = tool.executions.clone();
@@ -1575,16 +1579,15 @@ async fn reused_model_call_id_cannot_alias_a_different_invocation() {
     let (handle, mut events) = Engine::spawn(config, Vec::new()).expect("spawn");
     handle.submit("count twice", false).await.expect("submit");
 
-    let message = loop {
+    loop {
         match events.recv().await.expect("event") {
-            RuntimeEvent::Error { message } => break message,
-            RuntimeEvent::TurnCompleted => panic!("conflicting call id completed the turn"),
+            RuntimeEvent::TurnCompleted => break,
+            RuntimeEvent::Error { message } => panic!("reused call id failed the turn: {message}"),
             _ => {}
         }
-    };
+    }
 
-    assert!(message.contains("different invocation"));
-    assert_eq!(executions.load(Ordering::Relaxed), 1);
+    assert_eq!(executions.load(Ordering::Relaxed), 2);
 }
 
 #[tokio::test]

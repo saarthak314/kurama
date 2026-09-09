@@ -334,6 +334,25 @@ async fn write_rejects_symlink_escapes_and_ambiguous_payloads() {
 }
 
 #[tokio::test]
+async fn write_ignores_unknown_fields() {
+    let fixture = Fixture::empty();
+    let extra = invocation(
+        "write",
+        serde_json::json!({
+            "path": "note.txt",
+            "content": "ok\n",
+            "items": [{"id": "track_sdk_work", "content": "work", "status": "pending"}]
+        }),
+    );
+    let result = WriteTool::default()
+        .execute(fixture.context(normal_limits()), extra, &NeverCancel)
+        .await
+        .expect("ignore extra fields");
+    assert!(!result.is_error);
+    assert_eq!(fs::read(fixture.path("note.txt")).unwrap(), b"ok\n");
+}
+
+#[tokio::test]
 async fn yolo_writes_outside_workspace() {
     let fixture = Fixture::empty();
     let outside = fixture._temp.path().join("outside");

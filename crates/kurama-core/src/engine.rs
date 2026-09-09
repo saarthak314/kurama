@@ -1073,19 +1073,20 @@ impl EngineActor {
         invocation: ToolInvocation,
         cancel: &CancelToken,
     ) -> Result<ToolResult, KuramaError> {
+        let mut invocation = invocation;
         let mut record_invocation = match self.seen_tool_calls.get(&invocation.call_id) {
             Some(previous) if previous != &invocation => {
-                return Err(KuramaError::Model(format!(
-                    "model reused tool call id {} for a different invocation",
-                    invocation.call_id
-                )));
+                invocation.call_id = self.ids.call_id();
+                self.seen_tool_calls
+                    .insert(invocation.call_id.clone(), invocation.clone());
+                true
             }
             Some(_) => false,
             None if self.completed_tool_calls.contains_key(&invocation.call_id) => {
-                return Err(KuramaError::Model(format!(
-                    "model reused tool call id {} without a durable invocation",
-                    invocation.call_id
-                )));
+                invocation.call_id = self.ids.call_id();
+                self.seen_tool_calls
+                    .insert(invocation.call_id.clone(), invocation.clone());
+                true
             }
             None => {
                 self.seen_tool_calls
@@ -1104,7 +1105,6 @@ impl EngineActor {
             .await?;
             return Ok(result);
         }
-        let mut invocation = invocation;
         let Some(tool) = self.tools.get(&invocation.name).cloned() else {
             let operation_id = self.ids.operation_id();
             self.append(SessionEvent::ToolUnknown {

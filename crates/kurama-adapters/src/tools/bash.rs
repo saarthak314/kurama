@@ -58,7 +58,6 @@ impl Default for BashTool {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct BashArguments {
     command: String,
     cwd: String,

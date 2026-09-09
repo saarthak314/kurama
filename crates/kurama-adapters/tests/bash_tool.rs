@@ -532,19 +532,19 @@ fn bash_classification_is_conservative() {
 }
 
 #[tokio::test]
-async fn bash_rejects_unknown_fields_and_symlink_cwds() {
+async fn bash_ignores_unknown_fields_and_rejects_symlink_cwds() {
     let fixture = Fixture::empty();
-    let invalid = invocation(serde_json::json!({
+    let extra = invocation(serde_json::json!({
         "command": "pwd",
         "cwd": ".",
         "timeout_ms": 1000,
-        "extra": true
+        "items": [{"id": "track_sdk_work", "content": "work", "status": "pending"}]
     }));
-    let error = BashTool::default()
-        .execute(fixture.context(limits()), invalid, &NeverCancel)
+    let result = BashTool::default()
+        .execute(fixture.context(limits()), extra, &NeverCancel)
         .await
-        .expect_err("strict schema");
-    assert!(matches!(error, KuramaError::Tool(_)));
+        .expect("ignore extra fields");
+    assert!(!result.is_error);
 
     #[cfg(unix)]
     {
