@@ -592,7 +592,7 @@ fn transcript_uses_compact_codex_style_hierarchy() {
 }
 
 #[test]
-fn compact_tool_rows_hide_output_while_expanded_preserves_it() {
+fn compact_tool_rows_preview_output_while_expanded_preserves_it() {
     let entries = vec![
         TranscriptEntry::UserTurn {
             body: "inspect".into(),
@@ -787,7 +787,7 @@ fn unlabeled_notice_renders_body_only_in_dim_text() {
 
     let lines = transcript_lines(&entries, 80, TranscriptDetail::Compact);
 
-    assert_eq!(plain(lines.clone()), "runtime resumed");
+    assert_eq!(plain(lines.clone()), "• runtime resumed");
     assert!(
         lines[0]
             .spans
@@ -1686,6 +1686,47 @@ fn overlays_hide_the_composer_cursor() {
     state.overlay = Overlay::Shortcuts;
     terminal.draw(|frame| render(frame, &state)).unwrap();
     assert!(format!("{:?}", terminal.backend()).contains("cursor: false"));
+
+    state.overlay = Overlay::AgentMessage;
+    state.agent_message = "hi".into();
+    state.agent_message_cursor = 2;
+    state.agents = vec![AgentRow {
+        id: AgentId::from("a_1"),
+        role: "reviewer".into(),
+        profile: "gpt-5.6".into(),
+        task: "inspect".into(),
+        state: AgentState::Running,
+        activity: "reading".into(),
+        transcript: vec!["line one".into(), "line two".into()],
+    }];
+    state.selected_agent = 0;
+    terminal.draw(|frame| render(frame, &state)).unwrap();
+    assert!(format!("{:?}", terminal.backend()).contains("cursor: true"));
+}
+
+#[test]
+fn agent_inspect_does_not_double_space_transcript_lines() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.agents = vec![AgentRow {
+        id: AgentId::from("a_1"),
+        role: "reviewer".into(),
+        profile: "gpt-5.6".into(),
+        task: "inspect".into(),
+        state: AgentState::Running,
+        activity: "reading".into(),
+        transcript: vec!["line one".into(), "line two".into()],
+    }];
+    state.open_agents();
+    state.inspect_selected_agent();
+
+    let text = buffer_text(&rendered(&state, 80, 24));
+    let rows = text.lines().map(str::trim_end).collect::<Vec<_>>();
+    let one = rows.iter().position(|row| row.contains("line one"));
+    let two = rows.iter().position(|row| row.contains("line two"));
+    assert!(one.is_some() && two.is_some(), "{rows:#?}");
+    assert_eq!(two.unwrap(), one.unwrap() + 1, "{rows:#?}");
+    assert!(text.contains("RUNNING"));
+    assert!(!text.contains("Running"));
 }
 
 #[test]

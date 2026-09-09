@@ -122,7 +122,7 @@ pub(crate) fn render_composer(
         .map(|(index, line)| {
             Line::from(vec![
                 Span::styled(
-                    if index == 0 { PROMPT } else { "  " },
+                    if start + index == 0 { PROMPT } else { "  " },
                     Style::default().fg(ACCENT),
                 ),
                 Span::styled(line.clone(), Style::default().fg(TEXT)),
@@ -501,10 +501,7 @@ fn bounded_detail_lines(value: &str, width: usize, max_lines: usize) -> Vec<Line
         ])];
     }
     if max_lines == 2 {
-        let first = format!(
-            "{}…",
-            truncate_display(&wrapped[0], content_width.saturating_sub(1))
-        );
+        let first = truncate_display(&wrapped[0], content_width);
         let last = format!(
             "…{}",
             truncate_tail(

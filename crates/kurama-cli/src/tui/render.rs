@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use ratatui::{
     Frame,
-    layout::Rect,
+    layout::{Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
@@ -11,7 +11,9 @@ use ratatui::{
 use kurama_protocol::agent::AgentState;
 
 use super::{
-    Overlay, ResponsiveLayout, TranscriptEntry, TuiState, activity_line, command_palette_height,
+    Overlay, ResponsiveLayout, TranscriptEntry, TuiState, activity_line,
+    agents::state_label,
+    command_palette_height,
     composer::{
         approval_height, composer_height, render_approval, render_composer, render_footer,
         render_queue,
@@ -45,10 +47,16 @@ pub(crate) fn render_with_transcript(
     match state.overlay {
         Overlay::None | Overlay::Approval | Overlay::ApprovalEdit => {}
         Overlay::Shortcuts => render_shortcuts(frame, state),
-        Overlay::Onboarding => render_onboarding(frame, state),
+        Overlay::Onboarding => {
+            if let Some(position) = render_onboarding(frame, state) {
+                frame.set_cursor_position(position);
+            }
+        }
         Overlay::Agents => render_agents(frame, state),
         Overlay::AgentInspect | Overlay::AgentMessage | Overlay::ConfirmAgentCancel => {
-            render_agent_inspect(frame, state)
+            if let Some(position) = render_agent_inspect(frame, state) {
+                frame.set_cursor_position(position);
+            }
         }
     }
 }
@@ -165,6 +173,7 @@ fn render_shortcuts(frame: &mut Frame<'_>, state: &TuiState) {
     if area.is_empty() {
         return;
     }
+    frame.render_widget(Clear, area);
     let lines = [
         ("ctrl+c", "interrupt, then clear, then exit"),
         ("esc", "interrupt a running turn"),
@@ -196,11 +205,11 @@ fn render_shortcuts(frame: &mut Frame<'_>, state: &TuiState) {
     );
 }
 
-fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) {
+fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) -> Option<Position> {
     frame.render_widget(Clear, frame.area());
     let mut area = inset(frame.area(), 4, 2);
     if area.is_empty() {
-        return;
+        return None;
     }
     if area.height >= 5
         && let Some(TranscriptEntry::Startup {
@@ -214,63 +223,71 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) {
             Paragraph::new(startup_lines(version, project, *mode, area.width as usize)),
             Rect::new(area.x, area.y, area.width, banner_height),
         );
-        let consumed = banner_height.saturating_add(1).min(area.height);
-        area.y = area.y.saturating_add(consumed);
-        area.height = area.height.saturating_sub(consumed);
+        area.y = area.y.saturating_add(banner_height);
+        area.height = area.height.saturating_sub(banner_height);
     }
     if area.is_empty() {
-        return;
+        return None;
     }
     if !state.onboarding.is_selecting_connection() {
         let input = state.onboarding.display_input();
-        let lines = vec![
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(BORDER))
+            .padding(Padding::new(1, 1, 0, 0));
+        let inner = block.inner(area);
+        let field_width = inner.width.saturating_sub(2).max(1) as usize;
+        let shown = if input.is_empty() {
+            " ".to_owned()
+        } else {
+            truncate_display(&input, field_width)
+        };
+        let mut lines = vec![
             Line::from(Span::styled(
                 state.onboarding.step_label(),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             )),
-            Line::from(""),
             Line::from(Span::styled(
-                state.onboarding.prompt(),
+                truncate_display(&state.onboarding.prompt(), inner.width as usize),
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             )),
-            Line::from(""),
             Line::from(vec![
                 Span::styled(
-                    "›  ",
+                    "› ",
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    if input.is_empty() {
-                        " "
-                    } else {
-                        input.as_str()
-                    },
-                    Style::default().fg(TEXT),
-                ),
+                Span::styled(shown.as_str(), Style::default().fg(TEXT)),
             ]),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Enter confirms · Esc closes setup · secrets remain masked",
-                Style::default().fg(DIM),
-            )),
         ];
-        frame.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(BORDER))
-                    .padding(Padding::new(2, 2, 1, 1)),
+        if let Some(error) = state.onboarding.error() {
+            lines.push(Line::from(Span::styled(
+                truncate_display(error, inner.width as usize),
+                Style::default().fg(RED),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            truncate_display(
+                "Enter confirms · Esc closes setup · secrets remain masked",
+                inner.width as usize,
             ),
-            area,
-        );
-        return;
+            Style::default().fg(DIM),
+        )));
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+        let prompt_row = 2_u16.min(inner.height.saturating_sub(1));
+        let column = 2_u16.saturating_add(Line::from(shown.as_str()).width() as u16);
+        return Some(Position::new(
+            inner
+                .x
+                .saturating_add(column.min(inner.width.saturating_sub(1))),
+            inner.y.saturating_add(prompt_row),
+        ));
     }
     let mut lines = vec![
         Line::from(Span::styled(
             state.onboarding.step_label(),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
-        Line::from(""),
         Line::from(Span::styled(
             "How should Kurama connect?",
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
@@ -279,7 +296,6 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) {
             "Choose once. Projects remember the profile, not the secret.",
             Style::default().fg(DIM),
         )),
-        Line::from(""),
     ];
     for (index, option) in state.onboarding.options().iter().enumerate() {
         let selected = index == state.onboarding.selected();
@@ -306,7 +322,6 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) {
             ),
         ]));
     }
-    lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         connection_note(state.onboarding.selected()).trim_start(),
         Style::default().fg(DIM),
@@ -315,21 +330,19 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) {
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(BORDER))
-                .padding(Padding::new(2, 2, 1, 1)),
+                .padding(Padding::new(1, 1, 0, 0)),
         ),
         area,
     );
+    None
 }
 
 fn render_agents(frame: &mut Frame<'_>, state: &TuiState) {
     frame.render_widget(Clear, frame.area());
     let frame_area = frame.area();
-    let area = inset(
-        frame_area,
-        if frame_area.width >= 60 { 3 } else { 1 },
-        if frame_area.height >= 20 { 2 } else { 1 },
-    );
+    let area = inset(frame_area, 1, 0);
     if area.is_empty() {
         return;
     }
@@ -337,6 +350,7 @@ fn render_agents(frame: &mut Frame<'_>, state: &TuiState) {
     let vertical_padding = if area.height >= 10 { 1 } else { 0 };
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(BORDER))
         .padding(Padding::new(
             horizontal_padding,
@@ -383,7 +397,7 @@ fn render_agents(frame: &mut Frame<'_>, state: &TuiState) {
     }
     if show_columns {
         lines.push(Line::from(Span::styled(
-            "ID        ROLE          PROFILE      TASK                  STATE",
+            "  ID        ROLE          PROFILE      TASK                  STATE",
             Style::default().fg(DIM),
         )));
     }
@@ -406,9 +420,9 @@ fn render_agents(frame: &mut Frame<'_>, state: &TuiState) {
     let controls = if width >= 68 {
         "enter  inspect     m  message     x  cancel     ↑↓  select     esc  close"
     } else if width >= 36 {
-        "enter  inspect   ↑↓  select   esc  close"
+        "enter inspect  m message  x cancel  esc"
     } else {
-        "↵ inspect  ↑↓  esc"
+        "↵ m x esc"
     };
     lines.push(Line::from(Span::styled(
         truncate(controls, width),
@@ -460,79 +474,123 @@ fn agent_row(agent: &crate::tui::AgentRow, selected: bool, width: usize) -> Line
     ])
 }
 
-fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) {
+fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) -> Option<Position> {
     frame.render_widget(Clear, frame.area());
-    let area = inset(frame.area(), 3, 2);
+    let area = inset(frame.area(), 1, 0);
     if area.is_empty() {
-        return;
+        return None;
     }
     let Some(agent) = state.selected_agent() else {
-        return;
+        render_agents(frame, state);
+        return None;
     };
-    let mut lines = vec![
+    let state_color = match agent.state {
+        AgentState::Running => ACCENT,
+        AgentState::Queued => DIM,
+        AgentState::Completed => GREEN,
+        AgentState::Failed => RED,
+        AgentState::Cancelled => DIM,
+    };
+    let mut body = vec![
         Line::from(vec![
-            Span::styled("/AGENTS  /  ", Style::default().fg(ACCENT)),
+            Span::styled("agents / ", Style::default().fg(ACCENT)),
             Span::styled(
                 agent.id.to_string(),
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             ),
         ]),
-        Line::from(""),
         Line::from(Span::styled(
-            agent.role.to_uppercase(),
+            agent.role.as_str(),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::styled(
-            agent.task.as_str(),
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            format!("{}  ·  {:?}", agent.profile, agent.state),
-            Style::default().fg(DIM),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "CURRENT",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )),
+        Line::from(Span::styled(agent.task.as_str(), Style::default().fg(TEXT))),
+        Line::from(vec![
+            Span::styled(agent.profile.as_str(), Style::default().fg(DIM)),
+            Span::raw("  ·  "),
+            Span::styled(
+                state_label(&agent.state).to_uppercase(),
+                Style::default()
+                    .fg(state_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
         Line::from(Span::styled(
             agent.activity.as_str(),
             Style::default().fg(TEXT),
         )),
-        Line::from(""),
     ];
-    for line in &agent.transcript {
-        lines.push(Line::from(Span::styled(
-            format!("│ {line}"),
+    for (index, line) in agent.transcript.iter().enumerate() {
+        let last = index + 1 == agent.transcript.len();
+        body.push(Line::from(Span::styled(
+            format!("{} {line}", if last { "└" } else { "│" }),
             Style::default().fg(TEXT),
         )));
-        lines.push(Line::from("│"));
     }
-    if state.overlay == Overlay::AgentMessage {
-        lines.push(Line::from(Span::styled(
-            format!("m  {}", state.agent_message),
-            Style::default().fg(TEXT),
-        )));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER))
+        .padding(Padding::new(1, 1, 0, 0));
+    let inner = block.inner(area);
+    if inner.is_empty() {
+        frame.render_widget(block, area);
+        return None;
+    }
+    let field_width = inner.width.saturating_sub(2).max(1) as usize;
+    let action = if state.overlay == Overlay::AgentMessage {
+        Line::from(vec![
+            Span::styled("› ", Style::default().fg(ACCENT)),
+            Span::styled(
+                truncate_display(&state.agent_message, field_width),
+                Style::default().fg(TEXT),
+            ),
+        ])
     } else if state.overlay == Overlay::ConfirmAgentCancel {
-        lines.push(Line::from(Span::styled(
-            format!("Cancel {}?  y confirm  ·  n/esc return", agent.id),
+        Line::from(Span::styled(
+            truncate_display(
+                &format!("Cancel {}?  y confirm  ·  n/esc return", agent.id),
+                inner.width as usize,
+            ),
             Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-        )));
+        ))
     } else {
-        lines.push(Line::from(Span::styled(
-            "esc  agents     m  message     x  cancel agent",
+        Line::from(Span::styled(
+            truncate_display(
+                "esc  agents     m  message     x  cancel agent",
+                inner.width as usize,
+            ),
             Style::default().fg(DIM),
-        )));
+        ))
+    };
+    let action_height = 1.min(inner.height);
+    let body_height = inner.height.saturating_sub(action_height) as usize;
+    let start = body.len().saturating_sub(body_height);
+    let mut lines = body
+        .into_iter()
+        .skip(start)
+        .take(body_height)
+        .collect::<Vec<_>>();
+    while lines.len() + 1 < inner.height as usize {
+        lines.push(Line::from(""));
     }
-    frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(BORDER))
-                .padding(Padding::new(2, 2, 1, 1)),
-        ),
-        area,
-    );
+    let action_row = lines.len() as u16;
+    lines.push(action);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+    if state.overlay == Overlay::AgentMessage {
+        let cursor = state.agent_message_cursor.min(state.agent_message.len());
+        let prefix = truncate_display(&state.agent_message[..cursor], field_width);
+        let column = 2_u16.saturating_add(Line::from(prefix.as_str()).width() as u16);
+        Some(Position::new(
+            inner
+                .x
+                .saturating_add(column.min(inner.width.saturating_sub(1))),
+            inner
+                .y
+                .saturating_add(action_row.min(inner.height.saturating_sub(1))),
+        ))
+    } else {
+        None
+    }
 }
 
 fn connection_note(index: usize) -> &'static str {

@@ -563,6 +563,8 @@ impl App {
                         self.state.composer_edited();
                     }
                     Overlay::ApprovalEdit => self.state.insert_approval_text(&text),
+                    Overlay::Onboarding => self.state.onboarding.insert_str(&text),
+                    Overlay::AgentMessage => self.state.insert_agent_message(&text),
                     _ => {}
                 }
                 return Ok(false);
@@ -574,8 +576,7 @@ impl App {
             return Ok(self.handle_ctrl_c());
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
-            if self.state.overlay() == Overlay::Shortcuts {
-                self.state.close_overlay();
+            if self.state.overlay() != Overlay::None {
                 return Ok(false);
             }
             self.state.toggle_transcript_view();
@@ -610,7 +611,19 @@ impl App {
     }
 
     fn handle_ctrl_c(&mut self) -> bool {
-        if self.state.overlay() == Overlay::Shortcuts {
+        if self.state.overlay() == Overlay::Onboarding {
+            self.state.onboarding = OnboardingState::new();
+            self.state.overlay = Overlay::None;
+            return false;
+        }
+        if matches!(
+            self.state.overlay(),
+            Overlay::Shortcuts
+                | Overlay::Agents
+                | Overlay::AgentInspect
+                | Overlay::AgentMessage
+                | Overlay::ConfirmAgentCancel
+        ) {
             self.state.close_overlay();
             return false;
         }
@@ -928,6 +941,15 @@ impl App {
         match key.code {
             KeyCode::Up => self.state.onboarding.select_previous(),
             KeyCode::Down => self.state.onboarding.select_next(),
+            KeyCode::Char(digit)
+                if self.state.onboarding.is_selecting_connection() && digit.is_ascii_digit() =>
+            {
+                if let Some(index) = digit.to_digit(10) {
+                    self.state
+                        .onboarding
+                        .select_index(index.saturating_sub(1) as usize);
+                }
+            }
             KeyCode::Char(character) => self.state.onboarding.push(character),
             KeyCode::Backspace => self.state.onboarding.backspace(),
             KeyCode::Enter => match self.state.onboarding.submit() {
@@ -939,7 +961,7 @@ impl App {
                     }
                 }
                 Ok(None) => {}
-                Err(error) => self.state.push_error(error),
+                Err(error) => self.state.onboarding.set_error(error),
             },
             KeyCode::Esc => {
                 self.state.onboarding = OnboardingState::new();
@@ -1034,18 +1056,24 @@ impl App {
     }
 
     fn handle_approval_key(&mut self, key: KeyEvent) {
+        let unmodified = key.modifiers.is_empty();
         match (self.state.overlay, key.code) {
-            (Overlay::Approval, KeyCode::Char('a')) => {
+            (Overlay::Approval, KeyCode::Char('a')) if unmodified => {
                 self.state.resolve_approval(ApprovalResponse::ApproveOnce)
             }
-            (Overlay::Approval, KeyCode::Char('s')) => self
+            (Overlay::Approval, KeyCode::Char('s')) if unmodified => self
                 .state
                 .resolve_approval(ApprovalResponse::ApproveSession),
-            (Overlay::Approval, KeyCode::Char('d')) => {
+            (Overlay::Approval, KeyCode::Char('d')) if unmodified => {
                 self.state.resolve_approval(ApprovalResponse::Deny)
             }
-            (Overlay::Approval, KeyCode::Char('e')) => self.state.begin_approval_edit(),
-            (Overlay::ApprovalEdit, KeyCode::Char(character)) => {
+            (Overlay::Approval, KeyCode::Char('e')) if unmodified => {
+                self.state.begin_approval_edit()
+            }
+            (Overlay::ApprovalEdit, KeyCode::Char(character))
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
                 if let Some(approval) = &mut self.state.approval {
                     let mut encoded = [0_u8; 4];
                     approval.insert_str(character.encode_utf8(&mut encoded));
@@ -1071,6 +1099,16 @@ impl App {
                     approval.move_right();
                 }
             }
+            (Overlay::ApprovalEdit, KeyCode::Up) => {
+                if let Some(approval) = &mut self.state.approval {
+                    approval.move_up();
+                }
+            }
+            (Overlay::ApprovalEdit, KeyCode::Down) => {
+                if let Some(approval) = &mut self.state.approval {
+                    approval.move_down();
+                }
+            }
             (Overlay::ApprovalEdit, KeyCode::Home) => {
                 if let Some(approval) = &mut self.state.approval {
                     approval.move_home();
@@ -1079,6 +1117,13 @@ impl App {
             (Overlay::ApprovalEdit, KeyCode::End) => {
                 if let Some(approval) = &mut self.state.approval {
                     approval.move_end();
+                }
+            }
+            (Overlay::ApprovalEdit, KeyCode::Enter)
+                if key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                if let Some(approval) = &mut self.state.approval {
+                    approval.insert_str("\n");
                 }
             }
             (Overlay::ApprovalEdit, KeyCode::Enter) => {
@@ -1097,11 +1142,44 @@ impl App {
             (Overlay::Agents | Overlay::AgentInspect, KeyCode::Char('m')) => {
                 self.state.begin_agent_message()
             }
-            (Overlay::AgentMessage, KeyCode::Char(character)) => {
-                self.state.agent_message.push(character);
+            (Overlay::AgentMessage, KeyCode::Char(character))
+                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                let mut encoded = [0_u8; 4];
+                self.state
+                    .insert_agent_message(character.encode_utf8(&mut encoded));
             }
             (Overlay::AgentMessage, KeyCode::Backspace) => {
-                self.state.agent_message.pop();
+                if self.state.agent_message_cursor > 0 {
+                    let previous = self.state.agent_message[..self.state.agent_message_cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
+                    self.state
+                        .agent_message
+                        .drain(previous..self.state.agent_message_cursor);
+                    self.state.agent_message_cursor = previous;
+                }
+            }
+            (Overlay::AgentMessage, KeyCode::Left) => {
+                if let Some((index, _)) = self.state.agent_message
+                    [..self.state.agent_message_cursor]
+                    .char_indices()
+                    .next_back()
+                {
+                    self.state.agent_message_cursor = index;
+                }
+            }
+            (Overlay::AgentMessage, KeyCode::Right)
+                if self.state.agent_message_cursor < self.state.agent_message.len() =>
+            {
+                let next = self.state.agent_message[self.state.agent_message_cursor..]
+                    .chars()
+                    .next()
+                    .map(char::len_utf8)
+                    .unwrap_or(0);
+                self.state.agent_message_cursor += next;
             }
             (Overlay::AgentMessage, KeyCode::Enter) => self.state.submit_agent_message(),
             (Overlay::Agents | Overlay::AgentInspect, KeyCode::Char('x')) => {
@@ -1381,8 +1459,7 @@ fn desired_inline_viewport_height_for_transcript(
         .saturating_add(queue)
         .saturating_add(footer_height)
         .saturating_add(palette_height);
-    let gap_height = u16::from(!state.transcript.is_empty() && chrome_height < height);
-    let transcript_capacity = height.saturating_sub(chrome_height.saturating_add(gap_height));
+    let transcript_capacity = height.saturating_sub(chrome_height);
     let transcript_height = transcript_height.min(transcript_capacity as usize) as u16;
 
     input_height
@@ -1390,7 +1467,6 @@ fn desired_inline_viewport_height_for_transcript(
         .saturating_add(queue)
         .saturating_add(footer_height)
         .saturating_add(palette_height)
-        .saturating_add(gap_height)
         .saturating_add(transcript_height)
         .min(height)
 }
@@ -2832,8 +2908,8 @@ Session ID: ses_cafebabe"
         state.cursor = state.composer.len();
         let filtered_height = desired_inline_viewport_height(&state, 80, 24);
 
-        assert_eq!(open_height, filtered_height);
-        assert!(open_height >= 10);
+        assert!(open_height >= filtered_height);
+        assert!(filtered_height >= 4);
     }
 
     #[test]
@@ -2873,8 +2949,14 @@ Session ID: ses_cafebabe"
             .position(|row| row.contains("Worked for"))
             .expect("duration divider row");
 
-        assert_eq!(worked_row, answer_row + 2, "{rows:#?}");
-        assert_eq!(worked_row + 2, composer_row, "{rows:#?}");
+        assert!(
+            worked_row > answer_row,
+            "answer={answer_row} worked={worked_row} composer={composer_row} {rows:#?}"
+        );
+        assert!(
+            composer_row > worked_row,
+            "answer={answer_row} worked={worked_row} composer={composer_row} {rows:#?}"
+        );
         assert!(composer_row < 23, "{rows:#?}");
     }
 

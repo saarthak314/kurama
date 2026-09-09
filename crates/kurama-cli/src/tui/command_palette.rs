@@ -15,10 +15,11 @@ use super::{
 pub(crate) const MAX_COMMAND_PALETTE_ROWS: usize = 8;
 
 pub(crate) fn command_palette_height(state: &TuiState, available: u16) -> u16 {
-    if state.command_suggestions().is_empty() {
+    let count = state.command_suggestions().len();
+    if count == 0 {
         0
     } else {
-        MAX_COMMAND_PALETTE_ROWS.min(available as usize) as u16
+        count.min(MAX_COMMAND_PALETTE_ROWS).min(available as usize) as u16
     }
 }
 

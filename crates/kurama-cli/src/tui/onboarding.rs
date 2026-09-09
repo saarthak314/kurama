@@ -41,6 +41,7 @@ pub struct OnboardingState {
     endpoint: Option<String>,
     model: String,
     credential_profile: Option<String>,
+    error: Option<String>,
 }
 
 impl Default for OnboardingState {
@@ -59,6 +60,7 @@ impl OnboardingState {
             endpoint: None,
             model: String::new(),
             credential_profile: None,
+            error: None,
         }
     }
 
@@ -71,6 +73,7 @@ impl OnboardingState {
             endpoint: None,
             model: String::new(),
             credential_profile: Some(profile.into()),
+            error: None,
         }
     }
 
@@ -91,6 +94,12 @@ impl OnboardingState {
     pub fn select_previous(&mut self) {
         if self.stage == OnboardingStage::Connection {
             self.selected = self.selected.saturating_sub(1);
+        }
+    }
+
+    pub fn select_index(&mut self, index: usize) {
+        if self.stage == OnboardingStage::Connection && index < OPTIONS.len() {
+            self.selected = index;
         }
     }
 
@@ -136,14 +145,36 @@ impl OnboardingState {
         }
     }
 
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    pub fn set_error(&mut self, error: impl Into<String>) {
+        self.error = Some(error.into());
+    }
+
     pub fn push(&mut self, character: char) {
         if self.stage != OnboardingStage::Connection && !character.is_control() {
             self.input.push(character);
+            self.error = None;
         }
+    }
+
+    pub fn insert_str(&mut self, text: &str) {
+        if self.stage == OnboardingStage::Connection {
+            return;
+        }
+        for character in text.chars() {
+            if !character.is_control() {
+                self.input.push(character);
+            }
+        }
+        self.error = None;
     }
 
     pub fn backspace(&mut self) {
         self.input.pop();
+        self.error = None;
     }
 
     pub fn begin(&mut self) {

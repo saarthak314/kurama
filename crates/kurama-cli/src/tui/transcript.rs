@@ -1380,8 +1380,8 @@ pub fn transcript_lines(
             TranscriptEntry::Notice { label: None, body } => push_prefixed_lines(
                 &mut lines,
                 body,
-                "",
-                "",
+                "• ",
+                "  ",
                 Style::default().fg(DIM),
                 Style::default().fg(DIM),
                 width,
@@ -1513,18 +1513,16 @@ fn push_markdown_lines(lines: &mut Vec<Line<'static>>, body: &str, width: usize)
     if markdown.is_empty() {
         markdown.push(Line::default());
     }
-    if markdown.first().is_some_and(line_starts_with_list_marker) {
-        lines.extend(markdown);
-        return;
-    }
     for (index, mut line) in markdown.into_iter().enumerate() {
-        line.spans.insert(
-            0,
-            Span::styled(
-                if index == 0 { "• " } else { "  " },
-                Style::default().fg(DIM),
-            ),
-        );
+        if !line_starts_with_list_marker(&line) {
+            line.spans.insert(
+                0,
+                Span::styled(
+                    if index == 0 { "• " } else { "  " },
+                    Style::default().fg(DIM),
+                ),
+            );
+        }
         lines.push(line);
     }
 }
