@@ -9,6 +9,7 @@ use crate::{
 };
 
 pub const MAX_TODO_ITEMS: usize = 20;
+pub const MAX_GOAL_OBJECTIVE_CHARS: usize = 4_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -71,6 +72,88 @@ where
         }
     }
     todos
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalStatus {
+    Pursuing,
+    Paused,
+    Achieved,
+    Blocked,
+    BudgetLimited,
+}
+
+impl GoalStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pursuing => "pursuing",
+            Self::Paused => "paused",
+            Self::Achieved => "achieved",
+            Self::Blocked => "blocked",
+            Self::BudgetLimited => "budget_limited",
+        }
+    }
+
+    pub const fn is_active(self) -> bool {
+        matches!(self, Self::Pursuing)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionGoal {
+    pub objective: String,
+    pub status: GoalStatus,
+    pub turns: u32,
+    pub blocked_streak: u32,
+}
+
+impl SessionGoal {
+    pub fn new(objective: impl Into<String>) -> Result<Self, crate::KuramaError> {
+        let objective = Self::validate_objective(objective.into())?;
+        Ok(Self {
+            objective,
+            status: GoalStatus::Pursuing,
+            turns: 1,
+            blocked_streak: 0,
+        })
+    }
+
+    pub fn validate_objective(objective: String) -> Result<String, crate::KuramaError> {
+        let objective = objective.trim().to_owned();
+        if objective.is_empty() {
+            return Err(crate::KuramaError::Protocol(
+                "goal objective must be non-empty".into(),
+            ));
+        }
+        if objective.chars().count() > MAX_GOAL_OBJECTIVE_CHARS {
+            return Err(crate::KuramaError::Protocol(format!(
+                "goal objective cannot exceed {MAX_GOAL_OBJECTIVE_CHARS} characters"
+            )));
+        }
+        Ok(objective)
+    }
+
+    pub fn with_objective(&self, objective: impl Into<String>) -> Result<Self, crate::KuramaError> {
+        let mut goal = self.clone();
+        goal.objective = Self::validate_objective(objective.into())?;
+        Ok(goal)
+    }
+}
+
+pub fn latest_goal<'a, I>(events: I) -> Option<SessionGoal>
+where
+    I: IntoIterator<Item = &'a EventEnvelope>,
+{
+    let mut goal = None;
+    for event in events {
+        match &event.event {
+            SessionEvent::GoalUpdated { goal: next } => goal = Some(next.clone()),
+            SessionEvent::GoalCleared => goal = None,
+            _ => {}
+        }
+    }
+    goal
 }
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -229,6 +312,10 @@ pub enum SessionEvent {
     TodoUpdated {
         items: Vec<TodoItem>,
     },
+    GoalUpdated {
+        goal: SessionGoal,
+    },
+    GoalCleared,
     TurnCompleted,
     TurnFailed {
         error: String,

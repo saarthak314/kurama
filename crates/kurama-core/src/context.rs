@@ -3,7 +3,7 @@ use kurama_protocol::{
     agent::AgentBudget,
     id::{AgentId, SessionId},
     model::{DelegationSchema, ModelItem, ModelProfile, ModelRequest},
-    session::{EventEnvelope, SessionEvent, latest_todos},
+    session::{EventEnvelope, SessionEvent, latest_goal, latest_todos},
     tool::ToolDescriptor,
 };
 
@@ -283,6 +283,20 @@ impl ContextManager {
                 &mut used,
                 usable_tokens,
                 &mut todo_tokens,
+            )?;
+        }
+
+        if let Some(goal) = latest_goal(&self.canonical) {
+            let mut goal_tokens = 0;
+            push_if_fits(
+                &mut items,
+                ModelItem::Goal {
+                    continuation: goal.status.is_active(),
+                    goal,
+                },
+                &mut used,
+                usable_tokens,
+                &mut goal_tokens,
             )?;
         }
 

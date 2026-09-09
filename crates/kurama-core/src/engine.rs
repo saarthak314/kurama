@@ -16,7 +16,10 @@ use kurama_protocol::{
         PolicyDecision,
     },
     runtime::{AgentCommand, EngineCommand, RuntimeEvent},
-    session::{BlobRef, EventEnvelope, FileCheckpoint, SessionEvent, SessionMetadata},
+    session::{
+        BlobRef, EventEnvelope, FileCheckpoint, GoalStatus, SessionEvent, SessionGoal,
+        SessionMetadata, latest_goal,
+    },
     tool::{Operation, ToolContext, ToolInvocation, ToolLimits, ToolResult},
     traits::{
         ApprovalPolicy, EventSink, IdGenerator, ModelBackend, Orchestrator, SessionStore, Tool,
@@ -28,6 +31,7 @@ use crate::{
     agent_manager::{AgentManager, ChildRunner},
     cancel::CancelToken,
     context::{ContextManager, ContextPolicy, estimate_text, normalize_compaction_json},
+    goal::{GoalTool, update_from_result_or_arguments},
     recovery::{RecoveryAction, RecoveryPlanner, SessionRecoveryProbe, StreamRecovery},
     todo::{TodoTool, items_from_result_or_arguments},
 };
@@ -86,6 +90,32 @@ impl EngineHandle {
         self.send(EngineCommand::Shutdown).await
     }
 
+    pub async fn set_goal(&self, objective: impl Into<String>) -> Result<(), KuramaError> {
+        self.send(EngineCommand::SetGoal {
+            objective: objective.into(),
+        })
+        .await
+    }
+
+    pub async fn edit_goal(&self, objective: impl Into<String>) -> Result<(), KuramaError> {
+        self.send(EngineCommand::EditGoal {
+            objective: objective.into(),
+        })
+        .await
+    }
+
+    pub async fn pause_goal(&self) -> Result<(), KuramaError> {
+        self.send(EngineCommand::PauseGoal).await
+    }
+
+    pub async fn resume_goal(&self) -> Result<(), KuramaError> {
+        self.send(EngineCommand::ResumeGoal).await
+    }
+
+    pub async fn clear_goal(&self) -> Result<(), KuramaError> {
+        self.send(EngineCommand::ClearGoal).await
+    }
+
     async fn send(&self, command: EngineCommand) -> Result<(), KuramaError> {
         self.commands
             .send(command)
@@ -132,7 +162,7 @@ impl Engine {
         for tool in &config.tools {
             let descriptor = tool.descriptor();
             let name = descriptor.name.clone();
-            if config.agent_id.is_some() && name == "todo" {
+            if config.agent_id.is_some() && matches!(name.as_str(), "todo" | "update_goal") {
                 continue;
             }
             if tools.insert(name.clone(), tool.clone()).is_some() {
@@ -144,6 +174,11 @@ impl Engine {
             let tool: Arc<dyn Tool> = Arc::new(TodoTool);
             tool_descriptors.push(tool.descriptor());
             tools.insert("todo".into(), tool);
+        }
+        if config.agent_id.is_none() && !tools.contains_key("update_goal") {
+            let tool: Arc<dyn Tool> = Arc::new(GoalTool);
+            tool_descriptors.push(tool.descriptor());
+            tools.insert("update_goal".into(), tool);
         }
 
         let mut sequence = replay.last().map_or(0, |event| event.sequence + 1);
@@ -198,6 +233,7 @@ impl Engine {
                 .min(config.profile.max_output_tokens),
         );
         let mut context = ContextManager::new(config.context_policy);
+        let goal = latest_goal(&replay);
         context.replay(replay);
         let agent_manager = config.orchestration.as_ref().map(|orchestration| {
             Arc::new(
@@ -248,6 +284,9 @@ impl Engine {
             interrupted_agents: recovery.interrupted_agents,
             resume_incomplete_turn,
             shutdown_requested: false,
+            goal,
+            goal_pause_requested: false,
+            goal_clear_requested: false,
         };
         tokio::spawn(actor.run());
         Ok((
@@ -291,6 +330,9 @@ struct EngineActor {
     interrupted_agents: Vec<kurama_protocol::agent::AgentSnapshot>,
     resume_incomplete_turn: bool,
     shutdown_requested: bool,
+    goal: Option<SessionGoal>,
+    goal_pause_requested: bool,
+    goal_clear_requested: bool,
 }
 
 impl EngineActor {
@@ -340,6 +382,11 @@ impl EngineActor {
                 }
                 EngineCommand::Compact => self.compact_context().await,
                 EngineCommand::SetMode(mode) => self.change_mode(mode).await,
+                EngineCommand::SetGoal { objective } => self.set_goal(objective).await,
+                EngineCommand::EditGoal { objective } => self.edit_goal(objective).await,
+                EngineCommand::PauseGoal => self.pause_goal().await,
+                EngineCommand::ResumeGoal => self.resume_goal().await,
+                EngineCommand::ClearGoal => self.clear_goal().await,
                 EngineCommand::Agent(command) => self.agent_command(command).await,
                 EngineCommand::Shutdown => {
                     self.shutdown_requested = true;
@@ -820,27 +867,38 @@ impl EngineActor {
         self.continue_turn(false).await
     }
 
-    async fn continue_turn(&mut self, explicit_delegation: bool) -> Result<(), KuramaError> {
-        let cancel = CancelToken::new();
-        let capability_enabled = explicit_delegation
-            || self
-                .orchestrator
-                .explicit_delegation(self.latest_user_text().unwrap_or_default().as_str());
-        let outcome = self.drive_turn(capability_enabled, &cancel).await;
+    async fn continue_turn(&mut self, mut explicit_delegation: bool) -> Result<(), KuramaError> {
+        loop {
+            let cancel = CancelToken::new();
+            let capability_enabled = explicit_delegation
+                || self
+                    .orchestrator
+                    .explicit_delegation(self.latest_user_text().unwrap_or_default().as_str());
+            let outcome = self.drive_turn(capability_enabled, &cancel).await;
+            explicit_delegation = false;
 
-        match outcome {
-            Ok(()) => {
-                self.append(SessionEvent::TurnCompleted)?;
-                self.emit(RuntimeEvent::TurnCompleted).await
-            }
-            Err(error) => {
-                if self.shutdown_requested {
+            match outcome {
+                Ok(()) => {
+                    self.append(SessionEvent::TurnCompleted)?;
+                    self.apply_goal_turn_boundary().await?;
+                    if !self.should_continue_goal() {
+                        return self.emit(RuntimeEvent::TurnCompleted).await;
+                    }
+                    self.completed_tool_calls.clear();
+                    self.seen_tool_calls.clear();
+                }
+                Err(error) => {
+                    if self.shutdown_requested {
+                        return Err(error);
+                    }
+                    if matches!(error, KuramaError::Cancelled) {
+                        self.pause_active_goal().await?;
+                    }
+                    self.append(SessionEvent::TurnFailed {
+                        error: error.to_string(),
+                    })?;
                     return Err(error);
                 }
-                self.append(SessionEvent::TurnFailed {
-                    error: error.to_string(),
-                })?;
-                Err(error)
             }
         }
     }
@@ -1228,6 +1286,10 @@ impl EngineActor {
             let items = items_from_result_or_arguments(&result, &arguments)?;
             self.append(SessionEvent::TodoUpdated { items })?;
         }
+        if tool_name == "update_goal" && !result.is_error {
+            let update = update_from_result_or_arguments(&result, &arguments)?;
+            self.apply_model_goal_update(update).await?;
+        }
         let result = self.complete_tool(operation_id, result).await?;
         Ok(result)
     }
@@ -1515,6 +1577,15 @@ impl EngineActor {
                 Err(KuramaError::Cancelled)
             }
             Some(EngineCommand::Agent(command)) => self.agent_command(command).await,
+            Some(EngineCommand::EditGoal { objective }) => self.edit_goal(objective).await,
+            Some(EngineCommand::PauseGoal) => {
+                self.goal_pause_requested = true;
+                Ok(())
+            }
+            Some(EngineCommand::ClearGoal) => {
+                self.goal_clear_requested = true;
+                Ok(())
+            }
             Some(EngineCommand::ResolveApproval { .. }) => {
                 self.emit(RuntimeEvent::Error {
                     message: "there is no pending approval".into(),
@@ -1639,6 +1710,201 @@ impl EngineActor {
             .as_ref()
             .ok_or_else(|| KuramaError::Configuration("agent manager is not configured".into()))?;
         manager.command(command).await
+    }
+
+    async fn set_goal(&mut self, objective: String) -> Result<(), KuramaError> {
+        let goal = SessionGoal::new(objective.clone())?;
+        self.persist_goal(goal).await?;
+        self.run_turn(objective, false).await
+    }
+
+    async fn edit_goal(&mut self, objective: String) -> Result<(), KuramaError> {
+        let Some(goal) = &self.goal else {
+            return self
+                .emit(RuntimeEvent::Error {
+                    message: "no active goal".into(),
+                })
+                .await;
+        };
+        let goal = goal.with_objective(objective)?;
+        self.persist_goal(goal).await
+    }
+
+    async fn pause_goal(&mut self) -> Result<(), KuramaError> {
+        let Some(goal) = &self.goal else {
+            return self
+                .emit(RuntimeEvent::Error {
+                    message: "no active goal".into(),
+                })
+                .await;
+        };
+        if goal.status != GoalStatus::Pursuing {
+            return self
+                .emit(RuntimeEvent::Error {
+                    message: format!("goal is {}", goal.status.as_str()),
+                })
+                .await;
+        }
+        self.pause_active_goal().await
+    }
+
+    async fn resume_goal(&mut self) -> Result<(), KuramaError> {
+        let Some(goal) = self.goal.clone() else {
+            return self
+                .emit(RuntimeEvent::Error {
+                    message: "no active goal".into(),
+                })
+                .await;
+        };
+        match goal.status {
+            GoalStatus::Pursuing => {
+                self.emit(RuntimeEvent::Error {
+                    message: "goal is already pursuing".into(),
+                })
+                .await
+            }
+            GoalStatus::Achieved => {
+                self.emit(RuntimeEvent::Error {
+                    message: "goal is already achieved; set a new /goal".into(),
+                })
+                .await
+            }
+            GoalStatus::Paused | GoalStatus::Blocked | GoalStatus::BudgetLimited => {
+                let mut goal = goal;
+                goal.status = GoalStatus::Pursuing;
+                goal.turns = goal.turns.saturating_add(1);
+                goal.blocked_streak = 0;
+                self.persist_goal(goal).await?;
+                self.completed_tool_calls.clear();
+                self.seen_tool_calls.clear();
+                self.continue_turn(false).await
+            }
+        }
+    }
+
+    async fn clear_goal(&mut self) -> Result<(), KuramaError> {
+        if self.goal.is_none() {
+            return self
+                .emit(RuntimeEvent::Error {
+                    message: "no active goal".into(),
+                })
+                .await;
+        }
+        self.goal = None;
+        self.goal_pause_requested = false;
+        self.goal_clear_requested = false;
+        self.append(SessionEvent::GoalCleared)?;
+        self.emit(RuntimeEvent::GoalCleared).await
+    }
+
+    fn should_continue_goal(&self) -> bool {
+        !self.shutdown_requested
+            && !self.goal_pause_requested
+            && !self.goal_clear_requested
+            && self
+                .goal
+                .as_ref()
+                .is_some_and(|goal| goal.status.is_active())
+    }
+
+    async fn apply_goal_turn_boundary(&mut self) -> Result<(), KuramaError> {
+        if self.goal_clear_requested {
+            self.goal_clear_requested = false;
+            if self.goal.is_some() {
+                self.goal = None;
+                self.append(SessionEvent::GoalCleared)?;
+                self.emit(RuntimeEvent::GoalCleared).await?;
+            }
+            return Ok(());
+        }
+        if self.goal_pause_requested {
+            self.goal_pause_requested = false;
+            self.pause_active_goal().await?;
+            return Ok(());
+        }
+        if let Some(goal) = &mut self.goal
+            && goal.status == GoalStatus::Pursuing
+        {
+            goal.turns = goal.turns.saturating_add(1);
+            let snapshot = goal.clone();
+            self.append(SessionEvent::GoalUpdated {
+                goal: snapshot.clone(),
+            })?;
+            self.emit(RuntimeEvent::GoalUpdated { goal: snapshot })
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn pause_active_goal(&mut self) -> Result<(), KuramaError> {
+        let Some(goal) = &mut self.goal else {
+            return Ok(());
+        };
+        if goal.status != GoalStatus::Pursuing {
+            return Ok(());
+        }
+        goal.status = GoalStatus::Paused;
+        let snapshot = goal.clone();
+        self.append(SessionEvent::GoalUpdated {
+            goal: snapshot.clone(),
+        })?;
+        self.emit(RuntimeEvent::GoalUpdated { goal: snapshot })
+            .await
+    }
+
+    async fn persist_goal(&mut self, goal: SessionGoal) -> Result<(), KuramaError> {
+        self.goal = Some(goal.clone());
+        self.goal_pause_requested = false;
+        self.goal_clear_requested = false;
+        self.append(SessionEvent::GoalUpdated { goal: goal.clone() })?;
+        self.emit(RuntimeEvent::GoalUpdated { goal }).await
+    }
+
+    async fn apply_model_goal_update(
+        &mut self,
+        update: crate::goal::GoalUpdate,
+    ) -> Result<(), KuramaError> {
+        let Some(goal) = &mut self.goal else {
+            return Err(KuramaError::Protocol(
+                "update_goal requires an active goal".into(),
+            ));
+        };
+        if goal.status != GoalStatus::Pursuing {
+            return Err(KuramaError::Protocol(format!(
+                "goal is {}; update_goal is ignored",
+                goal.status.as_str()
+            )));
+        }
+        match update.status {
+            GoalStatus::Achieved => {
+                goal.status = GoalStatus::Achieved;
+                goal.blocked_streak = 0;
+            }
+            GoalStatus::Blocked => {
+                goal.blocked_streak = goal.blocked_streak.saturating_add(1);
+                if goal.blocked_streak < 3 {
+                    let snapshot = goal.clone();
+                    self.append(SessionEvent::GoalUpdated {
+                        goal: snapshot.clone(),
+                    })?;
+                    return self
+                        .emit(RuntimeEvent::GoalUpdated { goal: snapshot })
+                        .await;
+                }
+                goal.status = GoalStatus::Blocked;
+            }
+            _ => {
+                return Err(KuramaError::Protocol(
+                    "update_goal status must be complete or blocked".into(),
+                ));
+            }
+        }
+        let snapshot = goal.clone();
+        self.append(SessionEvent::GoalUpdated {
+            goal: snapshot.clone(),
+        })?;
+        self.emit(RuntimeEvent::GoalUpdated { goal: snapshot })
+            .await
     }
 
     fn append(&mut self, event: SessionEvent) -> Result<EventEnvelope, KuramaError> {

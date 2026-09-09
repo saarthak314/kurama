@@ -1,4 +1,8 @@
-use kurama_protocol::{id::SessionId, policy::ExecutionMode};
+use kurama_protocol::{
+    id::SessionId,
+    policy::ExecutionMode,
+    session::{MAX_GOAL_OBJECTIVE_CHARS, SessionGoal},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandSpec {
@@ -8,7 +12,7 @@ pub struct CommandSpec {
     pub requires_arguments: bool,
 }
 
-pub const COMMAND_SPECS: [CommandSpec; 15] = [
+pub const COMMAND_SPECS: [CommandSpec; 16] = [
     CommandSpec {
         name: "model",
         description: "select or list profiles",
@@ -25,6 +29,12 @@ pub const COMMAND_SPECS: [CommandSpec; 15] = [
         name: "todo",
         description: "show the session todo list",
         accepts_arguments: false,
+        requires_arguments: false,
+    },
+    CommandSpec {
+        name: "goal",
+        description: "set, view, pause, resume, or clear a goal",
+        accepts_arguments: true,
         requires_arguments: false,
     },
     CommandSpec {
@@ -105,6 +115,7 @@ pub const COMMAND_SPECS: [CommandSpec; 15] = [
 pub enum Command {
     Agents,
     Todo,
+    Goal(GoalAction),
     Model(Option<String>),
     Connect,
     Sessions,
@@ -118,6 +129,16 @@ pub enum Command {
     Mode(ExecutionMode),
     Help,
     Exit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoalAction {
+    View,
+    Set(String),
+    Edit(String),
+    Pause,
+    Resume,
+    Clear,
 }
 
 pub fn command_suggestions(input: &str) -> Vec<CommandSpec> {
@@ -160,6 +181,7 @@ pub fn parse_command(input: &str) -> Result<Command, String> {
     match (name, remainder.as_slice()) {
         ("/agents", []) => Ok(Command::Agents),
         ("/todo", []) => Ok(Command::Todo),
+        ("/goal", _) => parse_goal(input),
         ("/model", []) => Ok(Command::Model(None)),
         ("/model", [profile]) => Ok(Command::Model(Some((*profile).to_owned()))),
         ("/connect", []) => Ok(Command::Connect),
@@ -179,4 +201,37 @@ pub fn parse_command(input: &str) -> Result<Command, String> {
         ("/restart", _) => Err("/restart is intentionally unsupported; use /new or /resume".into()),
         _ => Err(format!("unknown or invalid command: {input}")),
     }
+}
+
+fn parse_goal(input: &str) -> Result<Command, String> {
+    let rest = input
+        .strip_prefix("/goal")
+        .ok_or_else(|| "unknown or invalid command: /goal".to_owned())?
+        .trim();
+    if rest.is_empty() {
+        return Ok(Command::Goal(GoalAction::View));
+    }
+    let action = match rest.split_once(char::is_whitespace) {
+        Some(("edit", objective)) => GoalAction::Edit(validate_goal_objective(objective)?),
+        None if rest == "edit" => {
+            return Err("usage: /goal edit <objective>".into());
+        }
+        None if rest == "pause" => GoalAction::Pause,
+        None if rest == "resume" => GoalAction::Resume,
+        None if rest == "clear" => GoalAction::Clear,
+        _ => GoalAction::Set(validate_goal_objective(rest)?),
+    };
+    Ok(Command::Goal(action))
+}
+
+fn validate_goal_objective(objective: &str) -> Result<String, String> {
+    SessionGoal::validate_objective(objective.to_owned()).map_err(|error| {
+        if objective.trim().is_empty() {
+            "goal objective must be non-empty".into()
+        } else if objective.trim().chars().count() > MAX_GOAL_OBJECTIVE_CHARS {
+            format!("goal objective cannot exceed {MAX_GOAL_OBJECTIVE_CHARS} characters")
+        } else {
+            error.to_string()
+        }
+    })
 }

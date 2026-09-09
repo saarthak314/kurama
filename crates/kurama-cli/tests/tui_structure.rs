@@ -1,6 +1,6 @@
 use kurama_cli::{
     app::App,
-    commands::{Command, parse_command},
+    commands::{Command, GoalAction, parse_command},
     tui::{
         ActivityState, AgentRow, Overlay, ResponsiveLayout, ToolLifecycle, ToolTranscript,
         TranscriptDetail, TranscriptEntry, TuiState, activity_line, render, transcript_lines,
@@ -176,6 +176,18 @@ fn parses_all_product_commands_without_restart() {
     assert_eq!(parse_command("/copy").unwrap(), Command::Copy);
     assert_eq!(parse_command("/diff").unwrap(), Command::Diff);
     assert_eq!(parse_command("/status").unwrap(), Command::Status);
+    assert_eq!(
+        parse_command("/goal").unwrap(),
+        Command::Goal(GoalAction::View)
+    );
+    assert_eq!(
+        parse_command("/goal keep tests green").unwrap(),
+        Command::Goal(GoalAction::Set("keep tests green".into()))
+    );
+    assert_eq!(
+        parse_command("/goal pause").unwrap(),
+        Command::Goal(GoalAction::Pause)
+    );
     assert_eq!(parse_command("/exit").unwrap(), Command::Exit);
     assert!(parse_command("/restart").is_err());
     assert!(parse_command("/mode yolo").is_err());

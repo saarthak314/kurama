@@ -298,6 +298,36 @@ fn context_text(item: &ModelItem) -> String {
             "Child agent {agent_id} result:\n{summary}\nChanged files: {}",
             changed_files.join(", ")
         ),
+        ModelItem::TodoList { items } => {
+            let mut lines = vec!["Session todo list:".to_owned()];
+            for item in items {
+                lines.push(format!(
+                    "- [{}] {}: {}",
+                    match item.status {
+                        kurama_protocol::session::TodoStatus::Pending => " ",
+                        kurama_protocol::session::TodoStatus::InProgress => ">",
+                        kurama_protocol::session::TodoStatus::Completed => "x",
+                        kurama_protocol::session::TodoStatus::Cancelled => "-",
+                    },
+                    item.id,
+                    item.content
+                ));
+            }
+            lines.join("\n")
+        }
+        ModelItem::Goal { goal, continuation } => {
+            let mut text = format!(
+                "Active goal ({}):\n{}",
+                goal.status.as_str(),
+                goal.objective
+            );
+            if *continuation {
+                text.push_str(
+                    "\n\nContinue this goal. Do not shrink it. Call update_goal with status \"complete\" only when current evidence proves every requirement. Call update_goal with status \"blocked\" only after the same blocker repeats for three consecutive goal turns. Otherwise keep working.",
+                );
+            }
+            text
+        }
         _ => unreachable!("message-like items are handled directly"),
     }
 }

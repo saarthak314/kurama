@@ -1,7 +1,7 @@
 use crate::{
     agent::DelegationRequest,
     id::{AgentId, CallId, SessionId},
-    session::{BlobRef, TodoItem},
+    session::{BlobRef, SessionGoal, TodoItem},
     tool::ToolDescriptor,
 };
 
@@ -95,6 +95,10 @@ pub enum ModelItem {
     },
     TodoList {
         items: Vec<TodoItem>,
+    },
+    Goal {
+        goal: SessionGoal,
+        continuation: bool,
     },
 }
 

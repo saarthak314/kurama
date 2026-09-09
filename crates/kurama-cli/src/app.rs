@@ -42,7 +42,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     args::{Args, ResumeChoice},
-    commands::{Command, command_missing_required_arguments, parse_command},
+    commands::{Command, GoalAction, command_missing_required_arguments, parse_command},
     tui::{
         CursorTrackingBackend, OnboardingState, OnboardingSubmission, Overlay, SURFACE,
         SharedBackend, TerminalGuard, TranscriptDetail, TuiState, approval_height,
@@ -853,6 +853,7 @@ impl App {
             match command {
                 Command::Agents => self.state.open_agents(),
                 Command::Todo => self.state.open_todos(),
+                Command::Goal(action) => self.handle_goal_command(action)?,
                 Command::Model(profile) => {
                     if let Some(profile) = profile {
                         let known = self
@@ -1357,6 +1358,51 @@ impl App {
         self.state.composer_edited();
     }
 
+    fn handle_goal_command(&mut self, action: GoalAction) -> Result<(), String> {
+        match action {
+            GoalAction::View => self.state.push_goal_status(),
+            GoalAction::Set(objective) => {
+                if !self.state.submit_goal(objective) {
+                    self.state
+                        .push_error("finish or interrupt the current turn first");
+                }
+            }
+            GoalAction::Edit(objective) => {
+                if self.state.goal.is_none() {
+                    self.state.push_error("no active goal");
+                } else {
+                    self.state
+                        .queue_command(EngineCommand::EditGoal { objective });
+                }
+            }
+            GoalAction::Pause => {
+                if !self
+                    .state
+                    .goal
+                    .as_ref()
+                    .is_some_and(|goal| goal.status.is_active())
+                {
+                    self.state.push_error("no pursuing goal");
+                } else {
+                    self.state.queue_command(EngineCommand::PauseGoal);
+                }
+            }
+            GoalAction::Resume => {
+                if !self.state.resume_goal() {
+                    self.state.push_error("no paused goal to resume");
+                }
+            }
+            GoalAction::Clear => {
+                if self.state.goal.is_none() {
+                    self.state.push_error("no active goal");
+                } else {
+                    self.state.queue_command(EngineCommand::ClearGoal);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn cycle_mode(&mut self) -> Result<(), String> {
         if self.state.mode == ExecutionMode::Yolo {
             self.state
@@ -1462,6 +1508,11 @@ impl App {
                 EngineCommand::CancelTurn => engine.cancel_turn().await,
                 EngineCommand::Compact => engine.compact().await,
                 EngineCommand::SetMode(mode) => engine.set_mode(mode).await,
+                EngineCommand::SetGoal { objective } => engine.set_goal(objective).await,
+                EngineCommand::EditGoal { objective } => engine.edit_goal(objective).await,
+                EngineCommand::PauseGoal => engine.pause_goal().await,
+                EngineCommand::ResumeGoal => engine.resume_goal().await,
+                EngineCommand::ClearGoal => engine.clear_goal().await,
                 EngineCommand::Agent(command) => engine.agent_command(command).await,
                 EngineCommand::Shutdown => engine.shutdown().await,
             }
@@ -1939,6 +1990,8 @@ fn requires_immediate_redraw(event: &RuntimeEvent) -> bool {
         RuntimeEvent::ApprovalRequired { .. }
             | RuntimeEvent::ToolCompleted { .. }
             | RuntimeEvent::TurnCompleted
+            | RuntimeEvent::GoalUpdated { .. }
+            | RuntimeEvent::GoalCleared
             | RuntimeEvent::Usage { .. }
             | RuntimeEvent::Error { .. }
             | RuntimeEvent::Shutdown
