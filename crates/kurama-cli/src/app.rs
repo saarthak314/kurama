@@ -46,8 +46,8 @@ use crate::{
     tui::{
         CursorTrackingBackend, OnboardingState, OnboardingSubmission, Overlay, SURFACE,
         SharedBackend, TerminalGuard, TranscriptDetail, TuiState, approval_height,
-        composer_cursor_vertical, composer_height, main_area, queue_height, render_with_transcript,
-        spawn_input_thread, transcript_lines, visible_activity_rect,
+        command_palette_height, composer_cursor_vertical, composer_height, main_area, queue_height,
+        render_with_transcript, spawn_input_thread, transcript_lines, visible_activity_rect,
     },
 };
 
@@ -733,9 +733,12 @@ impl App {
             }
             KeyCode::Up if self.state.select_previous_command() => {}
             KeyCode::Up => {
-                if let Some(cursor) =
-                    composer_cursor_vertical(&self.state.composer, self.state.cursor, 72, -1)
-                {
+                if let Some(cursor) = composer_cursor_vertical(
+                    &self.state.composer,
+                    self.state.cursor,
+                    self.state.composer_inner_width.get().max(4) as usize,
+                    -1,
+                ) {
                     self.state.cursor = cursor;
                 } else {
                     self.state.history_previous();
@@ -743,9 +746,12 @@ impl App {
             }
             KeyCode::Down if self.state.select_next_command() => {}
             KeyCode::Down => {
-                if let Some(cursor) =
-                    composer_cursor_vertical(&self.state.composer, self.state.cursor, 72, 1)
-                {
+                if let Some(cursor) = composer_cursor_vertical(
+                    &self.state.composer,
+                    self.state.cursor,
+                    self.state.composer_inner_width.get().max(4) as usize,
+                    1,
+                ) {
                     self.state.cursor = cursor;
                 } else {
                     self.state.history_next();
@@ -1486,8 +1492,11 @@ fn desired_inline_viewport_height_for_transcript(
 
     let area = main_area(Rect::new(0, 0, width, height));
     let approval_visible = matches!(state.overlay(), Overlay::Approval | Overlay::ApprovalEdit);
+    let shortcuts_visible = state.overlay() == Overlay::Shortcuts;
     let input_height = if approval_visible {
         approval_height(state, area.width)
+    } else if shortcuts_visible {
+        10.min(height).max(5)
     } else {
         composer_height(state, area.width)
     }
@@ -1508,6 +1517,12 @@ fn desired_inline_viewport_height_for_transcript(
         .saturating_add(activity_height)
         .saturating_add(queue)
         .saturating_add(footer_height);
+    let palette_height = if approval_visible || shortcuts_visible {
+        0
+    } else {
+        command_palette_height(state, height.saturating_sub(chrome_height))
+    };
+    let chrome_height = chrome_height.saturating_add(palette_height);
     let transcript_capacity = height.saturating_sub(chrome_height);
     let transcript_height = transcript_height.min(transcript_capacity as usize) as u16;
 
@@ -1515,6 +1530,7 @@ fn desired_inline_viewport_height_for_transcript(
         .saturating_add(activity_height)
         .saturating_add(queue)
         .saturating_add(footer_height)
+        .saturating_add(palette_height)
         .saturating_add(transcript_height)
         .min(height)
 }

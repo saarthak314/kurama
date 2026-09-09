@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -114,6 +115,7 @@ pub struct TuiState {
     pub usage: Usage,
     pub transcript: Vec<TranscriptEntry>,
     pub composer: String,
+    pub composer_inner_width: Cell<u16>,
     pub cursor: usize,
     pub scroll: usize,
     pub running_agents: usize,
@@ -161,6 +163,7 @@ impl TuiState {
             usage: Usage::default(),
             transcript: Vec::new(),
             composer: String::new(),
+            composer_inner_width: Cell::new(72),
             cursor: 0,
             scroll: 0,
             running_agents: 0,

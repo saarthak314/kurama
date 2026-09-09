@@ -82,6 +82,7 @@ pub(crate) fn render_composer(
     if content.is_empty() {
         return None;
     }
+    state.composer_inner_width.set(content.width);
 
     if state.composer.is_empty() {
         let placeholder = "Ask Kurama to do anything";
