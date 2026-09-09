@@ -231,13 +231,25 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) -> Option<Position
     }
     if !state.onboarding.is_selecting_connection() {
         let input = state.onboarding.display_input();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(BORDER))
+            .padding(Padding::new(1, 1, 0, 0));
+        let inner = block.inner(area);
+        let field_width = inner.width.saturating_sub(2).max(1) as usize;
+        let shown = if input.is_empty() {
+            " ".to_owned()
+        } else {
+            truncate_display(&input, field_width)
+        };
         let mut lines = vec![
             Line::from(Span::styled(
                 state.onboarding.step_label(),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
-                state.onboarding.prompt(),
+                truncate_display(&state.onboarding.prompt(), inner.width as usize),
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             )),
             Line::from(vec![
@@ -245,37 +257,25 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) -> Option<Position
                     "› ",
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    if input.is_empty() {
-                        " "
-                    } else {
-                        input.as_str()
-                    },
-                    Style::default().fg(TEXT),
-                ),
+                Span::styled(shown.as_str(), Style::default().fg(TEXT)),
             ]),
         ];
         if let Some(error) = state.onboarding.error() {
-            lines.push(Line::from(Span::styled(error, Style::default().fg(RED))));
+            lines.push(Line::from(Span::styled(
+                truncate_display(error, inner.width as usize),
+                Style::default().fg(RED),
+            )));
         }
         lines.push(Line::from(Span::styled(
-            "Enter confirms · Esc closes setup · secrets remain masked",
+            truncate_display(
+                "Enter confirms · Esc closes setup · secrets remain masked",
+                inner.width as usize,
+            ),
             Style::default().fg(DIM),
         )));
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(BORDER))
-            .padding(Padding::new(1, 1, 0, 0));
-        let inner = block.inner(area);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .block(block),
-            area,
-        );
+        frame.render_widget(Paragraph::new(lines).block(block), area);
         let prompt_row = 2_u16.min(inner.height.saturating_sub(1));
-        let column = 2_u16.saturating_add(Line::from(input.as_str()).width() as u16);
+        let column = 2_u16.saturating_add(Line::from(shown.as_str()).width() as u16);
         return Some(Position::new(
             inner
                 .x
@@ -526,22 +526,6 @@ fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) -> Option<Posit
             Style::default().fg(TEXT),
         )));
     }
-    let action = if state.overlay == Overlay::AgentMessage {
-        Line::from(vec![
-            Span::styled("› ", Style::default().fg(ACCENT)),
-            Span::styled(state.agent_message.as_str(), Style::default().fg(TEXT)),
-        ])
-    } else if state.overlay == Overlay::ConfirmAgentCancel {
-        Line::from(Span::styled(
-            format!("Cancel {}?  y confirm  ·  n/esc return", agent.id),
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-        ))
-    } else {
-        Line::from(Span::styled(
-            "esc  agents     m  message     x  cancel agent",
-            Style::default().fg(DIM),
-        ))
-    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -552,6 +536,32 @@ fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) -> Option<Posit
         frame.render_widget(block, area);
         return None;
     }
+    let field_width = inner.width.saturating_sub(2).max(1) as usize;
+    let action = if state.overlay == Overlay::AgentMessage {
+        Line::from(vec![
+            Span::styled("› ", Style::default().fg(ACCENT)),
+            Span::styled(
+                truncate_display(&state.agent_message, field_width),
+                Style::default().fg(TEXT),
+            ),
+        ])
+    } else if state.overlay == Overlay::ConfirmAgentCancel {
+        Line::from(Span::styled(
+            truncate_display(
+                &format!("Cancel {}?  y confirm  ·  n/esc return", agent.id),
+                inner.width as usize,
+            ),
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Line::from(Span::styled(
+            truncate_display(
+                "esc  agents     m  message     x  cancel agent",
+                inner.width as usize,
+            ),
+            Style::default().fg(DIM),
+        ))
+    };
     let action_height = 1.min(inner.height);
     let body_height = inner.height.saturating_sub(action_height) as usize;
     let start = body.len().saturating_sub(body_height);
@@ -567,9 +577,9 @@ fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) -> Option<Posit
     lines.push(action);
     frame.render_widget(Paragraph::new(lines).block(block), area);
     if state.overlay == Overlay::AgentMessage {
-        let column = 2_u16.saturating_add(
-            Line::from(&state.agent_message[..state.agent_message_cursor]).width() as u16,
-        );
+        let cursor = state.agent_message_cursor.min(state.agent_message.len());
+        let prefix = truncate_display(&state.agent_message[..cursor], field_width);
+        let column = 2_u16.saturating_add(Line::from(prefix.as_str()).width() as u16);
         Some(Position::new(
             inner
                 .x

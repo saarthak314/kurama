@@ -749,6 +749,7 @@ impl TuiState {
     pub fn submit_agent_message(&mut self) {
         if let Some(agent_id) = self.selected_agent().map(|agent| agent.id.clone()) {
             let text = std::mem::take(&mut self.agent_message);
+            self.agent_message_cursor = 0;
             if !text.trim().is_empty() {
                 self.sent_commands
                     .push(EngineCommand::Agent(AgentCommand::Message {

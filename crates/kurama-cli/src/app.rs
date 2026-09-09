@@ -611,10 +611,14 @@ impl App {
     }
 
     fn handle_ctrl_c(&mut self) -> bool {
+        if self.state.overlay() == Overlay::Onboarding {
+            self.state.onboarding = OnboardingState::new();
+            self.state.overlay = Overlay::None;
+            return false;
+        }
         if matches!(
             self.state.overlay(),
             Overlay::Shortcuts
-                | Overlay::Onboarding
                 | Overlay::Agents
                 | Overlay::AgentInspect
                 | Overlay::AgentMessage
