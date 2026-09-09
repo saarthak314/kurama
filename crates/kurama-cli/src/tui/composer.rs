@@ -206,9 +206,11 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect,
     }
 
     if show_help {
-        let hint = if state.activity().is_animated() && !state.composer.is_empty() {
+        let hint = if state.history_search_active() {
+            "enter use · esc cancel"
+        } else if state.activity().is_animated() && !state.composer.is_empty() {
             "enter queues · esc interrupt"
-        } else if state.composer.is_empty() {
+        } else if state.composer.is_empty() && area.width < 42 {
             "enter send · ctrl+j newline · ? shortcuts"
         } else {
             ""
@@ -230,6 +232,9 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect,
     let mode = FooterItem::new(mode_label(state.mode).to_owned(), mode_style(state.mode));
     let context = state.context_label().map(FooterItem::dim);
     let mut items = vec![profile, project];
+    if let Some(branch) = &state.git_branch {
+        items.push(FooterItem::dim(branch.clone()));
+    }
     if let Some(context) = context {
         items.push(context);
     }

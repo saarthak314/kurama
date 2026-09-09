@@ -8,7 +8,7 @@ pub struct CommandSpec {
     pub requires_arguments: bool,
 }
 
-pub const COMMAND_SPECS: [CommandSpec; 12] = [
+pub const COMMAND_SPECS: [CommandSpec; 15] = [
     CommandSpec {
         name: "model",
         description: "select or list profiles",
@@ -70,6 +70,24 @@ pub const COMMAND_SPECS: [CommandSpec; 12] = [
         requires_arguments: false,
     },
     CommandSpec {
+        name: "status",
+        description: "show model, mode, usage, and git",
+        accepts_arguments: false,
+        requires_arguments: false,
+    },
+    CommandSpec {
+        name: "copy",
+        description: "copy the latest assistant reply",
+        accepts_arguments: false,
+        requires_arguments: false,
+    },
+    CommandSpec {
+        name: "diff",
+        description: "show the working tree diff",
+        accepts_arguments: false,
+        requires_arguments: false,
+    },
+    CommandSpec {
         name: "help",
         description: "list slash commands",
         accepts_arguments: false,
@@ -94,6 +112,9 @@ pub enum Command {
     New,
     Context,
     Compact,
+    Copy,
+    Diff,
+    Status,
     Mode(ExecutionMode),
     Help,
     Exit,
@@ -146,7 +167,10 @@ pub fn parse_command(input: &str) -> Result<Command, String> {
         ("/resume", [session_id]) => Ok(Command::Resume(SessionId::from(*session_id))),
         ("/new", []) => Ok(Command::New),
         ("/context", []) => Ok(Command::Context),
+        ("/status", []) => Ok(Command::Status),
         ("/compact", []) => Ok(Command::Compact),
+        ("/copy", []) => Ok(Command::Copy),
+        ("/diff", []) => Ok(Command::Diff),
         ("/help", []) => Ok(Command::Help),
         ("/mode", ["supervised"]) => Ok(Command::Mode(ExecutionMode::Supervised)),
         ("/mode", ["auto"]) => Ok(Command::Mode(ExecutionMode::Auto)),

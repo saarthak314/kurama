@@ -58,6 +58,7 @@ const TRANSCRIPT_HORIZONTAL_PADDING: usize = 2;
 const MAX_TRANSCRIPT_INSERT_HEIGHT: usize = 1_024;
 const INLINE_VIEWPORT_MAX_HEIGHT: u16 = 12;
 const TOOL_EVENT_CAPACITY: usize = 64;
+const MAX_PASTE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const READY_EVENT_BATCH_LIMIT: usize = 128;
 const STREAM_REDRAW_INTERVAL: Duration = Duration::from_millis(33);
 const ACTIVITY_FRAME_INTERVAL: Duration = Duration::from_millis(100);
@@ -438,6 +439,7 @@ impl App {
         );
         state.max_input_tokens = active.max_input_tokens;
         state.hydrate_replay(&transcript_replay);
+        state.refresh_git_branch();
         state.prepend_startup(env!("CARGO_PKG_VERSION"), startup_project);
         if resumed_yolo {
             state.push_notice(
@@ -567,10 +569,15 @@ impl App {
         let key = match event {
             Event::Paste(text) => {
                 match self.state.overlay {
+                    Overlay::None if self.state.history_search_active() => {
+                        for character in text.chars() {
+                            if !character.is_control() {
+                                self.state.push_history_search_char(character);
+                            }
+                        }
+                    }
                     Overlay::None if !self.state.transcript_view_expanded() => {
-                        self.state.composer.insert_str(self.state.cursor, &text);
-                        self.state.cursor = self.state.cursor.saturating_add(text.len());
-                        self.state.composer_edited();
+                        self.ingest_composer_paste(&text);
                     }
                     Overlay::ApprovalEdit => self.state.insert_approval_text(&text),
                     Overlay::Onboarding => self.state.onboarding.insert_str(&text),
@@ -599,6 +606,23 @@ impl App {
                 KeyCode::Down => self.state.scroll = self.state.scroll.saturating_sub(1),
                 KeyCode::PageUp => self.state.scroll = self.state.scroll.saturating_add(5),
                 KeyCode::PageDown => self.state.scroll = self.state.scroll.saturating_sub(5),
+                KeyCode::Home => {
+                    let width = self.state.composer_inner_width.get().max(8) as usize;
+                    let rendered = crate::tui::transcript_lines(
+                        &self.state.transcript,
+                        width,
+                        crate::tui::TranscriptDetail::Expanded,
+                    );
+                    let viewport = self.state.viewport_height.get().max(1) as usize;
+                    self.state.scroll = rendered.len().saturating_sub(viewport);
+                }
+                KeyCode::End => self.state.scroll = 0,
+                KeyCode::Char('{') => self
+                    .state
+                    .jump_user_turn(-1, self.state.composer_inner_width.get().max(8) as usize),
+                KeyCode::Char('}') => self
+                    .state
+                    .jump_user_turn(1, self.state.composer_inner_width.get().max(8) as usize),
                 _ => {}
             }
             return Ok(false);
@@ -657,6 +681,12 @@ impl App {
 
     fn handle_main_key(&mut self, key: KeyEvent) -> Result<(), String> {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if self.state.history_search_active() {
+                if key.code == KeyCode::Char('r') {
+                    self.state.start_history_search();
+                }
+                return Ok(());
+            }
             match key.code {
                 KeyCode::Char('a') => self.state.cursor_home(),
                 KeyCode::Char('e') => self.state.cursor_end(),
@@ -668,6 +698,9 @@ impl App {
                     self.state.cursor += 1;
                     self.state.composer_edited();
                 }
+                KeyCode::Char('l') => self.state.scroll = 0,
+                KeyCode::Char('t') => self.state.toggle_todos(),
+                KeyCode::Char('r') => self.state.start_history_search(),
                 KeyCode::Char('d') => {
                     if self.state.composer.is_empty() {
                         self.exit_requested = true;
@@ -687,7 +720,12 @@ impl App {
             }
             return Ok(());
         }
+        if self.state.history_search_active() {
+            self.handle_history_search_key(key);
+            return Ok(());
+        }
         match key.code {
+            KeyCode::BackTab => self.cycle_mode()?,
             KeyCode::Home => self.state.cursor_home(),
             KeyCode::End => self.state.cursor_end(),
             KeyCode::Char('?') if self.state.composer.is_empty() => {
@@ -737,6 +775,7 @@ impl App {
                 self.state.cursor += 1;
                 self.state.composer_edited();
             }
+            KeyCode::Up if self.state.select_previous_file() => {}
             KeyCode::Up if self.state.select_previous_command() => {}
             KeyCode::Up => {
                 if let Some(cursor) = composer_cursor_vertical(
@@ -750,6 +789,7 @@ impl App {
                     self.state.history_previous();
                 }
             }
+            KeyCode::Down if self.state.select_next_file() => {}
             KeyCode::Down if self.state.select_next_command() => {}
             KeyCode::Down => {
                 if let Some(cursor) = composer_cursor_vertical(
@@ -763,9 +803,11 @@ impl App {
                     self.state.history_next();
                 }
             }
+            KeyCode::Tab if self.state.complete_selected_file() => {}
             KeyCode::Tab if self.state.selected_command().is_some() => {
                 self.state.complete_selected_command();
             }
+            KeyCode::Enter if self.state.complete_selected_file() => {}
             KeyCode::Enter => {
                 if let Some(selected) = self.state.selected_command() {
                     self.state.complete_selected_command();
@@ -777,6 +819,7 @@ impl App {
                 }
                 self.submit_composer()?;
             }
+            KeyCode::Esc if self.state.cancel_history_search() => {}
             KeyCode::Esc if !self.state.dismiss_command_palette() => {
                 if !self.state.interrupt_active() {
                     self.state.pop_queued_follow_up();
@@ -879,6 +922,9 @@ impl App {
                         self.state.push_error("context details are unavailable");
                     }
                 }
+                Command::Status => self.push_status_notice(),
+                Command::Copy => self.copy_last_assistant(),
+                Command::Diff => self.push_diff_notice(),
                 Command::Compact => {
                     self.state.queue_command(EngineCommand::Compact);
                     self.state
@@ -1262,6 +1308,132 @@ impl App {
                 self.state.close_overlay()
             }
             _ => {}
+        }
+    }
+
+    fn handle_history_search_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.state.cancel_history_search();
+            }
+            KeyCode::Enter => {
+                self.state.accept_history_search();
+            }
+            KeyCode::Up => {
+                self.state.select_previous_history_match();
+            }
+            KeyCode::Down => {
+                self.state.select_next_history_match();
+            }
+            KeyCode::Backspace => self.state.pop_history_search_char(),
+            KeyCode::Char(character)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.state.push_history_search_char(character);
+            }
+            _ => {}
+        }
+    }
+
+    fn ingest_composer_paste(&mut self, text: &str) {
+        if let Some((bytes, ext)) = crate::tui::decode_pasted_image(text) {
+            if bytes.len() > MAX_PASTE_IMAGE_BYTES {
+                self.state.push_error("pasted image is too large");
+                return;
+            }
+            match save_pasted_image(&self.state.project, &bytes, ext) {
+                Ok(path) => {
+                    self.state.insert_mention(&path);
+                    self.state
+                        .push_notice(Some("PASTE".into()), format!("attached {path}"));
+                }
+                Err(error) => self.state.push_error(error),
+            }
+            return;
+        }
+        self.state.composer.insert_str(self.state.cursor, text);
+        self.state.cursor = self.state.cursor.saturating_add(text.len());
+        self.state.composer_edited();
+    }
+
+    fn cycle_mode(&mut self) -> Result<(), String> {
+        if self.state.mode == ExecutionMode::Yolo {
+            self.state
+                .push_notice(Some("MODE".into()), "YOLO is launch-only");
+            return Ok(());
+        }
+        let mode = if self.state.mode == ExecutionMode::Supervised {
+            ExecutionMode::Auto
+        } else {
+            ExecutionMode::Supervised
+        };
+        if let Some(control) = &self.control {
+            control
+                .repository
+                .remember_mode(mode)
+                .map_err(|error| error.to_string())?;
+        }
+        self.state.mode = mode;
+        self.state.queue_command(EngineCommand::SetMode(mode));
+        self.state.push_notice(
+            Some("MODE".into()),
+            format!("mode {}", execution_mode_label(mode)),
+        );
+        Ok(())
+    }
+
+    fn push_status_notice(&mut self) {
+        let session = self.session_id.as_ref().map_or("none", AsRef::as_ref);
+        let todos = self.state.todos.len();
+        let branch = self.state.git_branch.as_deref().unwrap_or("-");
+        let max_input = self
+            .control
+            .as_ref()
+            .map(|control| control.max_input_tokens)
+            .unwrap_or(self.state.max_input_tokens);
+        let usage = if max_input == 0 {
+            "n/a".into()
+        } else if self.state.usage.input_tokens == 0 {
+            format!("{max_input} input")
+        } else {
+            format!(
+                "{}% of {max_input}",
+                (self.state.usage.input_tokens.saturating_mul(100) / max_input.max(1)).min(100)
+            )
+        };
+        self.state.push_notice(
+            Some("STATUS".into()),
+            format!(
+                "{}/{}  {}  session {session}  todos {todos}  git {branch}  context {usage}",
+                self.state.profile,
+                self.state.model,
+                execution_mode_label(self.state.mode),
+            ),
+        );
+    }
+
+    fn copy_last_assistant(&mut self) {
+        let Some(text) = self.state.last_assistant_text().map(str::to_owned) else {
+            self.state.push_error("no assistant reply to copy");
+            return;
+        };
+        match copy_to_clipboard(&text) {
+            Ok(()) => self.state.push_notice(
+                Some("COPY".into()),
+                format!("copied {} characters", text.chars().count()),
+            ),
+            Err(error) => self.state.push_error(error),
+        }
+    }
+
+    fn push_diff_notice(&mut self) {
+        match git_diff_stat(&self.state.project) {
+            Ok(diff) if diff.trim().is_empty() => self
+                .state
+                .push_notice(Some("DIFF".into()), "working tree is clean"),
+            Ok(diff) => self.state.push_notice(Some("DIFF".into()), diff),
+            Err(error) => self.state.push_error(error),
         }
     }
 
@@ -2217,6 +2389,102 @@ fn now_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+fn copy_to_clipboard(_text: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    let mut copied = false;
+    for command in ["pbcopy", "wl-copy", "xclip"] {
+        let mut child = match std::process::Command::new(command)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => continue,
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        if child.wait().map(|status| status.success()).unwrap_or(false) {
+            copied = true;
+            break;
+        }
+    }
+    if io::IsTerminal::is_terminal(&io::stdout()) {
+        let mut encoded = String::new();
+        base64_encode(text.as_bytes(), &mut encoded);
+        let mut stdout = io::stdout();
+        let _ = write!(stdout, "\x1b]52;c;{encoded}\x07");
+        let _ = stdout.flush();
+        copied = true;
+    }
+    if copied {
+        Ok(())
+    } else {
+        Err("no clipboard command available".into())
+    }
+}
+
+#[cfg(not(test))]
+fn base64_encode(bytes: &[u8], out: &mut String) {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for chunk in bytes.chunks(3) {
+        let a = chunk[0];
+        let b = chunk.get(1).copied().unwrap_or(0);
+        let c = chunk.get(2).copied().unwrap_or(0);
+        out.push(TABLE[(a >> 2) as usize] as char);
+        out.push(TABLE[(((a & 0x03) << 4) | (b >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(((b & 0x0f) << 2) | (c >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(c & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+}
+
+fn save_pasted_image(project: &str, bytes: &[u8], ext: &str) -> Result<String, String> {
+    let dir = Path::new(project).join(".kurama").join("paste");
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let relative = format!(".kurama/paste/{stamp}.{ext}");
+    std::fs::write(Path::new(project).join(&relative), bytes).map_err(|error| error.to_string())?;
+    Ok(relative)
+}
+
+fn git_diff_stat(project: &str) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .args(["-C", project, "diff", "--stat"])
+        .output()
+        .map_err(|error| format!("git diff failed: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    let mut diff = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if diff.chars().count() > 800 {
+        let end = diff
+            .char_indices()
+            .nth(800)
+            .map(|(index, _)| index)
+            .unwrap_or(diff.len());
+        diff.truncate(end);
+        diff.push('…');
+    }
+    Ok(diff)
 }
 
 fn execution_mode_label(mode: ExecutionMode) -> &'static str {

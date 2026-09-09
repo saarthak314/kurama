@@ -95,8 +95,9 @@ fn replay_hydrates_only_the_latest_todo_list() {
     );
     assert_eq!(
         plain_transcript(&state.transcript),
-        "• todo  1/2  next: implement fix"
+        "• todo\n  [x] inspect parser\n  [>] implement fix"
     );
+    assert!(!plain_transcript(&state.transcript).contains("Ran todo"));
 }
 
 #[test]
@@ -137,4 +138,63 @@ fn live_todo_tool_completion_updates_state_and_transcript() {
         state.transcript.last(),
         Some(TranscriptEntry::Todos { items }) if items[0].content == "ship the fix"
     ));
+    assert_eq!(
+        plain_transcript(&state.transcript),
+        "• todo\n  [ ] ship the fix"
+    );
+    assert!(
+        state
+            .transcript
+            .iter()
+            .all(|entry| !matches!(entry, TranscriptEntry::ToolCall(_)))
+    );
+
+    let updated = vec![
+        item("one", "ship the fix", TodoStatus::Completed),
+        item("two", "write tests", TodoStatus::InProgress),
+    ];
+    state.apply_runtime_event(RuntimeEvent::ToolCompleted {
+        operation_id: OperationId::from("operation_todo_2"),
+        result: ToolResult {
+            call_id: CallId::from("call_todo_2"),
+            output: "updated".into(),
+            is_error: false,
+            metadata: serde_json::json!({"tool_name": "todo", "items": updated}),
+            truncated: false,
+            blob_refs: Vec::new(),
+        },
+    });
+
+    assert_eq!(
+        state
+            .transcript
+            .iter()
+            .filter(|entry| matches!(entry, TranscriptEntry::Todos { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        plain_transcript(&state.transcript),
+        "• todo\n  [x] ship the fix\n  [>] write tests"
+    );
+}
+
+#[test]
+fn ctrl_t_toggles_todo_overlay() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.todos = vec![item("one", "ship the fix", TodoStatus::Pending)];
+    state.toggle_todos();
+    assert_eq!(state.overlay(), Overlay::Todos);
+    state.toggle_todos();
+    assert_eq!(state.overlay(), Overlay::None);
+}
+
+#[test]
+fn last_assistant_text_is_the_latest_reply() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    assert!(state.last_assistant_text().is_none());
+    state.push_assistant("first");
+    state.push_user("again");
+    state.push_assistant("second");
+    assert_eq!(state.last_assistant_text(), Some("second"));
 }

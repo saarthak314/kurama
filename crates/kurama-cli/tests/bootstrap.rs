@@ -736,6 +736,153 @@ async fn reopening_connect_resets_a_cancelled_wizard() {
     assert_eq!(app.state.onboarding.display_input(), "");
 }
 
+#[tokio::test]
+async fn at_sign_tab_completes_a_project_file() {
+    let (_temp, paths, project) = fixture();
+    std::fs::create_dir_all(project.join("src")).expect("src");
+    std::fs::write(project.join("src/lib.rs"), "fn x() {}").expect("write");
+    let repository = ConfigRepository::open(paths.clone()).expect("repository");
+    repository
+        .write_config(&bridge_config())
+        .expect("write config");
+    let mut app =
+        App::bootstrap_with_paths(&Args::default(), project, paths, SessionSecrets::default())
+            .expect("bootstrap");
+
+    type_command(&mut app, "@lib");
+    app.handle_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+        .expect("complete file");
+    assert_eq!(app.state.composer, "@src/lib.rs ");
+}
+
+#[tokio::test]
+async fn pasting_an_image_path_attaches_a_mention() {
+    let (_temp, paths, project) = fixture();
+    let png = project.join("shot.png");
+    std::fs::write(&png, b"\x89PNG\r\n\x1a\nrest").expect("png");
+    let repository = ConfigRepository::open(paths.clone()).expect("repository");
+    repository
+        .write_config(&bridge_config())
+        .expect("write config");
+    let mut app =
+        App::bootstrap_with_paths(&Args::default(), project, paths, SessionSecrets::default())
+            .expect("bootstrap");
+
+    app.handle_event(Event::Paste(png.to_string_lossy().into_owned()))
+        .expect("paste image");
+    assert!(
+        app.state.composer.starts_with("@.kurama/paste/") && app.state.composer.ends_with(".png "),
+        "{}",
+        app.state.composer
+    );
+    assert!(transcript_has_notice(&app, "attached .kurama/paste/"));
+}
+
+#[tokio::test]
+async fn ctrl_r_searches_composer_history() {
+    let (_temp, paths, project) = fixture();
+    let repository = ConfigRepository::open(paths.clone()).expect("repository");
+    repository
+        .write_config(&bridge_config())
+        .expect("write config");
+    let mut app =
+        App::bootstrap_with_paths(&Args::default(), project, paths, SessionSecrets::default())
+            .expect("bootstrap");
+
+    app.state.remember_prompt("open the palette");
+    app.state.remember_prompt("fix the failing tests");
+    app.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('r'),
+        KeyModifiers::CONTROL,
+    )))
+    .expect("start history search");
+    app.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('f'),
+        KeyModifiers::NONE,
+    )))
+    .expect("filter history");
+    assert_eq!(app.state.history_matches(), ["fix the failing tests"]);
+    press_enter(&mut app);
+    assert_eq!(app.state.composer, "fix the failing tests");
+    assert!(!app.state.history_search_active());
+}
+
+#[tokio::test]
+async fn escape_dismisses_file_mentions_without_clearing_composer() {
+    let (_temp, paths, project) = fixture();
+    std::fs::create_dir_all(project.join("src")).expect("src");
+    std::fs::write(project.join("src/lib.rs"), "fn x() {}").expect("write");
+    let repository = ConfigRepository::open(paths.clone()).expect("repository");
+    repository
+        .write_config(&bridge_config())
+        .expect("write config");
+    let mut app =
+        App::bootstrap_with_paths(&Args::default(), project, paths, SessionSecrets::default())
+            .expect("bootstrap");
+
+    type_command(&mut app, "@lib");
+    assert!(
+        !app.state.file_suggestions().is_empty(),
+        "{:?}",
+        app.state.file_suggestions()
+    );
+    app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .expect("dismiss files");
+    assert!(app.state.file_suggestions().is_empty());
+    assert_eq!(app.state.composer, "@lib");
+}
+
+#[tokio::test]
+async fn history_search_ignores_composer_control_keys() {
+    let (_temp, paths, project) = fixture();
+    let repository = ConfigRepository::open(paths.clone()).expect("repository");
+    repository
+        .write_config(&bridge_config())
+        .expect("write config");
+    let mut app =
+        App::bootstrap_with_paths(&Args::default(), project, paths, SessionSecrets::default())
+            .expect("bootstrap");
+
+    app.state.remember_prompt("fix the failing tests");
+    app.state.composer = "draft".into();
+    app.state.cursor = 5;
+    app.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('r'),
+        KeyModifiers::CONTROL,
+    )))
+    .expect("start history search");
+    app.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('u'),
+        KeyModifiers::CONTROL,
+    )))
+    .expect("ignore ctrl+u");
+    assert_eq!(app.state.composer, "draft");
+    assert!(app.state.history_search_active());
+}
+
+#[tokio::test]
+async fn paste_during_history_search_extends_the_query() {
+    let (_temp, paths, project) = fixture();
+    let repository = ConfigRepository::open(paths.clone()).expect("repository");
+    repository
+        .write_config(&bridge_config())
+        .expect("write config");
+    let mut app =
+        App::bootstrap_with_paths(&Args::default(), project, paths, SessionSecrets::default())
+            .expect("bootstrap");
+
+    app.state.remember_prompt("fix the failing tests");
+    app.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('r'),
+        KeyModifiers::CONTROL,
+    )))
+    .expect("start history search");
+    app.handle_event(Event::Paste("fail".into()))
+        .expect("paste query");
+    assert_eq!(app.state.history_search_query(), Some("fail"));
+    assert_eq!(app.state.history_matches(), ["fix the failing tests"]);
+}
+
 fn type_command(app: &mut App, command: &str) {
     for character in command.chars() {
         app.handle_event(Event::Key(KeyEvent::new(
