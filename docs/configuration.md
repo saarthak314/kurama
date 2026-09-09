@@ -52,7 +52,7 @@ Plaintext keys are invalid. Kurama never reads Codex or Claude credential stores
 
 ## Routing and Search
 
-`[roles.<name>]` routes an orchestrator-assigned child role to a profile. The model supplies objectives, scopes, budgets, and dependencies; it cannot select roles or profiles. Kurama derives roles from each objective, applies the matching role route, and otherwise inherits the parent profile. Dependency entries name the exact objective text of prerequisite agents. `escalation_profiles` is an ordered allowlist; automatic escalation never crosses to an unlisted provider or downgrade.
+`[roles.<name>]` routes an orchestrator-assigned child role to a profile. The model supplies objectives, scopes, budgets, and dependencies; it cannot select roles or profiles. Kurama derives roles from each objective, applies the matching role route, and otherwise inherits the parent profile. Researcher, planner, and reviewer write scopes are forced empty regardless of the model request. An implementer with an empty scope inherits the parent write scope; a non-empty implementer scope must stay a subset. Dependency entries name the exact objective text of prerequisite agents. `escalation_profiles` is an ordered allowlist; automatic escalation never crosses to an unlisted provider or downgrade.
 
 `[search] kind = "provider"` uses provider-native search when supported. Use `kind = "json"` with an HTTP endpoint for a configured search service; it must accept `{ "query", "limit" }` and return ranked `{ "title", "url", "snippet" }` results.
 

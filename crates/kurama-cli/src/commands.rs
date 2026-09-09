@@ -8,7 +8,7 @@ pub struct CommandSpec {
     pub requires_arguments: bool,
 }
 
-pub const COMMAND_SPECS: [CommandSpec; 11] = [
+pub const COMMAND_SPECS: [CommandSpec; 12] = [
     CommandSpec {
         name: "model",
         description: "select or list profiles",
@@ -18,6 +18,12 @@ pub const COMMAND_SPECS: [CommandSpec; 11] = [
     CommandSpec {
         name: "agents",
         description: "inspect and control sub-agents",
+        accepts_arguments: false,
+        requires_arguments: false,
+    },
+    CommandSpec {
+        name: "todo",
+        description: "show the session todo list",
         accepts_arguments: false,
         requires_arguments: false,
     },
@@ -80,6 +86,7 @@ pub const COMMAND_SPECS: [CommandSpec; 11] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Agents,
+    Todo,
     Model(Option<String>),
     Connect,
     Sessions,
@@ -131,6 +138,7 @@ pub fn parse_command(input: &str) -> Result<Command, String> {
 
     match (name, remainder.as_slice()) {
         ("/agents", []) => Ok(Command::Agents),
+        ("/todo", []) => Ok(Command::Todo),
         ("/model", []) => Ok(Command::Model(None)),
         ("/model", [profile]) => Ok(Command::Model(Some((*profile).to_owned()))),
         ("/connect", []) => Ok(Command::Connect),

@@ -107,9 +107,9 @@ fn derives_roles_routes_profiles_and_queues_above_concurrency() {
         agents: vec![
             agent("custom", Some("missing"), &[]),
             agent("reviewer", None, &[]),
-            agent("third", None, &[]),
-            agent("fourth", None, &[]),
-            agent("fifth", None, &[]),
+            agent("investigate third", None, &[]),
+            agent("investigate fourth", None, &[]),
+            agent("investigate fifth", None, &[]),
         ],
     };
     let plan = orchestrator.resolve(request, &context()).expect("resolve");
@@ -624,7 +624,10 @@ async fn manager_messages_one_child_and_cancels_another() {
     let plan = orchestrator
         .resolve(
             DelegationRequest {
-                agents: vec![agent("first", None, &[]), agent("second", None, &[])],
+                agents: vec![
+                    agent("investigate first", None, &[]),
+                    agent("investigate second", None, &[]),
+                ],
             },
             &context(),
         )
@@ -699,7 +702,10 @@ async fn queued_child_message_overflow_is_rejected_without_aborting_orchestratio
     let plan = orchestrator
         .resolve(
             DelegationRequest {
-                agents: vec![agent("first", None, &[]), agent("second", None, &[])],
+                agents: vec![
+                    agent("investigate first", None, &[]),
+                    agent("investigate second", None, &[]),
+                ],
             },
             &context(),
         )
@@ -813,7 +819,10 @@ async fn terminal_child_approval_is_removed_and_next_live_request_is_promoted() 
     let plan = SmartOrchestrator::new(Arc::new(SequenceIds::new(20)))
         .resolve(
             DelegationRequest {
-                agents: vec![agent("first", None, &[]), agent("second", None, &[])],
+                agents: vec![
+                    agent("investigate first", None, &[]),
+                    agent("investigate second", None, &[]),
+                ],
             },
             &context(),
         )

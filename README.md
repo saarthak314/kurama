@@ -2,7 +2,7 @@
 
 a terminal coding agent written in rust. one process, no daemon, no database.
 
-it gives models four tools: bounded file reads, atomic writes, timed shell commands, and public web search. sub-agents exist only when you ask for parallel work, and they cannot spawn children. sessions are resumable jsonl logs under `~/.kurama`.
+it gives models four environment tools: bounded file reads, atomic writes, timed shell commands, and public web search. a session todo list is parent-only orchestration, not a fifth environment tool. sub-agents exist only when you ask for parallel work, cannot spawn children, and stay read-only unless they are implementers. sessions are resumable jsonl logs under `~/.kurama`.
 
 ## install
 

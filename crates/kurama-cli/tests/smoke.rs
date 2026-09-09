@@ -228,6 +228,7 @@ fn transcript_entry_contains(entry: &TranscriptEntry, needle: &str) -> bool {
         | TranscriptEntry::Error { body }
         | TranscriptEntry::Notice { body, .. } => body.contains(needle),
         TranscriptEntry::ToolCall(tool) => tool.output.contains(needle),
+        TranscriptEntry::Todos { items } => items.iter().any(|item| item.content.contains(needle)),
     }
 }
 

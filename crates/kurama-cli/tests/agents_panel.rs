@@ -74,6 +74,25 @@ fn panel_shows_control_fields_but_not_tool_statistics() {
     assert!(!text.contains("SCOPE"));
     assert!(!text.contains("TIME"));
     assert!(text.contains("ID        ROLE          PROFILE      TASK                  STATE"));
+    assert!(text.contains("read-only"));
+}
+
+#[test]
+fn wrapping_up_phase_is_visible_in_the_agent_row() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    let mut wrapping = snapshot("a_wrap", AgentState::Running);
+    wrapping.phase = Some("wrapping up".into());
+    wrapping.active_operation = Some("running cargo test".into());
+
+    state.apply_runtime_event(RuntimeEvent::AgentUpdated { snapshot: wrapping });
+    state.open_agents();
+
+    let text = rendered(&state);
+    assert!(
+        text.contains("wrapping up"),
+        "missing wrapping-up activity: {text}"
+    );
+    assert_eq!(state.agents[0].activity, "wrapping up");
 }
 
 #[test]

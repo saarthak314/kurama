@@ -29,6 +29,7 @@ use crate::{cancel::CancelToken, orchestrator::scopes_overlap};
 const CHILD_CLEANUP_GRACE: Duration = Duration::from_millis(100);
 const CHILD_MESSAGE_CAPACITY: usize = 16;
 const CHILD_TIMEOUT_ERROR: &str = "child execution timed out";
+pub const CHILD_BUDGET_WRAP_UP: &str = "budget nearly exhausted; wrap up with a concise summary of results, changed files, and blockers";
 
 #[derive(Debug, Clone, Default)]
 pub struct ChildProgress {
@@ -104,6 +105,8 @@ struct ManagedAgent {
     profile_attempts: u8,
     next_escalation: usize,
     execution_deadline: Option<Instant>,
+    budget_warn_at: Option<Instant>,
+    budget_warned: bool,
     task: Option<Shared<BoxFuture<'static, ()>>>,
 }
 
@@ -185,6 +188,7 @@ impl AgentManager {
                 completed_tx.clone(),
             )
             .await?;
+            self.warn_due_time_budgets().await?;
 
             if self.all_terminal().await {
                 break;
@@ -199,7 +203,11 @@ impl AgentManager {
                 ));
             }
 
+            let warning_deadline = self.next_budget_warning().await;
             tokio::select! {
+                () = tokio::time::sleep_until(warning_deadline.unwrap_or_else(Instant::now)), if warning_deadline.is_some() => {
+                    self.warn_due_time_budgets().await?;
+                }
                 progress = progress_rx.recv() => {
                     if let Some((agent_id, progress)) = progress {
                         self.apply_progress(&agent_id, progress).await?;
@@ -432,6 +440,8 @@ impl AgentManager {
                     profile_attempts: 0,
                     next_escalation: 0,
                     execution_deadline: None,
+                    budget_warn_at: None,
+                    budget_warned: false,
                     task: None,
                 };
                 self.append_agent_event(
@@ -504,6 +514,12 @@ impl AgentManager {
                 let execution_deadline = *agent.execution_deadline.get_or_insert_with(|| {
                     Instant::now() + Duration::from_secs(agent.spec.budget.max_seconds)
                 });
+                if agent.budget_warn_at.is_none() {
+                    agent.budget_warn_at = Some(
+                        execution_deadline
+                            - Duration::from_secs(agent.spec.budget.max_seconds).mul_f64(0.2),
+                    );
+                }
                 agent.snapshot.state = AgentState::Running;
                 agent.snapshot.phase = Some("starting".into());
                 let snapshot = agent.snapshot.clone();
@@ -607,7 +623,7 @@ impl AgentManager {
         agent_id: &AgentId,
         progress: ChildProgress,
     ) -> Result<(), KuramaError> {
-        let snapshot = {
+        let (snapshot, wrap_up_sender) = {
             let mut state = self.state.lock().await;
             let agent = state
                 .agents
@@ -621,6 +637,26 @@ impl AgentManager {
             let budget_exhausted = progress.usage.input_tokens > agent.spec.budget.max_input_tokens
                 || progress.usage.output_tokens > agent.spec.budget.max_output_tokens
                 || progress.completed_turns > agent.spec.budget.max_turns;
+            let should_warn = !agent.budget_warned
+                && progress.completed_turns.saturating_mul(5)
+                    >= agent.spec.budget.max_turns.saturating_mul(4);
+            let wrap_up_sender = if should_warn && !budget_exhausted {
+                agent.budget_warned = true;
+                snapshot.phase = Some("wrapping up".into());
+                self.append_agent_event(
+                    agent,
+                    SessionEvent::AgentMessage {
+                        agent_id: agent_id.clone(),
+                        text: CHILD_BUDGET_WRAP_UP.into(),
+                    },
+                )?;
+                agent
+                    .transcript
+                    .push(format!("parent: {CHILD_BUDGET_WRAP_UP}"));
+                agent.messages.clone()
+            } else {
+                None
+            };
             if budget_exhausted {
                 snapshot.last_error = Some("child budget exhausted".into());
             }
@@ -639,9 +675,68 @@ impl AgentManager {
                 agent.cancel.cancel();
             }
             agent.snapshot = snapshot.clone();
-            snapshot
+            (snapshot, wrap_up_sender)
         };
-        self.emit(RuntimeEvent::AgentUpdated { snapshot }).await
+        self.emit(RuntimeEvent::AgentUpdated { snapshot }).await?;
+        if let Some(sender) = wrap_up_sender {
+            let _ = sender.send(CHILD_BUDGET_WRAP_UP.into()).await;
+        }
+        Ok(())
+    }
+
+    async fn next_budget_warning(&self) -> Option<Instant> {
+        self.state
+            .lock()
+            .await
+            .agents
+            .values()
+            .filter(|agent| agent.snapshot.state == AgentState::Running && !agent.budget_warned)
+            .filter_map(|agent| agent.budget_warn_at)
+            .min()
+    }
+
+    async fn warn_due_time_budgets(&self) -> Result<(), KuramaError> {
+        let warnings = {
+            let mut state = self.state.lock().await;
+            let now = Instant::now();
+            let mut warnings = Vec::new();
+            for agent in state.agents.values_mut() {
+                if agent.snapshot.state != AgentState::Running
+                    || agent.budget_warned
+                    || agent.budget_warn_at.is_none_or(|deadline| deadline > now)
+                {
+                    continue;
+                }
+                agent.budget_warned = true;
+                agent.snapshot.phase = Some("wrapping up".into());
+                let snapshot = agent.snapshot.clone();
+                self.append_agent_event(
+                    agent,
+                    SessionEvent::AgentProgress {
+                        snapshot: snapshot.clone(),
+                    },
+                )?;
+                self.append_agent_event(
+                    agent,
+                    SessionEvent::AgentMessage {
+                        agent_id: agent.spec.id.clone(),
+                        text: CHILD_BUDGET_WRAP_UP.into(),
+                    },
+                )?;
+                agent
+                    .transcript
+                    .push(format!("parent: {CHILD_BUDGET_WRAP_UP}"));
+                warnings.push((snapshot, agent.messages.clone()));
+            }
+            warnings
+        };
+        for (snapshot, sender) in warnings {
+            self.emit(RuntimeEvent::AgentUpdated { snapshot }).await?;
+            if let Some(sender) = sender {
+                let _ = sender.send(CHILD_BUDGET_WRAP_UP.into()).await;
+            }
+        }
+        Ok(())
     }
 
     async fn queue_approval(&self, approval: ChildApproval) -> Result<(), KuramaError> {
@@ -709,21 +804,12 @@ impl AgentManager {
                     },
                 )?;
                 (snapshot, None, next_request)
-            } else if agent.cancel.is_cancelled() {
-                agent.snapshot.state = AgentState::Cancelled;
-                let snapshot = agent.snapshot.clone();
-                self.append_agent_event(
-                    agent,
-                    SessionEvent::AgentCancelled {
-                        snapshot: snapshot.clone(),
-                    },
-                )?;
-                (snapshot, None, next_request)
             } else {
                 match outcome {
                     Ok(result) => {
                         agent.snapshot.state = AgentState::Completed;
                         agent.snapshot.changed_files = result.changed_files.clone();
+                        agent.snapshot.last_error = None;
                         let snapshot = agent.snapshot.clone();
                         self.append_agent_event(
                             agent,
@@ -733,6 +819,17 @@ impl AgentManager {
                             },
                         )?;
                         (snapshot, Some(result), next_request)
+                    }
+                    Err(_) if agent.cancel.is_cancelled() => {
+                        agent.snapshot.state = AgentState::Cancelled;
+                        let snapshot = agent.snapshot.clone();
+                        self.append_agent_event(
+                            agent,
+                            SessionEvent::AgentCancelled {
+                                snapshot: snapshot.clone(),
+                            },
+                        )?;
+                        (snapshot, None, next_request)
                     }
                     Err(error @ KuramaError::Model(_)) if agent.profile_attempts < 2 => {
                         agent.snapshot.state = AgentState::Queued;

@@ -8,9 +8,7 @@ use std::{
 use futures_util::StreamExt;
 use kurama_protocol::{
     KuramaError,
-    agent::{
-        AgentResult, AgentSnapshot, AgentState, OrchestrationContext, ResolvedAgentSpec, WriteScope,
-    },
+    agent::{AgentSnapshot, AgentState, OrchestrationContext, ResolvedAgentSpec, WriteScope},
     id::{AgentId, OperationId},
     model::{BackendCursor, FinishReason, ModelEvent, ModelItem, ModelProfile, ModelRequest},
     policy::{
@@ -31,9 +29,12 @@ use crate::{
     cancel::CancelToken,
     context::{ContextManager, ContextPolicy, estimate_text, normalize_compaction_json},
     recovery::{RecoveryAction, RecoveryPlanner, SessionRecoveryProbe, StreamRecovery},
+    todo::{TodoTool, items_from_result_or_arguments},
 };
 
 pub type RuntimeEvents = mpsc::Receiver<RuntimeEvent>;
+
+const MAX_DELEGATION_WAVES: u8 = 3;
 
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -127,11 +128,22 @@ impl Engine {
         mut replay: Vec<EventEnvelope>,
     ) -> Result<(EngineHandle, RuntimeEvents), KuramaError> {
         let mut tools = BTreeMap::new();
+        let mut tool_descriptors = Vec::new();
         for tool in &config.tools {
-            let name = tool.descriptor().name;
+            let descriptor = tool.descriptor();
+            let name = descriptor.name.clone();
+            if config.agent_id.is_some() && name == "todo" {
+                continue;
+            }
             if tools.insert(name.clone(), tool.clone()).is_some() {
                 return Err(KuramaError::Configuration(format!("duplicate tool {name}")));
             }
+            tool_descriptors.push(descriptor);
+        }
+        if config.agent_id.is_none() && !tools.contains_key("todo") {
+            let tool: Arc<dyn Tool> = Arc::new(TodoTool);
+            tool_descriptors.push(tool.descriptor());
+            tools.insert("todo".into(), tool);
         }
 
         let mut sequence = replay.last().map_or(0, |event| event.sequence + 1);
@@ -205,7 +217,7 @@ impl Engine {
             profile: config.profile,
             backend: config.backend,
             tools,
-            tool_descriptors: config.tools.iter().map(|tool| tool.descriptor()).collect(),
+            tool_descriptors,
             policy: config.policy,
             store: config.store,
             sink: config.sink,
@@ -838,6 +850,7 @@ impl EngineActor {
         capability_enabled: bool,
         cancel: &CancelToken,
     ) -> Result<(), KuramaError> {
+        let mut waves = 0u8;
         let mut delegation_available = capability_enabled && self.agent_id.is_none();
         loop {
             let mut assembled = self.context.assemble(
@@ -869,11 +882,15 @@ impl EngineActor {
                 self.execute_tool(invocation, cancel).await?;
             }
             for request in round.delegations {
-                self.execute_delegation(request, delegation_available, cancel)
-                    .await?;
-            }
-            if !round.delegations_empty {
-                delegation_available = false;
+                if self
+                    .execute_delegation(request, delegation_available, cancel)
+                    .await?
+                {
+                    waves += 1;
+                    delegation_available = capability_enabled
+                        && self.agent_id.is_none()
+                        && waves < MAX_DELEGATION_WAVES;
+                }
             }
             if !round.tool_calls_empty || !round.delegations_empty {
                 continue;
@@ -1185,6 +1202,7 @@ impl EngineActor {
         .await?;
         let call_id = invocation.call_id.clone();
         let tool_name = invocation.name.clone();
+        let arguments = invocation.arguments.clone();
         let execution = tool.execute(tool_context, invocation, cancel);
         tokio::pin!(execution);
         let mut result = loop {
@@ -1206,7 +1224,16 @@ impl EngineActor {
                 result: result.clone(),
             })?;
         }
-        self.complete_tool(operation_id, result).await
+        let todo_items = if tool_name == "todo" && !result.is_error {
+            Some(items_from_result_or_arguments(&result, &arguments)?)
+        } else {
+            None
+        };
+        let result = self.complete_tool(operation_id, result).await?;
+        if let Some(items) = todo_items {
+            self.append(SessionEvent::TodoUpdated { items })?;
+        }
+        Ok(result)
     }
 
     fn checkpoint_files(&self, paths: &[PathBuf]) -> Result<Vec<FileCheckpoint>, KuramaError> {
@@ -1350,7 +1377,7 @@ impl EngineActor {
         request: kurama_protocol::agent::DelegationRequest,
         capability_enabled: bool,
         cancel: &CancelToken,
-    ) -> Result<Vec<AgentResult>, KuramaError> {
+    ) -> Result<bool, KuramaError> {
         if !capability_enabled || self.agent_id.is_some() {
             return Err(KuramaError::Protocol(
                 "model emitted delegation without an enabled parent capability".into(),
@@ -1368,6 +1395,7 @@ impl EngineActor {
                 KuramaError::Configuration("agent manager is not configured".into())
             })?;
         let plan = self.orchestrator.resolve(request, &orchestration_context)?;
+        let scheduled = !plan.ready.is_empty() || !plan.queued.is_empty();
         for spec in plan.ready.iter().chain(&plan.queued).chain(&plan.blocked) {
             self.append(SessionEvent::AgentQueued {
                 snapshot: queued_agent_snapshot(spec),
@@ -1429,7 +1457,7 @@ impl EngineActor {
                 _ => {}
             }
         }
-        Ok(results)
+        Ok(scheduled)
     }
 
     async fn await_approval(

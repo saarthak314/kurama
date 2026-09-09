@@ -610,6 +610,11 @@ impl App {
             | Overlay::AgentInspect
             | Overlay::AgentMessage
             | Overlay::ConfirmAgentCancel => self.handle_agents_key(key),
+            Overlay::Todos => {
+                if key.code == KeyCode::Esc {
+                    self.state.close_overlay();
+                }
+            }
             Overlay::Shortcuts => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter) {
                     self.state.close_overlay();
@@ -630,6 +635,7 @@ impl App {
             self.state.overlay(),
             Overlay::Shortcuts
                 | Overlay::Agents
+                | Overlay::Todos
                 | Overlay::AgentInspect
                 | Overlay::AgentMessage
                 | Overlay::ConfirmAgentCancel
@@ -803,6 +809,7 @@ impl App {
             };
             match command {
                 Command::Agents => self.state.open_agents(),
+                Command::Todo => self.state.open_todos(),
                 Command::Model(profile) => {
                     if let Some(profile) = profile {
                         let known = self
@@ -3023,6 +3030,11 @@ Session ID: ses_cafebabe"
 
         state.overlay = Overlay::Shortcuts;
         assert_eq!(desired_inline_viewport_height(&state, 80, 24), 24);
+        assert!(!uses_full_inline_viewport(&state));
+
+        state.overlay = Overlay::Todos;
+        assert_eq!(desired_inline_viewport_height(&state, 80, 24), 24);
+        assert!(!uses_full_inline_viewport(&state));
     }
 
     #[test]

@@ -8,14 +8,15 @@ use std::{
 use futures_util::{StreamExt as _, stream};
 use kurama_core::{
     context::{ContextManager, ContextPolicy},
-    engine::{Engine, EngineConfig},
+    engine::{Engine, EngineConfig, EngineOrchestration},
+    orchestrator::SmartOrchestrator,
     testing::{
-        AllowAllPolicy, CollectingSink, EchoTool, MemoryStore, NoDelegation, ScriptedBackend,
-        SequenceIds,
+        AllowAllPolicy, CollectingSink, EchoTool, ImmediateChildRunner, MemoryStore, NoDelegation,
+        ScriptedBackend, SequenceIds, orchestration_context,
     },
 };
 use kurama_protocol::{
-    agent::{AgentSnapshot, AgentState, DelegationRequest, WriteScope},
+    agent::{AgentBudget, AgentSnapshot, AgentSpec, AgentState, DelegationRequest, WriteScope},
     id::{CallId, OperationId, SessionId},
     model::{BackendCapabilities, FinishReason, ModelEvent, ModelProfile, ModelRequest},
     policy::{ApprovalResponse, AutoBoundaries, ExecutionMode, PolicyContext, PolicyDecision},
@@ -804,6 +805,136 @@ async fn cancelled_finish_rejects_delegation_before_execution() {
     .expect("cancelled finish failure timed out");
 
     assert_eq!(message, "cancelled");
+}
+
+fn delegation_request(objective: &str) -> DelegationRequest {
+    DelegationRequest {
+        agents: vec![AgentSpec {
+            role: "researcher".into(),
+            objective: objective.into(),
+            profile: None,
+            context_refs: Vec::new(),
+            write_scope: WriteScope::default(),
+            budget: AgentBudget::default(),
+            depends_on: Vec::new(),
+        }],
+    }
+}
+
+fn delegation_config(
+    session_id: &str,
+    backend: Arc<dyn ModelBackend>,
+    store: Arc<MemoryStore>,
+) -> EngineConfig {
+    let mut config = partial_stream_config(session_id, backend, store);
+    config.orchestrator = Arc::new(SmartOrchestrator::new(Arc::new(SequenceIds::new(100))));
+    config.orchestration = Some(EngineOrchestration {
+        context: orchestration_context(),
+        runner: Arc::new(ImmediateChildRunner {
+            summary: "complete".into(),
+        }),
+    });
+    config
+}
+
+#[tokio::test]
+async fn delegation_can_run_two_waves_then_stop() {
+    let backend: Arc<dyn ModelBackend> = Arc::new(ScriptedBackend::new(vec![
+        vec![
+            Ok(ModelEvent::Delegation {
+                request: delegation_request("investigate first"),
+            }),
+            Ok(ModelEvent::ResponseCompleted {
+                cursor: None,
+                finish_reason: FinishReason::ToolCalls,
+            }),
+        ],
+        vec![
+            Ok(ModelEvent::Delegation {
+                request: delegation_request("investigate second"),
+            }),
+            Ok(ModelEvent::ResponseCompleted {
+                cursor: None,
+                finish_reason: FinishReason::ToolCalls,
+            }),
+        ],
+        vec![Ok(ModelEvent::ResponseCompleted {
+            cursor: None,
+            finish_reason: FinishReason::Stop,
+        })],
+    ]));
+    let store = Arc::new(MemoryStore::default());
+    let (handle, mut events) = Engine::spawn(
+        delegation_config("two-delegation-waves", backend, Arc::clone(&store)),
+        Vec::new(),
+    )
+    .expect("spawn engine");
+
+    handle.submit("delegate", true).await.expect("submit");
+    let mut completed_agents = 0;
+    loop {
+        match events.recv().await.expect("runtime event") {
+            RuntimeEvent::AgentUpdated { snapshot } if snapshot.state == AgentState::Completed => {
+                completed_agents += 1;
+            }
+            RuntimeEvent::TurnCompleted => break,
+            RuntimeEvent::Error { message } => panic!("engine error: {message}"),
+            _ => {}
+        }
+    }
+
+    assert_eq!(completed_agents, 2);
+    assert_eq!(
+        store
+            .events("two-delegation-waves")
+            .iter()
+            .filter(|event| matches!(event.event, SessionEvent::AgentCompleted { .. }))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn fourth_delegation_wave_is_refused() {
+    let streams = (0..4)
+        .map(|wave| {
+            vec![
+                Ok(ModelEvent::Delegation {
+                    request: delegation_request(&format!("investigate wave {wave}")),
+                }),
+                Ok(ModelEvent::ResponseCompleted {
+                    cursor: None,
+                    finish_reason: FinishReason::ToolCalls,
+                }),
+            ]
+        })
+        .collect();
+    let backend: Arc<dyn ModelBackend> = Arc::new(ScriptedBackend::new(streams));
+    let store = Arc::new(MemoryStore::default());
+    let (handle, mut events) = Engine::spawn(
+        delegation_config("fourth-delegation-wave", backend, Arc::clone(&store)),
+        Vec::new(),
+    )
+    .expect("spawn engine");
+
+    handle.submit("delegate", true).await.expect("submit");
+    let message = loop {
+        match events.recv().await.expect("runtime event") {
+            RuntimeEvent::Error { message } => break message,
+            RuntimeEvent::TurnCompleted => panic!("fourth delegation completed the turn"),
+            _ => {}
+        }
+    };
+
+    assert!(message.contains("capability"));
+    assert_eq!(
+        store
+            .events("fourth-delegation-wave")
+            .iter()
+            .filter(|event| matches!(event.event, SessionEvent::AgentCompleted { .. }))
+            .count(),
+        3
+    );
 }
 
 #[tokio::test]

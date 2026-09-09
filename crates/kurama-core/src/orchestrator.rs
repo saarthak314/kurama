@@ -120,6 +120,12 @@ impl SmartOrchestrator {
         });
         escalation_profiles.dedup();
 
+        let write_scope = match spec.role.as_str() {
+            "researcher" | "planner" | "reviewer" => WriteScope::default(),
+            "implementer" if spec.write_scope.is_read_only() => context.parent_write_scope.clone(),
+            _ => spec.write_scope,
+        };
+
         Ok(ResolvedAgentSpec {
             id: self.ids.agent_id(),
             parent_id: None,
@@ -128,7 +134,7 @@ impl SmartOrchestrator {
             objective: spec.objective,
             profile,
             context_refs: spec.context_refs,
-            write_scope: canonical_scope(spec.write_scope),
+            write_scope: canonical_scope(write_scope),
             budget: spec.budget,
             depends_on: spec.depends_on,
             escalation_profiles,
@@ -182,6 +188,15 @@ impl Orchestrator for SmartOrchestrator {
         for spec in &mut request.agents {
             spec.role = infer_role(&spec.objective, context);
             spec.profile = None;
+            match spec.role.as_str() {
+                "researcher" | "planner" | "reviewer" => {
+                    spec.write_scope = WriteScope::default();
+                }
+                "implementer" if spec.write_scope.is_read_only() => {
+                    spec.write_scope = context.parent_write_scope.clone();
+                }
+                _ => {}
+            }
         }
         self.validate_request(&request, context)?;
         let max_concurrency = context.max_concurrency.clamp(1, 8);

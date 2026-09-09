@@ -28,10 +28,13 @@ impl AgentRow {
             last_error,
         } = snapshot;
         let transcript = last_error.clone().into_iter().collect();
-        let activity = active_operation
-            .or(phase)
-            .or(last_error)
-            .unwrap_or_else(|| state_label(&state).into());
+        let activity = if phase.as_deref() == Some("wrapping up") {
+            phase
+        } else {
+            active_operation.or(phase)
+        }
+        .or(last_error)
+        .unwrap_or_else(|| state_label(&state).into());
 
         Self {
             id,
@@ -49,6 +52,16 @@ impl AgentRow {
         *self = Self::from_snapshot(snapshot);
         if !transcript.is_empty() {
             self.transcript = transcript;
+        }
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        matches!(
+            self.role.to_ascii_lowercase().as_str(),
+            "researcher" | "planner" | "reviewer"
+        ) || {
+            let activity = self.activity.to_ascii_lowercase();
+            activity.contains("read-only") || activity.contains("read only")
         }
     }
 }
