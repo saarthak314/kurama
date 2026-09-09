@@ -187,8 +187,8 @@ fn render_shortcuts(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
         ("ctrl+j", "newline"),
         ("ctrl+o", "expand transcript"),
         ("ctrl+t", "todo list"),
+        ("ctrl+r", "search history"),
         ("shift+tab", "cycle supervised/auto"),
-        ("?", "this overlay"),
     ]
     .into_iter()
     .map(|(key, hint)| {

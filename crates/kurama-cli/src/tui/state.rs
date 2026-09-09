@@ -1,5 +1,6 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use kurama_protocol::{
@@ -18,6 +19,12 @@ use super::{AgentRow, ApprovalState, OnboardingState, sort_agents};
 
 const MAX_LIVE_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
 const LIVE_OUTPUT_OMITTED: &str = "[earlier live output omitted]\n";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HistorySearch {
+    query: String,
+    selection: usize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Overlay {
@@ -136,6 +143,9 @@ pub struct TuiState {
     pub agent_message_cursor: usize,
     command_selection: usize,
     command_palette_dismissed: bool,
+    file_selection: usize,
+    file_index: RefCell<Option<Vec<String>>>,
+    history_search: Option<HistorySearch>,
     pending_turns: VecDeque<PendingTurn>,
     composer_history: Vec<String>,
     history_index: Option<usize>,
@@ -187,6 +197,9 @@ impl TuiState {
             agent_message_cursor: 0,
             command_selection: 0,
             command_palette_dismissed: false,
+            file_selection: 0,
+            file_index: RefCell::new(None),
+            history_search: None,
             pending_turns: VecDeque::new(),
             composer_history: Vec::new(),
             history_index: None,
@@ -207,9 +220,11 @@ impl TuiState {
     }
 
     pub fn command_suggestions(&self) -> Vec<CommandSpec> {
-        if self.command_palette_dismissed
+        if self.history_search.is_some()
+            || self.command_palette_dismissed
             || self.overlay != Overlay::None
             || self.transcript_view_expanded
+            || self.file_mention().is_some()
         {
             return Vec::new();
         }
@@ -222,6 +237,7 @@ impl TuiState {
 
     pub fn composer_edited(&mut self) {
         self.command_selection = 0;
+        self.file_selection = 0;
         self.command_palette_dismissed = false;
         self.history_index = None;
     }
@@ -370,6 +386,198 @@ impl TuiState {
         self.command_selection = 0;
         self.command_palette_dismissed = true;
         Some(selected)
+    }
+
+    pub fn file_mention(&self) -> Option<(usize, String)> {
+        if self.history_search.is_some() || self.overlay != Overlay::None {
+            return None;
+        }
+        super::mention_at_cursor(&self.composer, self.cursor)
+    }
+
+    pub fn file_suggestions(&self) -> Vec<String> {
+        let Some((_, query)) = self.file_mention() else {
+            return Vec::new();
+        };
+        if self.file_index.borrow().is_none() {
+            *self.file_index.borrow_mut() = Some(super::collect_files(Path::new(&self.project)));
+        }
+        let files = self.file_index.borrow();
+        super::filter_files(files.as_deref().unwrap_or(&[]), &query)
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    pub fn selected_file(&self) -> Option<String> {
+        let suggestions = self.file_suggestions();
+        suggestions
+            .get(self.file_selection.min(suggestions.len().saturating_sub(1)))
+            .cloned()
+    }
+
+    pub fn select_previous_file(&mut self) -> bool {
+        let len = self.file_suggestions().len();
+        if len == 0 {
+            return false;
+        }
+        self.file_selection = if self.file_selection == 0 {
+            len - 1
+        } else {
+            self.file_selection - 1
+        };
+        true
+    }
+
+    pub fn select_next_file(&mut self) -> bool {
+        let len = self.file_suggestions().len();
+        if len == 0 {
+            return false;
+        }
+        self.file_selection = (self.file_selection + 1) % len;
+        true
+    }
+
+    pub fn complete_selected_file(&mut self) -> bool {
+        let Some((start, _)) = self.file_mention() else {
+            return false;
+        };
+        let Some(path) = self.selected_file() else {
+            return false;
+        };
+        let suffix = self.composer[self.cursor..].to_owned();
+        self.composer.truncate(start);
+        self.composer.push('@');
+        self.composer.push_str(&path);
+        self.composer.push(' ');
+        let cursor = self.composer.len();
+        self.composer.push_str(&suffix);
+        self.cursor = cursor;
+        self.composer_edited();
+        true
+    }
+
+    pub fn history_search_active(&self) -> bool {
+        self.history_search.is_some()
+    }
+
+    pub fn history_matches(&self) -> Vec<&str> {
+        let Some(search) = &self.history_search else {
+            return Vec::new();
+        };
+        let query = search.query.to_ascii_lowercase();
+        self.composer_history
+            .iter()
+            .rev()
+            .filter(|prompt| query.is_empty() || prompt.to_ascii_lowercase().contains(&query))
+            .map(String::as_str)
+            .take(8)
+            .collect()
+    }
+
+    pub fn start_history_search(&mut self) {
+        if self.history_search.is_some() {
+            let matches = self.history_matches().len();
+            if let Some(search) = &mut self.history_search
+                && matches > 0
+            {
+                search.selection = (search.selection + 1) % matches;
+            }
+            return;
+        }
+        self.history_search = Some(HistorySearch {
+            query: String::new(),
+            selection: 0,
+        });
+    }
+
+    pub fn push_history_search_char(&mut self, character: char) {
+        if let Some(search) = &mut self.history_search {
+            search.query.push(character);
+            search.selection = 0;
+        }
+    }
+
+    pub fn pop_history_search_char(&mut self) {
+        if let Some(search) = &mut self.history_search {
+            search.query.pop();
+            search.selection = 0;
+        }
+    }
+
+    pub fn select_previous_history_match(&mut self) -> bool {
+        let len = self.history_matches().len();
+        let Some(search) = &mut self.history_search else {
+            return false;
+        };
+        if len == 0 {
+            return false;
+        }
+        search.selection = if search.selection == 0 {
+            len - 1
+        } else {
+            search.selection - 1
+        };
+        true
+    }
+
+    pub fn select_next_history_match(&mut self) -> bool {
+        let len = self.history_matches().len();
+        let Some(search) = &mut self.history_search else {
+            return false;
+        };
+        if len == 0 {
+            return false;
+        }
+        search.selection = (search.selection + 1) % len;
+        true
+    }
+
+    pub fn accept_history_search(&mut self) -> bool {
+        let Some(search) = &self.history_search else {
+            return false;
+        };
+        let selection = search.selection;
+        let Some(prompt) = self
+            .history_matches()
+            .get(selection)
+            .map(|prompt| (*prompt).to_owned())
+        else {
+            self.history_search = None;
+            return false;
+        };
+        self.composer = prompt;
+        self.cursor = self.composer.len();
+        self.history_search = None;
+        self.history_index = None;
+        true
+    }
+
+    pub fn cancel_history_search(&mut self) -> bool {
+        self.history_search.take().is_some()
+    }
+
+    pub fn history_search_query(&self) -> Option<&str> {
+        self.history_search
+            .as_ref()
+            .map(|search| search.query.as_str())
+    }
+
+    pub fn history_search_selection(&self) -> usize {
+        self.history_search
+            .as_ref()
+            .map(|search| search.selection)
+            .unwrap_or(0)
+    }
+
+    pub fn file_selection(&self) -> usize {
+        self.file_selection
+    }
+
+    pub fn insert_mention(&mut self, path: &str) {
+        self.composer.insert_str(self.cursor, &format!("@{path} "));
+        self.cursor += path.len() + 2;
+        self.composer_edited();
     }
 
     pub fn onboarding(project: impl Into<String>) -> Self {

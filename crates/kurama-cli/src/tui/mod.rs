@@ -6,6 +6,7 @@ mod command_palette;
 mod composer;
 mod input;
 mod layout;
+mod mentions;
 mod onboarding;
 mod render;
 mod state;
@@ -22,6 +23,7 @@ pub(crate) use composer::{approval_height, composer_cursor_vertical, composer_he
 pub use input::{TerminalGuard, spawn_input_thread};
 pub use layout::ResponsiveLayout;
 pub(crate) use layout::{main_area, queue_height, visible_activity_rect};
+pub(crate) use mentions::{collect_files, decode_pasted_image, filter_files, mention_at_cursor};
 pub use onboarding::{OnboardingState, OnboardingSubmission};
 pub use render::render;
 pub(crate) use render::render_with_transcript;

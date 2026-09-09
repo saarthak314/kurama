@@ -569,9 +569,7 @@ impl App {
             Event::Paste(text) => {
                 match self.state.overlay {
                     Overlay::None if !self.state.transcript_view_expanded() => {
-                        self.state.composer.insert_str(self.state.cursor, &text);
-                        self.state.cursor = self.state.cursor.saturating_add(text.len());
-                        self.state.composer_edited();
+                        self.ingest_composer_paste(&text);
                     }
                     Overlay::ApprovalEdit => self.state.insert_approval_text(&text),
                     Overlay::Onboarding => self.state.onboarding.insert_str(&text),
@@ -688,6 +686,7 @@ impl App {
                 }
                 KeyCode::Char('l') => self.state.scroll = 0,
                 KeyCode::Char('t') => self.state.toggle_todos(),
+                KeyCode::Char('r') => self.state.start_history_search(),
                 KeyCode::Char('d') => {
                     if self.state.composer.is_empty() {
                         self.exit_requested = true;
@@ -705,6 +704,10 @@ impl App {
                 }
                 _ => {}
             }
+            return Ok(());
+        }
+        if self.state.history_search_active() {
+            self.handle_history_search_key(key);
             return Ok(());
         }
         match key.code {
@@ -758,6 +761,7 @@ impl App {
                 self.state.cursor += 1;
                 self.state.composer_edited();
             }
+            KeyCode::Up if self.state.select_previous_file() => {}
             KeyCode::Up if self.state.select_previous_command() => {}
             KeyCode::Up => {
                 if let Some(cursor) = composer_cursor_vertical(
@@ -771,6 +775,7 @@ impl App {
                     self.state.history_previous();
                 }
             }
+            KeyCode::Down if self.state.select_next_file() => {}
             KeyCode::Down if self.state.select_next_command() => {}
             KeyCode::Down => {
                 if let Some(cursor) = composer_cursor_vertical(
@@ -784,9 +789,11 @@ impl App {
                     self.state.history_next();
                 }
             }
+            KeyCode::Tab if self.state.complete_selected_file() => {}
             KeyCode::Tab if self.state.selected_command().is_some() => {
                 self.state.complete_selected_command();
             }
+            KeyCode::Enter if self.state.complete_selected_file() => {}
             KeyCode::Enter => {
                 if let Some(selected) = self.state.selected_command() {
                     self.state.complete_selected_command();
@@ -798,6 +805,7 @@ impl App {
                 }
                 self.submit_composer()?;
             }
+            KeyCode::Esc if self.state.cancel_history_search() => {}
             KeyCode::Esc if !self.state.dismiss_command_palette() => {
                 if !self.state.interrupt_active() {
                     self.state.pop_queued_follow_up();
@@ -1287,6 +1295,45 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn handle_history_search_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.state.cancel_history_search();
+            }
+            KeyCode::Enter => {
+                self.state.accept_history_search();
+            }
+            KeyCode::Up => {
+                self.state.select_previous_history_match();
+            }
+            KeyCode::Down => {
+                self.state.select_next_history_match();
+            }
+            KeyCode::Backspace => self.state.pop_history_search_char(),
+            KeyCode::Char(character)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.state.push_history_search_char(character);
+            }
+            _ => {}
+        }
+    }
+
+    fn ingest_composer_paste(&mut self, text: &str) {
+        if let Some((bytes, ext)) = crate::tui::decode_pasted_image(text)
+            && let Ok(path) = save_pasted_image(&self.state.project, &bytes, ext)
+        {
+            self.state.insert_mention(&path);
+            self.state
+                .push_notice(Some("PASTE".into()), format!("attached {path}"));
+            return;
+        }
+        self.state.composer.insert_str(self.state.cursor, text);
+        self.state.cursor = self.state.cursor.saturating_add(text.len());
+        self.state.composer_edited();
     }
 
     fn cycle_mode(&mut self) -> Result<(), String> {
@@ -2384,6 +2431,18 @@ fn base64_encode(bytes: &[u8], out: &mut String) {
             out.push('=');
         }
     }
+}
+
+fn save_pasted_image(project: &str, bytes: &[u8], ext: &str) -> Result<String, String> {
+    let dir = Path::new(project).join(".kurama").join("paste");
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let relative = format!(".kurama/paste/{stamp}.{ext}");
+    std::fs::write(Path::new(project).join(&relative), bytes).map_err(|error| error.to_string())?;
+    Ok(relative)
 }
 
 fn git_diff_stat(project: &str) -> Result<String, String> {

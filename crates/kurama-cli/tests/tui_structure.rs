@@ -459,6 +459,20 @@ fn queued_follow_ups_are_visible_without_becoming_fake_user_turns() {
 }
 
 #[test]
+fn empty_composer_footer_shows_status_instead_of_repeating_hints() {
+    let state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    let wide = buffer_text(&rendered(&state, 80, 12));
+    assert!(wide.contains("work/model"), "{wide}");
+    assert_eq!(
+        wide.lines()
+            .filter(|row| row.contains("enter send"))
+            .count(),
+        1,
+        "{wide}"
+    );
+}
+
+#[test]
 fn question_mark_opens_a_shortcuts_overlay() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.open_shortcuts();
@@ -469,6 +483,7 @@ fn question_mark_opens_a_shortcuts_overlay() {
     assert!(text.contains("ctrl+c"));
     assert!(text.contains("ctrl+j"));
     assert!(text.contains("ctrl+t"));
+    assert!(text.contains("ctrl+r"));
     assert!(text.contains("close overlay") || text.contains("interrupt"));
 }
 
@@ -1759,4 +1774,44 @@ fn agent_inspect_does_not_double_space_transcript_lines() {
 #[test]
 fn standard_cli_registry_contains_exactly_four_tools() {
     assert_eq!(App::tool_names(), ["bash", "read", "web-search", "write"]);
+}
+
+#[test]
+fn at_sign_mentions_complete_a_project_file() {
+    let dir = tempfile::tempdir().expect("temp");
+    std::fs::create_dir_all(dir.path().join("src")).expect("src");
+    std::fs::write(dir.path().join("src/lib.rs"), "fn x() {}").expect("write");
+    let mut state = TuiState::new(
+        "work",
+        "model",
+        dir.path().to_string_lossy().into_owned(),
+        ExecutionMode::Supervised,
+    );
+    state.composer = "@lib".into();
+    state.cursor = 4;
+    state.composer_edited();
+
+    let text = buffer_text(&rendered(&state, 80, 12));
+    assert!(text.contains("src/lib.rs"), "{text}");
+    assert!(state.complete_selected_file());
+    assert_eq!(state.composer, "@src/lib.rs ");
+}
+
+#[test]
+fn history_search_filters_and_restores_a_prompt() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.remember_prompt("open the palette");
+    state.remember_prompt("fix the failing tests");
+    state.start_history_search();
+    state.push_history_search_char('f');
+    state.push_history_search_char('a');
+
+    let text = buffer_text(&rendered(&state, 80, 12));
+    assert!(text.contains("history  fa"), "{text}");
+    assert!(text.contains("fix the failing tests"), "{text}");
+    assert!(text.contains("enter use"), "{text}");
+    assert!(!text.contains("open the palette"), "{text}");
+    assert!(state.accept_history_search());
+    assert_eq!(state.composer, "fix the failing tests");
+    assert!(!state.history_search_active());
 }
