@@ -1,5 +1,8 @@
 use kurama_protocol::config::{AuthRef, ProfileConfig, ProfileKind};
+use unicode_segmentation::UnicodeSegmentation;
 use zeroize::Zeroize;
+
+use super::{input::previous_grapheme_boundary, transcript::sanitize_terminal_text};
 
 const OPTIONS: [&str; 5] = [
     "Codex subscription",
@@ -139,10 +142,33 @@ impl OnboardingState {
 
     pub fn display_input(&self) -> String {
         if self.is_secret() {
-            "•".repeat(self.input.chars().count())
+            "•".repeat(self.input.graphemes(true).count())
         } else {
-            self.input.clone()
+            sanitize_terminal_text(&self.input).into_owned()
         }
+    }
+
+    pub(crate) fn display_input_tail(&self, width: usize) -> (String, usize) {
+        let available = width.saturating_sub(1);
+        if available == 0 {
+            return (String::new(), 0);
+        }
+        if self.is_secret() {
+            let cells = self.input.graphemes(true).count().min(available);
+            return ("•".repeat(cells), cells);
+        }
+        let input = sanitize_terminal_text(&self.input);
+        let mut start = input.len();
+        let mut cells = 0;
+        for (offset, grapheme) in input.grapheme_indices(true).rev() {
+            let next = ratatui::text::Span::raw(grapheme).width();
+            if cells + next > available {
+                break;
+            }
+            cells += next;
+            start = offset;
+        }
+        (input[start..].to_owned(), cells)
     }
 
     pub fn error(&self) -> Option<&str> {
@@ -173,7 +199,9 @@ impl OnboardingState {
     }
 
     pub fn backspace(&mut self) {
-        self.input.pop();
+        let previous = previous_grapheme_boundary(&self.input, self.input.len());
+        self.input[previous..].zeroize();
+        self.input.truncate(previous);
         self.error = None;
     }
 
@@ -202,6 +230,7 @@ impl OnboardingState {
                 true
             }
             OnboardingStage::Secret => {
+                self.input.zeroize();
                 self.stage = OnboardingStage::Model;
                 self.input = self.model.clone();
                 true
@@ -340,4 +369,35 @@ fn valid_profile_name(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credentials_stay_masked_and_delete_as_graphemes() {
+        let mut state = OnboardingState::credential("remote");
+        state.insert_str("Ae\u{301}👩‍👩‍👧‍👦");
+        let (display, column) = state.display_input_tail(3);
+        assert_eq!(display, "••");
+        assert_eq!(column, 2);
+        state.backspace();
+        state.backspace();
+        let Some(OnboardingSubmission::Credential { secret, .. }) = state.submit().unwrap() else {
+            panic!("expected credential submission");
+        };
+        assert_eq!(secret, "A");
+    }
+
+    #[test]
+    fn long_onboarding_input_keeps_its_tail_and_cursor_in_bounds() {
+        let mut state = OnboardingState::new();
+        state.begin();
+        state.input = format!("{}界e\u{301}", "a".repeat(32_000));
+        let (display, column) = state.display_input_tail(4);
+        assert_eq!(display, "界e\u{301}");
+        assert_eq!(column, 3);
+        assert_eq!(state.display_input_tail(0), (String::new(), 0));
+    }
 }

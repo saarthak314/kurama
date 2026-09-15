@@ -50,6 +50,32 @@ pub trait ApprovalPolicy: Send + Sync {
 pub trait SessionStore: Send + Sync {
     fn create(&self, metadata: &SessionMetadata) -> Result<(), KuramaError>;
     fn append(&self, event: &EventEnvelope) -> Result<(), KuramaError>;
+
+    /// Assigns the next sequence in this event's session or agent log and appends it.
+    /// On success, `event.sequence` is the committed sequence. Concurrent callers of
+    /// `append_next` are serialized; callers of `append` must coordinate separately.
+    /// The compatibility implementation locks replay and append process-wide.
+    /// Stores shared across processes should override this with a storage-level
+    /// transaction or lock, and can avoid replaying the entire log that way.
+    fn append_next(&self, event: &mut EventEnvelope) -> Result<(), KuramaError> {
+        static APPEND_NEXT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = APPEND_NEXT_LOCK
+            .lock()
+            .map_err(|_| KuramaError::Storage("append_next lock poisoned".into()))?;
+        let events = match &event.agent_id {
+            Some(agent_id) => self.replay_agent(&event.session_id, agent_id)?,
+            None => self.replay(&event.session_id)?,
+        };
+        event.sequence = match events.last() {
+            Some(prior) => prior
+                .sequence
+                .checked_add(1)
+                .ok_or_else(|| KuramaError::Storage("event sequence exceeds u64".into()))?,
+            None => 0,
+        };
+        self.append(event)
+    }
+
     fn replay(&self, session_id: &SessionId) -> Result<Vec<EventEnvelope>, KuramaError>;
     fn replay_agent(
         &self,

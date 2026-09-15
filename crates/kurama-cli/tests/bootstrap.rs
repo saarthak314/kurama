@@ -87,6 +87,7 @@ fn missing_configuration_opens_onboarding_without_a_runtime() {
             version,
             project,
             mode: ExecutionMode::Supervised,
+            ..
         }] if version == env!("CARGO_PKG_VERSION") && project.ends_with("/project")
     ));
 }
@@ -111,6 +112,7 @@ async fn configured_profile_composes_the_real_four_tool_runtime() {
             version,
             project,
             mode: ExecutionMode::Supervised,
+            ..
         }) if version == env!("CARGO_PKG_VERSION") && project.ends_with("/project")
     ));
     assert_eq!(App::tool_names(), ["bash", "read", "web-search", "write"]);
@@ -325,6 +327,7 @@ async fn resume_hydrates_the_visible_transcript_once() {
                 version,
                 project,
                 mode: ExecutionMode::Supervised,
+                ..
             },
             TranscriptEntry::UserTurn { body: user },
             TranscriptEntry::AssistantMessage { body: assistant },

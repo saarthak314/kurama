@@ -56,13 +56,12 @@ impl AgentRow {
     }
 
     pub fn is_read_only(&self) -> bool {
-        matches!(
-            self.role.to_ascii_lowercase().as_str(),
-            "researcher" | "planner" | "reviewer"
-        ) || {
-            let activity = self.activity.to_ascii_lowercase();
-            activity.contains("read-only") || activity.contains("read only")
-        }
+        ["researcher", "planner", "reviewer"]
+            .iter()
+            .any(|role| self.role.eq_ignore_ascii_case(role))
+            || self.activity.as_bytes().windows(9).any(|part| {
+                part.eq_ignore_ascii_case(b"read-only") || part.eq_ignore_ascii_case(b"read only")
+            })
     }
 }
 

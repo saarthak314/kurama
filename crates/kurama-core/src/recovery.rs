@@ -335,7 +335,9 @@ impl RecoveryPlanner {
                 SessionEvent::UserMessage { .. } => turn_terminal = false,
                 SessionEvent::AgentQueued { snapshot }
                 | SessionEvent::AgentStarted { snapshot }
-                | SessionEvent::AgentProgress { snapshot } => {
+                | SessionEvent::AgentProgress { snapshot }
+                    if envelope.agent_id.as_ref() != Some(&snapshot.id) =>
+                {
                     agents.insert(snapshot.id.clone(), snapshot.clone());
                 }
                 SessionEvent::AgentCompleted { snapshot, .. }

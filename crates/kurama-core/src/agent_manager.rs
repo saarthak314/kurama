@@ -1034,19 +1034,20 @@ impl AgentManager {
         agent: &ManagedAgent,
         event: SessionEvent,
     ) -> Result<(), KuramaError> {
-        let next_sequence = self
-            .store
-            .replay_agent(&self.session_id, &agent.spec.id)?
-            .last()
-            .map_or(0, |event| event.sequence + 1);
-        let envelope = EventEnvelope::new(
-            next_sequence,
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let mut envelope = EventEnvelope::new(
             0,
+            timestamp_ms,
             self.session_id.clone(),
             Some(agent.spec.id.clone()),
             event,
         );
-        self.store.append(&envelope)?;
+        self.store.append_next(&mut envelope)?;
         Ok(())
     }
 

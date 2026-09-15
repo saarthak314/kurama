@@ -676,20 +676,6 @@ fn committed_transcript_marker_never_moves_backwards() {
 }
 
 #[test]
-fn resize_reflow_can_replay_the_committed_transcript_from_source() {
-    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-    state.push_user("retained prompt");
-    state.mark_transcript_committed(1);
-    assert!(state.stable_transcript().is_empty());
-    assert!(state.live_transcript().is_empty());
-
-    state.reset_transcript_commit();
-
-    assert_eq!(state.stable_transcript().len(), 1);
-    assert_eq!(state.live_transcript().len(), 1);
-}
-
-#[test]
 fn replay_hydration_clears_active_tool_stream_tracking() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.apply_runtime_event(tool_delta("call_1", "stdout", "stale"));

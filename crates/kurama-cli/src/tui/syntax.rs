@@ -1,12 +1,11 @@
 use ratatui::style::{Color, Modifier, Style};
 
-const KEYWORD: Color = Color::Rgb(198, 120, 221);
-const FUNCTION: Color = Color::Rgb(116, 177, 255);
-const TYPE: Color = Color::Rgb(137, 220, 235);
-const STRING: Color = Color::Rgb(166, 227, 161);
-const NUMBER: Color = Color::Rgb(249, 226, 175);
-const COMMENT: Color = Color::Rgb(126, 132, 146);
-const CONSTANT: Color = Color::Rgb(255, 184, 108);
+const KEYWORD: Color = Color::Magenta;
+const FUNCTION: Color = Color::Cyan;
+const TYPE: Color = Color::Cyan;
+const STRING: Color = Color::Green;
+const NUMBER: Color = Color::Yellow;
+const CONSTANT: Color = Color::Yellow;
 const MAX_HIGHLIGHT_BYTES: usize = 512 * 1024;
 const MAX_HIGHLIGHT_LINES: usize = 10_000;
 const MAX_HIGHLIGHT_LINE_BYTES: usize = 4 * 1024;
@@ -656,7 +655,7 @@ fn at_line_start(code: &str, offset: usize) -> bool {
 }
 
 fn comment_style() -> Style {
-    Style::default().fg(COMMENT).add_modifier(Modifier::ITALIC)
+    Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC)
 }
 
 fn push_span(spans: &mut Vec<HighlightedSpan>, content: &str, style: Style) {
@@ -692,13 +691,14 @@ mod tests {
 
     #[test]
     fn aliases_preserve_source_text() {
+        let source = "value = 42\n\n\t// café 👨‍👩‍👧‍👦\n\"unterminated";
         for language in ["rs", "tsx", "python3", "shell", "yml", "golang", "c++"] {
-            let spans = highlight_code("value = 42\n", language).expect("known alias");
+            let spans = highlight_code(source, language).expect("known alias");
             let reconstructed = spans
                 .iter()
                 .map(|span| span.content.as_str())
                 .collect::<String>();
-            assert_eq!(reconstructed, "value = 42\n", "alias {language}");
+            assert_eq!(reconstructed, source, "alias {language}");
         }
     }
 

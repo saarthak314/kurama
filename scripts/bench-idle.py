@@ -138,8 +138,12 @@ def main() -> int:
             if not readable or not os.read(master, 4096):
                 raise RuntimeError("Kurama did not render before the idle sample")
             time.sleep(IDLE_SECONDS)
+            if process.poll() is not None:
+                raise RuntimeError(f"Kurama exited before the idle sample: status {process.returncode}")
             rss_kib, cpu_percent = sample_process(process.pid)
             children = child_processes(process.pid)
+            if rss_kib <= 0 or process.poll() is not None:
+                raise RuntimeError("idle sample did not observe a live Kurama process")
         finally:
             terminate_group(process)
             os.close(master)

@@ -78,6 +78,8 @@ while let Some(event) = turn.next().await? {
 
 Event-driven UIs (the Kurama CLI) call `agent.launch(metadata, replay)` and drive `Handle` plus the typed event stream.
 
+Assistant text is coalesced to at most 4 KiB UTF-8-safe chunks, with a 50 ms flush deadline while text is pending. This is an engine buffering bound, not an end-to-end provider latency guarantee. Drain runtime events continuously: the bounded channel applies backpressure rather than dropping text or terminal events.
+
 ## Explicit composition
 
 `AgentBuilder` still requires every component:
@@ -98,6 +100,10 @@ let runtime = AgentBuilder::new()
 ```
 
 Duplicate model profile or tool names, missing required components, an unavailable active profile, and zero channel limits are errors.
+
+### Custom session stores
+
+`SessionStore::append` retains explicit-sequence validation. `append_next(&mut EventEnvelope)` assigns and commits the next sequence, returning that sequence in the envelope. The child engine and agent manager use this shared allocator because they interleave events in one child log. Filesystem and memory stores allocate under their storage lock without full replay. Existing custom stores inherit a compatibility implementation that serializes replay-plus-append within this process; override it with a transaction or shared storage lock for cross-process writers or efficient allocation. Store wrappers should forward `append_next` to the underlying allocator. Do not mix uncoordinated explicit-sequence appends with allocated appends to the same log.
 
 ## Providers and Tools
 

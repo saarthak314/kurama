@@ -168,18 +168,194 @@ fn parent_and_child_logs_validate_sequences_independently() {
         store.append(&event("session-b", 2, 23, Some("agent-a"))),
         Err(KuramaError::Storage(_))
     ));
+    let mut parent = event("session-b", 99, 24, None);
+    let mut child = event("session-b", 99, 25, Some("agent-a"));
+    store.append_next(&mut parent).expect("next parent");
+    store.append_next(&mut child).expect("next child");
+    assert_eq!((parent.sequence, child.sequence), (1, 1));
     assert_eq!(
         store
             .replay_agent(&SessionId::from("session-b"), &AgentId::from("agent-a"))
             .expect("child replay")
             .len(),
-        1
+        2
     );
     assert!(
         temp.path()
             .join("sessions/session-b/agents/agent-a.jsonl")
             .is_file()
     );
+}
+
+#[test]
+fn append_next_serializes_independent_handles_to_the_same_child_log() {
+    const WRITERS: usize = 4;
+    const EVENTS_PER_WRITER: usize = 16;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = FsSessionStore::open(temp.path().to_owned()).expect("store");
+    store.create(&metadata("concurrent", 10)).expect("create");
+    let handles: Vec<_> = (0..WRITERS)
+        .map(|_| FsSessionStore::open(temp.path().to_owned()).expect("independent handle"))
+        .collect();
+    let barrier = std::sync::Barrier::new(WRITERS);
+    let mut assigned = std::thread::scope(|scope| {
+        let workers: Vec<_> = handles
+            .iter()
+            .enumerate()
+            .map(|(writer, handle)| {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    (0..EVENTS_PER_WRITER)
+                        .map(|index| {
+                            let unique_id = (writer * EVENTS_PER_WRITER + index) as u64;
+                            let mut next = event("concurrent", unique_id, 11, Some("child"));
+                            handle.append_next(&mut next).expect("allocate and append");
+                            (next.sequence, next.event)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("writer"))
+            .collect::<Vec<_>>()
+    });
+    assigned.sort_by_key(|(sequence, _)| *sequence);
+    let replayed = store
+        .replay_agent(&SessionId::from("concurrent"), &AgentId::from("child"))
+        .expect("replay committed events");
+    assert_eq!(replayed.len(), WRITERS * EVENTS_PER_WRITER);
+    for (index, ((sequence, payload), replayed)) in assigned.iter().zip(&replayed).enumerate() {
+        assert_eq!(*sequence, index as u64);
+        assert_eq!(replayed.sequence, *sequence);
+        assert_eq!(&replayed.event, payload);
+    }
+}
+
+#[test]
+fn append_next_rejects_invalid_tails_without_changing_the_log() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = FsSessionStore::open(temp.path().to_owned()).expect("store");
+    store.create(&metadata("invalid-tail", 10)).expect("create");
+    let log = temp.path().join("sessions/invalid-tail/events.jsonl");
+    let mut unsupported = event("invalid-tail", 0, 11, None);
+    unsupported.schema_version += 1;
+    let invalid_events = [
+        unsupported,
+        event("wrong-session", 0, 11, None),
+        event("invalid-tail", 0, 11, Some("wrong-agent")),
+        event("invalid-tail", u64::MAX, 11, None),
+    ];
+    let mut invalid_tails: Vec<_> = invalid_events
+        .iter()
+        .map(|event| {
+            let mut bytes = serde_json::to_vec(event).expect("encode invalid tail");
+            bytes.push(b'\n');
+            bytes
+        })
+        .collect();
+    invalid_tails.extend([b"not-json\n".to_vec(), br#"{"schema_version":1"#.to_vec()]);
+    for bytes in invalid_tails {
+        std::fs::write(&log, &bytes).expect("invalid tail");
+        let mut next = event("invalid-tail", 0, 12, None);
+        assert!(matches!(
+            store.append_next(&mut next),
+            Err(KuramaError::Storage(_))
+        ));
+        assert_eq!(std::fs::read(&log).expect("unchanged log"), bytes);
+    }
+}
+
+#[test]
+fn append_next_validates_new_events_and_continues_after_tail_repair() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = FsSessionStore::open(temp.path().to_owned()).expect("store");
+    let mut next = event("repaired-next", 99, 11, None);
+    assert!(matches!(
+        store.append_next(&mut next),
+        Err(KuramaError::NotFound(_))
+    ));
+    store
+        .create(&metadata("repaired-next", 10))
+        .expect("create");
+    next.schema_version += 1;
+    assert!(matches!(
+        store.append_next(&mut next),
+        Err(KuramaError::Storage(_))
+    ));
+    next.schema_version -= 1;
+    store.append_next(&mut next).expect("first event");
+    assert_eq!(next.sequence, 0);
+    let log = temp.path().join("sessions/repaired-next/events.jsonl");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log)
+        .expect("open log")
+        .write_all(b"torn")
+        .expect("torn tail");
+    assert!(matches!(
+        store.append_next(&mut next),
+        Err(KuramaError::Storage(_))
+    ));
+    store
+        .replay(&SessionId::from("repaired-next"))
+        .expect("repair");
+    store.append_next(&mut next).expect("append after repair");
+    assert_eq!(next.sequence, 2);
+    let replayed = store
+        .replay(&SessionId::from("repaired-next"))
+        .expect("replay");
+    assert!(matches!(
+        replayed[1].event,
+        SessionEvent::RecoveryRepair { removed_bytes: 4 }
+    ));
+    assert_eq!(replayed[2], next);
+}
+
+#[test]
+fn append_next_reads_a_tail_record_larger_than_its_scan_buffer() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = FsSessionStore::open(temp.path().to_owned()).expect("store");
+    store.create(&metadata("large-tail", 10)).expect("create");
+    let mut large = event("large-tail", 99, 11, None);
+    large.event = SessionEvent::UserMessage {
+        text: "x".repeat(32 * 1024),
+    };
+    store.append_next(&mut large).expect("large event");
+    let mut next = event("large-tail", 99, 12, None);
+    store
+        .append_next(&mut next)
+        .expect("event following large tail");
+    assert_eq!(next.sequence, 1);
+    assert_eq!(
+        store
+            .replay(&SessionId::from("large-tail"))
+            .expect("replay"),
+        vec![large, next]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn append_next_rejects_symlinked_logs() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = FsSessionStore::open(temp.path().to_owned()).expect("store");
+    store.create(&metadata("symlink", 10)).expect("create");
+    let target = temp.path().join("target.jsonl");
+    std::fs::write(&target, b"").expect("target");
+    std::os::unix::fs::symlink(
+        &target,
+        temp.path().join("sessions/symlink/agents/child.jsonl"),
+    )
+    .expect("symlink child log");
+    let mut next = event("symlink", 0, 11, Some("child"));
+    assert!(matches!(
+        store.append_next(&mut next),
+        Err(KuramaError::Storage(_))
+    ));
+    assert_eq!(std::fs::read(target).expect("untouched target"), b"");
 }
 
 #[test]
@@ -296,6 +472,16 @@ fn append_inspects_only_the_final_record_of_a_large_log() {
         ))
         .expect("append");
 
+    assert!(tail_bytes_read <= 8 * 1024);
+    assert!(tail_bytes_read < log_bytes);
+    assert_eq!(records_deserialized, 1);
+    assert_eq!(syncs, 1);
+
+    let mut next = event("bounded-append", 0, 12 + EVENT_COUNT, None);
+    let (tail_bytes_read, records_deserialized, syncs) = store
+        .append_next_with_operation_counts_for_test(&mut next)
+        .expect("allocate next sequence");
+    assert_eq!(next.sequence, EVENT_COUNT + 1);
     assert!(tail_bytes_read <= 8 * 1024);
     assert!(tail_bytes_read < log_bytes);
     assert_eq!(records_deserialized, 1);

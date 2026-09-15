@@ -3,11 +3,60 @@ use std::{io, thread};
 use crossterm::{
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
     execute,
-    terminal::{
-        DisableLineWrap, EnableLineWrap, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    },
+    terminal::{DisableLineWrap, EnableLineWrap, disable_raw_mode, enable_raw_mode},
 };
 use tokio::sync::mpsc;
+use unicode_segmentation::GraphemeCursor;
+
+pub(crate) fn previous_grapheme_boundary(text: &str, cursor: usize) -> usize {
+    let original = cursor.min(text.len());
+    let mut cursor = original;
+    while !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    let mut boundary = GraphemeCursor::new(cursor, text.len(), true);
+    if cursor < original && boundary.is_boundary(text, 0) == Ok(true) {
+        return cursor;
+    }
+    boundary.prev_boundary(text, 0).ok().flatten().unwrap_or(0)
+}
+
+pub(crate) fn next_grapheme_boundary(text: &str, cursor: usize) -> usize {
+    let mut cursor = cursor.min(text.len());
+    while !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    GraphemeCursor::new(cursor, text.len(), true)
+        .next_boundary(text, 0)
+        .ok()
+        .flatten()
+        .unwrap_or(text.len())
+}
+
+pub(crate) fn grapheme_boundary_at_or_after(text: &str, cursor: usize) -> usize {
+    let mut cursor = cursor.min(text.len());
+    while !text.is_char_boundary(cursor) {
+        cursor += 1;
+    }
+    let mut boundary = GraphemeCursor::new(cursor, text.len(), true);
+    if boundary.is_boundary(text, 0) == Ok(true) {
+        cursor
+    } else {
+        boundary
+            .next_boundary(text, 0)
+            .ok()
+            .flatten()
+            .unwrap_or(text.len())
+    }
+}
+
+pub(crate) fn grapheme_display_width(grapheme: &str, column: usize) -> usize {
+    if grapheme == "\t" {
+        4 - column % 4
+    } else {
+        ratatui::text::Span::raw(grapheme).width()
+    }
+}
 
 pub struct TerminalGuard;
 
@@ -42,7 +91,6 @@ fn write_enter_commands<W: io::Write>(mut writer: W) -> io::Result<()> {
 fn write_exit_commands<W: io::Write>(mut writer: W) -> io::Result<()> {
     execute!(
         writer,
-        LeaveAlternateScreen,
         EnableLineWrap,
         DisableBracketedPaste,
         crossterm::cursor::Show
@@ -69,6 +117,22 @@ mod tests {
     use super::{write_enter_commands, write_exit_commands};
 
     #[test]
+    fn grapheme_boundaries_keep_combining_sequences_and_joined_emoji_whole() {
+        let text = "Ae\u{301}👩‍👩‍👧‍👦界";
+        let stops = [0, 1, "Ae\u{301}".len(), "Ae\u{301}👩‍👩‍👧‍👦".len(), text.len()];
+        for pair in stops.windows(2) {
+            assert_eq!(super::next_grapheme_boundary(text, pair[0]), pair[1]);
+            assert_eq!(super::previous_grapheme_boundary(text, pair[1]), pair[0]);
+            for cursor in pair[0] + 1..pair[1] {
+                assert_eq!(super::previous_grapheme_boundary(text, cursor), pair[0]);
+                assert_eq!(super::next_grapheme_boundary(text, cursor), pair[1]);
+            }
+        }
+        assert_eq!(super::previous_grapheme_boundary("", usize::MAX), 0);
+        assert_eq!(super::next_grapheme_boundary("", usize::MAX), 0);
+    }
+
+    #[test]
     fn terminal_commands_disable_and_restore_line_wrapping() {
         let mut enter = Vec::new();
         write_enter_commands(&mut enter).expect("enter commands");
@@ -78,8 +142,8 @@ mod tests {
         assert!(enter.windows(5).any(|window| window == b"\x1b[?7l"));
         assert!(exit.windows(5).any(|window| window == b"\x1b[?7h"));
         assert!(
-            exit.windows(8).any(|window| window == b"\x1b[?1049l"),
-            "leave alternate screen on exit"
+            !exit.windows(8).any(|window| window == b"\x1b[?1049l"),
+            "the raw-mode guard does not own an alternate screen"
         );
     }
 }

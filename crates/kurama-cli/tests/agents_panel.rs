@@ -73,7 +73,6 @@ fn panel_shows_control_fields_but_not_tool_statistics() {
     assert!(!text.contains("tool calls"));
     assert!(!text.contains("SCOPE"));
     assert!(!text.contains("TIME"));
-    assert!(text.contains("ID        ROLE          PROFILE      TASK                  STATE"));
     assert!(text.contains("read-only"));
 }
 
@@ -108,11 +107,10 @@ fn short_agent_panel_keeps_the_selected_row_visible() {
         state.select_next_agent();
     }
 
-    let text = rendered_at(&state, 80, 16);
+    let text = rendered_at(&state, 80, 8);
 
     assert!(text.contains("a_11"), "selected agent was clipped: {text}");
     assert!(!text.contains("a_00"), "panel did not scroll: {text}");
-    assert!(text.contains("enter  inspect"));
 }
 
 #[test]

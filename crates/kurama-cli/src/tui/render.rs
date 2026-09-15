@@ -1,11 +1,12 @@
-use std::time::Instant;
+use std::{collections::VecDeque, time::Instant};
+use unicode_segmentation::UnicodeSegmentation;
 
 use ratatui::{
     Frame,
     layout::{Position, Rect},
     style::{Modifier, Style},
-    text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph},
 };
 
 use kurama_protocol::{agent::AgentState, session::TodoStatus};
@@ -22,7 +23,8 @@ use super::{
     render_command_palette,
     theme::{ACCENT, AMBER, BORDER, DIM, GREEN, RED, TEXT},
     transcript::{
-        TranscriptDetail, render_transcript_view, startup_lines, transcript_lines, truncate_display,
+        TranscriptDetail, for_each_wrapped_line, render_transcript_view, sanitize_terminal_text,
+        startup_lines, transcript_lines, truncate_display,
     },
     worked_for_line,
 };
@@ -37,10 +39,12 @@ pub(crate) fn render_with_transcript(
     prepared_transcript: Option<&[Line<'static>]>,
 ) {
     if frame.area().is_empty() {
+        state.transcript_width.set(0);
+        state.viewport_height.set(0);
         return;
     }
     if state.transcript_view_expanded() {
-        render_transcript_view(frame, state);
+        render_transcript_view(frame, state, prepared_transcript);
         return;
     }
     render_main(frame, state, prepared_transcript);
@@ -97,6 +101,8 @@ fn render_main(
         activity.is_some(),
         queue_height(state, area.width),
     );
+    state.transcript_width.set(layout.transcript.width);
+    state.viewport_height.set(layout.transcript.height);
 
     if !layout.transcript.is_empty() {
         let transcript_width = layout.transcript.width as usize;
@@ -112,20 +118,28 @@ fn render_main(
             &rendered_transcript
         };
         let viewport_height = layout.transcript.height as usize;
-        state.viewport_height.set(layout.transcript.height);
         let scroll = state
             .scroll
             .min(transcript.len().saturating_sub(viewport_height));
         let start = transcript
             .len()
             .saturating_sub(viewport_height.saturating_add(scroll));
-        let transcript = transcript
+        for (row, line) in transcript
             .iter()
             .skip(start)
             .take(viewport_height)
-            .cloned()
-            .collect::<Vec<_>>();
-        frame.render_widget(Paragraph::new(Text::from(transcript)), layout.transcript);
+            .enumerate()
+        {
+            frame.render_widget(
+                line,
+                Rect::new(
+                    layout.transcript.x,
+                    layout.transcript.y + row as u16,
+                    layout.transcript.width,
+                    1,
+                ),
+            );
+        }
     }
 
     if let Some(activity) = activity
@@ -213,357 +227,385 @@ fn render_shortcuts(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
 
 fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) -> Option<Position> {
     frame.render_widget(Clear, frame.area());
-    let mut area = inset(frame.area(), 4, 2);
+    let mut area = inset(frame.area(), 2, 1);
     if area.is_empty() {
         return None;
     }
-    if area.height >= 5
+    if area.height >= 16
         && let Some(TranscriptEntry::Startup {
             version,
+            model,
             project,
             mode,
         }) = state.transcript.first()
     {
-        let banner_height = 2.min(area.height);
-        frame.render_widget(
-            Paragraph::new(startup_lines(version, project, *mode, area.width as usize)),
-            Rect::new(area.x, area.y, area.width, banner_height),
-        );
-        area.y = area.y.saturating_add(banner_height);
-        area.height = area.height.saturating_sub(banner_height);
+        let banner = startup_lines(version, model, project, *mode, area.width as usize);
+        let height = banner.len().min(area.height.saturating_sub(8) as usize) as u16;
+        for (row, line) in banner.iter().take(height as usize).enumerate() {
+            frame.render_widget(line, Rect::new(area.x, area.y + row as u16, area.width, 1));
+        }
+        area.y += height;
+        area.height -= height;
     }
-    if area.is_empty() {
+    let block = modal_block(area);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
         return None;
     }
-    if !state.onboarding.is_selecting_connection() {
-        let input = state.onboarding.display_input();
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(BORDER))
-            .padding(Padding::new(1, 1, 0, 0));
-        let inner = block.inner(area);
-        let field_width = inner.width.saturating_sub(2).max(1) as usize;
-        let shown = truncate_display(&input, field_width);
-        let mut lines = vec![
-            Line::from(Span::styled(
-                state.onboarding.step_label(),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                truncate_display(&state.onboarding.prompt(), inner.width as usize),
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(vec![
-                Span::styled(
-                    "› ",
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(shown.as_str(), Style::default().fg(TEXT)),
-            ]),
-        ];
-        if let Some(error) = state.onboarding.error() {
-            lines.push(Line::from(Span::styled(
-                truncate_display(error, inner.width as usize),
-                Style::default().fg(RED),
-            )));
+    let width = inner.width as usize;
+    let height = inner.height as usize;
+    if state.onboarding.is_selecting_connection() {
+        let header = usize::from(height >= 4);
+        let footer = usize::from(height >= 2);
+        let visible = height.saturating_sub(header + footer).max(1);
+        if header != 0 {
+            frame.render_widget(
+                Line::from(Span::styled(
+                    truncate("How should Kurama connect?", width),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Rect::new(inner.x, inner.y, inner.width, 1),
+            );
         }
-        lines.push(Line::from(Span::styled(
-            truncate_display(
-                "Enter confirms · Esc closes setup · secrets remain masked",
-                inner.width as usize,
-            ),
-            Style::default().fg(DIM),
-        )));
-        frame.render_widget(Paragraph::new(lines).block(block), area);
-        let prompt_row = 2_u16.min(inner.height.saturating_sub(1));
-        let column = 2_u16.saturating_add(Line::from(shown.as_str()).width() as u16);
-        return Some(Position::new(
-            inner
-                .x
-                .saturating_add(column.min(inner.width.saturating_sub(1))),
-            inner.y.saturating_add(prompt_row),
-        ));
-    }
-    let mut lines = vec![
-        Line::from(Span::styled(
-            state.onboarding.step_label(),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            "How should Kurama connect?",
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            "Choose once. Projects remember the profile, not the secret.",
-            Style::default().fg(DIM),
-        )),
-    ];
-    for (index, option) in state.onboarding.options().iter().enumerate() {
-        let selected = index == state.onboarding.selected();
-        lines.push(Line::from(vec![
-            Span::styled(
-                if selected { "› " } else { "  " },
-                Style::default().fg(ACCENT),
-            ),
-            Span::styled(
-                format!("{}  {option}", index + 1),
-                Style::default()
-                    .fg(if selected { TEXT } else { DIM })
-                    .add_modifier(if selected {
-                        Modifier::BOLD
+        let options = state.onboarding.options();
+        let selected = state
+            .onboarding
+            .selected()
+            .min(options.len().saturating_sub(1));
+        let start = selected
+            .saturating_sub(visible / 2)
+            .min(options.len().saturating_sub(visible));
+        for (row, option) in options.iter().enumerate().skip(start).take(visible) {
+            let prefix = truncate(if row == selected { "› " } else { "  " }, width.min(2));
+            let available = width.saturating_sub(Line::from(prefix.as_str()).width());
+            let line = Line::from(vec![
+                Span::styled(prefix, Style::default().fg(ACCENT)),
+                Span::styled(
+                    truncate(&format!("{}  {option}", row + 1), available),
+                    if row == selected {
+                        Style::default().add_modifier(Modifier::BOLD)
                     } else {
-                        Modifier::empty()
-                    }),
-            ),
-        ]));
+                        Style::default().fg(DIM)
+                    },
+                ),
+            ]);
+            frame.render_widget(
+                line,
+                Rect::new(
+                    inner.x,
+                    inner.y + (header + row - start) as u16,
+                    inner.width,
+                    1,
+                ),
+            );
+        }
+        if footer != 0 {
+            let hint = if width >= 38 {
+                "↑↓ choose · enter confirm · esc close"
+            } else {
+                "↑↓ enter esc"
+            };
+            frame.render_widget(
+                Line::from(Span::styled(
+                    truncate(hint, width),
+                    Style::default().fg(DIM),
+                )),
+                Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+            );
+        }
+        return None;
     }
-    lines.push(Line::from(Span::styled(
-        connection_note(state.onboarding.selected()).trim_start(),
-        Style::default().fg(DIM),
-    )));
+
+    let show_error = state.onboarding.error().is_some() && height >= 2;
+    let footer = usize::from(height >= 3);
+    let title = usize::from(height > 1 + footer + usize::from(show_error));
+    if title != 0 {
+        frame.render_widget(
+            Line::from(Span::styled(
+                truncate(&state.onboarding.prompt(), width),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+    }
+    let gutter = inner.width.saturating_sub(2).min(2);
+    let (shown, cursor_column) = state
+        .onboarding
+        .display_input_tail(width.saturating_sub(gutter as usize));
+    let input_row = inner.y + title as u16;
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(BORDER))
-                .padding(Padding::new(1, 1, 0, 0)),
-        ),
-        area,
+        Line::from(vec![
+            Span::styled(truncate("› ", gutter as usize), Style::default().fg(ACCENT)),
+            Span::raw(shown),
+        ]),
+        Rect::new(inner.x, input_row, inner.width, 1),
     );
-    None
+    if show_error {
+        frame.render_widget(
+            Line::from(Span::styled(
+                truncate(state.onboarding.error().unwrap_or_default(), width),
+                Style::default().fg(RED),
+            )),
+            Rect::new(inner.x, input_row + 1, inner.width, 1),
+        );
+    }
+    if footer != 0 {
+        frame.render_widget(
+            Line::from(Span::styled(
+                truncate("enter confirm · esc back", width),
+                Style::default().fg(DIM),
+            )),
+            Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+        );
+    }
+    Some(Position::new(
+        inner.x + (gutter as usize + cursor_column).min(width - 1) as u16,
+        input_row,
+    ))
 }
 
 fn render_agents(frame: &mut Frame<'_>, state: &TuiState) {
     frame.render_widget(Clear, frame.area());
-    let frame_area = frame.area();
-    let area = inset(frame_area, 1, 0);
+    let area = inset(frame.area(), 1, 0);
     if area.is_empty() {
         return;
     }
-    let horizontal_padding = if area.width >= 48 { 2 } else { 1 };
-    let vertical_padding = if area.height >= 10 { 1 } else { 0 };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(BORDER))
-        .padding(Padding::new(
-            horizontal_padding,
-            horizontal_padding,
-            vertical_padding,
-            vertical_padding,
-        ));
+    let block = modal_block(area);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.is_empty() {
         return;
     }
-
     let width = inner.width as usize;
-    let height = inner.height as usize;
-    let show_summary = height >= 9;
-    let show_columns = width >= 72 && height >= 7;
-    let fixed_lines = 2 + usize::from(show_summary) + usize::from(show_columns);
-    let list_height = height.saturating_sub(fixed_lines).max(1);
-    let selected = state
-        .selected_agent
-        .min(state.agents.len().saturating_sub(1));
-    let start = selected
-        .saturating_sub(list_height / 2)
-        .min(state.agents.len().saturating_sub(list_height));
-    let end = state.agents.len().min(start.saturating_add(list_height));
-
-    let title = truncate(
-        &format!(
-            "/AGENTS    {} running · {} queued",
+    let header = usize::from(inner.height >= 3);
+    let footer = usize::from(inner.height >= 2);
+    let list_height = (inner.height as usize)
+        .saturating_sub(header + footer)
+        .max(1);
+    if header != 0 {
+        let title = format!(
+            "/agents  {} running · {} queued",
             state.running_agents, state.queued_agents
-        ),
-        width,
-    );
-    let mut lines = vec![Line::from(Span::styled(
-        title,
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-    ))];
-    if show_summary {
-        lines.push(Line::from(Span::styled(
-            "Explicitly delegated children · no nested agents",
-            Style::default().fg(DIM),
-        )));
-    }
-    if show_columns {
-        lines.push(Line::from(Span::styled(
-            "  ID        ROLE          PROFILE      TASK                  STATE",
-            Style::default().fg(DIM),
-        )));
-    }
-    if state.agents.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "No sub-agents",
-            Style::default().fg(DIM),
-        )));
-    } else {
-        lines.extend(
-            state.agents[start..end]
-                .iter()
-                .enumerate()
-                .map(|(offset, agent)| agent_row(agent, start + offset == selected, width)),
+        );
+        frame.render_widget(
+            Line::from(Span::styled(
+                truncate(&title, width),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Rect::new(inner.x, inner.y, inner.width, 1),
         );
     }
-    while lines.len() + 1 < height {
-        lines.push(Line::from(""));
-    }
-    let controls = if width >= 68 {
-        "enter  inspect     m  message     x  cancel     ↑↓  select     esc  close"
-    } else if width >= 36 {
-        "enter inspect  m message  x cancel  esc"
+    if state.agents.is_empty() {
+        frame.render_widget(
+            Line::from(Span::styled(
+                truncate("No sub-agents", width),
+                Style::default().fg(DIM),
+            )),
+            Rect::new(inner.x, inner.y + header as u16, inner.width, 1),
+        );
     } else {
-        "↵ m x esc"
-    };
-    lines.push(Line::from(Span::styled(
-        truncate(controls, width),
-        Style::default().fg(DIM),
-    )));
-    frame.render_widget(Paragraph::new(lines), inner);
+        let selected = state.selected_agent.min(state.agents.len() - 1);
+        let start = selected
+            .saturating_sub(list_height / 2)
+            .min(state.agents.len().saturating_sub(list_height));
+        for (row, agent) in state
+            .agents
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(list_height)
+        {
+            frame.render_widget(
+                agent_row(agent, row == selected, width),
+                Rect::new(
+                    inner.x,
+                    inner.y + (header + row - start) as u16,
+                    inner.width,
+                    1,
+                ),
+            );
+        }
+    }
+    if footer != 0 {
+        let controls = if width >= 60 {
+            "enter inspect · m message · x cancel · ↑↓ select · esc close"
+        } else {
+            "↵ inspect · m · x · ↑↓ · esc"
+        };
+        frame.render_widget(
+            Line::from(Span::styled(
+                truncate(controls, width),
+                Style::default().fg(DIM),
+            )),
+            Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+        );
+    }
 }
 
 fn render_todos(frame: &mut Frame<'_>, state: &TuiState) {
     let frame_area = frame.area();
     if frame_area.is_empty() {
+        state.viewport_height.set(0);
         return;
     }
-    let desired_height = (state.todos.len() as u16).saturating_add(4).max(5);
-    let height = desired_height.min(frame_area.height);
-    let horizontal = 1.min(frame_area.width / 2);
-    let area = Rect::new(
-        frame_area.x.saturating_add(horizontal),
-        frame_area
-            .y
-            .saturating_add(frame_area.height.saturating_sub(height) / 2),
-        frame_area
-            .width
-            .saturating_sub(horizontal.saturating_mul(2)),
-        height,
-    );
-    if area.is_empty() {
-        return;
-    }
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(BORDER))
-        .padding(Padding::new(1, 1, 0, 0));
-    let inner = block.inner(area);
-    let width = inner.width as usize;
-    let completed = state
+    let height = state
         .todos
-        .iter()
-        .filter(|item| matches!(item.status, TodoStatus::Completed | TodoStatus::Cancelled))
-        .count();
-    let mut lines = vec![Line::from(Span::styled(
-        truncate(
-            &format!("/TODO    {completed}/{} complete", state.todos.len()),
-            width,
-        ),
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-    ))];
-    let list_height = inner.height.saturating_sub(2) as usize;
-    if state.todos.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "No todo items",
-            Style::default().fg(DIM),
-        )));
-    } else {
-        lines.extend(state.todos.iter().take(list_height).map(|item| {
-            let (status, color) = match item.status {
-                TodoStatus::Pending => ("pending    ", TEXT),
-                TodoStatus::InProgress => ("in progress", ACCENT),
-                TodoStatus::Completed => ("completed  ", DIM),
-                TodoStatus::Cancelled => ("cancelled  ", DIM),
-            };
-            let dimmed = matches!(item.status, TodoStatus::Completed | TodoStatus::Cancelled);
-            Line::from(vec![
-                Span::styled(status, Style::default().fg(color)),
-                Span::raw("  "),
-                Span::styled(
-                    truncate(&item.content, width.saturating_sub(13)),
-                    Style::default().fg(if dimmed { DIM } else { TEXT }),
+        .len()
+        .saturating_add(4)
+        .max(5)
+        .min(frame_area.height as usize) as u16;
+    let mut area = inset(frame_area, 1, 0);
+    area.y += area.height.saturating_sub(height) / 2;
+    area.height = height;
+    let block = modal_block(area);
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        state.viewport_height.set(0);
+        return;
+    }
+    let width = inner.width as usize;
+    let header = usize::from(inner.height >= 3);
+    let footer = usize::from(inner.height >= 2);
+    let visible = (inner.height as usize)
+        .saturating_sub(header + footer)
+        .max(1);
+    state.viewport_height.set(visible as u16);
+    if header != 0 {
+        let completed = state
+            .todos
+            .iter()
+            .filter(|item| matches!(item.status, TodoStatus::Completed | TodoStatus::Cancelled))
+            .count();
+        frame.render_widget(
+            Line::from(Span::styled(
+                truncate(
+                    &format!("/todo  {completed}/{} complete", state.todos.len()),
+                    width,
                 ),
-            ])
-        }));
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
     }
-    while lines.len() + 1 < inner.height as usize {
-        lines.push(Line::from(""));
+    if state.todos.is_empty() {
+        frame.render_widget(
+            Line::from(Span::styled(
+                truncate("No todo items", width),
+                Style::default().fg(DIM),
+            )),
+            Rect::new(inner.x, inner.y + header as u16, inner.width, 1),
+        );
+    } else {
+        let selected = state.selected_todo.min(state.todos.len() - 1);
+        let start = selected
+            .saturating_sub(visible / 2)
+            .min(state.todos.len().saturating_sub(visible));
+        for (row, item) in state.todos.iter().enumerate().skip(start).take(visible) {
+            let marker = match item.status {
+                TodoStatus::Completed => "[x]",
+                TodoStatus::Cancelled => "[-]",
+                TodoStatus::InProgress => "[>]",
+                TodoStatus::Pending => "[ ]",
+            };
+            let prefix = if row == selected { "› " } else { "  " };
+            let label = format!(
+                "{prefix}{marker} {}",
+                truncate(&item.content, width.saturating_sub(6))
+            );
+            let style = if row == selected {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else if matches!(item.status, TodoStatus::Completed | TodoStatus::Cancelled) {
+                Style::default().fg(DIM)
+            } else {
+                Style::default()
+            };
+            frame.render_widget(
+                Line::from(Span::styled(truncate(&label, width), style)),
+                Rect::new(
+                    inner.x,
+                    inner.y + (header + row - start) as u16,
+                    inner.width,
+                    1,
+                ),
+            );
+        }
     }
-    if inner.height > 0 {
-        lines.push(Line::from(Span::styled(
-            truncate("esc  close", width),
-            Style::default().fg(DIM),
-        )));
+    if footer != 0 {
+        frame.render_widget(
+            Line::from(Span::styled(
+                truncate("↑↓ scroll · esc close", width),
+                Style::default().fg(DIM),
+            )),
+            Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+        );
     }
-    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn agent_row(agent: &crate::tui::AgentRow, selected: bool, width: usize) -> Line<'static> {
-    let state_text = format!("{:?}", agent.state).to_uppercase();
+    if width == 0 {
+        return Line::default();
+    }
+    let marker = truncate(if selected { "› " } else { "  " }, width.min(2));
+    let marker_width = Line::from(marker.as_str()).width();
+    let state_text = truncate(
+        &state_label(&agent.state).to_uppercase(),
+        width.saturating_sub(marker_width),
+    );
     let state_color = match agent.state {
         AgentState::Running => ACCENT,
-        AgentState::Queued => DIM,
         AgentState::Completed => GREEN,
         AgentState::Failed => RED,
-        AgentState::Cancelled => DIM,
+        AgentState::Queued | AgentState::Cancelled => DIM,
     };
-    let marker = if selected { "▶ " } else { "  " };
-    let marker_width = Line::from(marker).width();
-    let read_only = agent.is_read_only();
-    let show_read_only = read_only && width >= 42;
-    let read_only_width = usize::from(show_read_only) * "  read-only".len();
-    let wrapping_up = agent.activity.eq_ignore_ascii_case("wrapping up");
-    let wrapping_up_width = usize::from(wrapping_up) * "  wrapping up".len();
+    let read_only = if agent.is_read_only() && width >= 42 {
+        "  read-only"
+    } else {
+        ""
+    };
+    let wrapping = if agent.activity.eq_ignore_ascii_case("wrapping up") && width >= 72 {
+        "  wrapping up"
+    } else {
+        ""
+    };
+    let budget =
+        width.saturating_sub(marker_width + state_text.len() + read_only.len() + wrapping.len());
+    let id = truncate(agent.id.as_ref(), budget.min(10));
     let body = if width >= 72 {
-        let id = truncate(agent.id.as_ref(), 8);
-        let task_width = width
-            .saturating_sub(
-                marker_width + state_text.len() + read_only_width + wrapping_up_width + 37,
-            )
-            .min(22);
         format!(
-            "{:<10}{:<14}{:<13}{:<task_width$}",
+            "{} {} {}  {}",
             id,
             truncate(&agent.role, 12),
-            truncate(&agent.profile, 11),
-            truncate(&agent.task, task_width.saturating_sub(2))
+            truncate(&agent.profile, 12),
+            truncate(&agent.task, budget)
         )
-    } else if width >= 42 {
-        let reserved = marker_width + state_text.len() + read_only_width + wrapping_up_width + 2;
-        let detail = truncate(
-            &format!("{} · {} · {}", agent.id, agent.role, agent.task),
-            width.saturating_sub(reserved),
-        );
-        format!("{detail}  ")
+    } else if width >= 32 {
+        format!(
+            "{} {}  {}",
+            id,
+            truncate(&agent.role, 12),
+            truncate(&agent.task, budget)
+        )
     } else {
-        let reserved = marker_width + state_text.len() + read_only_width + wrapping_up_width + 2;
-        let id = truncate(agent.id.as_ref(), width.saturating_sub(reserved));
-        format!("{id}  ")
+        id
     };
-    let mut spans = vec![
+    let body = truncate(&body, budget.saturating_sub(usize::from(budget > 0)));
+    let padding = " ".repeat(budget.saturating_sub(Line::from(body.as_str()).width()));
+    Line::from(vec![
         Span::styled(marker, Style::default().fg(ACCENT)),
         Span::styled(body, Style::default().fg(if selected { TEXT } else { DIM })),
+        Span::raw(padding),
         Span::styled(
             state_text,
             Style::default()
                 .fg(state_color)
                 .add_modifier(Modifier::BOLD),
         ),
-    ];
-    if wrapping_up {
-        spans.push(Span::styled("  wrapping up", Style::default().fg(AMBER)));
-    }
-    if show_read_only {
-        spans.push(Span::styled("  read-only", Style::default().fg(DIM)));
-    }
-    Line::from(spans)
+        Span::styled(read_only, Style::default().fg(DIM)),
+        Span::styled(wrapping, Style::default().fg(AMBER)),
+    ])
 }
 
 fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) -> Option<Position> {
@@ -576,146 +618,195 @@ fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) -> Option<Posit
         render_agents(frame, state);
         return None;
     };
-    let state_color = match agent.state {
-        AgentState::Running => ACCENT,
-        AgentState::Queued => DIM,
-        AgentState::Completed => GREEN,
-        AgentState::Failed => RED,
-        AgentState::Cancelled => DIM,
-    };
-    let mut body = vec![
-        Line::from(vec![
-            Span::styled("agents / ", Style::default().fg(ACCENT)),
-            Span::styled(
-                agent.id.to_string(),
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                agent.role.as_str(),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                if agent.is_read_only() {
-                    "  read-only"
-                } else {
-                    ""
-                },
-                Style::default().fg(DIM),
-            ),
-        ]),
-        Line::from(Span::styled(agent.task.as_str(), Style::default().fg(TEXT))),
-        Line::from(vec![
-            Span::styled(agent.profile.as_str(), Style::default().fg(DIM)),
-            Span::raw("  ·  "),
-            Span::styled(
-                state_label(&agent.state).to_uppercase(),
-                Style::default()
-                    .fg(state_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(Span::styled(
-            agent.activity.as_str(),
-            Style::default().fg(TEXT),
-        )),
-    ];
-    for (index, line) in agent.transcript.iter().enumerate() {
-        let last = index + 1 == agent.transcript.len();
-        body.push(Line::from(Span::styled(
-            format!("{} {line}", if last { "└" } else { "│" }),
-            Style::default().fg(TEXT),
-        )));
-    }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(BORDER))
-        .padding(Padding::new(1, 1, 0, 0));
+    let block = modal_block(area);
     let inner = block.inner(area);
+    frame.render_widget(block, area);
     if inner.is_empty() {
-        frame.render_widget(block, area);
         return None;
     }
-    let field_width = inner.width.saturating_sub(2).max(1) as usize;
-    let action = if state.overlay == Overlay::AgentMessage {
-        Line::from(vec![
-            Span::styled("› ", Style::default().fg(ACCENT)),
-            Span::styled(
-                truncate_display(&state.agent_message, field_width),
-                Style::default().fg(TEXT),
-            ),
-        ])
-    } else if state.overlay == Overlay::ConfirmAgentCancel {
-        Line::from(Span::styled(
-            truncate_display(
-                &format!("Cancel {}?  y confirm  ·  n/esc return", agent.id),
-                inner.width as usize,
-            ),
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-        ))
-    } else {
-        Line::from(Span::styled(
-            truncate_display(
-                "esc  agents     m  message     x  cancel agent",
-                inner.width as usize,
-            ),
-            Style::default().fg(DIM),
-        ))
-    };
-    let action_height = 1.min(inner.height);
-    let body_height = inner.height.saturating_sub(action_height) as usize;
-    let start = body.len().saturating_sub(body_height);
-    let mut lines = body
-        .into_iter()
-        .skip(start)
-        .take(body_height)
-        .collect::<Vec<_>>();
-    while lines.len() + 1 < inner.height as usize {
-        lines.push(Line::from(""));
+    let width = inner.width as usize;
+    let header = 2 * usize::from(inner.height >= 4) + usize::from(inner.height >= 8);
+    if header > 0 {
+        frame.render_widget(
+            agent_row(agent, true, width),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        let metadata = format!(
+            "{} / {}",
+            truncate(&agent.role, width / 2),
+            truncate(&agent.profile, width / 2)
+        );
+        frame.render_widget(
+            Line::from(Span::styled(
+                truncate(&metadata, width),
+                Style::default().fg(DIM),
+            )),
+            Rect::new(inner.x, inner.y + 1, inner.width, 1),
+        );
     }
-    let action_row = lines.len() as u16;
-    lines.push(action);
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    if header > 2 {
+        let activity = format!("Recent activity · {}", truncate(&agent.activity, width));
+        frame.render_widget(
+            Line::from(Span::styled(
+                truncate(&activity, width),
+                Style::default().fg(DIM),
+            )),
+            Rect::new(inner.x, inner.y + 2, inner.width, 1),
+        );
+    }
+    let body_height = (inner.height as usize).saturating_sub(header + 1);
+    let mut visible = Vec::with_capacity(body_height);
+    for entry in agent.transcript.iter().rev().take(body_height) {
+        let remaining = body_height - visible.len();
+        let mut tail = VecDeque::<String>::with_capacity(remaining);
+        for_each_wrapped_line(entry, width, |line| {
+            let mut row = if tail.len() == remaining {
+                tail.pop_front().unwrap_or_default()
+            } else {
+                String::new()
+            };
+            row.clear();
+            row.push_str(line);
+            tail.push_back(row);
+        });
+        visible.extend(tail.into_iter().rev());
+        if visible.len() == body_height {
+            break;
+        }
+    }
+    for (row, line) in visible.into_iter().rev().enumerate() {
+        frame.render_widget(
+            Line::from(line),
+            Rect::new(inner.x, inner.y + (header + row) as u16, inner.width, 1),
+        );
+    }
+    let action_area = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
     if state.overlay == Overlay::AgentMessage {
-        let cursor = state.agent_message_cursor.min(state.agent_message.len());
-        let prefix = truncate_display(&state.agent_message[..cursor], field_width);
-        let column = 2_u16.saturating_add(Line::from(prefix.as_str()).width() as u16);
-        Some(Position::new(
-            inner
-                .x
-                .saturating_add(column.min(inner.width.saturating_sub(1))),
-            inner
-                .y
-                .saturating_add(action_row.min(inner.height.saturating_sub(1))),
-        ))
+        let gutter = inner.width.saturating_sub(2).min(2);
+        let (shown, column) = editor_window(
+            &state.agent_message,
+            state.agent_message_cursor,
+            width - gutter as usize,
+        );
+        frame.render_widget(
+            Line::from(vec![
+                Span::styled(truncate("› ", gutter as usize), Style::default().fg(ACCENT)),
+                Span::raw(shown),
+            ]),
+            action_area,
+        );
+        return Some(Position::new(
+            inner.x + (gutter as usize + column).min(width - 1) as u16,
+            action_area.y,
+        ));
+    }
+    let action = if state.overlay == Overlay::ConfirmAgentCancel {
+        if width >= 30 {
+            format!(
+                "Cancel {}? y confirm · n/esc return",
+                truncate(agent.id.as_ref(), width.saturating_sub(29))
+            )
+        } else {
+            "y/n cancel · esc back".into()
+        }
     } else {
-        None
-    }
-}
-
-fn connection_note(index: usize) -> &'static str {
-    match index {
-        0 => "     Use the installed codex CLI · credentials stay inside Codex",
-        1 => "     Use the installed claude CLI · credentials stay inside Claude",
-        2 => "     Keychain, environment reference, or this session only",
-        3 => "     Keychain, environment reference, or this session only",
-        _ => "     Connect to an existing HTTP endpoint · no model runtime bundled",
-    }
+        "m message · x cancel · esc agents".into()
+    };
+    frame.render_widget(
+        Line::from(Span::styled(
+            truncate(&action, width),
+            Style::default().fg(if state.overlay == Overlay::ConfirmAgentCancel {
+                AMBER
+            } else {
+                DIM
+            }),
+        )),
+        action_area,
+    );
+    None
 }
 
 fn truncate(value: &str, width: usize) -> String {
-    truncate_display(value, width)
+    truncate_display(&sanitize_terminal_text(value), width)
 }
 
 fn inset(area: Rect, horizontal: u16, vertical: u16) -> Rect {
-    let horizontal = horizontal.min(area.width / 2);
-    let vertical = vertical.min(area.height / 2);
-    Rect {
-        x: area.x.saturating_add(horizontal),
-        y: area.y.saturating_add(vertical),
-        width: area.width.saturating_sub(horizontal.saturating_mul(2)),
-        height: area.height.saturating_sub(vertical.saturating_mul(2)),
+    let horizontal = area
+        .width
+        .saturating_sub(4)
+        .min(horizontal.saturating_mul(2));
+    let vertical = area
+        .height
+        .saturating_sub(3)
+        .min(vertical.saturating_mul(2));
+    Rect::new(
+        area.x.saturating_add(horizontal.div_ceil(2)),
+        area.y.saturating_add(vertical.div_ceil(2)),
+        area.width.saturating_sub(horizontal),
+        area.height.saturating_sub(vertical),
+    )
+}
+
+fn modal_block(area: Rect) -> Block<'static> {
+    if area.width < 4 || area.height < 3 {
+        return Block::default();
     }
+    let padding = u16::from(area.width >= 8);
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER))
+        .padding(Padding::new(padding, padding, 0, 0))
+}
+
+fn editor_window(value: &str, cursor: usize, width: usize) -> (String, usize) {
+    if width == 0 {
+        return (String::new(), 0);
+    }
+    let mut cursor = cursor.min(value.len());
+    while !value.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    let clean = sanitize_terminal_text(value);
+    let cursor = sanitize_terminal_text(&value[..cursor])
+        .len()
+        .min(clean.len());
+    let start = clean[..cursor].rfind('\n').map_or(0, |index| index + 1);
+    let end = clean[cursor..]
+        .find('\n')
+        .map_or(clean.len(), |index| cursor + index);
+    let line = &clean[start..end];
+    let cursor = cursor - start;
+    let cell_width = |grapheme: &str| {
+        if grapheme == "\t" {
+            1
+        } else {
+            Line::from(grapheme).width()
+        }
+    };
+    let cursor_column = line
+        .grapheme_indices(true)
+        .take_while(|(index, _)| *index < cursor)
+        .map(|(_, grapheme)| cell_width(grapheme))
+        .sum::<usize>();
+    let desired_start = cursor_column.saturating_sub(width - 1);
+    let mut skipped = 0;
+    let mut used = 0;
+    let mut shown = String::new();
+    for grapheme in line.graphemes(true) {
+        let cells = cell_width(grapheme);
+        if skipped < desired_start {
+            skipped += cells;
+            continue;
+        }
+        if used + cells > width {
+            if used == 0 && cells > width {
+                shown.push('�');
+            }
+            break;
+        }
+        shown.push_str(if grapheme == "\t" { " " } else { grapheme });
+        used += cells;
+    }
+    (shown, cursor_column.saturating_sub(skipped).min(width - 1))
 }

@@ -21,6 +21,7 @@ pub(crate) use backend::{CursorTrackingBackend, SharedBackend};
 pub(crate) use command_palette::{command_palette_height, render_command_palette};
 pub(crate) use composer::{approval_height, composer_cursor_vertical, composer_height};
 pub use input::{TerminalGuard, spawn_input_thread};
+pub(crate) use input::{next_grapheme_boundary, previous_grapheme_boundary};
 pub use layout::ResponsiveLayout;
 pub(crate) use layout::{main_area, queue_height, visible_activity_rect};
 pub(crate) use mentions::{collect_files, decode_pasted_image, filter_files, mention_at_cursor};
@@ -29,6 +30,7 @@ pub use render::render;
 pub(crate) use render::render_with_transcript;
 pub use state::{ActivityState, Overlay, ToolLifecycle, ToolTranscript, TranscriptEntry, TuiState};
 pub(crate) use theme::SURFACE;
+pub(crate) use transcript::transcript_lines_with_entry_starts;
 pub use transcript::{TranscriptDetail, transcript_lines};
 #[cfg(test)]
 pub(crate) use transcript::{reset_transcript_render_calls, transcript_render_calls};

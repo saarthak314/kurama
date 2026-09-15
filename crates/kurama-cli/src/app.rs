@@ -1,14 +1,16 @@
 use std::{
     collections::BTreeMap,
-    fmt,
-    io::{self, Write},
+    fmt, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(not(test))]
+use std::io::Write as _;
+
 use crossterm::{
-    event::{Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -36,7 +38,7 @@ use ratatui::{
     layout::{Position, Rect},
     style::Style,
     text::Line,
-    widgets::{Block, Padding, Paragraph, Widget},
+    widgets::Widget,
 };
 use tokio::sync::mpsc;
 
@@ -46,17 +48,15 @@ use crate::{
     tui::{
         CursorTrackingBackend, OnboardingState, OnboardingSubmission, Overlay, SURFACE,
         SharedBackend, TerminalGuard, TranscriptDetail, TuiState, approval_height,
-        command_palette_height, composer_cursor_vertical, composer_height, main_area, queue_height,
-        render_with_transcript, spawn_input_thread, transcript_lines, visible_activity_rect,
+        command_palette_height, composer_cursor_vertical, composer_height, main_area,
+        next_grapheme_boundary, previous_grapheme_boundary, queue_height, render_with_transcript,
+        spawn_input_thread, transcript_lines, transcript_lines_with_entry_starts,
+        visible_activity_rect,
     },
 };
 
-#[cfg(test)]
-use crate::tui::render;
-
 const TRANSCRIPT_HORIZONTAL_PADDING: usize = 2;
 const MAX_TRANSCRIPT_INSERT_HEIGHT: usize = 1_024;
-const INLINE_VIEWPORT_MAX_HEIGHT: u16 = 12;
 const TOOL_EVENT_CAPACITY: usize = 64;
 const MAX_PASTE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const READY_EVENT_BATCH_LIMIT: usize = 128;
@@ -65,39 +65,145 @@ const ACTIVITY_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
 struct TranscriptRenderCache {
-    width: Option<usize>,
+    key: Option<TranscriptCacheKey>,
     lines: Vec<Line<'static>>,
+    entry_starts: Vec<usize>,
+    viewport_height: u16,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TranscriptCacheKey {
+    width: usize,
+    revision: u64,
+    expanded: bool,
+    entries: usize,
+    first_entry: usize,
 }
 
 impl TranscriptRenderCache {
-    fn invalidate(&mut self) {
-        self.width = None;
-        self.lines.clear();
-    }
-
-    fn prepare(&mut self, state: &TuiState, frame_area: Rect) {
-        if state.transcript_view_expanded() {
-            self.invalidate();
+    fn prepare(&mut self, state: &mut TuiState, frame_area: Rect) {
+        if frame_area.is_empty() {
             return;
         }
-
+        let expanded = state.transcript_view_expanded();
         let width = main_area(frame_area).width as usize;
-        if self.width == Some(width) {
+        let first_entry = if expanded {
+            0
+        } else {
+            state.transcript.len() - state.live_transcript().len()
+        };
+        let key = TranscriptCacheKey {
+            width,
+            revision: state.transcript_revision(),
+            expanded,
+            entries: state.transcript.len(),
+            first_entry,
+        };
+        let viewport = frame_area
+            .height
+            .saturating_sub(u16::from(frame_area.height > 1));
+        if expanded {
+            state.transcript_width.set(width as u16);
+            state.viewport_height.set(viewport);
+        }
+        let previous_start = self
+            .lines
+            .len()
+            .saturating_sub(self.viewport_height as usize)
+            .saturating_sub(state.scroll);
+        if self.key == Some(key) {
+            if expanded {
+                let max_scroll = self.lines.len().saturating_sub(viewport as usize);
+                if state.scroll > 0 && viewport != self.viewport_height {
+                    state.scroll = max_scroll.saturating_sub(previous_start);
+                }
+                state.scroll = state.scroll.min(max_scroll);
+                self.viewport_height = viewport;
+            }
             return;
         }
-        self.lines = transcript_lines(state.live_transcript(), width, TranscriptDetail::Compact);
-        self.width = Some(width);
+        let anchor = if expanded && self.key.is_some_and(|key| key.expanded) && state.scroll > 0 {
+            self.entry_starts
+                .partition_point(|&row| row <= previous_start)
+                .checked_sub(1)
+                .map(|entry| {
+                    (
+                        entry,
+                        previous_start.saturating_sub(self.entry_starts[entry]),
+                    )
+                })
+        } else {
+            None
+        };
+        let reuse = self.key.is_some_and(|old| {
+            old.width == width && old.expanded == expanded && old.first_entry == first_entry
+        });
+        let retained = if reuse {
+            state
+                .transcript_dirty_from()
+                .saturating_sub(first_entry)
+                .min(state.transcript.len() - first_entry)
+                .min(self.entry_starts.len())
+        } else {
+            0
+        };
+        let prefix_rows = self
+            .entry_starts
+            .get(retained)
+            .copied()
+            .unwrap_or(self.lines.len());
+        let (mut lines, starts) = transcript_lines_with_entry_starts(
+            &state.transcript[first_entry + retained..],
+            width,
+            if expanded {
+                TranscriptDetail::Expanded
+            } else {
+                TranscriptDetail::Compact
+            },
+        );
+        if retained == 0 {
+            self.lines = lines;
+            self.entry_starts = starts;
+        } else {
+            self.lines.truncate(prefix_rows);
+            self.lines.append(&mut lines);
+            self.entry_starts.truncate(retained);
+            self.entry_starts
+                .extend(starts.into_iter().map(|row| prefix_rows + row));
+        }
+        if expanded {
+            if let Some((entry, offset)) = anchor {
+                let start = self
+                    .entry_starts
+                    .get(entry)
+                    .map(|&start| {
+                        let end = self
+                            .entry_starts
+                            .get(entry + 1)
+                            .copied()
+                            .unwrap_or(self.lines.len());
+                        start + offset.min(end.saturating_sub(start).saturating_sub(1))
+                    })
+                    .unwrap_or(previous_start);
+                state.scroll = self
+                    .lines
+                    .len()
+                    .saturating_sub(viewport as usize)
+                    .saturating_sub(start);
+            }
+            state.set_transcript_geometry(width as u16, self.lines.len(), &self.entry_starts);
+            state.scroll = state
+                .scroll
+                .min(self.lines.len().saturating_sub(viewport as usize));
+        }
+        state.mark_transcript_rendered();
+        self.viewport_height = viewport;
+        self.key = Some(key);
     }
 
     fn lines(&self) -> Option<&[Line<'static>]> {
-        self.width.map(|_| self.lines.as_slice())
+        self.key.map(|_| self.lines.as_slice())
     }
-}
-
-#[derive(Clone, Copy)]
-struct ResizeMode {
-    replay: bool,
-    purge_history: bool,
 }
 
 #[derive(Default)]
@@ -106,20 +212,12 @@ struct AltOverlay {
     saved: Option<Rect>,
 }
 
-impl ResizeMode {
-    const PRESERVE: Self = Self {
-        replay: false,
-        purge_history: false,
-    };
-    const PURGE_AND_REPLAY: Self = Self {
-        replay: true,
-        purge_history: true,
-    };
-    #[cfg(test)]
-    const REPLAY: Self = Self {
-        replay: true,
-        purge_history: false,
-    };
+impl Drop for AltOverlay {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        }
+    }
 }
 
 pub struct App {
@@ -528,7 +626,6 @@ impl App {
 
     pub async fn run(mut self) -> Result<Option<ExitSummary>, String> {
         let _guard = TerminalGuard::enter().map_err(|error| error.to_string())?;
-        purge_terminal_history().map_err(|error| error.to_string())?;
         let backend = SharedBackend::new(CursorTrackingBackend::new(CrosstermBackend::new(
             io::stdout(),
         )));
@@ -538,20 +635,24 @@ impl App {
         loop {
             let runtime_events = self.runtime_events.take();
             let tool_events = self.tool_events.take();
-            run_loop(
+            let result = run_loop(
                 &mut self,
                 &mut terminal,
                 &mut input,
                 runtime_events,
                 tool_events,
                 true,
-                ResizeMode::PURGE_AND_REPLAY,
             )
-            .await?;
+            .await;
+            if let Err(error) = result {
+                let _ = clear_inline_terminal(&mut terminal);
+                return Err(error);
+            }
             let Some(args) = self.restart_args.take() else {
                 clear_inline_terminal(&mut terminal).map_err(|error| error.to_string())?;
                 return Ok(self.exit_requested.then(|| self.exit_summary()).flatten());
             };
+            clear_inline_terminal(&mut terminal).map_err(|error| error.to_string())?;
             let control = self
                 .control
                 .as_ref()
@@ -562,6 +663,148 @@ impl App {
                 control.paths.clone(),
                 control.session_secrets.clone(),
             )?;
+        }
+    }
+
+    fn accepts_event(&self, event: &Event) -> bool {
+        let key = match event {
+            Event::Resize(..) => return true,
+            Event::Paste(text) => {
+                return !text.is_empty()
+                    && (matches!(
+                        self.state.overlay(),
+                        Overlay::ApprovalEdit | Overlay::Onboarding | Overlay::AgentMessage
+                    ) || (self.state.overlay() == Overlay::None
+                        && !self.state.transcript_view_expanded()));
+            }
+            Event::Key(key) if key.kind != KeyEventKind::Release => key,
+            _ => return false,
+        };
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('c') => return true,
+                KeyCode::Char('o') => return self.state.overlay() == Overlay::None,
+                _ if self.state.overlay() == Overlay::None
+                    && !self.state.transcript_view_expanded() =>
+                {
+                    return if self.state.history_search_active() {
+                        key.code == KeyCode::Char('r')
+                    } else {
+                        matches!(
+                            key.code,
+                            KeyCode::Char(
+                                'a' | 'e' | 'k' | 'u' | 'w' | 'j' | 'l' | 't' | 'r' | 'd'
+                            )
+                        )
+                    };
+                }
+                _ => {}
+            }
+        }
+        if self.state.transcript_view_expanded() {
+            return matches!(
+                key.code,
+                KeyCode::Esc
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::Char('{' | '}')
+            );
+        }
+        match self.state.overlay() {
+            Overlay::None => matches!(
+                key.code,
+                KeyCode::Char(_)
+                    | KeyCode::Backspace
+                    | KeyCode::Delete
+                    | KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::Enter
+                    | KeyCode::Esc
+                    | KeyCode::Tab
+                    | KeyCode::BackTab
+            ),
+            Overlay::Todos => matches!(
+                key.code,
+                KeyCode::Esc
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+            ),
+            Overlay::Shortcuts => {
+                matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?'))
+            }
+            Overlay::Agents => matches!(
+                key.code,
+                KeyCode::Esc
+                    | KeyCode::Enter
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Char('m' | 'x')
+            ),
+            Overlay::AgentInspect => matches!(key.code, KeyCode::Esc | KeyCode::Char('m' | 'x')),
+            Overlay::ConfirmAgentCancel => {
+                matches!(key.code, KeyCode::Esc | KeyCode::Char('y' | 'n'))
+            }
+            Overlay::AgentMessage => {
+                matches!(
+                    key.code,
+                    KeyCode::Esc
+                        | KeyCode::Enter
+                        | KeyCode::Backspace
+                        | KeyCode::Delete
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::Home
+                        | KeyCode::End
+                ) || matches!(key.code, KeyCode::Char(_))
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+            }
+            Overlay::Approval => {
+                matches!(key.code, KeyCode::Esc | KeyCode::Up | KeyCode::Down)
+                    || key.modifiers.is_empty()
+                        && matches!(
+                            key.code,
+                            KeyCode::Enter | KeyCode::Char('a' | 's' | 'd' | 'e')
+                        )
+            }
+            Overlay::ApprovalEdit => {
+                matches!(
+                    key.code,
+                    KeyCode::Esc
+                        | KeyCode::Enter
+                        | KeyCode::Backspace
+                        | KeyCode::Delete
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::Home
+                        | KeyCode::End
+                        | KeyCode::Up
+                        | KeyCode::Down
+                ) || matches!(key.code, KeyCode::Char(_))
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            }
+            Overlay::Onboarding => matches!(
+                key.code,
+                KeyCode::Char(_)
+                    | KeyCode::Backspace
+                    | KeyCode::Enter
+                    | KeyCode::Esc
+                    | KeyCode::Up
+                    | KeyCode::Down
+            ),
         }
     }
 
@@ -586,7 +829,7 @@ impl App {
                 }
                 return Ok(false);
             }
-            Event::Key(key) => key,
+            Event::Key(key) if key.kind != KeyEventKind::Release => key,
             _ => return Ok(false),
         };
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -604,27 +847,27 @@ impl App {
                 KeyCode::Esc => self.state.toggle_transcript_view(),
                 KeyCode::Up => self.state.scroll = self.state.scroll.saturating_add(1),
                 KeyCode::Down => self.state.scroll = self.state.scroll.saturating_sub(1),
-                KeyCode::PageUp => self.state.scroll = self.state.scroll.saturating_add(5),
-                KeyCode::PageDown => self.state.scroll = self.state.scroll.saturating_sub(5),
-                KeyCode::Home => {
-                    let width = self.state.composer_inner_width.get().max(8) as usize;
-                    let rendered = crate::tui::transcript_lines(
-                        &self.state.transcript,
-                        width,
-                        crate::tui::TranscriptDetail::Expanded,
-                    );
-                    let viewport = self.state.viewport_height.get().max(1) as usize;
-                    self.state.scroll = rendered.len().saturating_sub(viewport);
+                KeyCode::PageUp => {
+                    self.state.scroll = self.state.scroll.saturating_add(
+                        self.state.viewport_height.get().saturating_sub(1).max(1) as usize,
+                    )
                 }
+                KeyCode::PageDown => {
+                    self.state.scroll = self.state.scroll.saturating_sub(
+                        self.state.viewport_height.get().saturating_sub(1).max(1) as usize,
+                    )
+                }
+                KeyCode::Home => self.state.scroll = self.state.max_transcript_scroll(),
                 KeyCode::End => self.state.scroll = 0,
                 KeyCode::Char('{') => self
                     .state
-                    .jump_user_turn(-1, self.state.composer_inner_width.get().max(8) as usize),
+                    .jump_user_turn(-1, self.state.transcript_width.get() as usize),
                 KeyCode::Char('}') => self
                     .state
-                    .jump_user_turn(1, self.state.composer_inner_width.get().max(8) as usize),
+                    .jump_user_turn(1, self.state.transcript_width.get() as usize),
                 _ => {}
             }
+            self.state.scroll = self.state.scroll.min(self.state.max_transcript_scroll());
             return Ok(false);
         }
         match self.state.overlay {
@@ -635,9 +878,21 @@ impl App {
             | Overlay::AgentMessage
             | Overlay::ConfirmAgentCancel => self.handle_agents_key(key),
             Overlay::Todos => {
-                if key.code == KeyCode::Esc {
-                    self.state.close_overlay();
+                let page = self.state.viewport_height.get().saturating_sub(1).max(1) as usize;
+                self.state.selected_todo = match key.code {
+                    KeyCode::Esc => {
+                        self.state.close_overlay();
+                        self.state.selected_todo
+                    }
+                    KeyCode::Up => self.state.selected_todo.saturating_sub(1),
+                    KeyCode::Down => self.state.selected_todo.saturating_add(1),
+                    KeyCode::PageUp => self.state.selected_todo.saturating_sub(page),
+                    KeyCode::PageDown => self.state.selected_todo.saturating_add(page),
+                    KeyCode::Home => 0,
+                    KeyCode::End => self.state.todos.len().saturating_sub(1),
+                    _ => self.state.selected_todo,
                 }
+                .min(self.state.todos.len().saturating_sub(1));
             }
             Overlay::Shortcuts => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter) {
@@ -680,6 +935,7 @@ impl App {
     }
 
     fn handle_main_key(&mut self, key: KeyEvent) -> Result<(), String> {
+        self.state.normalize_composer_cursor();
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             if self.state.history_search_active() {
                 if key.code == KeyCode::Char('r') {
@@ -706,12 +962,7 @@ impl App {
                         self.exit_requested = true;
                         self.state.queue_command(EngineCommand::Shutdown);
                     } else if self.state.cursor < self.state.composer.len() {
-                        let next = self.state.cursor
-                            + self.state.composer[self.state.cursor..]
-                                .chars()
-                                .next()
-                                .map(char::len_utf8)
-                                .unwrap_or(0);
+                        let next = next_grapheme_boundary(&self.state.composer, self.state.cursor);
                         self.state.composer.drain(self.state.cursor..next);
                         self.state.composer_edited();
                     }
@@ -737,38 +988,22 @@ impl App {
                 self.state.composer_edited();
             }
             KeyCode::Backspace if self.state.cursor > 0 => {
-                let previous = self.state.composer[..self.state.cursor]
-                    .char_indices()
-                    .last()
-                    .map(|(index, _)| index)
-                    .unwrap_or(0);
+                let previous = previous_grapheme_boundary(&self.state.composer, self.state.cursor);
                 self.state.composer.drain(previous..self.state.cursor);
                 self.state.cursor = previous;
                 self.state.composer_edited();
             }
             KeyCode::Delete if self.state.cursor < self.state.composer.len() => {
-                let next = self.state.cursor
-                    + self.state.composer[self.state.cursor..]
-                        .chars()
-                        .next()
-                        .map(char::len_utf8)
-                        .unwrap_or(0);
+                let next = next_grapheme_boundary(&self.state.composer, self.state.cursor);
                 self.state.composer.drain(self.state.cursor..next);
                 self.state.composer_edited();
             }
             KeyCode::Left => {
-                self.state.cursor = self.state.composer[..self.state.cursor]
-                    .char_indices()
-                    .last()
-                    .map(|(index, _)| index)
-                    .unwrap_or(0);
+                self.state.cursor =
+                    previous_grapheme_boundary(&self.state.composer, self.state.cursor);
             }
             KeyCode::Right if self.state.cursor < self.state.composer.len() => {
-                self.state.cursor += self.state.composer[self.state.cursor..]
-                    .chars()
-                    .next()
-                    .map(char::len_utf8)
-                    .unwrap_or(0);
+                self.state.cursor = next_grapheme_boundary(&self.state.composer, self.state.cursor);
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.state.composer.insert(self.state.cursor, '\n');
@@ -781,7 +1016,7 @@ impl App {
                 if let Some(cursor) = composer_cursor_vertical(
                     &self.state.composer,
                     self.state.cursor,
-                    self.state.composer_inner_width.get().max(4) as usize,
+                    self.state.composer_inner_width.get() as usize,
                     -1,
                 ) {
                     self.state.cursor = cursor;
@@ -795,7 +1030,7 @@ impl App {
                 if let Some(cursor) = composer_cursor_vertical(
                     &self.state.composer,
                     self.state.cursor,
-                    self.state.composer_inner_width.get().max(4) as usize,
+                    self.state.composer_inner_width.get() as usize,
                     1,
                 ) {
                     self.state.cursor = cursor;
@@ -1254,6 +1489,7 @@ impl App {
     }
 
     fn handle_agents_key(&mut self, key: KeyEvent) {
+        self.state.normalize_agent_message_cursor();
         match (self.state.overlay, key.code) {
             (Overlay::Agents, KeyCode::Up) => self.state.select_previous_agent(),
             (Overlay::Agents, KeyCode::Down) => self.state.select_next_agent(),
@@ -1270,11 +1506,10 @@ impl App {
             }
             (Overlay::AgentMessage, KeyCode::Backspace) => {
                 if self.state.agent_message_cursor > 0 {
-                    let previous = self.state.agent_message[..self.state.agent_message_cursor]
-                        .char_indices()
-                        .next_back()
-                        .map(|(index, _)| index)
-                        .unwrap_or(0);
+                    let previous = previous_grapheme_boundary(
+                        &self.state.agent_message,
+                        self.state.agent_message_cursor,
+                    );
                     self.state
                         .agent_message
                         .drain(previous..self.state.agent_message_cursor);
@@ -1282,23 +1517,31 @@ impl App {
                 }
             }
             (Overlay::AgentMessage, KeyCode::Left) => {
-                if let Some((index, _)) = self.state.agent_message
-                    [..self.state.agent_message_cursor]
-                    .char_indices()
-                    .next_back()
-                {
-                    self.state.agent_message_cursor = index;
-                }
+                self.state.agent_message_cursor = previous_grapheme_boundary(
+                    &self.state.agent_message,
+                    self.state.agent_message_cursor,
+                );
             }
             (Overlay::AgentMessage, KeyCode::Right)
                 if self.state.agent_message_cursor < self.state.agent_message.len() =>
             {
-                let next = self.state.agent_message[self.state.agent_message_cursor..]
-                    .chars()
-                    .next()
-                    .map(char::len_utf8)
-                    .unwrap_or(0);
-                self.state.agent_message_cursor += next;
+                self.state.agent_message_cursor = next_grapheme_boundary(
+                    &self.state.agent_message,
+                    self.state.agent_message_cursor,
+                );
+            }
+            (Overlay::AgentMessage, KeyCode::Delete) => {
+                let next = next_grapheme_boundary(
+                    &self.state.agent_message,
+                    self.state.agent_message_cursor,
+                );
+                self.state
+                    .agent_message
+                    .drain(self.state.agent_message_cursor..next);
+            }
+            (Overlay::AgentMessage, KeyCode::Home) => self.state.agent_message_cursor = 0,
+            (Overlay::AgentMessage, KeyCode::End) => {
+                self.state.agent_message_cursor = self.state.agent_message.len()
             }
             (Overlay::AgentMessage, KeyCode::Enter) => self.state.submit_agent_message(),
             (Overlay::Agents | Overlay::AgentInspect, KeyCode::Char('x')) => {
@@ -1338,6 +1581,7 @@ impl App {
     }
 
     fn ingest_composer_paste(&mut self, text: &str) {
+        self.state.normalize_composer_cursor();
         if let Some((bytes, ext)) = crate::tui::decode_pasted_image(text) {
             if bytes.len() > MAX_PASTE_IMAGE_BYTES {
                 self.state.push_error("pasted image is too large");
@@ -1590,13 +1834,31 @@ where
     B: Backend,
 {
     let rows = backend.size()?.height;
-    let viewport_height = rows.min(INLINE_VIEWPORT_MAX_HEIGHT);
-    backend.clear_region(ClearType::All)?;
-    backend.set_cursor_position(Position::new(0, rows.saturating_sub(viewport_height)))?;
+    let cursor = match backend.get_cursor_position() {
+        Ok(cursor) => cursor,
+        Err(_) => {
+            // A basic PTY may not implement cursor-position reports. Reserve a
+            // fresh bottom row without clearing user history; tracking remembers it.
+            let cursor = Position::new(0, rows.saturating_sub(1));
+            backend.set_cursor_position(cursor)?;
+            if rows > 0 {
+                backend.append_lines(1)?;
+            }
+            cursor
+        }
+    };
+    if cursor.x > 0 {
+        backend.append_lines(1)?;
+        backend.set_cursor_position(Position::new(
+            0,
+            cursor.y.saturating_add(1).min(rows.saturating_sub(1)),
+        ))?;
+    }
+    // Claim only the current row until the first frame knows its required height.
     Terminal::with_options(
         backend,
         TerminalOptions {
-            viewport: Viewport::Inline(viewport_height),
+            viewport: Viewport::Inline(rows.min(1)),
         },
     )
 }
@@ -1605,30 +1867,23 @@ fn resize_inline_terminal<B>(
     terminal: &mut Terminal<B>,
     width: u16,
     height: u16,
-    reset_origin: bool,
 ) -> Result<(), B::Error>
 where
     B: Backend + Clone,
 {
-    let viewport_height = height.min(INLINE_VIEWPORT_MAX_HEIGHT);
-    let current_viewport_top = terminal.get_frame().area().top();
-    let viewport_top = height.saturating_sub(viewport_height);
-    let clear_top = if reset_origin {
-        0
-    } else {
-        current_viewport_top.min(viewport_top)
-    };
-    terminal
-        .backend_mut()
-        .set_cursor_position(Position::new(0, clear_top))?;
-    terminal
-        .backend_mut()
-        .clear_region(ClearType::AfterCursor)?;
-    terminal.backend_mut().flush()?;
+    let current = terminal.get_frame().area();
+    let viewport_height = current.height.min(height);
+    let top = current.y.min(height.saturating_sub(viewport_height));
+    if width >= current.width && viewport_height == current.height {
+        terminal.set_cursor_position(Position::new(0, top))?;
+        return terminal.resize(Rect::new(0, 0, width, height));
+    }
+    // Ratatui 0.1.2 clears the entire screen on horizontal shrink. Reconstruct
+    // only that path (or a changed Inline height, which has no public setter).
     replace_inline_terminal(
         terminal,
         Rect::new(0, 0, width, height),
-        viewport_top,
+        top,
         viewport_height,
     )
 }
@@ -1647,14 +1902,17 @@ where
             desired_inline_viewport_height_for_transcript(state, size.width, size.height, 0);
         set_inline_viewport_height(terminal, viewport_height).map_err(|error| error.to_string())?;
         commit_stable_transcript(state, terminal)?;
-        transcript_cache.invalidate();
     }
 
     let size = terminal.size().map_err(|error| error.to_string())?;
+    if uses_full_inline_viewport(state) && !state.transcript_view_expanded() {
+        return set_inline_viewport_height(terminal, size.height)
+            .map_err(|error| error.to_string());
+    }
+    transcript_cache.prepare(state, Rect::new(0, 0, size.width, size.height));
     let viewport_height = if uses_full_inline_viewport(state) {
         size.height
     } else {
-        transcript_cache.prepare(state, Rect::new(0, 0, size.width, size.height));
         desired_inline_viewport_height_for_transcript(
             state,
             size.width,
@@ -1667,7 +1925,7 @@ where
 }
 
 fn prepare_fullscreen_frame<B>(
-    state: &TuiState,
+    state: &mut TuiState,
     terminal: &mut Terminal<B>,
     transcript_cache: &mut TranscriptRenderCache,
 ) -> Result<(), String>
@@ -1675,6 +1933,9 @@ where
     B: Backend,
 {
     terminal.autoresize().map_err(|error| error.to_string())?;
+    if uses_full_inline_viewport(state) && !state.transcript_view_expanded() {
+        return Ok(());
+    }
     transcript_cache.prepare(state, terminal.get_frame().area());
     Ok(())
 }
@@ -1794,24 +2055,23 @@ where
         )
         .map_err(|error| error.to_string())?;
     } else {
-        terminal
+        let flush_result = terminal
             .backend_mut()
             .flush()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string());
         execute!(io::stdout(), LeaveAlternateScreen).map_err(|error| error.to_string())?;
         alt.active = false;
         let size = terminal.size().map_err(|error| error.to_string())?;
-        let saved = alt.saved.take().unwrap_or_else(|| {
-            let height = 8.min(size.height).max(1);
-            Rect::new(0, size.height.saturating_sub(height), size.width, height)
-        });
+        let saved = alt.saved.take().unwrap_or_default();
+        let viewport_height = saved.height.min(size.height);
         replace_inline_terminal(
             terminal,
             Rect::new(0, 0, size.width, size.height),
-            saved.y.min(size.height.saturating_sub(1)),
-            saved.height.max(1).min(size.height),
+            saved.y.min(size.height.saturating_sub(viewport_height)),
+            viewport_height,
         )
         .map_err(|error| error.to_string())?;
+        flush_result?;
     }
     Ok(())
 }
@@ -1823,31 +2083,29 @@ fn set_inline_viewport_height<B>(
 where
     B: Backend + Clone,
 {
-    let mut current_area = terminal.get_frame().area();
-    if current_area.height == viewport_height {
-        return Ok(());
-    }
-
+    let current = terminal.get_frame().area();
     let size = terminal.size()?;
     let viewport_height = viewport_height.min(size.height);
-    let growth = viewport_height.saturating_sub(current_area.height);
-    if growth > 0 {
-        terminal.insert_before(growth, |_| {})?;
-        current_area = terminal.get_frame().area();
+    if current.height == viewport_height
+        && current.width == size.width
+        && current.bottom() <= size.height
+    {
+        // Inline dimensions can be unchanged while the physical terminal grew.
+        // Synchronize Ratatui's screen height before insert_before uses it.
+        return terminal.autoresize();
     }
-    let viewport_top = size.height.saturating_sub(viewport_height);
-    let clear_top = current_area.top().min(viewport_top);
-    terminal
-        .backend_mut()
-        .set_cursor_position(Position::new(0, clear_top))?;
-    terminal
-        .backend_mut()
-        .clear_region(ClearType::AfterCursor)?;
-    terminal.backend_mut().flush()?;
+    if current.height == viewport_height {
+        return resize_inline_terminal(terminal, size.width, size.height);
+    }
+    // Shrinking keeps the same transcript boundary. Growing reserves rows below it;
+    // only overflow scrolls existing history, never a blank insert_before batch.
+    let top = current
+        .y
+        .min(size.height.saturating_sub(current.height.min(size.height)));
     replace_inline_terminal(
         terminal,
         Rect::new(0, 0, size.width, size.height),
-        viewport_top,
+        top,
         viewport_height,
     )
 }
@@ -1866,10 +2124,12 @@ where
         0,
         viewport_top.min(terminal_area.height.saturating_sub(1)),
     ))?;
+    // Clear live UI before reserving rows, so growth cannot push a composer into history.
+    backend.clear_region(ClearType::AfterCursor)?;
     let replacement = Terminal::with_options(
         backend,
         TerminalOptions {
-            viewport: Viewport::Inline(viewport_height),
+            viewport: Viewport::Inline(viewport_height.min(terminal_area.height)),
         },
     )?;
     *terminal = replacement;
@@ -1884,12 +2144,6 @@ where
     terminal.clear()?;
     terminal.set_cursor_position(viewport_top)?;
     terminal.backend_mut().flush()
-}
-
-fn purge_terminal_history() -> io::Result<()> {
-    let mut stdout = io::stdout().lock();
-    stdout.write_all(b"\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H")?;
-    stdout.flush()
 }
 
 pub async fn run(args: Args) -> Result<Option<ExitSummary>, String> {
@@ -1950,7 +2204,6 @@ where
         Some(runtime_events),
         None,
         false,
-        ResizeMode::PRESERVE,
     )
     .await?;
     Ok(app)
@@ -2079,6 +2332,34 @@ fn drain_ready_events(
     (immediate_redraw, exit)
 }
 
+fn handle_input_with_current_geometry(
+    app: &mut App,
+    cache: &mut TranscriptRenderCache,
+    area: Rect,
+    event: Event,
+) -> Result<bool, String> {
+    if app.state.transcript_view_expanded()
+        && matches!(
+            &event,
+            Event::Key(KeyEvent {
+                code: KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::Char('{')
+                    | KeyCode::Char('}'),
+                ..
+            })
+        )
+    {
+        // User navigation must refer to the same revision as the next draw.
+        cache.prepare(&mut app.state, area);
+    }
+    app.handle_event(event)
+}
+
 async fn run_loop<B>(
     app: &mut App,
     terminal: &mut Terminal<B>,
@@ -2086,7 +2367,6 @@ async fn run_loop<B>(
     runtime_events: Option<mpsc::Receiver<RuntimeEvent>>,
     tool_events: Option<mpsc::Receiver<RuntimeEvent>>,
     commit_to_scrollback: bool,
-    resize_mode: ResizeMode,
 ) -> Result<(), String>
 where
     B: Backend + Clone,
@@ -2108,8 +2388,10 @@ where
         false
     };
     let mut input_open = true;
+    let mut pending_input = None;
     let mut transcript_cache = TranscriptRenderCache::default();
     let mut alt_overlay = AltOverlay::default();
+    let result = async {
     if commit_to_scrollback {
         sync_alt_overlay(
             uses_full_inline_viewport(&app.state),
@@ -2118,7 +2400,7 @@ where
         )?;
         prepare_inline_frame(&mut app.state, terminal, &mut transcript_cache)?;
     } else {
-        prepare_fullscreen_frame(&app.state, terminal, &mut transcript_cache)?;
+        prepare_fullscreen_frame(&mut app.state, terminal, &mut transcript_cache)?;
     }
     terminal
         .draw(|frame| render_with_transcript(frame, &app.state, transcript_cache.lines()))
@@ -2132,8 +2414,6 @@ where
         let mut animation_tick = false;
         let mut force_redraw = false;
         let mut state_changed = false;
-        let mut transcript_changed = false;
-        let transcript_len_before = app.state.transcript.len();
         let terminal_area = terminal.get_frame().area();
         let animate_activity = !visible_activity_rect(terminal_area, &app.state).is_empty();
         let activity_deadline =
@@ -2157,27 +2437,34 @@ where
         tokio::pin!(stream_redraw);
         tokio::select! {
             biased;
-            event = input.recv(), if input_open => {
+            event = async { if pending_input.is_some() { pending_input.take() } else { input.recv().await } }, if input_open => {
                 match event {
-                    Some(Event::Resize(width, height)) if commit_to_scrollback => {
-                        if resize_mode.purge_history {
-                            purge_terminal_history().map_err(|error| error.to_string())?;
+                    Some(Event::Resize(mut width, mut height)) => {
+                        for _ in 0..READY_EVENT_BATCH_LIMIT {
+                            match input.try_recv() {
+                                Ok(Event::Resize(next_width, next_height)) => { width = next_width; height = next_height; }
+                                Ok(event) => { pending_input = Some(event); break; }
+                                Err(_) => break,
+                            }
                         }
-                        if resize_mode.replay {
-                            app.state.reset_transcript_commit();
+                        if commit_to_scrollback {
+                            if alt_overlay.active {
+                                replace_inline_terminal(terminal, Rect::new(0, 0, width, height), 0, height)
+                                    .map_err(|error| error.to_string())?;
+                            } else {
+                                resize_inline_terminal(terminal, width, height)
+                                    .map_err(|error| error.to_string())?;
+                            }
                         }
-                        resize_inline_terminal(terminal, width, height, resize_mode.replay)
-                            .map_err(|error| error.to_string())?;
                         state_changed = true;
-                        transcript_changed = true;
                         force_redraw = true;
                     }
-                    Some(event) => {
-                        exit = app.handle_event(event)?;
+                    Some(event) if app.accepts_event(&event) => {
+                        exit = handle_input_with_current_geometry(app, &mut transcript_cache, terminal_area, event)?;
                         state_changed = true;
-                        transcript_changed = app.state.transcript.len() != transcript_len_before;
                         force_redraw = true;
                     }
+                    Some(_) => {}
                     None => input_open = false,
                 }
             }
@@ -2185,7 +2472,6 @@ where
                 match event {
                     Some(event) => {
                         state_changed = true;
-                        transcript_changed = true;
                         let mut outcome = apply_runtime_channel_event(
                             &mut app.state,
                             event,
@@ -2213,7 +2499,6 @@ where
                 match event {
                     Some(event) => {
                         state_changed = true;
-                        transcript_changed = true;
                         let mut outcome = apply_tool_channel_event(&mut app.state, event);
                         if !outcome.0 {
                             let batch = drain_ready_events(
@@ -2241,9 +2526,6 @@ where
         if !app.state.sent_commands().is_empty() {
             app.flush_commands().await?;
         }
-        if transcript_changed {
-            transcript_cache.invalidate();
-        }
         redraw_pending |= state_changed;
         let now = tokio::time::Instant::now();
         let channels_closed = !input_open && !runtime_open && !tool_open;
@@ -2256,9 +2538,11 @@ where
                 )?;
                 prepare_inline_frame(&mut app.state, terminal, &mut transcript_cache)?;
             } else if !commit_to_scrollback {
-                prepare_fullscreen_frame(&app.state, terminal, &mut transcript_cache)?;
+                prepare_fullscreen_frame(&mut app.state, terminal, &mut transcript_cache)?;
             } else {
-                transcript_cache.prepare(&app.state, terminal.get_frame().area());
+                let height = terminal.get_frame().area().height;
+                set_inline_viewport_height(terminal, height).map_err(|error| error.to_string())?;
+                transcript_cache.prepare(&mut app.state, terminal.get_frame().area());
             }
             terminal
                 .draw(|frame| render_with_transcript(frame, &app.state, transcript_cache.lines()))
@@ -2271,10 +2555,14 @@ where
             break;
         }
     }
-    if commit_to_scrollback {
-        sync_alt_overlay(false, &mut alt_overlay, terminal)?;
-    }
     Ok(())
+    }.await;
+    let restore = if commit_to_scrollback {
+        sync_alt_overlay(false, &mut alt_overlay, terminal)
+    } else {
+        Ok(())
+    };
+    result.and(restore)
 }
 
 fn commit_stable_transcript<B>(
@@ -2282,47 +2570,44 @@ fn commit_stable_transcript<B>(
     terminal: &mut Terminal<B>,
 ) -> Result<(), String>
 where
-    B: Backend,
+    B: Backend + Clone,
 {
-    terminal.autoresize().map_err(|error| error.to_string())?;
+    let height = terminal.get_frame().area().height;
+    set_inline_viewport_height(terminal, height).map_err(|error| error.to_string())?;
     let committed_end = state.stable_transcript_end();
     if state.stable_transcript().is_empty() {
         return Ok(());
     }
 
-    let terminal_width = terminal.get_frame().area().width as usize;
-    if terminal_width <= TRANSCRIPT_HORIZONTAL_PADDING * 2 {
+    let terminal_area = terminal.get_frame().area();
+    let terminal_width = terminal_area.width as usize;
+    if terminal_area.is_empty() || terminal_width <= TRANSCRIPT_HORIZONTAL_PADDING * 2 {
         return Ok(());
     }
     let content_width = terminal_width
         .saturating_sub(TRANSCRIPT_HORIZONTAL_PADDING * 2)
         .max(1);
-    let mut lines = transcript_lines(
+    let lines = transcript_lines(
         state.stable_transcript(),
         content_width,
         TranscriptDetail::Compact,
     );
-    if state.transcript.len() > state.live_transcript().len()
-        && matches!(
-            state.stable_transcript().first(),
-            Some(crate::tui::TranscriptEntry::UserTurn { .. })
-        )
-    {
-        lines.insert(0, ratatui::text::Line::from(""));
-    }
 
     for chunk in lines.chunks(MAX_TRANSCRIPT_INSERT_HEIGHT) {
         terminal
             .insert_before(chunk.len() as u16, |buffer| {
                 buffer.set_style(*buffer.area(), Style::default().bg(SURFACE));
-                Paragraph::new(chunk.to_vec())
-                    .block(Block::default().padding(Padding::new(
-                        TRANSCRIPT_HORIZONTAL_PADDING as u16,
-                        TRANSCRIPT_HORIZONTAL_PADDING as u16,
-                        0,
-                        0,
-                    )))
-                    .render(*buffer.area(), buffer);
+                for (row, line) in chunk.iter().enumerate() {
+                    line.render(
+                        Rect::new(
+                            TRANSCRIPT_HORIZONTAL_PADDING as u16,
+                            row as u16,
+                            content_width as u16,
+                            1,
+                        ),
+                        buffer,
+                    );
+                }
             })
             .map_err(|error| error.to_string())?;
     }
@@ -2836,26 +3121,31 @@ Session ID: ses_cafebabe"
     }
 
     #[test]
-    fn expanded_transcript_view_uses_arrow_and_page_scrolling() {
+    fn expanded_transcript_scrolling_clamps_and_closing_returns_to_live_tail() {
         let mut app = test_app();
+        app.state.push_assistant("line\n\n".repeat(100));
+        app.state.viewport_height.set(10);
         app.state.toggle_transcript_view();
-
         app.handle_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)))
-            .expect("scroll transcript up");
+            .unwrap();
         app.handle_event(Event::Key(KeyEvent::new(
             KeyCode::PageUp,
             KeyModifiers::NONE,
         )))
-        .expect("page transcript up");
-        assert_eq!(app.state.scroll, 6);
-
-        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
-            .expect("scroll transcript down");
+        .unwrap();
+        assert_eq!(app.state.scroll, 10);
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)))
+            .unwrap();
+        let first = app.state.scroll;
         app.handle_event(Event::Key(KeyEvent::new(
-            KeyCode::PageDown,
+            KeyCode::PageUp,
             KeyModifiers::NONE,
         )))
-        .expect("page transcript down");
+        .unwrap();
+        assert_eq!(app.state.scroll, first);
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        assert!(!app.state.transcript_view_expanded());
         assert_eq!(app.state.scroll, 0);
     }
 
@@ -3106,7 +3396,6 @@ Session ID: ses_cafebabe"
             Some(runtime_events),
             None,
             false,
-            ResizeMode::PRESERVE,
         )
         .await
         .expect("run loop");
@@ -3169,7 +3458,6 @@ Session ID: ses_cafebabe"
             Some(runtime_events),
             Some(tool_events),
             false,
-            ResizeMode::PRESERVE,
         )
         .await
         .expect("run loop");
@@ -3324,29 +3612,25 @@ Session ID: ses_cafebabe"
     }
 
     #[test]
-    fn inline_terminal_initialization_clears_output_and_anchors_at_the_bottom() {
-        let mut lines = vec![" ".repeat(80); 40];
-        lines[0] = "stale shell prompt".into();
-        lines[4] = "stale viewport content".into();
-        lines[30] = "stale lower content".into();
-        let mut backend = TestBackend::with_lines(lines);
-        backend
-            .set_cursor_position(Position::new(0, 4))
-            .expect("position inline viewport");
-
-        let mut terminal = initialize_inline_terminal(backend).expect("initialize terminal");
-        let visible = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert_eq!(terminal.get_frame().area(), Rect::new(0, 28, 80, 12));
-        assert!(!visible.contains("stale shell prompt"));
-        assert!(!visible.contains("stale viewport content"));
-        assert!(!visible.contains("stale lower content"));
+    fn inline_terminal_starts_at_the_cursor_and_preserves_shell_history() {
+        let mut rows = vec![" ".repeat(80); 24];
+        rows[0] = "shell sentinel alpha".into();
+        rows[3] = "shell sentinel omega".into();
+        let mut backend = TestBackend::with_lines(rows);
+        backend.set_cursor_position(Position::new(0, 4)).unwrap();
+        let mut terminal = initialize_inline_terminal(backend).unwrap();
+        assert_eq!(terminal.get_frame().area().top(), 4);
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        state.prepend_startup("0.1.0", "project sentinel");
+        let mut cache = TranscriptRenderCache::default();
+        prepare_inline_frame(&mut state, &mut terminal, &mut cache).unwrap();
+        terminal
+            .draw(|frame| render_with_transcript(frame, &state, cache.lines()))
+            .unwrap();
+        let history = history_text(terminal.backend());
+        assert_eq!(history.matches("shell sentinel alpha").count(), 1);
+        assert_eq!(history.matches("shell sentinel omega").count(), 1);
+        assert_eq!(history.matches("project sentinel").count(), 1);
     }
 
     #[test]
@@ -3394,51 +3678,23 @@ Session ID: ses_cafebabe"
     }
 
     #[test]
-    fn committed_history_leaves_completion_and_composer_at_the_bottom() {
+    fn committed_answer_precedes_the_live_composer_without_padding_to_screen_bottom() {
         let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        state.submit_turn("hi", false);
-        state.push_assistant("hello from kurama");
-        state.apply_runtime_event(RuntimeEvent::TurnCompleted);
-        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24))
-            .expect("initialize inline terminal");
-
-        let mut transcript_cache = TranscriptRenderCache::default();
-        prepare_inline_frame(&mut state, &mut terminal, &mut transcript_cache)
-            .expect("prepare inline frame");
+        state.push_assistant("answer sentinel");
+        state.composer = "composer sentinel".into();
+        state.cursor = state.composer.len();
+        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24)).unwrap();
+        let mut cache = TranscriptRenderCache::default();
+        prepare_inline_frame(&mut state, &mut terminal, &mut cache).unwrap();
         terminal
-            .draw(|frame| render_with_transcript(frame, &state, transcript_cache.lines()))
-            .expect("draw idle frame");
-
-        assert_eq!(terminal.get_frame().area().bottom(), 24);
-        let rows = terminal
-            .backend()
-            .buffer()
-            .content()
-            .chunks(80)
-            .map(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>())
-            .collect::<Vec<_>>();
-        let answer_row = rows
-            .iter()
-            .position(|row| row.contains("hello from kurama"))
-            .expect("committed answer row");
-        let composer_row = rows
-            .iter()
-            .position(|row| row.contains("Ask Kurama"))
-            .expect("composer row");
-        let worked_row = rows
-            .iter()
-            .position(|row| row.contains("Worked for"))
-            .expect("duration divider row");
-
-        assert!(
-            worked_row > answer_row,
-            "answer={answer_row} worked={worked_row} composer={composer_row} {rows:#?}"
-        );
-        assert!(
-            composer_row > worked_row,
-            "answer={answer_row} worked={worked_row} composer={composer_row} {rows:#?}"
-        );
-        assert!(composer_row < 23, "{rows:#?}");
+            .draw(|frame| render_with_transcript(frame, &state, cache.lines()))
+            .unwrap();
+        let history = history_text(terminal.backend());
+        let answer = history.find("answer sentinel").unwrap();
+        let composer = history.find("composer sentinel").unwrap();
+        assert!(answer < composer);
+        assert!(terminal.get_frame().area().bottom() < 24);
+        assert!(state.live_transcript().is_empty());
     }
 
     #[test]
@@ -3470,13 +3726,8 @@ Session ID: ses_cafebabe"
             .chain(terminal.backend().buffer().content().iter())
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert_eq!(text.matches("◢ kurama").count(), 1, "{text}");
         assert_eq!(text.matches("~/project").count(), 1, "{text}");
-        assert_eq!(
-            text.matches("› inspect the repository").count(),
-            1,
-            "{text}"
-        );
+        assert_eq!(text.matches("inspect the repository").count(), 1, "{text}");
     }
 
     #[test]
@@ -3516,10 +3767,13 @@ Session ID: ses_cafebabe"
             .chain(terminal.backend().buffer().content().iter())
             .map(|cell| cell.symbol())
             .collect::<String>();
-        let rows = text
-            .as_bytes()
+        let rows = terminal
+            .backend()
+            .scrollback()
+            .content()
             .chunks(80)
-            .map(|row| std::str::from_utf8(row).unwrap_or("").trim().is_empty())
+            .chain(terminal.backend().buffer().content().chunks(80))
+            .map(|row| row.iter().all(|cell| cell.symbol().trim().is_empty()))
             .collect::<Vec<_>>();
         let start = rows.iter().position(|blank| !blank).unwrap_or(0);
         let end = rows.iter().rposition(|blank| !blank).unwrap_or(rows.len());
@@ -3527,106 +3781,67 @@ Session ID: ses_cafebabe"
             .windows(5)
             .any(|window| window.iter().all(|blank| *blank));
         assert!(!blank_run, "{text}");
-        assert!(text.contains("Ran bash"), "{text}");
-        assert!(text.contains("Ran read"), "{text}");
     }
 
     #[test]
-    fn inline_resize_does_not_commit_live_viewport_to_scrollback() {
-        let state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24))
-            .expect("initialize inline terminal");
-        terminal
-            .draw(|frame| render(frame, &state))
-            .expect("draw initial viewport");
-
-        terminal.backend_mut().resize(52, 12);
-        resize_inline_terminal(&mut terminal, 52, 12, false).expect("shrink inline terminal");
-        assert_eq!(terminal.get_frame().area(), Rect::new(0, 0, 52, 12));
-        terminal
-            .draw(|frame| render(frame, &state))
-            .expect("draw narrow viewport");
-
-        terminal.backend_mut().resize(100, 30);
-        resize_inline_terminal(&mut terminal, 100, 30, false).expect("grow inline terminal");
-        assert_eq!(terminal.get_frame().area(), Rect::new(0, 18, 100, 12));
-        terminal
-            .draw(|frame| render(frame, &state))
-            .expect("draw wide viewport");
-
-        let text = terminal
-            .backend()
-            .scrollback()
-            .content()
-            .iter()
-            .chain(terminal.backend().buffer().content().iter())
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert_eq!(text.matches("Ask Kurama").count(), 1, "{text}");
-        assert!(
-            text.contains("work/model")
-                || text.contains("enter send")
-                || text.contains("shortcuts"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn expanding_inline_viewport_clears_rows_above_the_old_viewport() {
-        let mut backend = TestBackend::with_lines(["stale terminal content"; 16]);
-        backend
-            .set_cursor_position(Position::new(0, 8))
-            .expect("position inline viewport");
-        let mut terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(8),
-            },
-        )
-        .expect("inline terminal");
+    fn inline_resize_preserves_committed_rows_and_does_not_commit_the_composer() {
+        let mut rows = vec![" ".repeat(80); 24];
+        rows[0] = "shell sentinel".into();
+        let mut backend = TestBackend::with_lines(rows);
+        backend.set_cursor_position(Position::new(0, 1)).unwrap();
+        let mut terminal = initialize_inline_terminal(backend).unwrap();
         let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        state.toggle_transcript_view();
-
-        set_inline_viewport_height(&mut terminal, 16).expect("expand inline viewport");
+        state.push_assistant("committed sentinel");
+        state.composer = "live composer sentinel".into();
+        state.cursor = state.composer.len();
+        let mut cache = TranscriptRenderCache::default();
+        prepare_inline_frame(&mut state, &mut terminal, &mut cache).unwrap();
         terminal
-            .draw(|frame| render(frame, &state))
-            .expect("draw expanded transcript");
-
-        let visible = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(!visible.contains("stale terminal content"), "{visible}");
+            .draw(|frame| render_with_transcript(frame, &state, cache.lines()))
+            .unwrap();
+        for (width, height) in [(52, 12), (100, 30), (30, 10), (80, 24)] {
+            resize_test_screen(terminal.backend_mut(), width, height);
+            resize_inline_terminal(&mut terminal, width, height).unwrap();
+            prepare_inline_frame(&mut state, &mut terminal, &mut cache).unwrap();
+            terminal
+                .draw(|frame| render_with_transcript(frame, &state, cache.lines()))
+                .unwrap();
+            let history = history_text(terminal.backend());
+            assert_eq!(history.matches("shell sentinel").count(), 1, "{history}");
+            assert_eq!(
+                history.matches("committed sentinel").count(),
+                1,
+                "{history}"
+            );
+            assert_eq!(
+                history.matches("live composer sentinel").count(),
+                1,
+                "{history}"
+            );
+            assert!(state.live_transcript().is_empty());
+        }
     }
 
     #[test]
-    fn clearing_inline_terminal_removes_the_live_ui_before_exit_output() {
-        let state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24))
-            .expect("initialize inline terminal");
+    fn clearing_inline_terminal_removes_only_the_live_ui_before_exit_output() {
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        state.push_assistant("committed sentinel");
+        state.composer = "live composer sentinel".into();
+        state.cursor = state.composer.len();
+        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24)).unwrap();
+        let mut cache = TranscriptRenderCache::default();
+        prepare_inline_frame(&mut state, &mut terminal, &mut cache).unwrap();
         terminal
-            .draw(|frame| render(frame, &state))
-            .expect("draw live viewport");
+            .draw(|frame| render_with_transcript(frame, &state, cache.lines()))
+            .unwrap();
+        assert!(history_text(terminal.backend()).contains("live composer sentinel"));
         let viewport_top = terminal.get_frame().area().as_position();
-
-        clear_inline_terminal(&mut terminal).expect("clear live viewport");
-
-        let text = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(!text.contains("Ask Kurama"), "{text}");
+        clear_inline_terminal(&mut terminal).unwrap();
+        let history = history_text(terminal.backend());
+        assert!(!history.contains("live composer sentinel"));
+        assert_eq!(history.matches("committed sentinel").count(), 1);
         assert_eq!(
-            terminal
-                .backend_mut()
-                .get_cursor_position()
-                .expect("exit cursor"),
+            terminal.backend_mut().get_cursor_position().unwrap(),
             viewport_top
         );
     }
@@ -3669,7 +3884,6 @@ Session ID: ses_cafebabe"
             Some(runtime_events),
             None,
             true,
-            ResizeMode::PRESERVE,
         )
         .await
         .expect("run inline terminal");
@@ -3699,44 +3913,6 @@ Session ID: ses_cafebabe"
             bg == Color::Reset || bg == Color::Rgb(36, 40, 48)
         }));
         assert!(app.state.live_transcript().is_empty());
-    }
-
-    #[tokio::test]
-    async fn inline_resize_replays_committed_history_without_duplicates() {
-        let mut app = test_app();
-        app.state.push_user("committed question");
-        app.state.push_assistant("committed answer");
-        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24))
-            .expect("initialize inline terminal");
-        let (input_sender, mut input) = mpsc::channel(2);
-        input_sender
-            .send(Event::Resize(60, 18))
-            .await
-            .expect("queue resize");
-        drop(input_sender);
-
-        run_loop(
-            &mut app,
-            &mut terminal,
-            &mut input,
-            None,
-            None,
-            true,
-            ResizeMode::REPLAY,
-        )
-        .await
-        .expect("run resized inline terminal");
-
-        let text = terminal
-            .backend()
-            .scrollback()
-            .content()
-            .iter()
-            .chain(terminal.backend().buffer().content().iter())
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert_eq!(text.matches("committed question").count(), 1, "{text}");
-        assert_eq!(text.matches("committed answer").count(), 1, "{text}");
     }
 
     #[test]
@@ -3774,17 +3950,9 @@ Session ID: ses_cafebabe"
         });
 
         crate::tui::reset_transcript_render_calls();
-        run_loop(
-            &mut app,
-            &mut terminal,
-            &mut input,
-            None,
-            None,
-            true,
-            ResizeMode::PRESERVE,
-        )
-        .await
-        .expect("run animated inline frame");
+        run_loop(&mut app, &mut terminal, &mut input, None, None, true)
+            .await
+            .expect("run animated inline frame");
         closer.await.expect("close input channel");
 
         assert_eq!(crate::tui::transcript_render_calls(), 1);
@@ -3809,17 +3977,9 @@ Session ID: ses_cafebabe"
         drop(input_sender);
 
         crate::tui::reset_transcript_render_calls();
-        run_loop(
-            &mut app,
-            &mut terminal,
-            &mut input,
-            None,
-            None,
-            true,
-            ResizeMode::PRESERVE,
-        )
-        .await
-        .expect("run composer redraw");
+        run_loop(&mut app, &mut terminal, &mut input, None, None, true)
+            .await
+            .expect("run composer redraw");
 
         assert_eq!(app.state.composer, "x");
         assert_eq!(crate::tui::transcript_render_calls(), 1);
@@ -3938,5 +4098,411 @@ Session ID: ses_cafebabe"
         commit_stable_transcript(&mut state, &mut terminal).expect("defer transcript");
 
         assert_eq!(state.live_transcript().len(), 1);
+    }
+    fn history_text(backend: &TestBackend) -> String {
+        backend
+            .scrollback()
+            .content()
+            .iter()
+            .chain(backend.buffer().content())
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn ignored_input_does_not_redraw_or_execute_global_shortcuts() {
+        let mut app = test_app();
+        let draws = Rc::new(Cell::new(1));
+        let backend = DrawBudgetBackend::new(TestBackend::new(80, 24), draws.clone());
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (sender, mut input) = mpsc::channel(8);
+        for event in [
+            Event::FocusGained,
+            Event::FocusLost,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Event::Key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Release,
+            )),
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('o'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Release,
+            )),
+        ] {
+            sender.send(event).await.unwrap();
+        }
+        drop(sender);
+        run_loop(&mut app, &mut terminal, &mut input, None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(draws.get(), 0);
+        assert!(!app.exit_requested);
+        assert!(!app.state.transcript_view_expanded());
+    }
+
+    #[test]
+    fn expanded_cache_uses_actual_width_and_true_prompt_anchors() {
+        let mut app = test_app();
+        for prompt in ["first prompt", "second prompt", "third prompt"] {
+            app.state.push_user(prompt);
+            app.state
+                .push_tool("bash", "› not a user prompt\n".repeat(30));
+        }
+        app.state.toggle_transcript_view();
+        app.state.composer_inner_width.set(90);
+        let mut terminal = Terminal::new(TestBackend::new(32, 8)).unwrap();
+        let mut cache = TranscriptRenderCache::default();
+        prepare_fullscreen_frame(&mut app.state, &mut terminal, &mut cache).unwrap();
+        terminal
+            .draw(|frame| render_with_transcript(frame, &app.state, cache.lines()))
+            .unwrap();
+        crate::tui::reset_transcript_render_calls();
+        for (key, prompt) in [
+            (KeyCode::Home, "first prompt"),
+            (KeyCode::Char('}'), "second prompt"),
+            (KeyCode::Char('}'), "third prompt"),
+            (KeyCode::Char('{'), "second prompt"),
+        ] {
+            app.handle_event(Event::Key(KeyEvent::new(key, KeyModifiers::NONE)))
+                .unwrap();
+            prepare_fullscreen_frame(&mut app.state, &mut terminal, &mut cache).unwrap();
+            terminal
+                .draw(|frame| render_with_transcript(frame, &app.state, cache.lines()))
+                .unwrap();
+            let first_row: String = terminal.backend().buffer().content()[..32]
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(first_row.contains(prompt), "{first_row}");
+        }
+        app.state.apply_runtime_event(RuntimeEvent::Usage {
+            usage: Usage {
+                input_tokens: 100,
+                ..Usage::default()
+            },
+        });
+        prepare_fullscreen_frame(&mut app.state, &mut terminal, &mut cache).unwrap();
+        assert_eq!(crate::tui::transcript_render_calls(), 0);
+    }
+
+    #[test]
+    fn expanded_read_position_survives_new_output_and_height_changes() {
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+            text: (0..80).map(|i| format!("row {i}\n\n")).collect(),
+        });
+        state.toggle_transcript_view();
+        let mut cache = TranscriptRenderCache::default();
+        cache.prepare(&mut state, Rect::new(0, 0, 40, 10));
+        state.scroll = 40;
+        let before = cache.lines[cache.lines.len() - 9 - state.scroll].clone();
+        state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+            text: "new output\n\n".into(),
+        });
+        cache.prepare(&mut state, Rect::new(0, 0, 40, 7));
+        assert_eq!(cache.lines[cache.lines.len() - 6 - state.scroll], before);
+        state.scroll = usize::MAX;
+        cache.prepare(&mut state, Rect::new(0, 0, 40, 7));
+        assert_eq!(state.scroll, cache.lines.len() - 6);
+    }
+
+    #[test]
+    fn composer_deletes_whole_graphemes_and_normalizes_invalid_byte_cursors() {
+        let mut app = test_app();
+        app.state.composer = "e\u{301}👨‍👩‍👧‍👦界".into();
+        app.state.cursor = app.state.composer.len();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        assert_eq!(app.state.composer, "e\u{301}👨‍👩‍👧‍👦");
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)))
+            .unwrap();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Delete,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        assert_eq!(app.state.composer, "e\u{301}");
+        app.state.cursor = 2;
+        app.handle_event(Event::Paste("x".into())).unwrap();
+        assert_eq!(app.state.composer, "xe\u{301}");
+        assert!(app.state.composer.is_char_boundary(app.state.cursor));
+    }
+    #[test]
+    fn inline_initialization_keeps_a_partially_occupied_shell_row() {
+        let mut rows = vec![" ".repeat(40); 8];
+        rows[3] = "shell command sentinel".into();
+        let mut backend = TestBackend::with_lines(rows);
+        backend.set_cursor_position(Position::new(22, 3)).unwrap();
+        let mut terminal = initialize_inline_terminal(backend).unwrap();
+        assert_eq!(terminal.get_frame().area().top(), 4);
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        let mut cache = TranscriptRenderCache::default();
+        prepare_inline_frame(&mut state, &mut terminal, &mut cache).unwrap();
+        terminal
+            .draw(|frame| render_with_transcript(frame, &state, cache.lines()))
+            .unwrap();
+        assert_eq!(
+            history_text(terminal.backend())
+                .matches("shell command sentinel")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn context_remaining_tracks_the_latest_model_window() {
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        state.max_input_tokens = 1000;
+        for (tokens, remaining) in [(0, 100), (900, 10), (200, 80), (1500, 0)] {
+            state.apply_runtime_event(RuntimeEvent::Usage {
+                usage: Usage {
+                    input_tokens: tokens,
+                    ..Usage::default()
+                },
+            });
+            assert_eq!(
+                state.context_label().unwrap(),
+                format!("{remaining}% context left")
+            );
+        }
+    }
+
+    // TestBackend::resize only changes the flat buffer stride, unlike a terminal.
+    // Preserve x/y cells in this fixture so widening cannot relocate old text.
+    fn resize_test_screen(backend: &mut TestBackend, width: u16, height: u16) {
+        let before = backend.buffer().clone();
+        let cursor = backend.cursor_position();
+        backend.resize(width, height);
+        backend.clear().unwrap();
+        backend
+            .draw(
+                before
+                    .content()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, cell)| {
+                        let x = (index % before.area.width as usize) as u16;
+                        let y = (index / before.area.width as usize) as u16;
+                        (x < width && y < height).then_some((x, y, cell))
+                    }),
+            )
+            .unwrap();
+        backend
+            .set_cursor_position(Position::new(
+                cursor.x.min(width.saturating_sub(1)),
+                cursor.y.min(height.saturating_sub(1)),
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn expanded_width_reflow_keeps_the_same_entry_at_the_reading_position() {
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        state.push_assistant("earlier wrapping text ".repeat(80));
+        state.push_user("ANCHOR");
+        state.push_assistant(
+            (0..30)
+                .map(|i| format!("short {i}\n\n"))
+                .collect::<String>(),
+        );
+        state.toggle_transcript_view();
+        let mut cache = TranscriptRenderCache::default();
+        cache.prepare(&mut state, Rect::new(0, 0, 80, 10));
+        let anchor = cache
+            .lines
+            .iter()
+            .position(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.contains("ANCHOR"))
+            })
+            .unwrap();
+        state.scroll = cache.lines.len() - 9 - anchor;
+        for width in [32, 100, 18] {
+            cache.prepare(&mut state, Rect::new(0, 0, width, 10));
+            let first = &cache.lines[cache.lines.len() - 9 - state.scroll];
+            assert!(
+                first
+                    .spans
+                    .iter()
+                    .any(|span| span.content.contains("ANCHOR")),
+                "lost reading position at width {width}: {first:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_before_resize_input_preserves_committed_output() {
+        let mut rows = vec![" ".repeat(80); 10];
+        rows[0] = "shell sentinel".into();
+        let mut backend = TestBackend::with_lines(rows);
+        backend.set_cursor_position(Position::new(0, 6)).unwrap();
+        let mut terminal = initialize_inline_terminal(backend).unwrap();
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        let mut cache = TranscriptRenderCache::default();
+        state.push_assistant("first committed sentinel");
+        prepare_inline_frame(&mut state, &mut terminal, &mut cache).unwrap();
+        terminal
+            .draw(|frame| render_with_transcript(frame, &state, cache.lines()))
+            .unwrap();
+        terminal.backend_mut().resize(80, 20);
+        state.push_assistant("second committed sentinel");
+        prepare_inline_frame(&mut state, &mut terminal, &mut cache).unwrap();
+        terminal
+            .draw(|frame| render_with_transcript(frame, &state, cache.lines()))
+            .unwrap();
+        let history = history_text(terminal.backend());
+        for marker in [
+            "shell sentinel",
+            "first committed sentinel",
+            "second committed sentinel",
+        ] {
+            assert_eq!(history.matches(marker).count(), 1, "{history}");
+        }
+    }
+
+    #[test]
+    fn prompt_navigation_uses_unpainted_stream_geometry_once() {
+        let mut app = test_app();
+        for prompt in ["first prompt", "second prompt", "third prompt"] {
+            app.state.push_user(prompt);
+            app.state.push_tool("bash", "tool output row\n".repeat(30));
+        }
+        app.state.toggle_transcript_view();
+        let area = Rect::new(0, 0, 32, 8);
+        let mut cache = TranscriptRenderCache::default();
+        cache.prepare(&mut app.state, area);
+        handle_input_with_current_geometry(
+            &mut app,
+            &mut cache,
+            area,
+            Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+        )
+        .unwrap();
+        app.state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+            text: "unpainted content ".repeat(20),
+        });
+        handle_input_with_current_geometry(
+            &mut app,
+            &mut cache,
+            area,
+            Event::Key(KeyEvent::new(KeyCode::Char('}'), KeyModifiers::NONE)),
+        )
+        .unwrap();
+        cache.prepare(&mut app.state, area);
+        let row = &cache.lines[cache.lines.len() - 7 - app.state.scroll];
+        assert!(
+            row.spans
+                .iter()
+                .any(|span| span.content.contains("second prompt")),
+            "{row:?}"
+        );
+    }
+
+    #[test]
+    fn pasted_joiner_backspace_preserves_neighboring_composer_text() {
+        let mut app = test_app();
+        app.state.composer = "A\u{1f469}\u{1f467}Z".into();
+        app.state.cursor = "A\u{1f469}".len();
+        app.handle_event(Event::Paste("\u{200d}".into())).unwrap();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        assert_eq!(app.state.composer, "AZ");
+    }
+
+    #[test]
+    fn incremental_stream_and_todo_updates_match_fresh_rendering() {
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        for index in 0..20 {
+            state.push_user(format!("earlier prompt {index}"));
+            state.push_assistant(format!("**earlier answer {index}**"));
+        }
+        state.toggle_transcript_view();
+        let mut cache = TranscriptRenderCache::default();
+        let area = Rect::new(0, 0, 48, 10);
+        cache.prepare(&mut state, area);
+        let todo = |items: serde_json::Value| {
+            let mut result =
+                kurama_protocol::tool::ToolResult::success("todo-call".into(), "updated");
+            result.metadata = serde_json::json!({"tool_name":"todo", "items":items});
+            RuntimeEvent::ToolCompleted {
+                operation_id: "todo-operation".into(),
+                result,
+            }
+        };
+        let mut completed =
+            kurama_protocol::tool::ToolResult::success("bash-call".into(), "complete output");
+        completed.metadata = serde_json::json!({"tool_name":"bash"});
+        for event in [
+            RuntimeEvent::AssistantDelta {
+                text: "streaming **answer".into(),
+            },
+            RuntimeEvent::AssistantDelta {
+                text: "**\n\nsecond paragraph".into(),
+            },
+            RuntimeEvent::ToolOutputDelta {
+                call_id: "bash-call".into(),
+                stream: "stdout".into(),
+                chunk: "first output".into(),
+            },
+            todo(serde_json::json!([{"id":"one","content":"in-flight item","status":"pending"}])),
+            RuntimeEvent::ToolOutputDelta {
+                call_id: "bash-call".into(),
+                stream: "stdout".into(),
+                chunk: "\nupdated output".into(),
+            },
+            todo(serde_json::json!([])),
+            RuntimeEvent::ToolCompleted {
+                operation_id: "bash-operation".into(),
+                result: completed,
+            },
+            RuntimeEvent::AssistantDelta {
+                text: "final answer".into(),
+            },
+        ] {
+            state.apply_runtime_event(event);
+            cache.prepare(&mut state, area);
+            assert_eq!(
+                cache.lines,
+                transcript_lines(&state.transcript, 44, TranscriptDetail::Expanded)
+            );
+        }
+    }
+
+    #[test]
+    fn zero_height_terminal_defers_history_until_rows_return() {
+        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 0)).unwrap();
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        state.push_assistant("deferred output");
+        let mut cache = TranscriptRenderCache::default();
+        prepare_inline_frame(&mut state, &mut terminal, &mut cache).unwrap();
+        assert!(!state.stable_transcript().is_empty());
+        terminal.backend_mut().resize(80, 12);
+        prepare_inline_frame(&mut state, &mut terminal, &mut cache).unwrap();
+        terminal
+            .draw(|frame| render_with_transcript(frame, &state, cache.lines()))
+            .unwrap();
+        assert_eq!(
+            history_text(terminal.backend())
+                .matches("deferred output")
+                .count(),
+            1
+        );
+        assert!(state.stable_transcript().is_empty());
     }
 }

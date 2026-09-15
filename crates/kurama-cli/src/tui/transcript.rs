@@ -1,3 +1,5 @@
+use std::{borrow::Cow, collections::VecDeque};
+
 use kurama_protocol::policy::ExecutionMode;
 use kurama_protocol::session::TodoStatus;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -5,8 +7,8 @@ use ratatui::{
     Frame,
     layout::Rect,
     style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
-    widgets::{Block, Padding, Paragraph},
+    text::{Line, Span},
+    widgets::Paragraph,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -16,8 +18,80 @@ use std::cell::Cell;
 use super::{
     ToolLifecycle, TranscriptEntry, TuiState,
     syntax::highlight_code,
-    theme::{ACCENT, BLUE, BORDER, DIM, GREEN, RED, TEXT, USER_BAND},
+    theme::{ACCENT, BLUE, BORDER, DIM, GREEN, RED, TEXT},
 };
+
+/// Removes terminal instructions from display text without changing stored content.
+pub(crate) fn sanitize_terminal_text(value: &str) -> Cow<'_, str> {
+    if !value
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
+    {
+        return Cow::Borrowed(value);
+    }
+    let mut clean = String::with_capacity(value.len());
+    for_each_terminal_character(value, |ch| clean.push(ch));
+    Cow::Owned(clean)
+}
+
+fn for_each_terminal_character(value: &str, mut emit: impl FnMut(char)) {
+    #[derive(Clone, Copy)]
+    enum Escape {
+        Text,
+        Start,
+        Intermediate,
+        Csi,
+        String { bell: bool },
+        Terminator { bell: bool },
+    }
+    let mut state = Escape::Text;
+    for ch in value.chars() {
+        state = match state {
+            Escape::Text => match ch {
+                '\x1b' => Escape::Start,
+                '\u{009b}' => Escape::Csi,
+                '\u{009d}' => Escape::String { bell: true },
+                '\u{0090}' | '\u{0098}' | '\u{009e}' | '\u{009f}' => Escape::String { bell: false },
+                _ => {
+                    if !ch.is_control() || matches!(ch, '\n' | '\t') {
+                        emit(ch);
+                    }
+                    Escape::Text
+                }
+            },
+            Escape::Start => match ch {
+                '[' => Escape::Csi,
+                ']' => Escape::String { bell: true },
+                'P' | 'X' | '^' | '_' => Escape::String { bell: false },
+                '\x20'..='\x2f' => Escape::Intermediate,
+                '\x1b' => Escape::Start,
+                _ => Escape::Text,
+            },
+            Escape::Intermediate => match ch {
+                '\x30'..='\x7e' => Escape::Text,
+                '\x1b' => Escape::Start,
+                _ => Escape::Intermediate,
+            },
+            Escape::Csi => match ch {
+                '\x40'..='\x7e' => Escape::Text,
+                '\x1b' => Escape::Start,
+                _ => Escape::Csi,
+            },
+            Escape::String { bell } => match ch {
+                '\u{009c}' => Escape::Text,
+                '\x07' if bell => Escape::Text,
+                '\x1b' => Escape::Terminator { bell },
+                _ => Escape::String { bell },
+            },
+            Escape::Terminator { bell } => match ch {
+                '\\' | '\u{009c}' => Escape::Text,
+                '\x07' if bell => Escape::Text,
+                '\x1b' => Escape::Terminator { bell },
+                _ => Escape::String { bell },
+            },
+        };
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -63,8 +137,33 @@ struct MarkdownContext {
 }
 
 fn markdown_lines(markdown: &str, width: usize) -> Vec<Line<'static>> {
-    let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
-    let events = Parser::new_ext(markdown, options).collect::<Vec<_>>();
+    if width == 0 {
+        return Vec::new();
+    }
+    let markdown = sanitize_terminal_text(markdown);
+    let options =
+        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let events = Parser::new_ext(&markdown, options).collect::<Vec<_>>();
+    // Bound recursive rendering of adversarial nesting; the literal fallback keeps all source.
+    let mut depth = 0_usize;
+    if events.iter().any(|event| {
+        match event {
+            Event::Start(_) => depth += 1,
+            Event::End(_) => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        depth > 128
+    }) {
+        return hard_wrap_styled_fragments(
+            &[StyledFragment {
+                content: markdown.to_string(),
+                style: text_style(),
+            }],
+            width,
+            &[],
+            &[],
+        );
+    }
     let mut index = 0;
     let blocks = parse_markdown_blocks(&events, &mut index, None);
     let mut lines = Vec::new();
@@ -75,9 +174,6 @@ fn markdown_lines(markdown: &str, width: usize) -> Vec<Line<'static>> {
         true,
         &mut lines,
     );
-    while lines.last().is_some_and(|line| line.width() == 0) {
-        lines.pop();
-    }
     lines
 }
 
@@ -312,7 +408,11 @@ fn parse_code_block<'a>(events: &[Event<'a>], index: &mut usize) -> String {
             | Event::FootnoteReference(_) => {}
         }
     }
-    content.trim_end_matches('\n').to_owned()
+    // The final newline terminates the last source row; earlier blank rows are literal code.
+    if content.ends_with('\n') {
+        content.pop();
+    }
+    content
 }
 
 fn parse_html_block<'a>(events: &[Event<'a>], index: &mut usize) -> String {
@@ -407,7 +507,7 @@ fn render_markdown_blocks(
 ) {
     for (index, block) in blocks.iter().enumerate() {
         if separated && index > 0 {
-            push_markdown_blank(lines, context);
+            push_markdown_blank(lines, context, width);
         }
         render_markdown_block(block, width, context, None, lines);
     }
@@ -420,32 +520,47 @@ fn render_markdown_block(
     marker: Option<&str>,
     lines: &mut Vec<Line<'static>>,
 ) {
+    if marker.is_some()
+        && matches!(
+            block,
+            MarkdownBlock::Quote(_) | MarkdownBlock::Code { .. } | MarkdownBlock::List { .. }
+        )
+    {
+        let (first, continuation) = markdown_prefixes(context, marker, None);
+        let first = bounded_prefix(&first, width);
+        let continuation = bounded_prefix(&continuation, width);
+        let inner_width =
+            width.saturating_sub(fragments_width(&first).max(fragments_width(&continuation)));
+        let start = lines.len();
+        render_markdown_block(block, inner_width, MarkdownContext::default(), None, lines);
+        for (index, line) in lines[start..].iter_mut().enumerate() {
+            let prefix = if index == 0 { &first } else { &continuation };
+            line.spans.splice(
+                0..0,
+                prefix
+                    .iter()
+                    .map(|fragment| Span::styled(fragment.content.clone(), fragment.style)),
+            );
+        }
+        return;
+    }
     match block {
         MarkdownBlock::Paragraph(fragments) => {
             render_fragments(fragments, width, context, marker, None, lines);
         }
         MarkdownBlock::Heading(level, fragments) => {
-            let heading_style = Style::default()
-                .fg(if *level == HeadingLevel::H1 {
-                    RED
-                } else {
-                    TEXT
-                })
-                .add_modifier(Modifier::BOLD);
-            let fragments = fragments
-                .iter()
-                .cloned()
-                .map(|fragment| StyledFragment {
-                    content: fragment.content,
-                    style: fragment.style.patch(heading_style),
-                })
-                .collect::<Vec<_>>();
-            render_fragments(&fragments, width, context, marker, None, lines);
+            let heading_style = text_style().add_modifier(Modifier::BOLD);
+            let mut heading = vec![StyledFragment {
+                content: format!("{} ", "#".repeat(*level as usize)),
+                style: heading_style,
+            }];
+            heading.extend(fragments.iter().map(|fragment| StyledFragment {
+                content: fragment.content.clone(),
+                style: fragment.style.patch(heading_style),
+            }));
+            render_fragments(&heading, width, context, marker, None, lines);
         }
         MarkdownBlock::Quote(blocks) => {
-            if marker.is_some() {
-                render_fragments(&[], width, context, marker, None, lines);
-            }
             let nested = MarkdownContext {
                 quote_depth: context.quote_depth + 1,
                 ..context
@@ -455,7 +570,7 @@ fn render_markdown_block(
         MarkdownBlock::Code { language, content } => {
             let frame_label = language
                 .as_ref()
-                .map_or_else(|| "┌".to_owned(), |language| format!("┌ {language}"));
+                .map_or_else(|| "```".to_owned(), |language| format!("```{language}"));
             render_fragments(
                 &[StyledFragment {
                     content: frame_label,
@@ -485,17 +600,10 @@ fn render_markdown_block(
                         style: code_style(),
                     }]
                 });
-            render_hard_fragments(
-                &highlighted,
-                width,
-                context,
-                None,
-                Some(("│ ", "│ ", Style::default().fg(DIM))),
-                lines,
-            );
+            render_hard_fragments(&highlighted, width, context, None, None, lines);
             render_fragments(
                 &[StyledFragment {
-                    content: "└".to_owned(),
+                    content: "```".to_owned(),
                     style: Style::default().fg(DIM),
                 }],
                 width,
@@ -506,16 +614,18 @@ fn render_markdown_block(
             );
         }
         MarkdownBlock::List { start, items } => {
-            render_markdown_list(*start, items, width, context, marker, lines);
+            render_markdown_list(*start, items, width, context, lines);
         }
         MarkdownBlock::Rule => {
-            let (mut prefix, _) = markdown_prefixes(context, marker, None);
-            let prefix_width = fragments_width(&prefix);
-            prefix.push(StyledFragment {
-                content: "─".repeat(width.saturating_sub(prefix_width).max(3)),
-                style: Style::default().fg(BORDER),
-            });
-            lines.push(Line::from(fragments_into_spans(prefix)));
+            let (prefix, _) = markdown_prefixes(context, marker, None);
+            let prefix = bounded_prefix(&prefix, width);
+            let remaining = width.saturating_sub(fragments_width(&prefix));
+            let mut spans = fragments_into_spans(prefix);
+            spans.push(Span::styled(
+                "─".repeat(remaining.min(32)),
+                Style::default().fg(BORDER),
+            ));
+            lines.push(Line::from(spans));
         }
         MarkdownBlock::Table {
             alignments,
@@ -530,16 +640,12 @@ fn render_markdown_list(
     items: &[Vec<MarkdownBlock>],
     width: usize,
     context: MarkdownContext,
-    outer_marker: Option<&str>,
     lines: &mut Vec<Line<'static>>,
 ) {
-    if outer_marker.is_some() {
-        render_fragments(&[], width, context, outer_marker, None, lines);
-    }
     for (item_index, item) in items.iter().enumerate() {
         let marker = start.map_or_else(
             || "• ".to_owned(),
-            |number| format!("{}. ", number + item_index as u64),
+            |number| format!("{}. ", number.saturating_add(item_index as u64)),
         );
         if item.is_empty() {
             render_fragments(&[], width, context, Some(&marker), None, lines);
@@ -653,7 +759,7 @@ fn markdown_prefixes(
     if let Some(marker) = marker {
         first.push(StyledFragment {
             content: marker.to_owned(),
-            style: Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+            style: Style::default().fg(DIM),
         });
         continuation.push(StyledFragment {
             content: " ".repeat(display_width(marker)),
@@ -666,15 +772,30 @@ fn markdown_prefixes(
     (first, continuation)
 }
 
+fn bounded_prefix(prefix: &[StyledFragment], width: usize) -> Vec<StyledFragment> {
+    // Leave room for a wide grapheme; discard cosmetic indentation on tiny surfaces.
+    if fragments_width(prefix) > width.saturating_sub(2) {
+        Vec::new()
+    } else {
+        prefix.to_vec()
+    }
+}
+
 fn wrap_styled_fragments(
     fragments: &[StyledFragment],
     width: usize,
     first_prefix: &[StyledFragment],
     continuation_prefix: &[StyledFragment],
 ) -> Vec<Line<'static>> {
-    let width = width.max(1);
+    if width == 0 {
+        return Vec::new();
+    }
+    let first_prefix = bounded_prefix(first_prefix, width);
+    let continuation_prefix = bounded_prefix(continuation_prefix, width);
+    let content_capacity = width
+        .saturating_sub(fragments_width(&first_prefix).max(fragments_width(&continuation_prefix)));
     let mut lines = Vec::new();
-    let mut current = first_prefix.to_vec();
+    let mut current = first_prefix;
     let mut current_width = fragments_width(&current);
     let mut content_width = 0_usize;
     let mut pending_whitespace = Vec::new();
@@ -684,7 +805,7 @@ fn wrap_styled_fragments(
             StyledWrapToken::Whitespace(whitespace) => pending_whitespace = whitespace,
             StyledWrapToken::Break => {
                 lines.push(Line::from(fragments_into_spans(current)));
-                current = continuation_prefix.to_vec();
+                current = continuation_prefix.clone();
                 current_width = fragments_width(&current);
                 content_width = 0;
                 pending_whitespace.clear();
@@ -703,7 +824,7 @@ fn wrap_styled_fragments(
                         > width
                 {
                     lines.push(Line::from(fragments_into_spans(current)));
-                    current = continuation_prefix.to_vec();
+                    current = continuation_prefix.clone();
                     current_width = fragments_width(&current);
                     content_width = 0;
                 }
@@ -717,15 +838,20 @@ fn wrap_styled_fragments(
 
                 for fragment in word {
                     for grapheme in fragment.content.graphemes(true) {
-                        let grapheme_width = display_width(grapheme);
+                        let original_width = display_width(grapheme);
+                        let (grapheme, grapheme_width) = if original_width > content_capacity {
+                            ("�", 1)
+                        } else {
+                            (grapheme, original_width)
+                        };
                         if content_width > 0 && current_width.saturating_add(grapheme_width) > width
                         {
                             lines.push(Line::from(fragments_into_spans(current)));
-                            current = continuation_prefix.to_vec();
+                            current = continuation_prefix.clone();
                             current_width = fragments_width(&current);
                             content_width = 0;
                         }
-                        push_fragment(&mut current, grapheme.to_owned(), fragment.style);
+                        push_fragment_str(&mut current, grapheme, fragment.style);
                         current_width = current_width.saturating_add(grapheme_width);
                         content_width = content_width.saturating_add(grapheme_width);
                     }
@@ -746,37 +872,55 @@ fn hard_wrap_styled_fragments(
     first_prefix: &[StyledFragment],
     continuation_prefix: &[StyledFragment],
 ) -> Vec<Line<'static>> {
-    let width = width.max(1);
-    let mut lines = Vec::new();
-    let mut current = first_prefix.to_vec();
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut current = bounded_prefix(first_prefix, width);
+    let continuation_prefix = bounded_prefix(continuation_prefix, width);
+    let content_capacity =
+        width.saturating_sub(fragments_width(&current).max(fragments_width(&continuation_prefix)));
     let mut current_width = fragments_width(&current);
     let mut content_width = 0_usize;
-
+    let mut source_width = 0_usize;
+    let mut lines = Vec::new();
     for fragment in fragments {
-        for grapheme in fragment.content.graphemes(true) {
+        let content = sanitize_terminal_text(&fragment.content);
+        for grapheme in content.graphemes(true) {
             if grapheme == "\n" {
                 lines.push(Line::from(fragments_into_spans(current)));
-                current = continuation_prefix.to_vec();
+                current = continuation_prefix.clone();
                 current_width = fragments_width(&current);
                 content_width = 0;
+                source_width = 0;
                 continue;
             }
-            let grapheme_width = display_width(grapheme);
-            if content_width > 0 && current_width.saturating_add(grapheme_width) > width {
-                lines.push(Line::from(fragments_into_spans(current)));
-                current = continuation_prefix.to_vec();
-                current_width = fragments_width(&current);
-                content_width = 0;
+            let spaces = if grapheme == "\t" {
+                4 - source_width % 4
+            } else {
+                0
+            };
+            for _ in 0..spaces.max(1) {
+                let grapheme = if spaces > 0 { " " } else { grapheme };
+                let original_width = display_width(grapheme);
+                source_width = source_width.saturating_add(original_width);
+                let (grapheme, grapheme_width) = if original_width > content_capacity {
+                    ("�", 1)
+                } else {
+                    (grapheme, original_width)
+                };
+                if content_width > 0 && current_width.saturating_add(grapheme_width) > width {
+                    lines.push(Line::from(fragments_into_spans(current)));
+                    current = continuation_prefix.clone();
+                    current_width = fragments_width(&current);
+                    content_width = 0;
+                }
+                push_fragment_str(&mut current, grapheme, fragment.style);
+                current_width = current_width.saturating_add(grapheme_width);
+                content_width = content_width.saturating_add(grapheme_width);
             }
-            push_fragment(&mut current, grapheme.to_owned(), fragment.style);
-            current_width = current_width.saturating_add(grapheme_width);
-            content_width = content_width.saturating_add(grapheme_width);
         }
     }
-
-    if content_width > 0 || lines.is_empty() {
-        lines.push(Line::from(fragments_into_spans(current)));
-    }
+    lines.push(Line::from(fragments_into_spans(current)));
     lines
 }
 
@@ -792,7 +936,8 @@ fn styled_wrap_tokens(fragments: &[StyledFragment]) -> Vec<StyledWrapToken> {
     let mut current_is_whitespace = None;
 
     for fragment in fragments {
-        for grapheme in fragment.content.graphemes(true) {
+        let content = sanitize_terminal_text(&fragment.content);
+        for grapheme in content.graphemes(true) {
             if grapheme == "\n" {
                 push_wrap_token(&mut tokens, &mut current, current_is_whitespace);
                 current_is_whitespace = None;
@@ -805,7 +950,11 @@ fn styled_wrap_tokens(fragments: &[StyledFragment]) -> Vec<StyledWrapToken> {
                 push_wrap_token(&mut tokens, &mut current, current_is_whitespace);
             }
             current_is_whitespace = Some(is_whitespace);
-            push_fragment(&mut current, grapheme.to_owned(), fragment.style);
+            push_fragment_str(
+                &mut current,
+                if grapheme == "\t" { " " } else { grapheme },
+                fragment.style,
+            );
         }
     }
     push_wrap_token(&mut tokens, &mut current, current_is_whitespace);
@@ -830,7 +979,7 @@ fn push_wrap_token(
 
 fn append_fragments(target: &mut Vec<StyledFragment>, fragments: &[StyledFragment]) {
     for fragment in fragments {
-        push_fragment(target, fragment.content.clone(), fragment.style);
+        push_fragment_str(target, &fragment.content, fragment.style);
     }
 }
 
@@ -854,15 +1003,12 @@ fn render_markdown_table(
     let (first_prefix, continuation_prefix) = markdown_prefixes(context, marker, None);
     let prefix_width = fragments_width(&first_prefix);
     let separator_width = column_count.saturating_sub(1) * 3;
-    let available = width
-        .saturating_sub(prefix_width)
-        .saturating_sub(separator_width);
     let natural_column_widths = (0..column_count)
         .map(|column| {
             std::iter::once(header.get(column))
                 .chain(rows.iter().map(|row| row.get(column)))
                 .flatten()
-                .map(|cell| display_width(&fragments_text(cell)))
+                .map(|cell| fragments_width(cell))
                 .max()
                 .unwrap_or(1)
                 .max(1)
@@ -871,22 +1017,29 @@ fn render_markdown_table(
     let natural_grid_width = prefix_width
         .saturating_add(separator_width)
         .saturating_add(natural_column_widths.iter().sum::<usize>());
-    if !rows.is_empty() && natural_grid_width > width {
-        render_stacked_markdown_table(header, rows, width, context, marker, lines);
+    if natural_grid_width > width
+        || header.iter().chain(rows.iter().flatten()).any(|cell| {
+            cell.iter()
+                .any(|fragment| fragment.content.contains(['\n', '\t']))
+        })
+    {
+        if rows.is_empty() {
+            for (column, cell) in header.iter().enumerate() {
+                render_fragments(
+                    cell,
+                    width,
+                    context,
+                    if column == 0 { marker } else { None },
+                    None,
+                    lines,
+                );
+            }
+        } else {
+            render_stacked_markdown_table(header, rows, width, context, marker, lines);
+        }
         return;
     }
-    let mut column_widths = natural_column_widths;
-    while column_widths.iter().sum::<usize>() > available {
-        let Some((index, _)) = column_widths
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| **value > 1)
-            .max_by_key(|(_, value)| **value)
-        else {
-            break;
-        };
-        column_widths[index] -= 1;
-    }
+    let column_widths = natural_column_widths;
 
     if !header.is_empty() {
         lines.push(table_row_line(
@@ -948,8 +1101,8 @@ fn render_stacked_markdown_table(
 
             if fragments_width(&base_first_prefix)
                 .saturating_add(label_width)
-                .saturating_add(2)
-                < width
+                .saturating_add(4)
+                <= width
             {
                 let mut first_prefix = base_first_prefix;
                 append_fragments(&mut first_prefix, &label);
@@ -998,7 +1151,7 @@ fn render_stacked_markdown_table(
             }
         }
         if row_index + 1 < rows.len() {
-            push_markdown_blank(lines, record_context);
+            push_markdown_blank(lines, record_context, width);
         }
     }
 }
@@ -1041,10 +1194,8 @@ fn table_row_line(
         if column > 0 {
             push_fragment(&mut fragments, " │ ".into(), Style::default().fg(BORDER));
         }
-        let content = row.get(column).map_or_else(Vec::new, |cell| {
-            fit_table_cell_fragments(cell, *column_width, header)
-        });
-        let content_width = fragments_width(&content);
+        let content = row.get(column).map(Vec::as_slice).unwrap_or(&[]);
+        let content_width = fragments_width(content);
         let padding = column_width.saturating_sub(content_width);
         let alignment = alignments.get(column).copied().unwrap_or(Alignment::None);
         let (left_padding, right_padding) = match alignment {
@@ -1053,70 +1204,23 @@ fn table_row_line(
             Alignment::None | Alignment::Left => (0, padding),
         };
         push_fragment(&mut fragments, " ".repeat(left_padding), text_style());
-        fragments.extend(content);
+        for fragment in content {
+            push_fragment_str(
+                &mut fragments,
+                &fragment.content,
+                if header {
+                    fragment.style.add_modifier(Modifier::BOLD)
+                } else {
+                    fragment.style
+                },
+            );
+        }
         push_fragment(&mut fragments, " ".repeat(right_padding), text_style());
     }
     Line::from(fragments_into_spans(fragments))
 }
 
-fn fit_table_cell_fragments(
-    fragments: &[StyledFragment],
-    width: usize,
-    header: bool,
-) -> Vec<StyledFragment> {
-    let fragments = fragments
-        .iter()
-        .cloned()
-        .map(|fragment| StyledFragment {
-            content: fragment.content,
-            style: if header {
-                fragment.style.add_modifier(Modifier::BOLD)
-            } else {
-                fragment.style
-            },
-        })
-        .collect::<Vec<_>>();
-    if fragments_width(&fragments) <= width {
-        return fragments;
-    }
-    truncate_styled_fragments(&fragments, width)
-}
-
-fn truncate_styled_fragments(fragments: &[StyledFragment], width: usize) -> Vec<StyledFragment> {
-    if width == 0 {
-        return Vec::new();
-    }
-    let fallback_style = fragments
-        .first()
-        .map_or_else(text_style, |fragment| fragment.style);
-    if width == 1 {
-        return vec![StyledFragment {
-            content: "…".into(),
-            style: fallback_style,
-        }];
-    }
-
-    let content_width = width - 1;
-    let mut truncated = Vec::new();
-    let mut current_width = 0_usize;
-    'fragments: for fragment in fragments {
-        for grapheme in fragment.content.graphemes(true) {
-            let grapheme_width = display_width(grapheme);
-            if current_width.saturating_add(grapheme_width) > content_width {
-                break 'fragments;
-            }
-            push_fragment(&mut truncated, grapheme.to_owned(), fragment.style);
-            current_width = current_width.saturating_add(grapheme_width);
-        }
-    }
-    let ellipsis_style = truncated
-        .last()
-        .map_or(fallback_style, |fragment| fragment.style);
-    push_fragment(&mut truncated, "…".into(), ellipsis_style);
-    truncated
-}
-
-fn push_markdown_blank(lines: &mut Vec<Line<'static>>, context: MarkdownContext) {
+fn push_markdown_blank(lines: &mut Vec<Line<'static>>, context: MarkdownContext, width: usize) {
     if lines.last().is_some_and(|line| line.width() == 0) {
         return;
     }
@@ -1125,10 +1229,16 @@ fn push_markdown_blank(lines: &mut Vec<Line<'static>>, context: MarkdownContext)
         return;
     }
     let (prefix, _) = markdown_prefixes(context, None, None);
-    lines.push(Line::from(fragments_into_spans(prefix)));
+    lines.push(Line::from(fragments_into_spans(bounded_prefix(
+        &prefix, width,
+    ))));
 }
 
 fn push_fragment(fragments: &mut Vec<StyledFragment>, content: String, style: Style) {
+    let content = match sanitize_terminal_text(&content) {
+        Cow::Borrowed(_) => content,
+        Cow::Owned(clean) => clean,
+    };
     if content.is_empty() {
         return;
     }
@@ -1139,6 +1249,22 @@ fn push_fragment(fragments: &mut Vec<StyledFragment>, content: String, style: St
         return;
     }
     fragments.push(StyledFragment { content, style });
+}
+
+fn push_fragment_str(fragments: &mut Vec<StyledFragment>, content: &str, style: Style) {
+    if content.is_empty() {
+        return;
+    }
+    if let Some(last) = fragments.last_mut()
+        && last.style == style
+    {
+        last.content.push_str(content);
+    } else {
+        fragments.push(StyledFragment {
+            content: content.to_owned(),
+            style,
+        });
+    }
 }
 
 fn fragments_into_spans(fragments: Vec<StyledFragment>) -> Vec<Span<'static>> {
@@ -1163,12 +1289,13 @@ fn fragments_width(fragments: &[StyledFragment]) -> usize {
 }
 
 fn display_width(value: &str) -> usize {
-    Line::from(value).width()
+    Span::raw(value).width()
 }
 
 pub(crate) fn truncate_display(value: &str, width: usize) -> String {
-    if display_width(value) <= width {
-        return value.to_owned();
+    let value = single_line_text(value);
+    if display_width(&value) <= width {
+        return value.into_owned();
     }
     if width == 0 {
         return String::new();
@@ -1191,8 +1318,9 @@ pub(crate) fn truncate_display(value: &str, width: usize) -> String {
 }
 
 fn truncate_display_left(value: &str, width: usize) -> String {
-    if display_width(value) <= width {
-        return value.to_owned();
+    let value = single_line_text(value);
+    if display_width(&value) <= width {
+        return value.into_owned();
     }
     if width == 0 {
         return String::new();
@@ -1214,8 +1342,18 @@ fn truncate_display_left(value: &str, width: usize) -> String {
     format!("…{}", graphemes.concat())
 }
 
+fn single_line_text(value: &str) -> Cow<'_, str> {
+    let value = sanitize_terminal_text(value);
+    if value.contains(['\n', '\t']) {
+        Cow::Owned(value.replace(['\n', '\t'], " "))
+    } else {
+        value
+    }
+}
+
 pub(crate) fn startup_lines(
     version: &str,
+    model: &str,
     project: &str,
     mode: ExecutionMode,
     width: usize,
@@ -1223,53 +1361,63 @@ pub(crate) fn startup_lines(
     if width == 0 {
         return Vec::new();
     }
-    let version = format!("v{version}");
-    let full_title = format!("◢ kurama  {version}");
-    let title = if display_width(&full_title) <= width {
-        Line::from(vec![
-            Span::styled("◢ ", Style::default().fg(ACCENT)),
-            Span::styled(
-                "kurama",
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("  {version}"), Style::default().fg(DIM)),
-        ])
-    } else {
-        Line::from(Span::styled(
-            truncate_display(&format!("◢ kurama {version}"), width),
-            Style::default().fg(TEXT),
-        ))
-    };
-
-    let mode = mode_label(mode);
-    let wide_separator = "  ·  ";
-    let compact_separator = " · ";
-    let wide_width = display_width(project)
-        .saturating_add(display_width(wide_separator))
-        .saturating_add(display_width(mode));
-    let separator = if wide_width <= width {
-        wide_separator
-    } else if display_width(mode).saturating_add(display_width(compact_separator)) < width {
-        compact_separator
-    } else {
-        " "
-    };
-    let suffix_width = display_width(separator).saturating_add(display_width(mode));
-    let metadata = if suffix_width < width {
-        let project = truncate_display_left(project, width.saturating_sub(suffix_width));
-        Line::from(vec![
-            Span::styled(project, Style::default().fg(DIM)),
-            Span::styled(separator, Style::default().fg(DIM)),
-            Span::styled(mode, Style::default().fg(ACCENT)),
-        ])
-    } else {
-        Line::from(Span::styled(
-            truncate_display(mode, width),
-            Style::default().fg(ACCENT),
-        ))
-    };
-
-    vec![title, metadata]
+    let title = format!(">_ kurama  v{}", sanitize_terminal_text(version));
+    let model = sanitize_terminal_text(model);
+    let project = sanitize_terminal_text(project);
+    let metadata = [
+        ("model", model.as_ref()),
+        ("directory", project.as_ref()),
+        ("approval", mode_label(mode)),
+    ];
+    // A bounded card stays quiet on ultrawide terminals; tiny terminals get plain rows.
+    let card_width = width.min(64);
+    let framed = card_width >= 24;
+    let inner_width = card_width.saturating_sub(if framed { 4 } else { 0 });
+    let mut contents = vec![Line::from(Span::styled(
+        truncate_display(&title, inner_width),
+        text_style().add_modifier(Modifier::BOLD),
+    ))];
+    for (label, value) in metadata {
+        let label = format!("{label}: ");
+        if display_width(&label) < inner_width {
+            let available = inner_width - display_width(&label);
+            let value = if label.starts_with("directory") {
+                truncate_display_left(value, available)
+            } else {
+                truncate_display(value, available)
+            };
+            contents.push(Line::from(vec![
+                Span::styled(label, Style::default().fg(DIM)),
+                Span::styled(value, text_style()),
+            ]));
+        } else {
+            contents.push(Line::from(Span::styled(
+                truncate_display(value, inner_width),
+                text_style(),
+            )));
+        }
+    }
+    if !framed {
+        return contents;
+    }
+    let border = Style::default().fg(BORDER);
+    let mut lines = Vec::with_capacity(contents.len() + 2);
+    lines.push(Line::from(Span::styled(
+        format!("╭{}╮", "─".repeat(card_width - 2)),
+        border,
+    )));
+    for mut line in contents {
+        let padding = inner_width.saturating_sub(line.width());
+        line.spans.insert(0, Span::styled("│ ", border));
+        line.spans
+            .push(Span::styled(format!("{} │", " ".repeat(padding)), border));
+        lines.push(line);
+    }
+    lines.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(card_width - 2)),
+        border,
+    )));
+    lines
 }
 
 fn mode_label(mode: ExecutionMode) -> &'static str {
@@ -1289,7 +1437,7 @@ fn code_style() -> Style {
 }
 
 fn inline_code_style() -> Style {
-    Style::default().fg(Color::Rgb(166, 227, 161))
+    Style::default().fg(Color::Green)
 }
 
 pub fn transcript_lines(
@@ -1297,31 +1445,54 @@ pub fn transcript_lines(
     width: usize,
     detail: TranscriptDetail,
 ) -> Vec<Line<'static>> {
+    render_transcript_entries(entries, width, detail, None)
+}
+
+pub(crate) fn transcript_lines_with_entry_starts(
+    entries: &[TranscriptEntry],
+    width: usize,
+    detail: TranscriptDetail,
+) -> (Vec<Line<'static>>, Vec<usize>) {
+    if width == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let mut starts = Vec::with_capacity(entries.len());
+    let lines = render_transcript_entries(entries, width, detail, Some(&mut starts));
+    (lines, starts)
+}
+
+fn render_transcript_entries(
+    entries: &[TranscriptEntry],
+    width: usize,
+    detail: TranscriptDetail,
+    mut entry_starts: Option<&mut Vec<usize>>,
+) -> Vec<Line<'static>> {
     #[cfg(test)]
     TRANSCRIPT_RENDER_CALLS.with(|calls| calls.set(calls.get() + 1));
+    if width == 0 {
+        return Vec::new();
+    }
 
     let mut lines = Vec::new();
     for entry in entries {
+        if let Some(starts) = &mut entry_starts {
+            starts.push(lines.len());
+        }
         match entry {
             TranscriptEntry::Startup {
                 version,
+                model,
                 project,
                 mode,
-            } => lines.extend(startup_lines(version, project, *mode, width)),
+            } => lines.extend(startup_lines(version, model, project, *mode, width)),
             TranscriptEntry::UserTurn { body } => {
-                if !lines.is_empty() {
-                    lines.push(Line::from(""));
-                }
                 push_prefixed_lines(
                     &mut lines,
                     body,
                     "› ",
                     "  ",
-                    Style::default()
-                        .fg(BLUE)
-                        .bg(USER_BAND)
-                        .add_modifier(Modifier::BOLD),
-                    Style::default().fg(TEXT).bg(USER_BAND),
+                    Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+                    text_style(),
                     width,
                 );
             }
@@ -1340,7 +1511,12 @@ pub fn transcript_lines(
                     .as_deref()
                     .filter(|context| !context.trim().is_empty())
                     .map_or(action.clone(), |context| format!("{action} · {context}"));
-                let summary = truncate_display(&summary, width.saturating_sub(2).max(1));
+                let summary = match detail {
+                    TranscriptDetail::Compact => {
+                        truncate_display(&summary, width.saturating_sub(2).max(1))
+                    }
+                    TranscriptDetail::Expanded => summary,
+                };
                 let failed = tool.lifecycle == ToolLifecycle::Failed;
                 push_prefixed_lines(
                     &mut lines,
@@ -1353,28 +1529,26 @@ pub fn transcript_lines(
                         .add_modifier(Modifier::BOLD),
                     width,
                 );
-                let output_width = width.saturating_sub(4).max(1);
-                let output = tool.output.trim_end_matches(['\r', '\n']);
+                let output_width = width.saturating_sub(tool_output_gutter(width));
                 let output = match detail {
-                    TranscriptDetail::Compact => compact_tool_output(tool, output, output_width),
-                    TranscriptDetail::Expanded => expanded_tool_output(output, output_width),
+                    TranscriptDetail::Compact => compact_tool_output(&tool.output, output_width),
+                    TranscriptDetail::Expanded => expanded_tool_output(&tool.output, output_width),
                 };
-                push_tool_output_lines(&mut lines, output);
+                push_tool_output_lines(&mut lines, output, width);
             }
             TranscriptEntry::Todos { items } => {
                 if items.is_empty() {
                     continue;
                 }
-                if !lines.is_empty() {
-                    lines.push(Line::from(""));
-                }
-                lines.push(Line::from(vec![
-                    Span::styled("• ", Style::default().fg(DIM)),
-                    Span::styled(
-                        "todo",
-                        Style::default().fg(DIM).add_modifier(Modifier::BOLD),
-                    ),
-                ]));
+                push_prefixed_lines(
+                    &mut lines,
+                    "todo",
+                    "• ",
+                    "  ",
+                    Style::default().fg(DIM),
+                    Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+                    width,
+                );
                 for item in items {
                     let (marker, continuation, marker_style, body_style) = match item.status {
                         TodoStatus::Completed => (
@@ -1444,34 +1618,10 @@ pub fn transcript_lines(
                 width,
             ),
         }
+        // Each entry owns its separator, making separately committed batches composable.
+        lines.push(Line::default());
     }
-    squeeze_blank_lines(lines)
-}
-
-fn squeeze_blank_lines(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
-    let mut squeezed = Vec::with_capacity(lines.len());
-    let mut last_blank = true;
-    for line in lines {
-        let blank = line.width() == 0
-            || line
-                .spans
-                .iter()
-                .all(|span| span.content.as_ref().trim().is_empty());
-        if blank {
-            if last_blank {
-                continue;
-            }
-            last_blank = true;
-            squeezed.push(Line::from(""));
-        } else {
-            last_blank = false;
-            squeezed.push(line);
-        }
-    }
-    while squeezed.last().is_some_and(|line| line.width() == 0) {
-        squeezed.pop();
-    }
-    squeezed
+    lines
 }
 
 #[cfg(test)]
@@ -1484,42 +1634,52 @@ pub(crate) fn transcript_render_calls() -> usize {
     TRANSCRIPT_RENDER_CALLS.with(Cell::get)
 }
 
-fn compact_tool_output(tool: &super::ToolTranscript, output: &str, width: usize) -> Vec<String> {
-    const RUNNING_TAIL_LINES: usize = 2;
-
-    if tool.lifecycle == ToolLifecycle::Running {
-        if output.is_empty() {
-            return Vec::new();
-        }
-        return compact_wrapped_tail(hard_wrap(output, width), RUNNING_TAIL_LINES);
-    }
-
-    if output.is_empty() {
+fn compact_tool_output(output: &str, width: usize) -> Vec<String> {
+    if output.is_empty() || width == 0 {
         return Vec::new();
     }
-
-    const PREVIEW_LINES: usize = 2;
-    compact_wrapped_tail(hard_wrap(output, width), PREVIEW_LINES)
+    compact_wrapped_tail(output, width, 2)
 }
 
-fn compact_wrapped_tail(wrapped: Vec<String>, tail: usize) -> Vec<String> {
-    let wrapped = wrapped
-        .into_iter()
-        .filter(|line| !line.trim().is_empty())
-        .collect::<Vec<_>>();
-    if wrapped.is_empty() {
-        return Vec::new();
-    }
-    let omitted = wrapped.len().saturating_sub(tail);
-    let mut visible = Vec::new();
+fn compact_wrapped_tail(output: &str, width: usize, tail: usize) -> Vec<String> {
+    let mut visible = VecDeque::<String>::with_capacity(tail);
+    let mut retain_row = |line: &str| {
+        if tail == 0 {
+            return;
+        }
+        let mut row = if visible.len() == tail {
+            visible.pop_front().unwrap_or_default()
+        } else {
+            String::new()
+        };
+        row.clear();
+        row.push_str(line);
+        visible.push_back(row);
+    };
+    let mut total = 0_usize;
+    let mut pending_blank = 0_usize;
+    for_each_wrapped_line(output, width, |line| {
+        if line.trim().is_empty() {
+            pending_blank = pending_blank.saturating_add(1);
+            return;
+        }
+        total = total.saturating_add(pending_blank).saturating_add(1);
+        for _ in 0..pending_blank.min(tail) {
+            retain_row("");
+        }
+        pending_blank = 0;
+        retain_row(line);
+    });
+    let omitted = total.saturating_sub(visible.len());
+    let mut lines = Vec::with_capacity(visible.len() + usize::from(omitted > 0));
     if omitted > 0 {
-        visible.push(format!(
-            "… {omitted} earlier {}",
-            pluralize(omitted, "line")
+        lines.push(truncate_display(
+            &format!("… {omitted} earlier {}", pluralize(omitted, "line")),
+            width,
         ));
     }
-    visible.extend(wrapped.into_iter().skip(omitted));
-    visible
+    lines.extend(visible);
+    lines
 }
 
 fn expanded_tool_output(output: &str, width: usize) -> Vec<String> {
@@ -1534,61 +1694,68 @@ fn pluralize(count: usize, singular: &'static str) -> &'static str {
     if count == 1 { singular } else { "lines" }
 }
 
-fn push_tool_output_lines(lines: &mut Vec<Line<'static>>, output: Vec<String>) {
-    let output_len = output.len();
-    for (index, line) in output.into_iter().enumerate() {
+fn push_tool_output_lines(lines: &mut Vec<Line<'static>>, output: Vec<String>, width: usize) {
+    let prefix = " ".repeat(tool_output_gutter(width));
+    for line in output {
         lines.push(Line::from(vec![
-            Span::styled(
-                if index + 1 == output_len {
-                    "  └ "
-                } else {
-                    "  │ "
-                },
-                Style::default().fg(DIM),
-            ),
+            Span::raw(prefix.clone()),
             Span::styled(line, Style::default().fg(DIM)),
         ]));
     }
 }
 
-pub(crate) fn render_transcript_view(frame: &mut Frame<'_>, state: &TuiState) {
-    let area = frame.area();
-    if area.is_empty() {
-        return;
-    }
+fn tool_output_gutter(width: usize) -> usize {
+    if width >= 6 { 4 } else { 0 }
+}
 
-    let block = Block::default().padding(Padding::new(2, 2, 0, 0));
-    let mut transcript_area = block.inner(area);
-    if transcript_area.is_empty() {
-        frame.render_widget(block, area);
-        return;
-    }
+pub(crate) fn render_transcript_view(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    prepared_transcript: Option<&[Line<'static>]>,
+) {
+    let area = frame.area();
+    let mut transcript_area = super::layout::main_area(area);
     let hint_height = u16::from(transcript_area.height > 1);
     transcript_area.height = transcript_area.height.saturating_sub(hint_height);
-
-    let transcript = transcript_lines(
-        &state.transcript,
-        transcript_area.width as usize,
-        TranscriptDetail::Expanded,
-    );
-    let viewport_height = transcript_area.height as usize;
+    state.transcript_width.set(transcript_area.width);
     state.viewport_height.set(transcript_area.height);
+    if transcript_area.is_empty() {
+        return;
+    }
+    let owned;
+    let transcript = if let Some(prepared) = prepared_transcript {
+        prepared
+    } else {
+        owned = transcript_lines(
+            &state.transcript,
+            transcript_area.width as usize,
+            TranscriptDetail::Expanded,
+        );
+        &owned
+    };
+    let viewport_height = transcript_area.height as usize;
     let scroll = state
         .scroll
         .min(transcript.len().saturating_sub(viewport_height));
     let start = transcript
         .len()
         .saturating_sub(viewport_height.saturating_add(scroll));
-    let visible = transcript
-        .into_iter()
+    for (row, line) in transcript
+        .iter()
         .skip(start)
         .take(viewport_height)
-        .collect::<Vec<_>>();
-
-    frame.render_widget(
-        Paragraph::new(Text::from(visible)).block(block.clone()),
-        area,
-    );
+        .enumerate()
+    {
+        frame.render_widget(
+            line,
+            Rect::new(
+                transcript_area.x,
+                transcript_area.y + row as u16,
+                transcript_area.width,
+                1,
+            ),
+        );
+    }
     if hint_height > 0 {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -1606,31 +1773,26 @@ pub(crate) fn render_transcript_view(frame: &mut Frame<'_>, state: &TuiState) {
 }
 
 fn push_markdown_lines(lines: &mut Vec<Line<'static>>, body: &str, width: usize) {
-    let prefix_width = display_width("  ");
-    let mut markdown = markdown_lines(body, width.saturating_sub(prefix_width).max(1));
+    if width == 0 {
+        return;
+    }
+    let gutter = if width >= 4 { 2 } else { 0 };
+    let mut markdown = markdown_lines(body, width - gutter);
     if markdown.is_empty() {
         markdown.push(Line::default());
     }
     for (index, mut line) in markdown.into_iter().enumerate() {
-        if !line_starts_with_list_marker(&line) && index > 0 {
-            line.spans
-                .insert(0, Span::styled("  ", Style::default().fg(DIM)));
+        if gutter > 0 {
+            line.spans.insert(
+                0,
+                Span::styled(
+                    if index == 0 { "• " } else { "  " },
+                    Style::default().fg(DIM),
+                ),
+            );
         }
         lines.push(line);
     }
-}
-
-fn line_starts_with_list_marker(line: &Line<'_>) -> bool {
-    let text = line
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>();
-    let text = text.trim_start();
-    text.starts_with("• ")
-        || text.split_once(". ").is_some_and(|(number, _)| {
-            !number.is_empty() && number.chars().all(|character| character.is_ascii_digit())
-        })
 }
 
 fn push_prefixed_lines(
@@ -1642,131 +1804,115 @@ fn push_prefixed_lines(
     body_style: Style,
     width: usize,
 ) {
-    let prefix_width = Line::from(first_prefix).width();
-    for (index, line) in word_wrap(body, width.saturating_sub(prefix_width).max(1))
-        .into_iter()
-        .enumerate()
-    {
-        lines.push(Line::from(vec![
-            Span::styled(
-                if index == 0 {
-                    first_prefix
-                } else {
-                    continuation_prefix
-                },
-                prefix_style,
-            ),
-            Span::styled(line, body_style),
-        ]));
-    }
+    let body = sanitize_terminal_text(body);
+    lines.extend(wrap_styled_fragments(
+        &[StyledFragment {
+            content: body.into_owned(),
+            style: body_style,
+        }],
+        width,
+        &[StyledFragment {
+            content: first_prefix.into(),
+            style: prefix_style,
+        }],
+        &[StyledFragment {
+            content: continuation_prefix.into(),
+            style: prefix_style,
+        }],
+    ));
 }
 
 pub(crate) fn hard_wrap(value: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
     let mut wrapped = Vec::new();
-    for source_line in value.split('\n') {
-        if source_line.is_empty() {
-            wrapped.push(String::new());
-            continue;
-        }
-
-        let mut line = String::new();
-        let mut line_width = 0_usize;
-        for grapheme in source_line.graphemes(true) {
-            let grapheme_width = display_width(grapheme);
-            if line_width > 0 && line_width.saturating_add(grapheme_width) > width {
-                if let Some(previous) =
-                    split_before_trailing_punctuation(&mut line, &mut line_width, grapheme, width)
-                {
-                    wrapped.push(previous);
-                } else {
-                    wrapped.push(std::mem::take(&mut line));
-                    line_width = 0;
-                }
-            }
-            line.push_str(grapheme);
-            line_width = line_width.saturating_add(grapheme_width);
-        }
-        wrapped.push(line);
-    }
+    for_each_wrapped_line(value, width, |line| wrapped.push(line.to_owned()));
     wrapped
 }
 
-fn split_before_trailing_punctuation(
-    line: &mut String,
-    line_width: &mut usize,
-    grapheme: &str,
-    width: usize,
-) -> Option<String> {
-    if !matches!(grapheme, "," | "." | ";" | ":" | "!" | "?") {
-        return None;
+// Visits rows with one reusable buffer, so compact previews retain only their visible tail.
+pub(crate) fn for_each_wrapped_line(value: &str, width: usize, mut visit: impl FnMut(&str)) {
+    if width == 0 {
+        return;
     }
-
-    let punctuation_width = display_width(grapheme);
-    let split_at = line
-        .char_indices()
-        .rev()
-        .find(|(_, character)| character.is_whitespace())
-        .map(|(index, character)| index + character.len_utf8())
-        .or_else(|| {
-            line.grapheme_indices(true)
-                .next_back()
-                .map(|(index, _)| index)
-                .filter(|index| *index > 0)
-        })?;
-    let previous = line[..split_at].trim_end().to_owned();
-    let continuation = line[split_at..].trim_start();
-    if previous.is_empty()
-        || continuation.is_empty()
-        || display_width(continuation).saturating_add(punctuation_width) > width
+    if value
+        .bytes()
+        .all(|byte| byte == b'\n' || byte == b' ' || byte.is_ascii_graphic())
     {
-        return None;
-    }
-
-    *line = continuation.to_owned();
-    *line_width = display_width(line);
-    Some(previous)
-}
-
-pub(crate) fn word_wrap(value: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut wrapped = Vec::new();
-    for source_line in value.split('\n') {
-        let mut line = String::new();
-        let mut line_width = 0_usize;
-        for word in source_line.split_whitespace() {
-            let word_width = Line::from(word).width();
-            if word_width > width {
-                if !line.is_empty() {
-                    wrapped.push(std::mem::take(&mut line));
-                    line_width = 0;
-                }
-                let mut chunks = hard_wrap(word, width);
-                if let Some(last) = chunks.pop() {
-                    wrapped.extend(chunks);
-                    line_width = Line::from(last.as_str()).width();
-                    line = last;
-                }
-            } else if line.is_empty() {
-                line.push_str(word);
-                line_width = word_width;
-            } else if line_width.saturating_add(1 + word_width) <= width {
-                line.push(' ');
-                line.push_str(word);
-                line_width = line_width.saturating_add(1 + word_width);
+        for line in value.split('\n') {
+            if line.is_empty() {
+                visit("");
             } else {
-                wrapped.push(std::mem::take(&mut line));
-                line.push_str(word);
-                line_width = word_width;
+                for start in (0..line.len()).step_by(width) {
+                    visit(&line[start..line.len().min(start.saturating_add(width))]);
+                }
             }
         }
-        if !line.is_empty() {
-            wrapped.push(line);
-        } else if source_line.is_empty() {
-            wrapped.push(String::new());
-        }
+        return;
     }
-    wrapped
+    let mut line = String::new();
+    let mut line_width = 0_usize;
+    let mut source_width = 0_usize;
+    let mut render = |safe: &str| {
+        for grapheme in safe.graphemes(true) {
+            if grapheme == "\n" {
+                visit(&line);
+                line.clear();
+                line_width = 0;
+                source_width = 0;
+                continue;
+            }
+            let spaces = if grapheme == "\t" {
+                4 - source_width % 4
+            } else {
+                0
+            };
+            for _ in 0..spaces.max(1) {
+                let grapheme = if spaces > 0 { " " } else { grapheme };
+                let original_width = display_width(grapheme);
+                source_width = source_width.saturating_add(original_width);
+                let (grapheme, grapheme_width) = if original_width > width {
+                    ("�", 1)
+                } else {
+                    (grapheme, original_width)
+                };
+                if line_width > 0 && line_width.saturating_add(grapheme_width) > width {
+                    visit(&line);
+                    line.clear();
+                    line_width = 0;
+                }
+                line.push_str(grapheme);
+                line_width = line_width.saturating_add(grapheme_width);
+            }
+        }
+    };
+    if value
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
+    {
+        // Carry the last grapheme across sanitized chunks so even escapes inside emoji
+        // cannot split a cluster. Memory is bounded by the chunk and the largest grapheme.
+        let mut chunk = String::with_capacity(4096);
+        let mut flush_at = 4096_usize;
+        for_each_terminal_character(value, |ch| {
+            chunk.push(ch);
+            if chunk.len() >= flush_at {
+                let boundary = chunk
+                    .grapheme_indices(true)
+                    .next_back()
+                    .map_or(0, |(index, _)| index);
+                if boundary > 0 {
+                    render(&chunk[..boundary]);
+                    drop(chunk.drain(..boundary));
+                    flush_at = chunk.len().saturating_add(4096);
+                } else {
+                    flush_at = flush_at.saturating_mul(2);
+                }
+            }
+        });
+        render(&chunk);
+    } else {
+        render(value);
+    }
+    visit(&line);
 }
 
 fn tool_name(label: &str) -> String {
@@ -1778,4 +1924,245 @@ fn tool_name(label: &str) -> String {
         first
     };
     name.to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain(lines: &[Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn compact_preview_does_not_hide_text_behind_terminal_newlines() {
+        let rows = plain(&transcript_lines(
+            &[tool("first\nlast\n\n\n")],
+            80,
+            TranscriptDetail::Compact,
+        ));
+        assert!(rows.iter().any(|row| row.contains("last")));
+    }
+
+    fn tool(output: &str) -> TranscriptEntry {
+        TranscriptEntry::ToolCall(super::super::ToolTranscript {
+            call_id: None,
+            name: "bash".into(),
+            context: None,
+            output: output.into(),
+            lifecycle: ToolLifecycle::Completed,
+        })
+    }
+
+    #[test]
+    fn terminal_sequences_are_removed_without_copying_clean_text() {
+        let clean = "界 e\u{301}\tvalue\nnext";
+        assert!(matches!(sanitize_terminal_text(clean), Cow::Borrowed(value) if value == clean));
+        let unsafe_text = concat!(
+            "a\x1b[2Jb\x1b]8;;https://example.test\x1b\\link\x1b]8;;\x07",
+            "\x1bPignored\x1b\\c\x1b(0d\u{009b}31me\u{009d}title\u{009c}",
+            "\x00\x07\x08\r\x7f\t\nend\x1b[31"
+        );
+        assert_eq!(sanitize_terminal_text(unsafe_text), "ablinkcde\t\nend");
+    }
+
+    #[test]
+    fn literal_code_and_tool_blank_rows_survive_rendering() {
+        let rows = plain(&markdown_lines("```text\n alpha  \n\n\n \n```", 80));
+        assert_eq!(&rows[1..5], &[" alpha  ", "", "", " "]);
+        let source = "  one  \n\n\n two\n \n";
+        let rows = plain(&transcript_lines(
+            &[tool(source)],
+            80,
+            TranscriptDetail::Expanded,
+        ));
+        let output = rows[1..rows.len() - 1]
+            .iter()
+            .map(|row| row.strip_prefix("    ").unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(output, source.split('\n').collect::<Vec<_>>());
+        assert_eq!(hard_wrap("a bcd.", 5).concat(), "a bcd.");
+        assert_eq!(hard_wrap("a\tb", 80), ["a   b"]);
+    }
+
+    #[test]
+    fn escapes_split_across_stream_chunks_do_not_change_visible_graphemes() {
+        let source = format!(
+            "{}e\x1b[31m\u{301}👨\x1b[0m‍👩‍👧‍👦\n\x1b]title spanning\nrows\x1b\\tail",
+            "x".repeat(4094)
+        );
+        let clean = format!("{}e\u{301}👨‍👩‍👧‍👦\ntail", "x".repeat(4094));
+        assert_eq!(hard_wrap(&source, 40), hard_wrap(&clean, 40));
+        assert_eq!(
+            compact_tool_output(&source, 40),
+            compact_tool_output(&clean, 40)
+        );
+        assert_eq!(hard_wrap("12345\tx", 3).concat(), "12345   x");
+    }
+
+    #[test]
+    fn compact_tail_counts_blank_and_wrapped_rows_without_discarding_the_tail() {
+        assert_eq!(
+            compact_tool_output("a\n\n\nz", 40),
+            ["… 2 earlier lines", "", "z"]
+        );
+        let source = format!("{}{}", "old\n".repeat(10_000), "x".repeat(80));
+        let preview = compact_tool_output(&source, 40);
+        assert_eq!(
+            preview,
+            [
+                "… 10000 earlier lines".to_owned(),
+                "x".repeat(40),
+                "x".repeat(40)
+            ]
+        );
+        assert_eq!(
+            expanded_tool_output(&source, 40).last(),
+            Some(&"x".repeat(40))
+        );
+    }
+
+    #[test]
+    fn independent_entry_batches_keep_identical_separators() {
+        let entries = [
+            TranscriptEntry::UserTurn {
+                body: "first".into(),
+            },
+            TranscriptEntry::AssistantMessage {
+                body: "answer\n\n```\na\n\n```".into(),
+            },
+            tool("result\n\n"),
+            TranscriptEntry::UserTurn {
+                body: "second".into(),
+            },
+        ];
+        let together = transcript_lines(&entries, 40, TranscriptDetail::Expanded);
+        let separate = entries
+            .iter()
+            .flat_map(|entry| {
+                transcript_lines(std::slice::from_ref(entry), 40, TranscriptDetail::Expanded)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(together, separate);
+    }
+
+    #[test]
+    fn transcript_entries_fit_tiny_widths_and_never_emit_controls() {
+        let hostile = "界👨‍👩‍👧‍👦e\u{301}\x1b[31m red\x07";
+        let entries = [
+            TranscriptEntry::Startup {
+                version: "1.0".into(),
+                model: hostile.into(),
+                project: hostile.into(),
+                mode: ExecutionMode::Supervised,
+            },
+            TranscriptEntry::UserTurn {
+                body: hostile.into(),
+            },
+            TranscriptEntry::AssistantMessage {
+                body: format!(
+                    "# {hostile}\n\n> quoted\n>\n> next\n\n- list\n  - nested\n\n---\n\n```rust\n{hostile}\tvalue\n\n```\n\n| head | second |\n|---|---|\n|{hostile}|long value|\n\n| header only | other |\n|---|---|"
+                ),
+            },
+            tool(hostile),
+            TranscriptEntry::Error {
+                body: hostile.into(),
+            },
+            TranscriptEntry::Notice {
+                label: Some(hostile.into()),
+                body: hostile.into(),
+            },
+        ];
+        for width in 0..40 {
+            for detail in [TranscriptDetail::Compact, TranscriptDetail::Expanded] {
+                let lines = transcript_lines(&entries, width, detail);
+                assert!(
+                    lines.iter().all(|line| line.width() <= width),
+                    "width {width}: {:?}",
+                    plain(&lines)
+                );
+                assert!(
+                    plain(&lines)
+                        .iter()
+                        .flat_map(|line| line.chars())
+                        .all(|ch| !ch.is_control())
+                );
+            }
+        }
+        assert_eq!(hard_wrap("界", 1), ["�"]);
+        assert_eq!(hard_wrap("界👨‍👩‍👧‍👦e\u{301}", 2).concat(), "界👨‍👩‍👧‍👦e\u{301}");
+    }
+
+    #[test]
+    fn nested_blocks_keep_their_parent_marker_and_continuation_indent() {
+        let rows = plain(&markdown_lines(
+            "-\n  - child\n\n-\n  > quoted\n\n-\n  ```\n  code\n  ```",
+            80,
+        ));
+        assert!(!rows.iter().any(|row| row.trim() == "•"));
+        assert!(rows.iter().any(|row| row == "• • child"));
+        assert!(rows.iter().any(|row| row == "• │ quoted"));
+        assert!(rows.iter().any(|row| row == "  code"));
+    }
+
+    #[test]
+    fn partial_markdown_can_reinterpret_earlier_text_without_losing_code() {
+        assert_eq!(plain(&markdown_lines("Title", 80)), ["Title"]);
+        let heading = markdown_lines("Title\n===", 80);
+        assert_eq!(plain(&heading), ["# Title"]);
+        assert!(
+            heading[0]
+                .spans
+                .iter()
+                .all(|span| span.style.add_modifier.contains(Modifier::BOLD))
+        );
+        for source in ["```rust\nlet x = 1;", "```rust\nlet x = 1;\n```"] {
+            assert_eq!(plain(&markdown_lines(source, 80))[1], "let x = 1;");
+        }
+        let decoded = markdown_lines("| heading |\n|---|\n| &#27;[31mvisible&#7; |", 80);
+        assert!(
+            plain(&decoded)
+                .iter()
+                .flat_map(|line| line.chars())
+                .all(|ch| !ch.is_control())
+        );
+    }
+
+    #[test]
+    fn header_only_tables_and_deep_nesting_keep_source_available() {
+        let rows = plain(&markdown_lines("| alphabet | second |\n|---|---|", 3));
+        assert_eq!(rows.concat(), "alphabetsecond");
+        let source = format!("{}leaf", "> ".repeat(200));
+        assert_eq!(plain(&markdown_lines(&source, 20)).concat(), source);
+        let mut lines = Vec::new();
+        let items = vec![
+            vec![MarkdownBlock::Paragraph(vec![StyledFragment {
+                content: "one".into(),
+                style: text_style(),
+            }])],
+            vec![MarkdownBlock::Paragraph(vec![StyledFragment {
+                content: "two".into(),
+                style: text_style(),
+            }])],
+        ];
+        render_markdown_list(
+            Some(u64::MAX),
+            &items,
+            80,
+            MarkdownContext::default(),
+            &mut lines,
+        );
+        assert_eq!(
+            plain(&lines),
+            [format!("{}. one", u64::MAX), format!("{}. two", u64::MAX)]
+        );
+    }
 }

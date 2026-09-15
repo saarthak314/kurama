@@ -39,6 +39,8 @@ use crate::{
 pub type RuntimeEvents = mpsc::Receiver<RuntimeEvent>;
 
 const MAX_DELEGATION_WAVES: u8 = 3;
+const ASSISTANT_DELTA_BYTES: usize = 4_096;
+const ASSISTANT_DELTA_DELAY: Duration = Duration::from_millis(50);
 
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -873,7 +875,7 @@ impl EngineActor {
             let capability_enabled = explicit_delegation
                 || self
                     .orchestrator
-                    .explicit_delegation(self.latest_user_text().unwrap_or_default().as_str());
+                    .explicit_delegation(self.context.latest_user_text().unwrap_or_default());
             let outcome = self.drive_turn(capability_enabled, &cancel).await;
             explicit_delegation = false;
 
@@ -984,9 +986,26 @@ impl EngineActor {
             };
             let mut round = ModelRound::default();
             let mut runtime_buffer = String::new();
+            let mut flush_deadline = None;
             let mut progressed = false;
             loop {
                 tokio::select! {
+                    biased;
+                    () = async {
+                        match flush_deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        self.flush_deltas(&mut runtime_buffer, true).await?;
+                        flush_deadline = None;
+                    }
+                    command = self.command_rx.recv() => {
+                        if let Err(error) = self.handle_turn_command(command, cancel).await {
+                            self.preserve_partial_assistant(round, &mut runtime_buffer).await?;
+                            return Err(error);
+                        }
+                    }
                     item = stream.next() => {
                         match item {
                             Some(Ok(event)) => {
@@ -995,12 +1014,18 @@ impl EngineActor {
                                     ModelEvent::ResponseStarted { .. } => {}
                                     ModelEvent::TextDelta { text } => {
                                         round.text.push_str(&text);
+                                        if runtime_buffer.is_empty() && !text.is_empty() {
+                                            flush_deadline = Some(tokio::time::Instant::now() + ASSISTANT_DELTA_DELAY);
+                                        }
                                         runtime_buffer.push_str(&text);
                                         self.flush_deltas(&mut runtime_buffer, false).await?;
+                                        if runtime_buffer.is_empty() {
+                                            flush_deadline = None;
+                                        }
                                     }
                                     ModelEvent::ToolCall { call_id, name, arguments } => {
                                         if !round.tool_call_ids.insert(call_id.clone()) {
-                                            self.preserve_partial_assistant(&round, &mut runtime_buffer).await?;
+                                            self.preserve_partial_assistant(round, &mut runtime_buffer).await?;
                                             return Err(KuramaError::Model(format!(
                                                 "model emitted duplicate tool call id {call_id} in one response"
                                             )));
@@ -1010,6 +1035,8 @@ impl EngineActor {
                                     ModelEvent::Delegation { request } => round.delegations.push(request),
                                     ModelEvent::Usage { usage } => {
                                         self.append(SessionEvent::ModelUsage { usage })?;
+                                        self.flush_deltas(&mut runtime_buffer, true).await?;
+                                        flush_deadline = None;
                                         self.emit(RuntimeEvent::Usage { usage }).await?;
                                     }
                                     ModelEvent::ResponseCompleted { cursor, finish_reason } => {
@@ -1030,21 +1057,15 @@ impl EngineActor {
                                 break;
                             }
                             Some(Err(error)) => {
-                                self.preserve_partial_assistant(&round, &mut runtime_buffer).await?;
+                                self.preserve_partial_assistant(round, &mut runtime_buffer).await?;
                                 return Err(error);
                             }
                             None => {
-                                self.preserve_partial_assistant(&round, &mut runtime_buffer).await?;
+                                self.preserve_partial_assistant(round, &mut runtime_buffer).await?;
                                 return Err(KuramaError::Model(
                                     "model stream ended before response completion".into(),
                                 ));
                             }
-                        }
-                    }
-                    command = self.command_rx.recv() => {
-                        if let Err(error) = self.handle_turn_command(command, cancel).await {
-                            self.preserve_partial_assistant(&round, &mut runtime_buffer).await?;
-                            return Err(error);
                         }
                     }
                 }
@@ -1621,36 +1642,33 @@ impl EngineActor {
         buffer: &mut String,
         flush_all: bool,
     ) -> Result<(), KuramaError> {
-        while buffer.len() >= 4_096 || (flush_all && !buffer.is_empty()) {
-            let requested = if flush_all {
-                buffer.len().min(4_096)
-            } else {
-                4_096
-            };
-            let mut boundary = requested;
+        let mut emitted = 0;
+        while buffer.len() - emitted >= ASSISTANT_DELTA_BYTES
+            || (flush_all && emitted < buffer.len())
+        {
+            let mut boundary = (emitted + ASSISTANT_DELTA_BYTES).min(buffer.len());
             while !buffer.is_char_boundary(boundary) {
                 boundary -= 1;
             }
-            let remainder = buffer.split_off(boundary);
-            let chunk = std::mem::replace(buffer, remainder);
-            self.emit(RuntimeEvent::AssistantDelta { text: chunk })
-                .await?;
+            let text = buffer[emitted..boundary].to_owned();
+            self.emit(RuntimeEvent::AssistantDelta { text }).await?;
+            emitted = boundary;
         }
+        // Move the remaining tail once, not once per emitted chunk.
+        buffer.drain(..emitted);
         Ok(())
     }
 
     async fn preserve_partial_assistant(
         &mut self,
-        round: &ModelRound,
+        round: ModelRound,
         runtime_buffer: &mut String,
     ) -> Result<(), KuramaError> {
         if round.text.is_empty() {
             return Ok(());
         }
         self.flush_deltas(runtime_buffer, true).await?;
-        self.append(SessionEvent::AssistantMessage {
-            text: round.text.clone(),
-        })?;
+        self.append(SessionEvent::AssistantMessage { text: round.text })?;
         Ok(())
     }
 
@@ -1907,18 +1925,22 @@ impl EngineActor {
             .await
     }
 
-    fn append(&mut self, event: SessionEvent) -> Result<EventEnvelope, KuramaError> {
-        let envelope = EventEnvelope::new(
+    fn append(&mut self, event: SessionEvent) -> Result<(), KuramaError> {
+        let mut envelope = EventEnvelope::new(
             self.sequence,
             now_ms(),
             self.session_id.clone(),
             self.agent_id.clone(),
             event,
         );
-        self.store.append(&envelope)?;
-        self.sequence += 1;
-        self.context.record(envelope.clone());
-        Ok(envelope)
+        if self.agent_id.is_some() {
+            self.store.append_next(&mut envelope)?;
+        } else {
+            self.store.append(&envelope)?;
+        }
+        self.sequence = envelope.sequence.saturating_add(1);
+        self.context.record(envelope);
+        Ok(())
     }
 
     async fn emit(&self, event: RuntimeEvent) -> Result<(), KuramaError> {
@@ -1939,21 +1961,6 @@ impl EngineActor {
             limits: self.tool_limits,
             write_scope: self.write_scope.clone(),
         }
-    }
-
-    fn latest_user_text(&self) -> Option<String> {
-        self.store
-            .replay(&self.session_id)
-            .ok()?
-            .into_iter()
-            .rev()
-            .find_map(|event| {
-                if let SessionEvent::UserMessage { text } = event.event {
-                    Some(text)
-                } else {
-                    None
-                }
-            })
     }
 }
 

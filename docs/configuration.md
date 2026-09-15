@@ -40,7 +40,7 @@ Only `default_mode = "supervised"` or `default_mode = "auto"` is valid. `yolo` i
 
 ## Profiles and Authentication
 
-Profile kinds are `openai`, `anthropic`, `openai_compatible`, `codex_cli`, and `claude_cli`. HTTP profiles define a model, endpoint, input/output limits, and an auth reference. CLI profiles define the installed official command and model. OpenAI-compatible profiles are also the route for existing local inference servers.
+Profile kinds are `openai`, `anthropic`, `open_ai_compatible`, `codex_cli`, and `claude_cli`. HTTP profiles define a model, endpoint, input/output limits, and an auth reference. CLI profiles define the installed official command and model. OpenAI-compatible profiles are also the route for existing local inference servers.
 
 Authentication accepts only:
 

@@ -9,7 +9,10 @@ const MAX_DEPTH: usize = 6;
 const MAX_ROWS: usize = 8;
 
 pub fn mention_at_cursor(composer: &str, cursor: usize) -> Option<(usize, String)> {
-    let cursor = cursor.min(composer.len());
+    let mut cursor = cursor.min(composer.len());
+    while !composer.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
     let before = &composer[..cursor];
     let start = before.rfind('@')?;
     if start > 0 {
@@ -69,32 +72,36 @@ pub fn collect_files(root: &Path) -> Vec<String> {
 }
 
 pub fn filter_files<'a>(files: &'a [String], query: &str) -> Vec<&'a str> {
-    let query = query.to_ascii_lowercase();
-    let mut scored = files
-        .iter()
-        .filter_map(|path| {
-            let lowered = path.to_ascii_lowercase();
-            if !subsequence(&lowered, &query) {
-                return None;
-            }
-            let score = if query.is_empty() {
-                path.len()
-            } else if lowered.rsplit('/').next() == Some(query.as_str()) {
-                0
-            } else if lowered.contains(&query) {
-                1
-            } else {
-                2
-            };
-            Some((score, path.len(), path.as_str()))
-        })
-        .collect::<Vec<_>>();
-    scored.sort_by_key(|(score, len, path)| (*score, *len, *path));
-    scored
-        .into_iter()
-        .take(MAX_ROWS)
-        .map(|(_, _, path)| path)
-        .collect()
+    let mut best = Vec::with_capacity(MAX_ROWS + 1);
+    for path in files {
+        if !subsequence(path, query) {
+            continue;
+        }
+        let score = if query.is_empty() {
+            path.len()
+        } else if path
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case(query))
+        {
+            0
+        } else if path
+            .as_bytes()
+            .windows(query.len())
+            .any(|part| part.eq_ignore_ascii_case(query.as_bytes()))
+        {
+            1
+        } else {
+            2
+        };
+        let candidate = (score, path.len(), path.as_str());
+        let index = best.partition_point(|existing| existing < &candidate);
+        if index < MAX_ROWS {
+            best.insert(index, candidate);
+            best.truncate(MAX_ROWS);
+        }
+    }
+    best.into_iter().map(|(_, _, path)| path).collect()
 }
 
 fn subsequence(haystack: &str, needle: &str) -> bool {
@@ -102,7 +109,9 @@ fn subsequence(haystack: &str, needle: &str) -> bool {
         return true;
     }
     let mut chars = haystack.chars();
-    needle.chars().all(|wanted| chars.any(|got| got == wanted))
+    needle
+        .chars()
+        .all(|wanted| chars.any(|got| got.eq_ignore_ascii_case(&wanted)))
 }
 
 pub fn image_extension(bytes: &[u8]) -> Option<&'static str> {
@@ -251,6 +260,8 @@ mod tests {
         );
         assert!(mention_at_cursor("email@x", 7).is_none());
         assert!(mention_at_cursor("@src foo", 8).is_none());
+        assert_eq!(mention_at_cursor("@界", 2), Some((0, String::new())));
+        assert_eq!(mention_at_cursor("@界", usize::MAX), Some((0, "界".into())));
     }
 
     #[test]

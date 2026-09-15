@@ -1,3 +1,10 @@
+use std::cell::Cell;
+
+use super::{
+    composer::editor_cursor_vertical,
+    input::{grapheme_boundary_at_or_after, next_grapheme_boundary, previous_grapheme_boundary},
+};
+
 use kurama_protocol::policy::ApprovalRequest;
 
 #[derive(Debug, Clone)]
@@ -9,6 +16,7 @@ pub struct ApprovalState {
     pub validation_error: Option<String>,
     pub editing: bool,
     pub selected: usize,
+    pub(crate) editor_width: Cell<usize>,
 }
 
 impl ApprovalState {
@@ -23,6 +31,7 @@ impl ApprovalState {
             validation_error: None,
             editing: false,
             selected: 0,
+            editor_width: Cell::new(usize::MAX),
         }
     }
 
@@ -43,16 +52,16 @@ impl ApprovalState {
     pub fn insert_str(&mut self, value: &str) {
         self.clamp_cursor();
         self.editor.insert_str(self.editor_cursor, value);
-        self.editor_cursor = self.editor_cursor.saturating_add(value.len());
+        self.editor_cursor = grapheme_boundary_at_or_after(
+            &self.editor,
+            self.editor_cursor.saturating_add(value.len()),
+        );
         self.validation_error = None;
     }
 
     pub fn backspace(&mut self) {
         self.clamp_cursor();
-        let Some((previous, _)) = self.editor[..self.editor_cursor].char_indices().next_back()
-        else {
-            return;
-        };
+        let previous = previous_grapheme_boundary(&self.editor, self.editor_cursor);
         self.editor.drain(previous..self.editor_cursor);
         self.editor_cursor = previous;
         self.validation_error = None;
@@ -60,26 +69,19 @@ impl ApprovalState {
 
     pub fn delete(&mut self) {
         self.clamp_cursor();
-        let Some(character) = self.editor[self.editor_cursor..].chars().next() else {
-            return;
-        };
-        let next = self.editor_cursor.saturating_add(character.len_utf8());
+        let next = next_grapheme_boundary(&self.editor, self.editor_cursor);
         self.editor.drain(self.editor_cursor..next);
         self.validation_error = None;
     }
 
     pub fn move_left(&mut self) {
         self.clamp_cursor();
-        if let Some((previous, _)) = self.editor[..self.editor_cursor].char_indices().next_back() {
-            self.editor_cursor = previous;
-        }
+        self.editor_cursor = previous_grapheme_boundary(&self.editor, self.editor_cursor);
     }
 
     pub fn move_right(&mut self) {
         self.clamp_cursor();
-        if let Some(character) = self.editor[self.editor_cursor..].chars().next() {
-            self.editor_cursor = self.editor_cursor.saturating_add(character.len_utf8());
-        }
+        self.editor_cursor = next_grapheme_boundary(&self.editor, self.editor_cursor);
     }
 
     pub fn move_home(&mut self) {
@@ -98,53 +100,32 @@ impl ApprovalState {
 
     pub fn move_up(&mut self) {
         self.clamp_cursor();
-        let column = self.column();
-        self.move_home();
-        if self.editor_cursor == 0 {
-            return;
+        if let Some(cursor) = editor_cursor_vertical(
+            &self.editor,
+            self.editor_cursor,
+            self.editor_width.get(),
+            -1,
+        ) {
+            self.editor_cursor = cursor;
         }
-        self.editor_cursor -= 1;
-        self.move_home();
-        self.move_to_column(column);
     }
 
     pub fn move_down(&mut self) {
         self.clamp_cursor();
-        let column = self.column();
-        self.move_end();
-        if self.editor_cursor >= self.editor.len() {
-            return;
+        if let Some(cursor) =
+            editor_cursor_vertical(&self.editor, self.editor_cursor, self.editor_width.get(), 1)
+        {
+            self.editor_cursor = cursor;
         }
-        self.editor_cursor += 1;
-        self.move_to_column(column);
-    }
-
-    fn column(&self) -> usize {
-        self.editor_cursor
-            - self.editor[..self.editor_cursor]
-                .rfind('\n')
-                .map_or(0, |index| index + 1)
-    }
-
-    fn move_to_column(&mut self, column: usize) {
-        let start = self.editor_cursor;
-        let end = self.editor[start..]
-            .find('\n')
-            .map_or(self.editor.len(), |offset| start + offset);
-        let mut index = start;
-        for (used, character) in self.editor[start..end].chars().enumerate() {
-            if used >= column {
-                break;
-            }
-            index += character.len_utf8();
-        }
-        self.editor_cursor = index;
     }
 
     fn clamp_cursor(&mut self) {
         self.editor_cursor = self.editor_cursor.min(self.editor.len());
-        while !self.editor.is_char_boundary(self.editor_cursor) {
-            self.editor_cursor = self.editor_cursor.saturating_sub(1);
+        if self.editor_cursor < self.editor.len() {
+            self.editor_cursor = previous_grapheme_boundary(
+                &self.editor,
+                next_grapheme_boundary(&self.editor, self.editor_cursor),
+            );
         }
     }
 }

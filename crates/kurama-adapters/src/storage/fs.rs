@@ -139,6 +139,41 @@ impl FsSessionStore {
         }
     }
 
+    fn open_for_append(&self, event: &EventEnvelope) -> Result<(File, u64), KuramaError> {
+        if event.schema_version != SCHEMA_VERSION {
+            return Err(KuramaError::Storage(format!(
+                "unsupported session schema version {}",
+                event.schema_version
+            )));
+        }
+        let session_dir = self.session_dir(&event.session_id)?;
+        if !session_dir.join(METADATA_FILE).is_file() {
+            return Err(KuramaError::NotFound(format!(
+                "session {}",
+                event.session_id
+            )));
+        }
+        if event.agent_id.is_some() {
+            ensure_directory(&session_dir.join("agents"))?;
+        }
+        let path = self.log_path(&event.session_id, event.agent_id.as_ref())?;
+        let mut file = open_locked(&path, true)?;
+        let prior = read_last_complete_record(&mut file)?;
+        let next_sequence = match prior {
+            Some(bytes) => deserialize_event(
+                &bytes,
+                &event.session_id,
+                event.agent_id.as_ref(),
+                "trailing",
+            )?
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| KuramaError::Storage("event sequence exceeds u64".into()))?,
+            None => 0,
+        };
+        Ok((file, next_sequence))
+    }
+
     fn replay_log(
         &self,
         session_id: &SessionId,
@@ -182,12 +217,7 @@ impl FsSessionStore {
                 SessionEvent::RecoveryRepair { removed_bytes },
             );
             file.set_len(complete_end)?;
-            file.seek(SeekFrom::Start(complete_end))?;
-            serde_json::to_writer(&mut file, &repair)
-                .map_err(|error| storage_error("serialize recovery repair", error))?;
-            file.write_all(b"\n")?;
-            file.sync_data()?;
-            count_sync();
+            commit_event(&mut file, &repair)?;
         }
         Ok(scan)
     }
@@ -212,6 +242,22 @@ impl FsSessionStore {
     ) -> Result<(u64, u64, u64), KuramaError> {
         reset_operation_counts();
         <Self as SessionStore>::append(self, event)?;
+        let counts = operation_counts();
+        Ok((
+            counts.tail_bytes_read,
+            counts.records_deserialized,
+            counts.syncs,
+        ))
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn append_next_with_operation_counts_for_test(
+        &self,
+        event: &mut EventEnvelope,
+    ) -> Result<(u64, u64, u64), KuramaError> {
+        reset_operation_counts();
+        <Self as SessionStore>::append_next(self, event)?;
         let counts = operation_counts();
         Ok((
             counts.tail_bytes_read,
@@ -260,51 +306,20 @@ impl SessionStore for FsSessionStore {
     }
 
     fn append(&self, event: &EventEnvelope) -> Result<(), KuramaError> {
-        if event.schema_version != SCHEMA_VERSION {
-            return Err(KuramaError::Storage(format!(
-                "unsupported session schema version {}",
-                event.schema_version
-            )));
-        }
-        let session_dir = self.session_dir(&event.session_id)?;
-        if !session_dir.join(METADATA_FILE).is_file() {
-            return Err(KuramaError::NotFound(format!(
-                "session {}",
-                event.session_id
-            )));
-        }
-        if event.agent_id.is_some() {
-            ensure_directory(&session_dir.join("agents"))?;
-        }
-        let path = self.log_path(&event.session_id, event.agent_id.as_ref())?;
-        let mut file = open_locked(&path, true)?;
-        let prior = read_last_complete_record(&mut file)?;
-        let expected = match prior {
-            Some(bytes) => deserialize_event(
-                &bytes,
-                &event.session_id,
-                event.agent_id.as_ref(),
-                "trailing",
-            )?
-            .sequence
-            .checked_add(1)
-            .ok_or_else(|| KuramaError::Storage("event sequence exceeds u64".into()))?,
-            None => 0,
-        };
+        let (mut file, expected) = self.open_for_append(event)?;
         if event.sequence != expected {
             return Err(KuramaError::Storage(format!(
                 "invalid event sequence {}; expected {expected}",
                 event.sequence
             )));
         }
+        commit_event(&mut file, event)
+    }
 
-        file.seek(SeekFrom::End(0))?;
-        serde_json::to_writer(&mut file, event)
-            .map_err(|error| storage_error("serialize session event", error))?;
-        file.write_all(b"\n")?;
-        file.sync_data()?;
-        count_sync();
-        Ok(())
+    fn append_next(&self, event: &mut EventEnvelope) -> Result<(), KuramaError> {
+        let (mut file, next_sequence) = self.open_for_append(event)?;
+        event.sequence = next_sequence;
+        commit_event(&mut file, event)
     }
 
     fn replay(&self, session_id: &SessionId) -> Result<Vec<EventEnvelope>, KuramaError> {
@@ -432,6 +447,17 @@ impl SessionStore for FsSessionStore {
         verify_blob_bytes(&bytes, &reference.sha256, reference.bytes)?;
         Ok(bytes)
     }
+}
+
+fn commit_event(file: &mut File, event: &EventEnvelope) -> Result<(), KuramaError> {
+    let mut encoded = serde_json::to_vec(event)
+        .map_err(|error| storage_error("serialize session event", error))?;
+    encoded.push(b'\n');
+    file.seek(SeekFrom::End(0))?;
+    file.write_all(&encoded)?;
+    file.sync_data()?;
+    count_sync();
+    Ok(())
 }
 
 fn complete_log_end(file: &mut File) -> Result<(u64, u64), KuramaError> {

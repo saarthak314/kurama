@@ -15,6 +15,9 @@ use kurama_protocol::{
 
 use crate::commands::{CommandSpec, command_suggestions};
 
+use super::input::{
+    grapheme_boundary_at_or_after, next_grapheme_boundary, previous_grapheme_boundary,
+};
 use super::{AgentRow, ApprovalState, OnboardingState, sort_agents};
 
 const MAX_LIVE_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
@@ -95,6 +98,7 @@ struct PendingTurn {
 pub enum TranscriptEntry {
     Startup {
         version: String,
+        model: String,
         project: String,
         mode: ExecutionMode,
     },
@@ -127,6 +131,7 @@ pub struct TuiState {
     pub transcript: Vec<TranscriptEntry>,
     pub composer: String,
     pub composer_inner_width: Cell<u16>,
+    pub transcript_width: Cell<u16>,
     pub cursor: usize,
     pub scroll: usize,
     pub running_agents: usize,
@@ -136,6 +141,7 @@ pub struct TuiState {
     pub approval: Option<ApprovalState>,
     pub agents: Vec<AgentRow>,
     pub todos: Vec<TodoItem>,
+    pub selected_todo: usize,
     pub goal: Option<SessionGoal>,
     pub git_branch: Option<String>,
     pub viewport_height: Cell<u16>,
@@ -162,7 +168,17 @@ pub struct TuiState {
     pending_tool_context: Option<String>,
     replayed_agent_ids: HashSet<AgentId>,
     committed_transcript_entries: usize,
+    transcript_revision: u64,
+    transcript_dirty_from: usize,
+    transcript_geometry: RefCell<Option<TranscriptGeometry>>,
     sent_commands: Vec<EngineCommand>,
+}
+
+struct TranscriptGeometry {
+    revision: u64,
+    width: u16,
+    lines: usize,
+    prompt_starts: Vec<usize>,
 }
 
 impl TuiState {
@@ -182,6 +198,7 @@ impl TuiState {
             transcript: Vec::new(),
             composer: String::new(),
             composer_inner_width: Cell::new(72),
+            transcript_width: Cell::new(72),
             cursor: 0,
             scroll: 0,
             running_agents: 0,
@@ -191,6 +208,7 @@ impl TuiState {
             approval: None,
             agents: Vec::new(),
             todos: Vec::new(),
+            selected_todo: 0,
             goal: None,
             git_branch: None,
             viewport_height: Cell::new(12),
@@ -217,6 +235,9 @@ impl TuiState {
             pending_tool_context: None,
             replayed_agent_ids: HashSet::new(),
             committed_transcript_entries: 0,
+            transcript_revision: 0,
+            transcript_dirty_from: 0,
+            transcript_geometry: RefCell::new(None),
             sent_commands: Vec::new(),
         }
     }
@@ -238,6 +259,7 @@ impl TuiState {
     }
 
     pub fn composer_edited(&mut self) {
+        self.cursor = grapheme_boundary_at_or_after(&self.composer, self.cursor);
         self.command_selection = 0;
         self.file_selection = 0;
         self.command_palette_dismissed = false;
@@ -259,17 +281,20 @@ impl TuiState {
     }
 
     pub fn kill_to_end(&mut self) {
+        self.normalize_composer_cursor();
         self.composer.truncate(self.cursor);
         self.composer_edited();
     }
 
     pub fn kill_to_start(&mut self) {
+        self.normalize_composer_cursor();
         self.composer.replace_range(..self.cursor, "");
         self.cursor = 0;
         self.composer_edited();
     }
 
     pub fn kill_previous_word(&mut self) {
+        self.normalize_composer_cursor();
         if self.cursor == 0 {
             return;
         }
@@ -284,6 +309,74 @@ impl TuiState {
         self.composer.replace_range(word_start..self.cursor, "");
         self.cursor = word_start;
         self.composer_edited();
+    }
+
+    pub(crate) fn normalize_composer_cursor(&mut self) {
+        self.cursor = grapheme_cursor(&self.composer, self.cursor);
+    }
+
+    pub(crate) const fn transcript_revision(&self) -> u64 {
+        self.transcript_revision
+    }
+
+    pub(crate) const fn transcript_dirty_from(&self) -> usize {
+        self.transcript_dirty_from
+    }
+
+    pub(crate) fn mark_transcript_rendered(&mut self) {
+        self.transcript_dirty_from = self.transcript.len();
+    }
+
+    fn transcript_changed(&mut self, from: usize) {
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        self.transcript_dirty_from = self.transcript_dirty_from.min(from);
+    }
+
+    pub(crate) fn set_transcript_geometry(&self, width: u16, lines: usize, entry_starts: &[usize]) {
+        *self.transcript_geometry.borrow_mut() = Some(TranscriptGeometry {
+            revision: self.transcript_revision,
+            width,
+            lines,
+            prompt_starts: self
+                .transcript
+                .iter()
+                .zip(entry_starts)
+                .filter_map(|(entry, &row)| {
+                    matches!(entry, TranscriptEntry::UserTurn { .. }).then_some(row)
+                })
+                .collect(),
+        });
+    }
+
+    fn ensure_transcript_geometry(&self, width: u16) {
+        if self
+            .transcript_geometry
+            .borrow()
+            .as_ref()
+            .is_some_and(|geometry| {
+                geometry.revision == self.transcript_revision && geometry.width == width
+            })
+        {
+            return;
+        }
+        let (lines, starts) = super::transcript::transcript_lines_with_entry_starts(
+            &self.transcript,
+            width as usize,
+            super::TranscriptDetail::Expanded,
+        );
+        self.set_transcript_geometry(width, lines.len(), &starts);
+    }
+
+    pub(crate) fn max_transcript_scroll(&self) -> usize {
+        self.ensure_transcript_geometry(self.transcript_width.get());
+        self.transcript_geometry
+            .borrow()
+            .as_ref()
+            .map_or(0, |geometry| {
+                geometry
+                    .lines
+                    .saturating_sub(self.viewport_height.get() as usize)
+            })
     }
 
     pub fn remember_prompt(&mut self, text: &str) {
@@ -513,7 +606,8 @@ impl TuiState {
 
     pub fn pop_history_search_char(&mut self) {
         if let Some(search) = &mut self.history_search {
-            search.query.pop();
+            let boundary = previous_grapheme_boundary(&search.query, search.query.len());
+            search.query.truncate(boundary);
             search.selection = 0;
         }
     }
@@ -588,6 +682,7 @@ impl TuiState {
     }
 
     pub fn insert_mention(&mut self, path: &str) {
+        self.normalize_composer_cursor();
         self.composer.insert_str(self.cursor, &format!("@{path} "));
         self.cursor += path.len() + 2;
         self.composer_edited();
@@ -609,10 +704,12 @@ impl TuiState {
             0,
             TranscriptEntry::Startup {
                 version: version.into(),
+                model: self.model.clone(),
                 project: project.into(),
                 mode: self.mode,
             },
         );
+        self.transcript_changed(0);
     }
 
     pub fn credential(project: impl Into<String>, profile: impl Into<String>) -> Self {
@@ -669,12 +766,8 @@ impl TuiState {
         if self.max_input_tokens == 0 {
             return None;
         }
-        if self.usage.input_tokens == 0 {
-            return Some(compact_tokens(self.max_input_tokens));
-        }
-        let percent =
-            (self.usage.input_tokens.saturating_mul(100) / self.max_input_tokens.max(1)).min(100);
-        Some(format!("{percent}%"))
+        let used = self.usage.input_tokens.saturating_mul(100) / self.max_input_tokens;
+        Some(format!("{}% context left", 100_u64.saturating_sub(used)))
     }
 
     pub fn open_shortcuts(&mut self) {
@@ -683,9 +776,7 @@ impl TuiState {
 
     pub fn toggle_transcript_view(&mut self) {
         self.transcript_view_expanded = !self.transcript_view_expanded;
-        if self.transcript_view_expanded {
-            self.scroll = 0;
-        }
+        self.scroll = 0;
     }
 
     pub const fn transcript_view_expanded(&self) -> bool {
@@ -760,6 +851,7 @@ impl TuiState {
 
     fn push_transcript_entry(&mut self, entry: TranscriptEntry) {
         self.transcript.push(entry);
+        self.transcript_changed(self.transcript.len() - 1);
     }
 
     pub fn stable_transcript_end(&self) -> usize {
@@ -782,11 +874,6 @@ impl TuiState {
         self.scroll = 0;
     }
 
-    pub fn reset_transcript_commit(&mut self) {
-        self.committed_transcript_entries = 0;
-        self.scroll = 0;
-    }
-
     pub fn live_transcript(&self) -> &[TranscriptEntry] {
         &self.transcript[self.committed_transcript_entries..]
     }
@@ -803,6 +890,7 @@ impl TuiState {
         self.replayed_agent_ids.clear();
         self.committed_transcript_entries = 0;
         self.transcript.clear();
+        self.transcript_changed(0);
         self.agents.clear();
         self.todos.clear();
         self.usage = Usage::default();
@@ -940,6 +1028,7 @@ impl TuiState {
     }
 
     pub fn open_todos(&mut self) {
+        self.selected_todo = 0;
         self.overlay = Overlay::Todos;
     }
 
@@ -970,48 +1059,33 @@ impl TuiState {
     }
 
     pub fn jump_user_turn(&mut self, direction: i32, width: usize) {
-        let width = width.max(8);
-        let viewport = self.viewport_height.get().max(1) as usize;
-        let rendered =
-            super::transcript_lines(&self.transcript, width, super::TranscriptDetail::Compact);
-        if rendered.len() <= viewport {
-            self.scroll = 0;
+        let width = width.min(u16::MAX as usize) as u16;
+        self.ensure_transcript_geometry(width);
+        let geometry = self.transcript_geometry.borrow();
+        let Some(geometry) = geometry.as_ref() else {
             return;
-        }
-        let mut starts = Vec::new();
-        for (index, entry) in self.transcript.iter().enumerate() {
-            if matches!(entry, TranscriptEntry::UserTurn { .. }) {
-                starts.push(
-                    super::transcript_lines(
-                        &self.transcript[..index],
-                        width,
-                        super::TranscriptDetail::Compact,
-                    )
-                    .len(),
-                );
-            }
-        }
-        if starts.is_empty() {
-            return;
-        }
-        let max_scroll = rendered.len().saturating_sub(viewport);
-        let current_start = rendered
-            .len()
-            .saturating_sub(viewport.saturating_add(self.scroll));
-        let current = starts
-            .iter()
-            .rposition(|start| *start <= current_start)
-            .unwrap_or(0);
-        let next = if direction < 0 {
-            current.saturating_sub(1)
-        } else {
-            (current + 1).min(starts.len().saturating_sub(1))
         };
-        let target = starts[next];
-        self.scroll = rendered
-            .len()
-            .saturating_sub(viewport.saturating_add(target))
-            .min(max_scroll);
+        let max_scroll = geometry
+            .lines
+            .saturating_sub(self.viewport_height.get() as usize);
+        let current_start = max_scroll.saturating_sub(self.scroll);
+        let target = if direction < 0 {
+            geometry
+                .prompt_starts
+                .iter()
+                .rev()
+                .find(|&&start| start < current_start)
+                .or_else(|| geometry.prompt_starts.first())
+        } else {
+            geometry
+                .prompt_starts
+                .iter()
+                .find(|&&start| start > current_start)
+                .or_else(|| geometry.prompt_starts.last())
+        };
+        if let Some(&target) = target {
+            self.scroll = max_scroll.saturating_sub(target);
+        }
     }
 
     pub const fn overlay(&self) -> Overlay {
@@ -1060,13 +1134,20 @@ impl TuiState {
         self.agent_message_cursor = self.agent_message.len();
     }
 
+    pub(crate) fn normalize_agent_message_cursor(&mut self) {
+        self.agent_message_cursor = grapheme_cursor(&self.agent_message, self.agent_message_cursor);
+    }
+
     pub fn insert_agent_message(&mut self, text: &str) {
+        self.normalize_agent_message_cursor();
         self.agent_message
             .insert_str(self.agent_message_cursor, text);
         self.agent_message_cursor = self
             .agent_message_cursor
             .saturating_add(text.len())
             .min(self.agent_message.len());
+        self.agent_message_cursor =
+            grapheme_boundary_at_or_after(&self.agent_message, self.agent_message_cursor);
     }
 
     pub fn submit_agent_message(&mut self) {
@@ -1350,6 +1431,7 @@ impl TuiState {
             && let Some(TranscriptEntry::AssistantMessage { body }) = self.transcript.get_mut(index)
         {
             body.push_str(&text);
+            self.transcript_changed(index);
             return;
         }
 
@@ -1374,6 +1456,7 @@ impl TuiState {
                     append_stream_boundary(&mut tool.output, &stream);
                 }
                 append_live_tool_output(&mut tool.output, &chunk);
+                self.transcript_changed(index);
             }
             self.active_tool_streams.insert(call_id, stream);
             return;
@@ -1420,7 +1503,8 @@ impl TuiState {
         if name == "todo" && lifecycle != ToolLifecycle::Failed {
             if let Some(index) = self.active_tool_entries.remove(&result.call_id) {
                 self.transcript.remove(index);
-                self.reindex_active_tool_entries(index);
+                self.transcript_changed(index);
+                self.reindex_active_entries(index);
             }
             return;
         }
@@ -1446,6 +1530,7 @@ impl TuiState {
             {
                 tool.output = display_output;
             }
+            self.transcript_changed(index);
             return;
         }
 
@@ -1458,12 +1543,19 @@ impl TuiState {
         }));
     }
 
-    fn reindex_active_tool_entries(&mut self, removed: usize) {
-        for index in self.active_tool_entries.values_mut() {
+    fn reindex_active_entries(&mut self, removed: usize) {
+        self.active_tool_entries.retain(|_, index| {
+            if *index == removed {
+                return false;
+            }
             if *index > removed {
                 *index -= 1;
             }
-        }
+            true
+        });
+        self.active_assistant_entry = self
+            .active_assistant_entry
+            .and_then(|index| (index != removed).then(|| index - usize::from(index > removed)));
     }
 
     pub fn submit_goal(&mut self, objective: String) -> bool {
@@ -1545,6 +1637,7 @@ impl TuiState {
 
     fn replace_todos(&mut self, items: Vec<TodoItem>) {
         self.todos.clone_from(&items);
+        self.selected_todo = self.selected_todo.min(items.len().saturating_sub(1));
         let live_start = self.committed_transcript_entries;
         let existing = self.transcript[live_start..]
             .iter()
@@ -1552,15 +1645,28 @@ impl TuiState {
         if items.is_empty() {
             if let Some(offset) = existing {
                 self.transcript.remove(live_start + offset);
+                self.transcript_changed(live_start + offset);
+                self.reindex_active_entries(live_start + offset);
             }
             return;
         }
         if let Some(offset) = existing {
             self.transcript[live_start + offset] = TranscriptEntry::Todos { items };
+            self.transcript_changed(live_start + offset);
         } else {
             self.push_transcript_entry(TranscriptEntry::Todos { items });
         }
     }
+}
+
+fn grapheme_cursor(text: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(text.len());
+    if cursor == 0 {
+        return 0;
+    }
+    let previous = previous_grapheme_boundary(text, cursor);
+    let next = next_grapheme_boundary(text, previous);
+    if next == cursor { cursor } else { previous }
 }
 
 fn is_non_terminal_runtime_error(message: &str) -> bool {
@@ -1585,16 +1691,12 @@ fn append_live_tool_output(output: &mut String, chunk: &str) {
     while !output.is_char_boundary(retained_start) {
         retained_start += 1;
     }
-    let retained = output[retained_start..].to_owned();
-    output.clear();
-    output.push_str(LIVE_OUTPUT_OMITTED);
-    output.push_str(&retained);
+    output.replace_range(..retained_start, LIVE_OUTPUT_OMITTED);
 }
 
 fn bounded_live_tool_output(mut output: String) -> String {
     if output.len() > MAX_LIVE_TOOL_OUTPUT_BYTES {
-        let contents = std::mem::take(&mut output);
-        append_live_tool_output(&mut output, &contents);
+        append_live_tool_output(&mut output, "");
     }
     output
 }
@@ -1693,13 +1795,5 @@ fn mode_label(mode: ExecutionMode) -> &'static str {
         ExecutionMode::Supervised => "supervised",
         ExecutionMode::Auto => "auto",
         ExecutionMode::Yolo => "yolo",
-    }
-}
-
-fn compact_tokens(tokens: u64) -> String {
-    if tokens >= 1000 {
-        format!("{}k", (tokens + 500) / 1000)
-    } else {
-        tokens.to_string()
     }
 }
