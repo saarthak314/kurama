@@ -90,9 +90,8 @@ fn write_enter_commands<W: io::Write>(mut writer: W) -> io::Result<()> {
         crossterm::cursor::MoveTo(0, 0),
         crossterm::cursor::Hide,
         EnableBracketedPaste,
-        // Crossterm's EnableMouseCapture also enables all-motion reporting.
-        // Button tracking includes wheel events without flooding the input loop.
-        crossterm::style::Print("\x1b[?1000h\x1b[?1006h"),
+        // Report motion only while a button is held, so dragging selects text.
+        crossterm::style::Print("\x1b[?1002h\x1b[?1006h"),
         DisableLineWrap
     )
 }
@@ -101,7 +100,7 @@ fn write_exit_commands<W: io::Write>(mut writer: W) -> io::Result<()> {
     execute!(
         writer,
         EnableLineWrap,
-        crossterm::style::Print("\x1b[?1006l\x1b[?1000l"),
+        crossterm::style::Print("\x1b[?1006l\x1b[?1002l"),
         DisableBracketedPaste,
         LeaveAlternateScreen,
         crossterm::cursor::Show
@@ -161,11 +160,11 @@ mod tests {
         assert!(enter.contains("\x1b[?7l"));
         assert!(exit.contains("\x1b[?7h"));
         assert!(exit.contains("\x1b[?2004l"));
-        for mode in [1000, 1006] {
+        for mode in [1002, 1006] {
             assert_eq!(enter.matches(&format!("\x1b[?{mode}h")).count(), 1);
             assert_eq!(exit.matches(&format!("\x1b[?{mode}l")).count(), 1);
         }
-        for mode in [1002, 1003, 1015] {
+        for mode in [1000, 1003, 1015] {
             assert!(!enter.contains(&format!("\x1b[?{mode}h")));
         }
         assert_eq!(enter.matches("\x1b[?1049h").count(), 1);

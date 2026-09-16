@@ -125,6 +125,11 @@ fn render_main(
                 ),
             );
         }
+        if state.overlay == Overlay::None
+            && let Some(selection) = &state.transcript_selection
+        {
+            selection.render(frame, layout.transcript, start);
+        }
     }
 
     if let Some(activity) = activity
@@ -761,4 +766,67 @@ fn editor_window(value: &str, cursor: usize, width: usize) -> (String, usize) {
         used += cells;
     }
     (shown, cursor_column.saturating_sub(skipped).min(width - 1))
+}
+
+#[cfg(test)]
+mod tests {
+    use kurama_protocol::policy::ExecutionMode;
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Color};
+
+    use super::*;
+    use crate::tui::{TranscriptPoint, TranscriptSelection};
+
+    fn selected_frame(state: &TuiState, rows: &[TranscriptLine]) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        terminal
+            .draw(|frame| render_with_transcript(frame, state, Some(rows)))
+            .unwrap()
+            .buffer
+            .clone()
+    }
+
+    #[test]
+    fn compact_and_expanded_views_highlight_absolute_rows_and_preserve_composer() {
+        for expanded in [false, true] {
+            let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+            if expanded {
+                state.toggle_transcript_view();
+            }
+            let frame_area = Rect::new(0, 0, 40, 16);
+            let area = if expanded {
+                let mut area = main_area(frame_area);
+                area.height -= 1;
+                area
+            } else {
+                main_layout(frame_area, &state).transcript
+            };
+            let rows = (0..usize::from(area.height) + 7)
+                .map(|row| TranscriptLine::from(Line::raw(format!("row-{row:03}"))))
+                .collect::<Vec<_>>();
+            state.scroll = 4;
+            let before = selected_frame(&state, &rows);
+            let mut selection =
+                TranscriptSelection::new(TranscriptPoint { row: 4, column: 1 }, None);
+            selection.update(TranscriptPoint { row: 4, column: 2 });
+            state.transcript_selection = Some(selection);
+            let selected = selected_frame(&state, &rows);
+            let feedback_row = if expanded { 15 } else { 14 };
+            for y in 0..16 {
+                for x in 0..40 {
+                    let cell = &selected[(x, y)];
+                    if y == area.y + 1 && (area.x + 1..=area.x + 2).contains(&x) {
+                        assert_eq!(cell.fg, Color::Black);
+                        assert_eq!(cell.bg, ACCENT);
+                        assert_eq!(cell.symbol(), before[(x, y)].symbol());
+                    } else if y != feedback_row {
+                        assert_eq!(cell, &before[(x, y)]);
+                    }
+                }
+            }
+            state.overlay = Overlay::Shortcuts;
+            let overlay = selected_frame(&state, &rows);
+            state.transcript_selection = None;
+            assert_eq!(overlay, selected_frame(&state, &rows));
+        }
+    }
 }

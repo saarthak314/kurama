@@ -262,6 +262,20 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect,
             ],
             Overlay::None => ["", "", ""],
         }
+    } else if state.selection_copied {
+        ["Copied selection · Esc clear", "Copied selection", "Copied"]
+    } else if let Some(selection) = state
+        .transcript_selection
+        .as_ref()
+        .filter(|selection| selection.dragged)
+    {
+        if selection.dragging {
+            ["Release to copy selection", "Release to copy", "Copy"]
+        } else if selection.copied {
+            ["Copied selection · Esc clear", "Copied selection", "Copied"]
+        } else {
+            ["Ctrl+C copy selection · Esc clear", "Ctrl+C copy", "Copy"]
+        }
     } else if state.history_search_active() {
         ["Enter use · Esc cancel", "Enter use", "↵"]
     } else if state.selected_command().is_some() {

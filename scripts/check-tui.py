@@ -17,10 +17,10 @@ import os
 from pathlib import Path
 import pty
 import select
-import re
 import signal
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import threading
@@ -369,6 +369,35 @@ def main():
         state = root / ".kurama"
         state.mkdir()
         (root / "input.txt").write_text("fixture input\n")
+        pointer_log = root / "pointer-actions.jsonl"
+        helper_directory = root / "fixture-bin"
+        helper_directory.mkdir()
+        helper_source = (
+            f"#!{sys.executable}\n"
+            + """import json
+import os
+from pathlib import Path
+import sys
+
+command = Path(sys.argv[0]).name
+kind = "open" if command in ("open", "xdg-open") else "copy"
+record = {"kind": kind, "command": command, "args": sys.argv[1:]}
+if kind == "copy":
+    record["text"] = sys.stdin.buffer.read().decode("utf-8")
+payload = (json.dumps(record) + "\\n").encode("utf-8")
+descriptor = os.open(
+    os.environ["KURAMA_TUI_POINTER_LOG"], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600
+)
+try:
+    os.write(descriptor, payload)
+finally:
+    os.close(descriptor)
+"""
+        )
+        for name in ("open", "xdg-open", "pbcopy", "wl-copy", "xclip"):
+            helper = helper_directory / name
+            helper.write_text(helper_source)
+            helper.chmod(0o700)
         (state / "config.toml").write_text(f"""version = 1
 default_profile = "fixture"
 default_mode = "supervised"
@@ -519,6 +548,10 @@ endpoint = "http://127.0.0.1:9/search"
         environment = dict(
             os.environ, HOME=str(root), TERM="xterm-256color", COLORTERM="truecolor"
         )
+        environment["PATH"] = (
+            str(helper_directory) + os.pathsep + os.environ.get("PATH", os.defpath)
+        )
+        environment["KURAMA_TUI_POINTER_LOG"] = str(pointer_log)
         environment.pop("NO_COLOR", None)
         started = time.monotonic()
         process = subprocess.Popen(
@@ -571,6 +604,37 @@ endpoint = "http://127.0.0.1:9/search"
         def send(text):
             os.write(master, text if isinstance(text, bytes) else text.encode())
             pump(0.15)
+
+        def mouse(button, point, release=False):
+            column, row = point
+            send(f"\x1b[<{button};{column + 1};{row + 1}{'m' if release else 'M'}")
+
+        def visible_point(text):
+            # These fixture tokens are ASCII, so character offsets are cells.
+            for row, line in enumerate(screen.display):
+                column = line.find(text)
+                if column >= 0:
+                    return column, row
+            raise AssertionError(f"pointer target is not visible: {text}")
+
+        def pointer_actions():
+            if not pointer_log.exists():
+                return []
+            return [json.loads(line) for line in pointer_log.read_text().splitlines()]
+
+        def assert_pointer_actions(copies):
+            actions = pointer_actions()
+            assert [
+                action["args"] for action in actions if action["kind"] == "open"
+            ] == [["https://example.com/reference"]], actions
+            assert [
+                action["text"] for action in actions if action["kind"] == "copy"
+            ] == (copies), actions
+            assert len(actions) == 1 + len(copies), actions
+
+        def wait_for_copy(count):
+            wait_for(lambda: len(pointer_actions()) >= count + 1)
+            wait_for(lambda: "Copied selection" in "\n".join(screen.display[-2:]))
 
         def rss_kib():
             measured = subprocess.run(
@@ -695,14 +759,25 @@ endpoint = "http://127.0.0.1:9/search"
             resize(100, 36)
             capture("startup-restored")
             if args.seed_large_output_mib:
-                assert "LARGE_TAIL_MARKER" in screen.all_text()
+                for _ in range(40):
+                    if "LARGE_TAIL_MARKER" in screen.all_text():
+                        break
+                    send(b"\x1b[<64;5;10M")
+                else:
+                    raise AssertionError("large output preview was not reachable")
+                capture("large-output-preview")
                 send(b"\x0f")
                 send(b"\x1b[H")
                 wait_for(lambda: "LARGE_HEAD_MARKER" in "\n".join(screen.display))
                 capture("large-output-expanded", view="transcript")
                 result["resources"]["expanded_rss_kib"] = rss_kib()
                 send(b"\x1b[F")
-                wait_for(lambda: "LARGE_TAIL_MARKER" in "\n".join(screen.display))
+                for _ in range(40):
+                    if "LARGE_TAIL_MARKER" in "\n".join(screen.display):
+                        break
+                    send(b"\x1b[<64;5;10M")
+                else:
+                    raise AssertionError("expanded large output tail was not reachable")
                 send(b"\x1b")
                 wait_for(composer_ready)
                 capture("large-output-collapsed")
@@ -798,15 +873,96 @@ endpoint = "http://127.0.0.1:9/search"
             assert "```" not in visible
             assert not any(line.strip() == "rust" for line in screen.display)
             result["findings"]["code_fences_and_language_hidden"] = True
-            hyperlinks = re.findall(
-                rb"\x1b\]8;[^;]*;([^\x1b\x07]*)(?:\x1b\\|\x07)", raw
-            )
-            assert b"https://example.com/reference" in hyperlinks
-            assert hyperlinks[-1] == b"", "hyperlink remained active outside its text"
-            result["findings"]["native_hyperlinks_emitted"] = True
             wait_for(lambda: "? shortcuts" in screen.display[-2])
             draft = "OVERLAY_DRAFT_MARKER"
             send(draft)
+            capture("pointer-before", composer_text=draft)
+            reference = visible_point("reference")
+            assert pointer_actions() == []
+            mouse(0, reference)
+            assert pointer_actions() == [], "link opened before mouse release"
+            mouse(0, reference, release=True)
+            wait_for(lambda: len(pointer_actions()) >= 1)
+            assert_pointer_actions([])
+            capture("link-click", composer_text=draft)
+            result["findings"]["plain_link_click_opens_exact_url"] = True
+
+            code_text = 'println!("rendered exactly");'
+            code_start = visible_point(code_text)
+            code_end = (code_start[0] + len(code_text) - 1, code_start[1])
+            original_backgrounds = [
+                screen.buffer[code_start[1]][column].bg
+                for column in range(code_start[0] - 1, code_end[0] + 2)
+            ]
+            mouse(0, code_start)
+            mouse(32, code_end)
+            capture("selection-dragging", composer_text=draft)
+            selected_cells = [
+                screen.buffer[code_start[1]][column]
+                for column in range(code_start[0], code_end[0] + 1)
+            ]
+            assert len({cell.bg for cell in selected_cells}) == 1
+            assert all(
+                cell.fg != cell.bg and cell.bg != previous
+                for cell, previous in zip(selected_cells, original_backgrounds[1:-1])
+            )
+            assert (
+                screen.buffer[code_start[1]][code_start[0] - 1].bg
+                == original_backgrounds[0]
+            )
+            assert (
+                screen.buffer[code_end[1]][code_end[0] + 1].bg
+                == original_backgrounds[-1]
+            )
+            assert_pointer_actions([])
+            result["findings"]["drag_selection_highlighted"] = True
+            mouse(0, code_end, release=True)
+            copied_texts = [code_text]
+            wait_for_copy(len(copied_texts))
+            assert_pointer_actions(copied_texts)
+            capture("selection-copied", composer_text=draft)
+            result["findings"]["drag_selection_copies_exact_text"] = True
+            result["findings"]["copied_selection_feedback_visible"] = True
+
+            reference_end = (reference[0] + len("reference") - 1, reference[1])
+            mouse(0, reference)
+            assert_pointer_actions(copied_texts)
+            mouse(32, reference_end)
+            capture("link-selection-dragging", composer_text=draft)
+            assert_pointer_actions(copied_texts)
+            mouse(0, reference_end, release=True)
+            copied_texts.append("reference")
+            wait_for_copy(len(copied_texts))
+            assert_pointer_actions(copied_texts)
+            capture("link-selection-copied", composer_text=draft)
+            result["findings"]["link_drag_copies_text_without_opening"] = True
+
+            block_start = visible_point("fn main() {")
+            block_end = (block_start[0], block_start[1] + 2)
+            assert screen.display[block_end[1]][block_end[0]] == "}"
+            mouse(0, block_end)
+            mouse(32, block_start)
+            capture("selection-backward-multiline-dragging", composer_text=draft)
+            assert_pointer_actions(copied_texts)
+            mouse(0, block_start, release=True)
+            copied_texts.append("\n".join(("fn main() {", "    " + code_text, "}")))
+            wait_for_copy(len(copied_texts))
+            assert_pointer_actions(copied_texts)
+            capture("selection-backward-multiline-copied", composer_text=draft)
+            result["findings"][
+                "backward_multiline_selection_copies_in_display_order"
+            ] = True
+
+            send(b"\x1b")
+            capture("selection-dismissed", composer_text=draft)
+            assert "Copied selection" not in "\n".join(screen.display[-2:])
+            assert all(
+                screen.buffer[row][column].bg != "cyan"
+                for row in range(block_start[1], block_end[1] + 1)
+                for column in range(screen.columns)
+            )
+            result["findings"]["selection_cleared_with_escape"] = True
+            result["findings"]["composer_draft_survived_pointer_interactions"] = True
             before_overlay = capture("draft-before-overlay", composer_text=draft)
             send(b"\x0f")
             capture("transcript-overlay", view="transcript")
@@ -927,17 +1083,14 @@ endpoint = "http://127.0.0.1:9/search"
             assert f"kurama resume {logs[0].parent.name}" in screen.all_text()
             assert pyte.modes.DECAWM in screen.mode, "line wrapping was not restored"
             assert raw.rfind(b"\x1b[?2004l") > raw.rfind(b"\x1b[?2004h")
-            for mode in (1000, 1006):
+            for mode in (1002, 1006):
                 enabled = f"\x1b[?{mode}h".encode()
                 disabled = f"\x1b[?{mode}l".encode()
                 assert raw.count(enabled) == raw.count(disabled) == 1
                 assert raw.rfind(disabled) > raw.rfind(enabled)
             assert b"\x1b[?1003h" not in raw, "all-motion mouse reporting was enabled"
-            hyperlinks = re.findall(
-                rb"\x1b\]8;[^;]*;([^\x1b\x07]*)(?:\x1b\\|\x07)", raw
-            )
-            assert sum(bool(target) for target in hyperlinks) == hyperlinks.count(b"")
-            result["findings"]["mouse_modes_restored_and_hyperlinks_closed"] = True
+            result["findings"]["drag_mouse_modes_restored"] = True
+            assert_pointer_actions(copied_texts)
             assert raw.count(b"\x1b[?1049h") == raw.count(b"\x1b[?1049l") == 1
             capture("exit-restored", active=False)
             result["findings"]["shell_history_restored_on_exit"] = True

@@ -22,7 +22,7 @@ use crate::commands::{CommandSpec, command_suggestions};
 use super::input::{
     grapheme_boundary_at_or_after, next_grapheme_boundary, previous_grapheme_boundary,
 };
-use super::{AgentRow, ApprovalState, OnboardingState, sort_agents};
+use super::{AgentRow, ApprovalState, OnboardingState, TranscriptSelection, sort_agents};
 
 const MAX_LIVE_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
 const LIVE_OUTPUT_OMITTED: &str = "[earlier live output omitted]\n";
@@ -285,6 +285,8 @@ pub struct TuiState {
     pub transcript_width: Cell<u16>,
     pub cursor: usize,
     pub scroll: usize,
+    pub(crate) transcript_selection: Option<TranscriptSelection>,
+    pub(crate) selection_copied: bool,
     pub running_agents: usize,
     pub queued_agents: usize,
     pub overlay: Overlay,
@@ -355,6 +357,8 @@ impl TuiState {
             transcript_width: Cell::new(72),
             cursor: 0,
             scroll: 0,
+            transcript_selection: None,
+            selection_copied: false,
             running_agents: 0,
             queued_agents: 0,
             overlay: Overlay::None,

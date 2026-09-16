@@ -8,6 +8,7 @@ mod layout;
 mod mentions;
 mod onboarding;
 mod render;
+mod selection;
 mod state;
 mod syntax;
 mod theme;
@@ -26,6 +27,7 @@ pub(crate) use mentions::{collect_files, decode_pasted_image, filter_files, ment
 pub use onboarding::{OnboardingState, OnboardingSubmission};
 pub use render::render;
 pub(crate) use render::render_with_transcript;
+pub(crate) use selection::{TranscriptPoint, TranscriptSelection};
 pub use state::{ActivityState, Overlay, ToolLifecycle, ToolTranscript, TranscriptEntry, TuiState};
 pub use transcript::{TranscriptDetail, transcript_lines};
 pub(crate) use transcript::{TranscriptLine, transcript_lines_with_entry_starts};

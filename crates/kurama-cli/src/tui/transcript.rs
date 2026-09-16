@@ -1,11 +1,10 @@
-use std::{borrow::Cow, collections::VecDeque, num::NonZeroU16, ops::Range, sync::Arc};
+use std::{borrow::Cow, collections::VecDeque, ops::Range, sync::Arc};
 
 use kurama_protocol::policy::ExecutionMode;
 use kurama_protocol::session::TodoStatus;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::{
     Frame,
-    buffer::CellDiffOption,
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -17,7 +16,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use std::cell::Cell;
 
 use super::{
-    ToolLifecycle, TranscriptEntry, TuiState,
+    Overlay, ToolLifecycle, TranscriptEntry, TuiState,
     syntax::highlight_code,
     theme::{ACCENT, BLUE, BORDER, DIM, GREEN, RED, TEXT},
 };
@@ -123,10 +122,8 @@ pub(crate) struct TranscriptLine {
 #[derive(Clone, Debug)]
 struct HyperlinkRun {
     column: usize,
-    width: NonZeroU16,
+    width: usize,
     target: Arc<str>,
-    content: String,
-    encoded: String,
 }
 
 impl TranscriptLine {
@@ -136,15 +133,12 @@ impl TranscriptLine {
         for fragment in fragments {
             let width = display_width(&fragment.content);
             if let Some(target) = fragment.target
-                && let Ok(width) = u16::try_from(width)
-                && let Some(width) = NonZeroU16::new(width)
+                && width > 0
             {
                 line.hyperlinks.push(HyperlinkRun {
                     column,
                     width,
-                    encoded: encode_hyperlink(&target, &fragment.content),
                     target,
-                    content: fragment.content.clone(),
                 });
             }
             column += width;
@@ -168,47 +162,15 @@ impl TranscriptLine {
         );
     }
 
+    pub(crate) fn link_at(&self, column: usize) -> Option<Arc<str>> {
+        self.hyperlinks
+            .iter()
+            .find(|link| column >= link.column && column - link.column < link.width)
+            .map(|link| Arc::clone(&link.target))
+    }
+
     pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
-        let area = area.intersection(frame.area());
-        if area.is_empty() {
-            return;
-        }
         frame.render_widget(&self.text, area);
-        let buffer = frame.buffer_mut();
-        for link in &self.hyperlinks {
-            let available = (area.width as usize).saturating_sub(link.column);
-            if available == 0 {
-                continue;
-            }
-            let clipped;
-            let (encoded, width) = if usize::from(link.width.get()) <= available {
-                (link.encoded.as_str(), link.width)
-            } else {
-                let mut bytes = 0;
-                let mut width = 0;
-                for grapheme in link.content.graphemes(true) {
-                    let next = width + display_width(grapheme);
-                    if next > available {
-                        break;
-                    }
-                    bytes += grapheme.len();
-                    width = next;
-                }
-                let Some(width) = NonZeroU16::new(width as u16) else {
-                    continue;
-                };
-                clipped = encode_hyperlink(&link.target, &link.content[..bytes]);
-                (clipped.as_str(), width)
-            };
-            let x = area.x + link.column as u16;
-            buffer[(x, area.y)].set_symbol(encoded);
-            buffer[(x, area.y)].diff_option = CellDiffOption::ForcedWidth(width);
-            // Mark covered cells so removing or shortening even an unstyled link redraws
-            // every character, including spaces, rather than leaving stale terminal links.
-            for offset in 1..width.get() {
-                buffer[(x + offset, area.y)].diff_option = CellDiffOption::Skip;
-            }
-        }
     }
 }
 
@@ -221,12 +183,8 @@ impl From<Line<'static>> for TranscriptLine {
     }
 }
 
-fn encode_hyperlink(target: &str, content: &str) -> String {
-    format!("\x1b]8;;{target}\x1b\\{content}\x1b]8;;\x1b\\")
-}
-
 fn safe_link_target(value: &str) -> Option<Arc<str>> {
-    // Targets repeat on wrapped terminal runs; bound their retained and emitted size.
+    // Targets repeat across wrapped hit regions; bound their retained size.
     if value.len() > MAX_LINK_TARGET_BYTES {
         return None;
     }
@@ -855,7 +813,7 @@ fn render_markdown_block(
             let remaining = width.saturating_sub(fragments_width(&prefix));
             let mut spans = fragments_into_spans(prefix);
             spans.push(Span::styled(
-                "─".repeat(remaining.min(32)),
+                "─".repeat(remaining),
                 Style::default().fg(BORDER),
             ));
             lines.push(Line::from(spans).into());
@@ -1792,8 +1750,20 @@ fn render_transcript_entries(
                 );
             }
             TranscriptEntry::AssistantMessage { body } => {
+                let start = lines.len();
                 lines.extend(markdown_lines(body, width));
                 if Some(entry_index) != latest_assistant {
+                    while lines.len() > start
+                        && lines.last().is_some_and(|line| {
+                            line.text
+                                .spans
+                                .iter()
+                                .all(|span| span.content.trim().is_empty())
+                        })
+                    {
+                        lines.pop();
+                    }
+                    lines.push(TranscriptLine::default());
                     lines.push(
                         Line::from(Span::styled("─".repeat(width), Style::default().fg(BORDER)))
                             .into(),
@@ -2224,12 +2194,26 @@ pub(crate) fn render_transcript_view(
             ),
         );
     }
+    if state.overlay == Overlay::None
+        && let Some(selection) = &state.transcript_selection
+    {
+        selection.render(frame, transcript_area, start);
+    }
     if hint_height > 0 {
+        let hint = if state.overlay == Overlay::None && state.selection_copied {
+            "Copied selection · Esc clear"
+        } else if state.overlay == Overlay::None
+            && state
+                .transcript_selection
+                .as_ref()
+                .is_some_and(|selection| selection.dragging && selection.dragged)
+        {
+            "Release to copy selection · Esc clear"
+        } else {
+            "esc close · ↑↓ scroll · { } prompts"
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "esc close · ↑↓ scroll · { } prompts",
-                Style::default().fg(DIM),
-            ))),
+            Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(DIM)))),
             Rect::new(
                 transcript_area.x,
                 transcript_area.bottom(),
@@ -2421,49 +2405,66 @@ mod tests {
             .clone()
     }
 
+    fn linked_text(rows: &[TranscriptLine], target: &str) -> String {
+        let mut linked = String::new();
+        for row in rows {
+            let text = row
+                .text
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            let mut column = 0;
+            for grapheme in text.graphemes(true) {
+                let width = display_width(grapheme);
+                let hit = row.link_at(column);
+                for offset in 1..width {
+                    assert_eq!(row.link_at(column + offset), hit);
+                }
+                if hit.as_deref() == Some(target) {
+                    linked.push_str(grapheme);
+                }
+                column += width;
+            }
+            assert!(row.link_at(column).is_none());
+        }
+        linked
+    }
+
     #[test]
-    fn native_links_wrap_unicode_and_keep_style_boundaries_and_clipping() {
+    fn links_hit_every_wrapped_unicode_cell_without_changing_plain_rendering() {
         let target = "https://example.test/界";
+        let label = "界ébold👨‍👩‍👧‍👦abcdef";
         let rows = markdown_lines(&format!("- [界é**bold**👨‍👩‍👧‍👦abcdef]({target})"), 10);
-        assert!(
-            rows.iter()
-                .flat_map(|row| &row.text.spans)
-                .all(|span| !span.content.contains('\x1b'))
-        );
+        assert_eq!(linked_text(&rows, target), format!("{label}{target}"));
+        for row in &rows {
+            assert!(row.link_at(0).is_none());
+            assert!(row.link_at(1).is_none());
+        }
+        let plain_rows = rows
+            .iter()
+            .map(|row| TranscriptLine::from(row.text.clone()))
+            .collect::<Vec<_>>();
         for width in [7, 10] {
             let buffer = render_rows(&rows, width);
-            let mut linked = String::new();
-            for cell in &buffer.content {
-                if let CellDiffOption::ForcedWidth(columns) = cell.diff_option {
-                    assert!(
-                        cell.symbol()
-                            .starts_with(&format!("\x1b]8;;{target}\x1b\\"))
-                    );
-                    assert!(cell.symbol().ends_with("\x1b]8;;\x1b\\"));
-                    let visible = sanitize_terminal_text(cell.symbol());
-                    assert_eq!(display_width(&visible), usize::from(columns.get()));
-                    linked.push_str(&visible);
-                }
-            }
-            if width == 10 {
-                assert!(
-                    linked.contains("界ébold👨‍👩‍👧‍👦abcdef"),
-                    "linked={linked:?}, rows={:?}",
-                    rich_plain(&rows)
-                );
-                assert!(
-                    buffer
-                        .content
-                        .iter()
-                        .any(|cell| cell.symbol().contains("bold")
-                            && cell.modifier.contains(Modifier::BOLD))
-                );
-            }
+            assert_eq!(buffer, render_rows(&plain_rows, width));
+            assert!(
+                buffer
+                    .content
+                    .iter()
+                    .all(|cell| !cell.symbol().contains('\x1b'))
+            );
+            assert!(
+                buffer
+                    .content
+                    .iter()
+                    .any(|cell| { cell.symbol() == "b" && cell.modifier.contains(Modifier::BOLD) })
+            );
         }
     }
 
     #[test]
-    fn hyperlink_target_changes_and_removal_redraw_the_full_visible_run() {
+    fn changing_or_removing_link_targets_updates_hits_without_changing_text() {
         let row = |target| {
             TranscriptLine::from_fragments(vec![StyledFragment {
                 content: "a b界".into(),
@@ -2471,23 +2472,22 @@ mod tests {
                 target,
             }])
         };
-        let original = render_rows(&[row(safe_link_target("https://one.test"))], 8);
-        let changed = render_rows(&[row(safe_link_target("https://two.test"))], 8);
-        let plain = render_rows(&[row(None)], 8);
-        let updates = original.diff(&changed);
-        assert_eq!(updates.len(), 1);
-        assert!(updates[0].2.symbol().contains("https://two.test"));
-        let restored = changed.diff(&plain);
-        assert_eq!(
-            restored.iter().map(|(x, _, _)| *x).collect::<Vec<_>>(),
-            [0, 1, 2, 3]
-        );
-        assert!(
-            restored
-                .iter()
-                .all(|(_, _, cell)| !cell.symbol().contains('\x1b'))
-        );
-        assert!(changed.diff(&changed).is_empty());
+        let original = row(safe_link_target("https://one.test"));
+        let changed = row(safe_link_target("https://two.test"));
+        let plain = row(None);
+        for column in 0..5 {
+            assert_eq!(
+                original.link_at(column).as_deref(),
+                Some("https://one.test")
+            );
+            assert_eq!(changed.link_at(column).as_deref(), Some("https://two.test"));
+            assert!(plain.link_at(column).is_none());
+        }
+        assert!(original.link_at(5).is_none());
+        assert!(changed.link_at(usize::MAX).is_none());
+        let original = render_rows(&[original], 8);
+        assert_eq!(original, render_rows(&[changed], 8));
+        assert_eq!(original, render_rows(&[plain], 8));
     }
 
     #[test]
@@ -2528,7 +2528,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_link_targets_stay_readable_without_repeated_osc_payloads() {
+    fn oversized_link_targets_stay_readable_without_becoming_clickable() {
         let target = format!("https://example.test/{}", "a".repeat(4096));
         let rows = markdown_lines(&format!("[reference]({target})"), 32);
         assert!(rows.iter().all(|row| row.hyperlinks.is_empty()));
@@ -2541,21 +2541,19 @@ mod tests {
             "éHTTP://ignored.test (HTTPS://example.test/a_(b)). —http://second.test/q?x=1#part!",
         )];
         let rows = prepared_transcript_lines(&entries, 160, TranscriptDetail::Expanded);
-        let targets = rows
-            .iter()
-            .flat_map(|row| &row.hyperlinks)
-            .map(|link| link.target.as_ref())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            targets,
-            [
-                "HTTPS://example.test/a_(b)",
-                "http://second.test/q?x=1#part"
-            ]
-        );
+        assert!(linked_text(&rows, "HTTP://ignored.test").is_empty());
+        for target in [
+            "HTTPS://example.test/a_(b)",
+            "http://second.test/q?x=1#part",
+        ] {
+            assert_eq!(linked_text(&rows, target), target);
+        }
         let oversized = format!("https://example.test/{}", ")".repeat(5000));
         let rows = prepared_transcript_lines(&[tool(&oversized)], 40, TranscriptDetail::Compact);
-        assert!(rows.iter().all(|row| row.hyperlinks.is_empty()));
+        assert!(
+            rows.iter()
+                .all(|row| (0..row.text.width()).all(|column| row.link_at(column).is_none()))
+        );
     }
 
     #[test]
@@ -2565,22 +2563,13 @@ mod tests {
         let entries = [tool(&source)];
         for detail in [TranscriptDetail::Compact, TranscriptDetail::Expanded] {
             let rows = prepared_transcript_lines(&entries, 18, detail);
-            let links = rows
-                .iter()
-                .flat_map(|row| &row.hyperlinks)
-                .collect::<Vec<_>>();
-            assert!(!links.is_empty());
-            assert!(links.iter().all(|link| link.target.as_ref() == target));
+            let linked = linked_text(&rows, &target);
             if detail == TranscriptDetail::Compact {
                 assert!(rows.len() <= 5);
+                assert!(linked.ends_with("界é"));
+                assert!(target.ends_with(&linked));
             } else {
-                assert_eq!(
-                    links
-                        .iter()
-                        .map(|link| link.content.as_str())
-                        .collect::<String>(),
-                    target
-                );
+                assert_eq!(linked, target);
             }
         }
     }
@@ -2590,20 +2579,22 @@ mod tests {
         let source = "| [Site](https://header.test) |\n|---|\n| [界value](https://value.test) |";
         for width in [12, 100] {
             let rows = markdown_lines(source, width);
-            let buffer = render_rows(&rows, width as u16);
-            for target in ["https://header.test", "https://value.test"] {
-                assert!(
-                    buffer.content.iter().any(|cell| {
-                        matches!(cell.diff_option, CellDiffOption::ForcedWidth(_))
-                            && cell
-                                .symbol()
-                                .starts_with(&format!("\x1b]8;;{target}\x1b\\"))
-                    }),
-                    "missing {target} at width {width}"
-                );
-            }
+            assert!(linked_text(&rows, "https://header.test").contains("Site"));
+            assert!(linked_text(&rows, "https://value.test").contains("界value"));
             assert!(rows.iter().all(|row| row.text.width() <= width));
         }
+    }
+
+    #[test]
+    fn copying_a_link_label_excludes_its_target_and_terminal_controls() {
+        use super::super::{TranscriptPoint, TranscriptSelection};
+
+        let rows = markdown_lines("[**reference**](https://example.test/hidden)\x1b[31m", 80);
+        let mut selection = TranscriptSelection::new(TranscriptPoint { row: 0, column: 0 }, None);
+        let end = TranscriptPoint { row: 0, column: 8 };
+        selection.update(end);
+        selection.finish(end);
+        assert_eq!(selection.text(&rows), "reference");
     }
 
     #[test]
@@ -2846,10 +2837,33 @@ mod tests {
             let text = plain(&rows);
             let older = text.iter().position(|row| row == "older").unwrap();
             let latest = text.iter().position(|row| row == "latest").unwrap();
-            assert_eq!(text[older + 1], "─".repeat(40));
-            assert_eq!(rows[older + 1].spans[0].style.fg, Some(BORDER));
+            assert!(text[older + 1].is_empty());
+            assert_eq!(text[older + 2], "─".repeat(40));
+            assert!(text[older + 3].is_empty());
+            assert_eq!(rows[older + 2].spans[0].style.fg, Some(BORDER));
             assert_eq!(text.iter().filter(|row| row.contains('─')).count(), 1);
             assert!(text[latest + 1..].iter().all(|row| row.trim().is_empty()));
+        }
+    }
+
+    #[test]
+    fn separator_padding_is_independent_of_markdown_trailing_blank_rows() {
+        for body in ["older\n\n", "```rust\nolder\n\n\n```"] {
+            for width in [16, 40, 100] {
+                let entries = [
+                    TranscriptEntry::AssistantMessage { body: body.into() },
+                    TranscriptEntry::AssistantMessage {
+                        body: "latest".into(),
+                    },
+                ];
+                let rows = transcript_lines(&entries, width, TranscriptDetail::Compact);
+                assert_eq!(
+                    plain(&rows),
+                    ["older", "", &"─".repeat(width), "", "latest", ""]
+                );
+                let markdown_rule = markdown_lines("before\n\n---\n\nafter", width);
+                assert!(rich_plain(&markdown_rule).contains(&"─".repeat(width)));
+            }
         }
     }
 

@@ -9,7 +9,9 @@ use std::{
 #[cfg(not(test))]
 use std::io::Write as _;
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use kurama_adapters::{
     AppPaths, BashTool, ClaudeNativeSearch, CodexNativeSearch, ConfigRepository,
     CredentialResolver, FsSessionStore, HttpClient, JsonSearchBackend, OpenAiNativeSearch,
@@ -41,9 +43,10 @@ use crate::{
     commands::{Command, GoalAction, command_missing_required_arguments, parse_command},
     tui::{
         OnboardingState, OnboardingSubmission, Overlay, TerminalGuard, TranscriptDetail,
-        TranscriptLine, TuiState, composer_cursor_vertical, main_area, main_layout,
-        next_grapheme_boundary, previous_grapheme_boundary, render_with_transcript,
-        spawn_input_thread, transcript_lines_with_entry_starts, visible_activity_rect,
+        TranscriptLine, TranscriptPoint, TranscriptSelection, TuiState, command_palette_height,
+        composer_cursor_vertical, main_area, main_layout, next_grapheme_boundary,
+        previous_grapheme_boundary, render_with_transcript, spawn_input_thread,
+        transcript_lines_with_entry_starts, visible_activity_rect,
     },
 };
 
@@ -73,6 +76,7 @@ struct TranscriptCacheKey {
 impl TranscriptRenderCache {
     fn prepare(&mut self, state: &mut TuiState, frame_area: Rect) {
         if frame_area.is_empty() {
+            state.transcript_selection = None;
             return;
         }
         let expanded = state.transcript_view_expanded();
@@ -83,6 +87,16 @@ impl TranscriptRenderCache {
             expanded,
             entries: state.transcript.len(),
         };
+        let same_layout = self
+            .key
+            .is_some_and(|old| old.width == width && old.expanded == expanded);
+        if !same_layout || state.overlay() != Overlay::None {
+            state.transcript_selection = None;
+        }
+        let frozen = state
+            .transcript_selection
+            .as_ref()
+            .is_some_and(|selection| selection.dragging);
         let viewport = if expanded {
             frame_area
                 .height
@@ -97,6 +111,19 @@ impl TranscriptRenderCache {
             .len()
             .saturating_sub(self.viewport_height as usize)
             .saturating_sub(state.scroll);
+        if frozen {
+            // Keep the text under a held pointer stable while the engine continues running.
+            if viewport != self.viewport_height {
+                state.scroll = self
+                    .lines
+                    .len()
+                    .saturating_sub(viewport as usize)
+                    .saturating_sub(previous_start);
+            }
+            state.set_transcript_geometry(width as u16, self.lines.len(), &self.entry_starts);
+            self.viewport_height = viewport;
+            return;
+        }
         if self.key == Some(key) {
             let max_scroll = self.lines.len().saturating_sub(viewport as usize);
             if state.scroll > 0 && viewport != self.viewport_height {
@@ -106,6 +133,7 @@ impl TranscriptRenderCache {
             self.viewport_height = viewport;
             return;
         }
+        state.transcript_selection = None;
         let anchor = if self.key.is_some_and(|key| key.expanded == expanded) && state.scroll > 0 {
             self.entry_starts
                 .partition_point(|&row| row <= previous_start)
@@ -196,6 +224,53 @@ impl TranscriptRenderCache {
         self.key = Some(key);
     }
 
+    fn point_at(
+        &self,
+        state: &TuiState,
+        area: Rect,
+        mouse: MouseEvent,
+        clamp: bool,
+    ) -> Option<TranscriptPoint> {
+        let mut view = main_area(area);
+        view.height = self.viewport_height;
+        if view.is_empty() || self.lines.is_empty() {
+            return None;
+        }
+        if !state.transcript_view_expanded() {
+            let layout = main_layout(area, state);
+            let palette_height =
+                command_palette_height(state, layout.input.y.saturating_sub(view.y));
+            if palette_height > 0
+                && mouse.row >= layout.input.y.saturating_sub(palette_height)
+                && mouse.row < layout.input.y
+            {
+                return None;
+            }
+        }
+        let inside = mouse.column >= view.x
+            && mouse.column < view.right()
+            && mouse.row >= view.y
+            && mouse.row < view.bottom();
+        if !clamp && !inside {
+            return None;
+        }
+        let column = mouse.column.clamp(view.x, view.right() - 1) - view.x;
+        let visible_row = mouse.row.clamp(view.y, view.bottom() - 1) - view.y;
+        let first = self
+            .lines
+            .len()
+            .saturating_sub(view.height as usize)
+            .saturating_sub(state.scroll);
+        let row = first.saturating_add(visible_row as usize);
+        if !clamp && row >= self.lines.len() {
+            return None;
+        }
+        Some(TranscriptPoint {
+            row: row.min(self.lines.len() - 1),
+            column: column as usize,
+        })
+    }
+
     fn lines(&self) -> Option<&[TranscriptLine]> {
         self.key.map(|_| self.lines.as_slice())
     }
@@ -211,6 +286,7 @@ pub struct App {
     restart_args: Option<Args>,
     exit_requested: bool,
     control: Option<AppControl>,
+    link_tasks: tokio::task::JoinSet<Result<(), String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -536,6 +612,7 @@ impl App {
             session_id: Some(session_id),
             restart_args: None,
             exit_requested: false,
+            link_tasks: tokio::task::JoinSet::new(),
             control: Some(AppControl {
                 project,
                 paths,
@@ -566,6 +643,7 @@ impl App {
             restart_args: None,
             exit_requested: false,
             control: None,
+            link_tasks: tokio::task::JoinSet::new(),
         }
     }
 
@@ -580,6 +658,7 @@ impl App {
             restart_args: None,
             exit_requested: false,
             control: Some(control),
+            link_tasks: tokio::task::JoinSet::new(),
         }
     }
 
@@ -645,7 +724,11 @@ impl App {
                 return self.state.overlay() == Overlay::None
                     && matches!(
                         mouse.kind,
-                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                        MouseEventKind::ScrollUp
+                            | MouseEventKind::ScrollDown
+                            | MouseEventKind::Down(MouseButton::Left)
+                            | MouseEventKind::Drag(MouseButton::Left)
+                            | MouseEventKind::Up(MouseButton::Left)
                     );
             }
             Event::Resize(..) => return true,
@@ -1968,29 +2051,163 @@ fn handle_input_with_current_geometry(
     area: Rect,
     event: Event,
 ) -> Result<bool, String> {
-    let wheel = matches!(&event, Event::Mouse(mouse)
-        if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown));
-    if wheel
-        || (app.state.transcript_view_expanded()
-            && matches!(
-                &event,
-                Event::Key(KeyEvent {
-                    code: KeyCode::Up
-                        | KeyCode::Down
-                        | KeyCode::PageUp
-                        | KeyCode::PageDown
-                        | KeyCode::Home
-                        | KeyCode::End
-                        | KeyCode::Char('{')
-                        | KeyCode::Char('}'),
-                    ..
-                })
-            ))
+    if let Event::Mouse(mouse) = event {
+        cache.prepare(&mut app.state, area);
+        if let Some(action) = update_transcript_pointer(&mut app.state, cache, area, mouse) {
+            apply_pointer_action(app, action);
+        }
+        return Ok(false);
+    }
+    if let Event::Key(key) = &event {
+        if key.kind != KeyEventKind::Release && app.state.overlay() == Overlay::None {
+            if key.code == KeyCode::Esc
+                && (app.state.transcript_selection.is_some() || app.state.selection_copied)
+            {
+                app.state.transcript_selection = None;
+                app.state.selection_copied = false;
+                return Ok(false);
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.code == KeyCode::Char('c')
+                && let Some(selection) = app
+                    .state
+                    .transcript_selection
+                    .as_ref()
+                    .filter(|selection| selection.dragged)
+            {
+                let text = selection.text(&cache.lines);
+                if let Some(selection) = app.state.transcript_selection.as_mut() {
+                    selection.dragging = false;
+                }
+                apply_pointer_action(app, PointerAction::Copy(text));
+                return Ok(false);
+            }
+        }
+        if key.kind != KeyEventKind::Release {
+            app.state.transcript_selection = None;
+            app.state.selection_copied = false;
+        }
+    } else if matches!(&event, Event::Paste(_)) {
+        app.state.transcript_selection = None;
+        app.state.selection_copied = false;
+    }
+    if app.state.transcript_view_expanded()
+        && matches!(
+            &event,
+            Event::Key(KeyEvent {
+                code: KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::Char('{')
+                    | KeyCode::Char('}'),
+                ..
+            })
+        )
     {
-        // User navigation must refer to the same revision as the next draw.
         cache.prepare(&mut app.state, area);
     }
     app.handle_event(event)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PointerAction {
+    Open(Arc<str>),
+    Copy(String),
+}
+
+fn update_transcript_pointer(
+    state: &mut TuiState,
+    cache: &TranscriptRenderCache,
+    area: Rect,
+    mouse: MouseEvent,
+) -> Option<PointerAction> {
+    if state.overlay() != Overlay::None {
+        return None;
+    }
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            state.selection_copied = false;
+            state.transcript_selection = cache.point_at(state, area, mouse, false).map(|point| {
+                TranscriptSelection::new(point, cache.lines[point.row].link_at(point.column))
+            });
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let point = cache.point_at(state, area, mouse, true);
+            if let Some(selection) = state
+                .transcript_selection
+                .as_mut()
+                .filter(|selection| selection.dragging)
+                && let Some(point) = point
+            {
+                selection.update(point);
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let mut selection = state.transcript_selection.take()?;
+            if !selection.dragging {
+                state.transcript_selection = Some(selection);
+                return None;
+            }
+            let released = cache.point_at(state, area, mouse, false);
+            let point = cache.point_at(state, area, mouse, true)?;
+            if point != selection.anchor {
+                selection.update(point);
+            }
+            selection.finish(point);
+            if selection.dragged {
+                let text = selection.text(&cache.lines);
+                if !text.is_empty() {
+                    state.transcript_selection = Some(selection);
+                    return Some(PointerAction::Copy(text));
+                }
+            } else if released == Some(selection.anchor)
+                && let Some(target) = selection.pressed_link
+                && cache.lines[point.row].link_at(point.column).as_deref() == Some(target.as_ref())
+            {
+                return Some(PointerAction::Open(target));
+            }
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            state.scroll_transcript(if mouse.kind == MouseEventKind::ScrollUp {
+                3
+            } else {
+                -3
+            });
+            let point = cache.point_at(state, area, mouse, true);
+            if let Some(selection) = state
+                .transcript_selection
+                .as_mut()
+                .filter(|selection| selection.dragging)
+                && let Some(point) = point
+            {
+                selection.update(point);
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+fn apply_pointer_action(app: &mut App, action: PointerAction) {
+    let result = match action {
+        PointerAction::Open(target) => {
+            app.link_tasks
+                .spawn(async move { open_link(&target).await });
+            Ok(())
+        }
+        PointerAction::Copy(text) => copy_to_clipboard(&text).inspect(|()| {
+            app.state.selection_copied = true;
+            if let Some(selection) = app.state.transcript_selection.as_mut() {
+                selection.copied = true;
+            }
+        }),
+    };
+    if let Err(error) = result {
+        app.state.push_error(error);
+    }
 }
 
 fn handle_preapproval_input(
@@ -2000,6 +2217,9 @@ fn handle_preapproval_input(
     origin: &mut Overlay,
     event: Event,
 ) -> Result<(bool, bool), String> {
+    if matches!(&event, Event::Mouse(_)) {
+        return Ok((false, false));
+    }
     let interrupt = matches!(&event, Event::Key(key)
         if key.code == KeyCode::Esc
             || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c')));
@@ -2205,6 +2425,18 @@ where
                     None => tool_open = false,
                 }
             }
+            result = app.link_tasks.join_next(), if !app.link_tasks.is_empty() => {
+                let error = match result {
+                    Some(Ok(Err(error))) => Some(error),
+                    Some(Err(error)) => Some(format!("link opener failed: {error}")),
+                    _ => None,
+                };
+                if let Some(error) = error {
+                    app.state.push_error(error);
+                    state_changed = true;
+                    force_redraw = true;
+                }
+            }
             _ = &mut stream_redraw => force_redraw = true,
             _ = &mut animation => {
                 force_redraw = true;
@@ -2369,6 +2601,32 @@ fn now_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+async fn open_link(target: &str) -> Result<(), String> {
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        "rundll32.exe"
+    } else {
+        "xdg-open"
+    };
+    let mut command = tokio::process::Command::new(program);
+    #[cfg(target_os = "windows")]
+    command.arg("url.dll,FileProtocolHandler");
+    let status = command
+        .arg(target)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map_err(|error| format!("could not open link: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("system link opener failed: {status}"))
+    }
+}
+
 #[cfg(test)]
 fn copy_to_clipboard(_text: &str) -> Result<(), String> {
     Ok(())
@@ -2376,9 +2634,12 @@ fn copy_to_clipboard(_text: &str) -> Result<(), String> {
 
 #[cfg(not(test))]
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
-    let mut copied = false;
-    for command in ["pbcopy", "wl-copy", "xclip"] {
-        let mut child = match std::process::Command::new(command)
+    for program in ["pbcopy", "wl-copy", "xclip"] {
+        let mut command = std::process::Command::new(program);
+        if program == "xclip" {
+            command.args(["-selection", "clipboard"]);
+        }
+        let mut child = match command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -2387,24 +2648,24 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
             Ok(child) => child,
             Err(_) => continue,
         };
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
+        let written = child
+            .stdin
+            .take()
+            .is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
+        if !written {
+            let _ = child.kill();
         }
-        if child.wait().map(|status| status.success()).unwrap_or(false) {
-            copied = true;
-            break;
+        if child.wait().is_ok_and(|status| status.success()) && written {
+            return Ok(());
         }
     }
     if io::IsTerminal::is_terminal(&io::stdout()) {
         let mut encoded = String::new();
         base64_encode(text.as_bytes(), &mut encoded);
         let mut stdout = io::stdout();
-        let _ = write!(stdout, "\x1b]52;c;{encoded}\x07");
-        let _ = stdout.flush();
-        copied = true;
-    }
-    if copied {
-        Ok(())
+        write!(stdout, "\x1b]52;c;{encoded}\x07")
+            .and_then(|()| stdout.flush())
+            .map_err(|error| format!("could not send text to the clipboard: {error}"))
     } else {
         Err("no clipboard command available".into())
     }
@@ -2609,7 +2870,31 @@ mod tests {
             restart_args: None,
             exit_requested: false,
             control: None,
+            link_tasks: tokio::task::JoinSet::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn pending_desktop_link_does_not_block_exit() {
+        let mut app = test_app();
+        app.link_tasks.spawn(std::future::pending());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let (sender, mut input) = mpsc::channel(1);
+        sender
+            .send(Event::Key(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+            )))
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            run_loop(&mut app, &mut terminal, &mut input, None, None),
+        )
+        .await
+        .expect("desktop handler must not block input")
+        .unwrap();
+        assert!(app.exit_requested);
     }
 
     #[cfg(unix)]
@@ -3603,6 +3888,153 @@ Session ID: ses_cafebabe"
         assert!(!app.accepts_event(&wheel(MouseEventKind::Moved)));
     }
 
+    fn pointer(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn plain_link_click_opens_but_link_drag_selects_without_changing_the_draft() {
+        let mut app = test_app();
+        app.state
+            .push_assistant("Select [reference](https://example.test/one).");
+        app.state.composer = "keep draft".into();
+        app.state.cursor = 4;
+        let area = Rect::new(0, 0, 80, 24);
+        let mut cache = TranscriptRenderCache::default();
+        cache.prepare(&mut app.state, area);
+        assert_eq!(
+            update_transcript_pointer(
+                &mut app.state,
+                &cache,
+                area,
+                pointer(MouseEventKind::Down(MouseButton::Left), 9, 0)
+            ),
+            None
+        );
+        assert_eq!(
+            update_transcript_pointer(
+                &mut app.state,
+                &cache,
+                area,
+                pointer(MouseEventKind::Up(MouseButton::Left), 9, 0)
+            ),
+            Some(PointerAction::Open(Arc::from("https://example.test/one")))
+        );
+        update_transcript_pointer(
+            &mut app.state,
+            &cache,
+            area,
+            pointer(MouseEventKind::Down(MouseButton::Left), 9, 0),
+        );
+        update_transcript_pointer(
+            &mut app.state,
+            &cache,
+            area,
+            pointer(MouseEventKind::Drag(MouseButton::Left), 13, 0),
+        );
+        assert_eq!(
+            update_transcript_pointer(
+                &mut app.state,
+                &cache,
+                area,
+                pointer(MouseEventKind::Up(MouseButton::Left), 13, 0)
+            ),
+            Some(PointerAction::Copy("refer".into()))
+        );
+        assert_eq!(app.state.composer, "keep draft");
+        assert_eq!(app.state.cursor, 4);
+    }
+
+    #[test]
+    fn dragging_copies_the_visible_snapshot_while_streaming_markdown_reflows() {
+        let mut app = test_app();
+        app.state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+            text: "[reference](https://example.test".into(),
+        });
+        let area = Rect::new(0, 0, 80, 24);
+        let mut cache = TranscriptRenderCache::default();
+        cache.prepare(&mut app.state, area);
+        update_transcript_pointer(
+            &mut app.state,
+            &cache,
+            area,
+            pointer(MouseEventKind::Down(MouseButton::Left), 3, 0),
+        );
+        app.state
+            .apply_runtime_event(RuntimeEvent::AssistantDelta { text: ")".into() });
+        cache.prepare(&mut app.state, area);
+        update_transcript_pointer(
+            &mut app.state,
+            &cache,
+            area,
+            pointer(MouseEventKind::Drag(MouseButton::Left), 11, 0),
+        );
+        assert_eq!(
+            update_transcript_pointer(
+                &mut app.state,
+                &cache,
+                area,
+                pointer(MouseEventKind::Up(MouseButton::Left), 11, 0)
+            ),
+            Some(PointerAction::Copy("reference".into()))
+        );
+        cache.prepare(&mut app.state, area);
+        assert!(app.state.transcript_selection.is_none());
+        assert!(cache.lines[0].text.to_string().starts_with("reference"));
+    }
+
+    #[test]
+    fn resize_cancels_pointer_coordinates_before_a_link_can_open() {
+        let mut app = test_app();
+        app.state
+            .push_assistant("[reference](https://example.test)");
+        let mut cache = TranscriptRenderCache::default();
+        let wide = Rect::new(0, 0, 80, 24);
+        let narrow = Rect::new(0, 0, 40, 12);
+        cache.prepare(&mut app.state, wide);
+        update_transcript_pointer(
+            &mut app.state,
+            &cache,
+            wide,
+            pointer(MouseEventKind::Down(MouseButton::Left), 2, 0),
+        );
+        cache.prepare(&mut app.state, narrow);
+        assert_eq!(
+            update_transcript_pointer(
+                &mut app.state,
+                &cache,
+                narrow,
+                pointer(MouseEventKind::Up(MouseButton::Left), 2, 0)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn escape_dismisses_copied_feedback_without_cancelling_the_active_turn() {
+        let mut app = test_app();
+        app.state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+            text: "still working".into(),
+        });
+        app.state.selection_copied = true;
+        let mut cache = TranscriptRenderCache::default();
+        handle_input_with_current_geometry(
+            &mut app,
+            &mut cache,
+            Rect::new(0, 0, 80, 24),
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        )
+        .unwrap();
+        assert!(!app.state.selection_copied);
+        assert!(app.state.activity().is_animated());
+        assert!(app.state.sent_commands().is_empty());
+    }
+
     #[test]
     fn fullscreen_prepare_reuses_markdown_render_for_draw() {
         let mut state = TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised);
@@ -3682,6 +4114,7 @@ Session ID: ses_cafebabe"
             restart_args: None,
             exit_requested: false,
             control: None,
+            link_tasks: tokio::task::JoinSet::new(),
         };
         app.state.push_user("visible fullscreen question");
         let mut rows = vec![" ".repeat(80); 16];
