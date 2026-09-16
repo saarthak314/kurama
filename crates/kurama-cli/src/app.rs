@@ -9,7 +9,7 @@ use std::{
 #[cfg(not(test))]
 use std::io::Write as _;
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use kurama_adapters::{
     AppPaths, BashTool, ClaudeNativeSearch, CodexNativeSearch, ConfigRepository,
     CredentialResolver, FsSessionStore, HttpClient, JsonSearchBackend, OpenAiNativeSearch,
@@ -33,7 +33,6 @@ use ratatui::{
     Terminal,
     backend::{Backend, CrosstermBackend},
     layout::Rect,
-    text::Line,
 };
 use tokio::sync::mpsc;
 
@@ -41,10 +40,10 @@ use crate::{
     args::{Args, ResumeChoice},
     commands::{Command, GoalAction, command_missing_required_arguments, parse_command},
     tui::{
-        OnboardingState, OnboardingSubmission, Overlay, TerminalGuard, TranscriptDetail, TuiState,
-        composer_cursor_vertical, main_area, next_grapheme_boundary, previous_grapheme_boundary,
-        render_with_transcript, spawn_input_thread, transcript_lines_with_entry_starts,
-        visible_activity_rect,
+        OnboardingState, OnboardingSubmission, Overlay, TerminalGuard, TranscriptDetail,
+        TranscriptLine, TuiState, composer_cursor_vertical, main_area, main_layout,
+        next_grapheme_boundary, previous_grapheme_boundary, render_with_transcript,
+        spawn_input_thread, transcript_lines_with_entry_starts, visible_activity_rect,
     },
 };
 
@@ -57,9 +56,10 @@ const ACTIVITY_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 #[derive(Default)]
 struct TranscriptRenderCache {
     key: Option<TranscriptCacheKey>,
-    lines: Vec<Line<'static>>,
+    lines: Vec<TranscriptLine>,
     entry_starts: Vec<usize>,
     viewport_height: u16,
+    last_assistant_entry: Option<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -83,30 +83,30 @@ impl TranscriptRenderCache {
             expanded,
             entries: state.transcript.len(),
         };
-        let viewport = frame_area
-            .height
-            .saturating_sub(u16::from(frame_area.height > 1));
-        if expanded {
-            state.transcript_width.set(width as u16);
-            state.viewport_height.set(viewport);
-        }
+        let viewport = if expanded {
+            frame_area
+                .height
+                .saturating_sub(u16::from(frame_area.height > 1))
+        } else {
+            main_layout(frame_area, state).transcript.height
+        };
+        state.transcript_width.set(width as u16);
+        state.viewport_height.set(viewport);
         let previous_start = self
             .lines
             .len()
             .saturating_sub(self.viewport_height as usize)
             .saturating_sub(state.scroll);
         if self.key == Some(key) {
-            if expanded {
-                let max_scroll = self.lines.len().saturating_sub(viewport as usize);
-                if state.scroll > 0 && viewport != self.viewport_height {
-                    state.scroll = max_scroll.saturating_sub(previous_start);
-                }
-                state.scroll = state.scroll.min(max_scroll);
-                self.viewport_height = viewport;
+            let max_scroll = self.lines.len().saturating_sub(viewport as usize);
+            if state.scroll > 0 && viewport != self.viewport_height {
+                state.scroll = max_scroll.saturating_sub(previous_start);
             }
+            state.scroll = state.scroll.min(max_scroll);
+            self.viewport_height = viewport;
             return;
         }
-        let anchor = if expanded && self.key.is_some_and(|key| key.expanded) && state.scroll > 0 {
+        let anchor = if self.key.is_some_and(|key| key.expanded == expanded) && state.scroll > 0 {
             self.entry_starts
                 .partition_point(|&row| row <= previous_start)
                 .checked_sub(1)
@@ -122,7 +122,7 @@ impl TranscriptRenderCache {
         let reuse = self
             .key
             .is_some_and(|old| old.width == width && old.expanded == expanded);
-        let retained = if reuse {
+        let mut retained = if reuse {
             state
                 .transcript_dirty_from()
                 .min(state.transcript.len())
@@ -130,6 +130,17 @@ impl TranscriptRenderCache {
         } else {
             0
         };
+        // A new answer makes the former latest answer gain its ending rule.
+        if reuse
+            && state
+                .transcript
+                .iter()
+                .skip(self.entry_starts.len())
+                .any(|entry| matches!(entry, crate::tui::TranscriptEntry::AssistantMessage { .. }))
+            && let Some(previous) = self.last_assistant_entry
+        {
+            retained = retained.min(previous);
+        }
         let prefix_rows = self
             .entry_starts
             .get(retained)
@@ -154,37 +165,38 @@ impl TranscriptRenderCache {
             self.entry_starts
                 .extend(starts.into_iter().map(|row| prefix_rows + row));
         }
-        if expanded {
-            if let Some((entry, offset)) = anchor {
-                let start = self
-                    .entry_starts
-                    .get(entry)
-                    .map(|&start| {
-                        let end = self
-                            .entry_starts
-                            .get(entry + 1)
-                            .copied()
-                            .unwrap_or(self.lines.len());
-                        start + offset.min(end.saturating_sub(start).saturating_sub(1))
-                    })
-                    .unwrap_or(previous_start);
-                state.scroll = self
-                    .lines
-                    .len()
-                    .saturating_sub(viewport as usize)
-                    .saturating_sub(start);
-            }
-            state.set_transcript_geometry(width as u16, self.lines.len(), &self.entry_starts);
-            state.scroll = state
-                .scroll
-                .min(self.lines.len().saturating_sub(viewport as usize));
+        if let Some((entry, offset)) = anchor {
+            let start = self
+                .entry_starts
+                .get(entry)
+                .map(|&start| {
+                    let end = self
+                        .entry_starts
+                        .get(entry + 1)
+                        .copied()
+                        .unwrap_or(self.lines.len());
+                    start + offset.min(end.saturating_sub(start).saturating_sub(1))
+                })
+                .unwrap_or(previous_start);
+            state.scroll = self
+                .lines
+                .len()
+                .saturating_sub(viewport as usize)
+                .saturating_sub(start);
         }
+        state.set_transcript_geometry(width as u16, self.lines.len(), &self.entry_starts);
+        state.scroll = state
+            .scroll
+            .min(self.lines.len().saturating_sub(viewport as usize));
         state.mark_transcript_rendered();
+        self.last_assistant_entry = state.transcript.iter().rposition(|entry| {
+            matches!(entry, crate::tui::TranscriptEntry::AssistantMessage { .. })
+        });
         self.viewport_height = viewport;
         self.key = Some(key);
     }
 
-    fn lines(&self) -> Option<&[Line<'static>]> {
+    fn lines(&self) -> Option<&[TranscriptLine]> {
         self.key.map(|_| self.lines.as_slice())
     }
 }
@@ -629,6 +641,13 @@ impl App {
 
     fn accepts_event(&self, event: &Event) -> bool {
         let key = match event {
+            Event::Mouse(mouse) => {
+                return self.state.overlay() == Overlay::None
+                    && matches!(
+                        mouse.kind,
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                    );
+            }
             Event::Resize(..) => return true,
             Event::Paste(text) => {
                 return !text.is_empty()
@@ -771,6 +790,18 @@ impl App {
 
     pub fn handle_event(&mut self, event: Event) -> Result<bool, String> {
         let key = match event {
+            Event::Mouse(mouse) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        self.state.scroll_transcript(3);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        self.state.scroll_transcript(-3);
+                    }
+                    _ => {}
+                }
+                return Ok(false);
+            }
             Event::Paste(text) => {
                 match self.state.overlay {
                     Overlay::None if self.state.history_search_active() => {
@@ -1937,21 +1968,24 @@ fn handle_input_with_current_geometry(
     area: Rect,
     event: Event,
 ) -> Result<bool, String> {
-    if app.state.transcript_view_expanded()
-        && matches!(
-            &event,
-            Event::Key(KeyEvent {
-                code: KeyCode::Up
-                    | KeyCode::Down
-                    | KeyCode::PageUp
-                    | KeyCode::PageDown
-                    | KeyCode::Home
-                    | KeyCode::End
-                    | KeyCode::Char('{')
-                    | KeyCode::Char('}'),
-                ..
-            })
-        )
+    let wheel = matches!(&event, Event::Mouse(mouse)
+        if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown));
+    if wheel
+        || (app.state.transcript_view_expanded()
+            && matches!(
+                &event,
+                Event::Key(KeyEvent {
+                    code: KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                        | KeyCode::Home
+                        | KeyCode::End
+                        | KeyCode::Char('{')
+                        | KeyCode::Char('}'),
+                    ..
+                })
+            ))
     {
         // User navigation must refer to the same revision as the next draw.
         cache.prepare(&mut app.state, area);
@@ -2743,7 +2777,7 @@ printf '%s\n' '{"type":"turn.completed"}'
                 .lines()
                 .unwrap()
                 .iter()
-                .any(|line| line.to_string().contains("second head"))
+                .any(|line| line.text.to_string().contains("second head"))
         );
         toggle_transcript(&mut app);
         cache.prepare(&mut app.state, Rect::new(0, 0, 80, 24));
@@ -2754,7 +2788,7 @@ printf '%s\n' '{"type":"turn.completed"}'
                 .lines()
                 .unwrap()
                 .iter()
-                .any(|line| line.to_string().contains("second head"))
+                .any(|line| line.text.to_string().contains("second head"))
         );
         toggle_transcript(&mut app);
         assert_eq!(displayed_tool_output(&app, 0), full);
@@ -3529,36 +3563,44 @@ Session ID: ses_cafebabe"
     }
 
     #[test]
-    fn mouse_events_preserve_native_terminal_selection() {
-        let mut app = App {
-            state: TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised),
-            engine: None,
-            runtime_events: None,
-            tool_events: None,
-            orchestrator: None,
-            session_id: None,
-            restart_args: None,
-            exit_requested: false,
-            control: None,
+    fn wheel_scroll_moves_output_without_mutating_the_draft() {
+        let mut app = test_app();
+        app.state.push_assistant(
+            (0..100)
+                .map(|row| format!("output {row}\n\n"))
+                .collect::<String>(),
+        );
+        app.state.remember_prompt("previous prompt");
+        app.state.composer = "current draft".into();
+        app.state.cursor = 3;
+        let area = Rect::new(0, 0, 48, 12);
+        let mut cache = TranscriptRenderCache::default();
+        cache.prepare(&mut app.state, area);
+        let wheel = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 4,
+                row: 9,
+                modifiers: KeyModifiers::NONE,
+            })
         };
-
-        app.handle_event(Event::Mouse(MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        }))
-        .expect("scroll up");
+        let up = wheel(MouseEventKind::ScrollUp);
+        assert!(app.accepts_event(&up));
+        handle_input_with_current_geometry(&mut app, &mut cache, area, up).unwrap();
+        assert!(app.state.scroll > 0);
+        assert_eq!(app.state.composer, "current draft");
+        assert_eq!(app.state.cursor, 3);
+        handle_input_with_current_geometry(
+            &mut app,
+            &mut cache,
+            area,
+            wheel(MouseEventKind::ScrollDown),
+        )
+        .unwrap();
         assert_eq!(app.state.scroll, 0);
-
-        app.handle_event(Event::Mouse(MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        }))
-        .expect("scroll down");
-        assert_eq!(app.state.scroll, 0);
+        assert_eq!(app.state.composer, "current draft");
+        assert_eq!(app.state.cursor, 3);
+        assert!(!app.accepts_event(&wheel(MouseEventKind::Moved)));
     }
 
     #[test]
@@ -3713,7 +3755,7 @@ Session ID: ses_cafebabe"
             Event::FocusGained,
             Event::FocusLost,
             Event::Mouse(MouseEvent {
-                kind: MouseEventKind::ScrollUp,
+                kind: MouseEventKind::Moved,
                 column: 0,
                 row: 0,
                 modifiers: KeyModifiers::NONE,
@@ -3788,24 +3830,33 @@ Session ID: ses_cafebabe"
     }
 
     #[test]
-    fn expanded_read_position_survives_new_output_and_height_changes() {
-        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        state.apply_runtime_event(RuntimeEvent::AssistantDelta {
-            text: (0..80).map(|i| format!("row {i}\n\n")).collect(),
-        });
-        state.toggle_transcript_view();
-        let mut cache = TranscriptRenderCache::default();
-        cache.prepare(&mut state, Rect::new(0, 0, 40, 10));
-        state.scroll = 40;
-        let before = cache.lines[cache.lines.len() - 9 - state.scroll].clone();
-        state.apply_runtime_event(RuntimeEvent::AssistantDelta {
-            text: "new output\n\n".into(),
-        });
-        cache.prepare(&mut state, Rect::new(0, 0, 40, 7));
-        assert_eq!(cache.lines[cache.lines.len() - 6 - state.scroll], before);
-        state.scroll = usize::MAX;
-        cache.prepare(&mut state, Rect::new(0, 0, 40, 7));
-        assert_eq!(state.scroll, cache.lines.len() - 6);
+    fn read_position_survives_new_output_and_height_changes() {
+        for expanded in [false, true] {
+            let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+            state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+                text: (0..80).map(|i| format!("row {i}\n\n")).collect(),
+            });
+            if expanded {
+                state.toggle_transcript_view();
+            }
+            let mut cache = TranscriptRenderCache::default();
+            cache.prepare(&mut state, Rect::new(0, 0, 40, 10));
+            state.scroll = 40;
+            let top = cache.lines.len() - cache.viewport_height as usize - state.scroll;
+            let before = cache.lines[top].text.clone();
+            state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+                text: "new output\n\n".into(),
+            });
+            cache.prepare(&mut state, Rect::new(0, 0, 40, 7));
+            let top = cache.lines.len() - cache.viewport_height as usize - state.scroll;
+            assert_eq!(cache.lines[top].text, before);
+            state.scroll = usize::MAX;
+            cache.prepare(&mut state, Rect::new(0, 0, 40, 7));
+            assert_eq!(
+                state.scroll,
+                cache.lines.len() - cache.viewport_height as usize
+            );
+        }
     }
 
     #[test]
@@ -3868,7 +3919,8 @@ Session ID: ses_cafebabe"
             .lines
             .iter()
             .position(|line| {
-                line.spans
+                line.text
+                    .spans
                     .iter()
                     .any(|span| span.content.contains("ANCHOR"))
             })
@@ -3879,6 +3931,7 @@ Session ID: ses_cafebabe"
             let first = &cache.lines[cache.lines.len() - 9 - state.scroll];
             assert!(
                 first
+                    .text
                     .spans
                     .iter()
                     .any(|span| span.content.contains("ANCHOR")),
@@ -3980,7 +4033,8 @@ Session ID: ses_cafebabe"
         cache.prepare(&mut app.state, area);
         let row = &cache.lines[cache.lines.len() - 7 - app.state.scroll];
         assert!(
-            row.spans
+            row.text
+                .spans
                 .iter()
                 .any(|span| span.content.contains("second prompt")),
             "{row:?}"
@@ -4054,8 +4108,14 @@ Session ID: ses_cafebabe"
             state.apply_runtime_event(event);
             cache.prepare(&mut state, area);
             assert_eq!(
-                cache.lines,
+                cache
+                    .lines
+                    .iter()
+                    .map(|line| &line.text)
+                    .collect::<Vec<_>>(),
                 transcript_lines(&state.transcript, 44, TranscriptDetail::Expanded)
+                    .iter()
+                    .collect::<Vec<_>>(),
             );
         }
     }

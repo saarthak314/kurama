@@ -12,19 +12,16 @@ use ratatui::{
 use kurama_protocol::{agent::AgentState, session::TodoStatus};
 
 use super::{
-    Overlay, ResponsiveLayout, TranscriptEntry, TuiState, activity_line,
+    Overlay, TranscriptEntry, TuiState, activity_line,
     agents::state_label,
     command_palette_height,
-    composer::{
-        approval_height, composer_height, render_approval, render_composer, render_footer,
-        render_queue,
-    },
-    layout::{main_area, queue_height},
+    composer::{render_approval, render_composer, render_footer, render_queue},
+    layout::{main_area, main_layout},
     render_command_palette,
     theme::{ACCENT, AMBER, BORDER, DIM, GREEN, RED, TEXT},
     transcript::{
-        TranscriptDetail, for_each_wrapped_line, render_transcript_view, sanitize_terminal_text,
-        startup_lines, transcript_lines, truncate_display,
+        TranscriptDetail, TranscriptLine, for_each_wrapped_line, prepared_transcript_lines,
+        render_transcript_view, sanitize_terminal_text, startup_lines, truncate_display,
     },
     worked_for_line,
 };
@@ -36,7 +33,7 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
 pub(crate) fn render_with_transcript(
     frame: &mut Frame<'_>,
     state: &TuiState,
-    prepared_transcript: Option<&[Line<'static>]>,
+    prepared_transcript: Option<&[TranscriptLine]>,
 ) {
     if frame.area().is_empty() {
         state.transcript_width.set(0);
@@ -69,7 +66,7 @@ pub(crate) fn render_with_transcript(
 fn render_main(
     frame: &mut Frame<'_>,
     state: &TuiState,
-    prepared_transcript: Option<&[Line<'static>]>,
+    prepared_transcript: Option<&[TranscriptLine]>,
 ) {
     let frame_area = frame.area();
     let area = main_area(frame_area);
@@ -78,13 +75,6 @@ fn render_main(
     }
     let approval_visible = matches!(state.overlay, Overlay::Approval | Overlay::ApprovalEdit);
     let shortcuts_visible = state.overlay == Overlay::Shortcuts;
-    let input_height = if approval_visible {
-        approval_height(state, area.width)
-    } else if shortcuts_visible {
-        10.min(area.height).max(5)
-    } else {
-        composer_height(state, area.width)
-    };
     let now = Instant::now();
     let activity = if state.overlay == Overlay::None {
         activity_line(state.activity(), area.width as usize, now).or_else(|| {
@@ -95,12 +85,7 @@ fn render_main(
     } else {
         None
     };
-    let layout = ResponsiveLayout::for_area(
-        area,
-        input_height,
-        activity.is_some(),
-        queue_height(state, area.width),
-    );
+    let layout = main_layout(frame_area, state);
     state.transcript_width.set(layout.transcript.width);
     state.viewport_height.set(layout.transcript.height);
 
@@ -110,7 +95,7 @@ fn render_main(
         let transcript = if let Some(transcript) = prepared_transcript {
             transcript
         } else {
-            rendered_transcript = transcript_lines(
+            rendered_transcript = prepared_transcript_lines(
                 &state.transcript,
                 transcript_width,
                 TranscriptDetail::Compact,
@@ -130,8 +115,8 @@ fn render_main(
             .take(viewport_height)
             .enumerate()
         {
-            frame.render_widget(
-                line,
+            line.render(
+                frame,
                 Rect::new(
                     layout.transcript.x,
                     layout.transcript.y + row as u16,

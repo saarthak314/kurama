@@ -21,13 +21,13 @@ pub(crate) use composer::composer_cursor_vertical;
 pub use input::{TerminalGuard, spawn_input_thread};
 pub(crate) use input::{next_grapheme_boundary, previous_grapheme_boundary};
 pub use layout::ResponsiveLayout;
-pub(crate) use layout::{main_area, visible_activity_rect};
+pub(crate) use layout::{main_area, main_layout, visible_activity_rect};
 pub(crate) use mentions::{collect_files, decode_pasted_image, filter_files, mention_at_cursor};
 pub use onboarding::{OnboardingState, OnboardingSubmission};
 pub use render::render;
 pub(crate) use render::render_with_transcript;
 pub use state::{ActivityState, Overlay, ToolLifecycle, ToolTranscript, TranscriptEntry, TuiState};
-pub(crate) use transcript::transcript_lines_with_entry_starts;
 pub use transcript::{TranscriptDetail, transcript_lines};
+pub(crate) use transcript::{TranscriptLine, transcript_lines_with_entry_starts};
 #[cfg(test)]
 pub(crate) use transcript::{reset_transcript_render_calls, transcript_render_calls};

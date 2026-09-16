@@ -532,7 +532,11 @@ impl TuiState {
         let (lines, starts) = super::transcript::transcript_lines_with_entry_starts(
             &self.transcript,
             width as usize,
-            super::TranscriptDetail::Expanded,
+            if self.transcript_view_expanded {
+                super::TranscriptDetail::Expanded
+            } else {
+                super::TranscriptDetail::Compact
+            },
         );
         self.set_transcript_geometry(width, lines.len(), &starts);
     }
@@ -547,6 +551,21 @@ impl TuiState {
                     .lines
                     .saturating_sub(self.viewport_height.get() as usize)
             })
+    }
+
+    pub(crate) fn scroll_transcript(&mut self, rows: i32) -> bool {
+        if self.overlay != Overlay::None || rows == 0 {
+            return false;
+        }
+        let previous = self.scroll;
+        let max_scroll = self.max_transcript_scroll();
+        let scroll = previous.min(max_scroll);
+        self.scroll = if rows > 0 {
+            scroll.saturating_add(rows as usize).min(max_scroll)
+        } else {
+            scroll.saturating_sub(rows.unsigned_abs() as usize)
+        };
+        self.scroll != previous
     }
 
     pub fn remember_prompt(&mut self, text: &str) {
@@ -922,6 +941,7 @@ impl TuiState {
 
     pub fn submit_turn(&mut self, text: impl Into<String>, explicit_delegation: bool) {
         let text = text.into();
+        self.scroll = 0;
         if !matches!(self.activity, ActivityState::Idle) {
             self.pending_turns.push_back(PendingTurn {
                 text,
@@ -954,6 +974,7 @@ impl TuiState {
 
     pub fn toggle_transcript_view(&mut self) {
         self.transcript_view_expanded = !self.transcript_view_expanded;
+        *self.transcript_geometry.get_mut() = None;
         self.scroll = 0;
         if let Some(store) = &self.display_store {
             let mut dirty_from = self.transcript.len();
@@ -1803,6 +1824,7 @@ impl TuiState {
         if !matches!(self.activity, ActivityState::Idle) {
             return false;
         }
+        self.scroll = 0;
         self.apply_goal(
             Some(SessionGoal {
                 objective: objective.clone(),
@@ -2037,5 +2059,124 @@ fn mode_label(mode: ExecutionMode) -> &'static str {
         ExecutionMode::Supervised => "supervised",
         ExecutionMode::Auto => "auto",
         ExecutionMode::Yolo => "yolo",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Overlay, TuiState};
+    use kurama_protocol::policy::ExecutionMode;
+
+    fn scrollable_state() -> TuiState {
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        state.transcript_width.set(24);
+        state.viewport_height.set(4);
+        state.push_assistant(
+            "a long assistant answer that wraps across several terminal rows\n".repeat(10),
+        );
+        state
+    }
+
+    #[test]
+    fn wheel_scroll_clamps_wrapped_rows_and_preserves_history_draft() {
+        let mut state = scrollable_state();
+        state.remember_prompt("first prompt");
+        state.remember_prompt("second prompt");
+        state.composer = "unfinished draft".into();
+        assert!(state.history_previous());
+        state.cursor = 3;
+
+        let max_scroll = state.max_transcript_scroll();
+        assert!(max_scroll > 3);
+        assert!(!state.scroll_transcript(-3));
+        assert!(state.scroll_transcript(3));
+        assert_eq!(state.scroll, 3);
+        assert!(state.scroll_transcript(i32::MAX));
+        assert_eq!(state.scroll, max_scroll);
+        assert!(!state.scroll_transcript(3));
+        state.scroll = usize::MAX;
+        assert!(state.scroll_transcript(-3));
+        assert_eq!(state.scroll, max_scroll - 3);
+        assert!(state.scroll_transcript(i32::MIN));
+        assert_eq!(state.scroll, 0);
+        assert!(!state.scroll_transcript(0));
+
+        assert_eq!(state.composer, "second prompt");
+        assert_eq!(state.cursor, 3);
+        assert!(state.history_previous());
+        assert_eq!(state.composer, "first prompt");
+        assert!(state.history_next());
+        assert_eq!(state.composer, "second prompt");
+        assert!(state.history_next());
+        assert_eq!(state.composer, "unfinished draft");
+    }
+
+    #[test]
+    fn wheel_scroll_ignores_overlays_and_short_transcripts() {
+        let mut state = scrollable_state();
+        state.composer = "draft".into();
+        state.agent_message = "agent draft".into();
+        state.agent_message_cursor = 2;
+        assert!(state.scroll_transcript(3));
+        for overlay in [
+            Overlay::Onboarding,
+            Overlay::Approval,
+            Overlay::ApprovalEdit,
+            Overlay::Agents,
+            Overlay::Todos,
+            Overlay::AgentInspect,
+            Overlay::AgentMessage,
+            Overlay::ConfirmAgentCancel,
+            Overlay::Shortcuts,
+        ] {
+            state.overlay = overlay;
+            assert!(!state.scroll_transcript(3));
+            assert!(!state.scroll_transcript(-3));
+            assert_eq!(state.scroll, 3);
+        }
+        assert_eq!(state.composer, "draft");
+        assert_eq!(state.agent_message, "agent draft");
+        assert_eq!(state.agent_message_cursor, 2);
+        state.overlay = Overlay::None;
+        state.viewport_height.set(u16::MAX);
+        assert!(state.scroll_transcript(3));
+        assert_eq!(state.scroll, 0);
+        assert!(!state.scroll_transcript(3));
+        assert!(!state.scroll_transcript(-3));
+    }
+
+    #[test]
+    fn wheel_scroll_geometry_tracks_detail_width_and_new_prompts() {
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        state.transcript_width.set(24);
+        state.viewport_height.set(1);
+        state.push_tool(
+            "TOOL / bash",
+            "a long output row with enough text to wrap\n".repeat(40),
+        );
+
+        assert!(state.scroll_transcript(i32::MAX));
+        let compact_max = state.scroll;
+        state.toggle_transcript_view();
+        assert_eq!(state.scroll, 0);
+        assert!(state.scroll_transcript(i32::MAX));
+        let expanded_max = state.scroll;
+        assert!(expanded_max > compact_max);
+        state.transcript_width.set(12);
+        assert!(state.scroll_transcript(i32::MAX));
+        assert!(state.scroll > expanded_max);
+        state.transcript_width.set(24);
+        state.toggle_transcript_view();
+        assert!(state.scroll_transcript(i32::MAX));
+        assert_eq!(state.scroll, compact_max);
+
+        state.submit_turn("new prompt", false);
+        assert_eq!(state.scroll, 0);
+        state.push_assistant("live answer");
+        assert_eq!(state.scroll, 0);
+        assert!(state.scroll_transcript(3));
+        state.submit_turn("queued prompt", false);
+        assert_eq!(state.scroll, 0);
+        assert_eq!(state.pending_turn_count(), 1);
     }
 }

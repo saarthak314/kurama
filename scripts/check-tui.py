@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import pty
 import select
+import re
 import signal
 import struct
 import subprocess
@@ -792,6 +793,17 @@ endpoint = "http://127.0.0.1:9/search"
             result["findings"]["responsive_content_sizes"] = responsive_sizes
             resize(100, 36)
             capture("markdown-wide")
+            visible = "\n".join(screen.display)
+            assert "fn main()" in visible
+            assert "```" not in visible
+            assert not any(line.strip() == "rust" for line in screen.display)
+            result["findings"]["code_fences_and_language_hidden"] = True
+            hyperlinks = re.findall(
+                rb"\x1b\]8;[^;]*;([^\x1b\x07]*)(?:\x1b\\|\x07)", raw
+            )
+            assert b"https://example.com/reference" in hyperlinks
+            assert hyperlinks[-1] == b"", "hyperlink remained active outside its text"
+            result["findings"]["native_hyperlinks_emitted"] = True
             wait_for(lambda: "? shortcuts" in screen.display[-2])
             draft = "OVERLAY_DRAFT_MARKER"
             send(draft)
@@ -812,7 +824,49 @@ endpoint = "http://127.0.0.1:9/search"
             send("long answer\r")
             wait_for(lambda: "LONG_COMPLETE" in screen.all_text())
             capture("long-answer")
+            assert not any(
+                line.strip() and set(line.strip()) == {"─"}
+                for line in screen.display[: screen.cursor.y - 1]
+            )
+            result["findings"]["latest_output_has_no_separator"] = True
+            wheel_draft = "WHEEL_DRAFT_MARKER"
+            send(wheel_draft)
+            wheel_before = capture("wheel-before", composer_text=wheel_draft)
+            send(b"\x1b[<64;5;10M" * 3)
+            wait_for(lambda: screen.display[0] != wheel_before["screen"][0])
+            capture("wheel-older", composer_text=wheel_draft)
+            assert "LONG_COMPLETE" not in "\n".join(screen.display)
+            resize(48, 14)
+            capture("wheel-older-resized", composer_text=wheel_draft)
+            resize(100, 36)
+            send(b"\x1b[<65;5;10M" * 100)
+            wait_for(lambda: "LONG_COMPLETE" in "\n".join(screen.display))
+            wheel_after = capture("wheel-latest", composer_text=wheel_draft)
+            assert wheel_after["screen"] == wheel_before["screen"]
+            result["findings"]["mouse_wheel_browses_output_without_changing_draft"] = (
+                True
+            )
+            send(b"\x03")
             send(b"\x0f")
+            for _ in range(100):
+                if "RENDER_COMPLETE" in "\n".join(screen.display):
+                    break
+                send(b"\x1b[<64;5;10M")
+            else:
+                raise AssertionError(
+                    "older output was not reachable with the mouse wheel"
+                )
+            previous_end = next(
+                index
+                for index, line in enumerate(screen.display)
+                if "RENDER_COMPLETE" in line
+            )
+            assert any(
+                line.strip() and set(line.strip()) == {"─"}
+                for line in screen.display[previous_end + 1 : previous_end + 5]
+            )
+            capture("older-output-separator", view="transcript")
+            result["findings"]["older_output_has_separator"] = True
             send(b"\x1b[H")
             capture("transcript-home", view="transcript")
             send(b"\x1b[F")
@@ -873,6 +927,17 @@ endpoint = "http://127.0.0.1:9/search"
             assert f"kurama resume {logs[0].parent.name}" in screen.all_text()
             assert pyte.modes.DECAWM in screen.mode, "line wrapping was not restored"
             assert raw.rfind(b"\x1b[?2004l") > raw.rfind(b"\x1b[?2004h")
+            for mode in (1000, 1006):
+                enabled = f"\x1b[?{mode}h".encode()
+                disabled = f"\x1b[?{mode}l".encode()
+                assert raw.count(enabled) == raw.count(disabled) == 1
+                assert raw.rfind(disabled) > raw.rfind(enabled)
+            assert b"\x1b[?1003h" not in raw, "all-motion mouse reporting was enabled"
+            hyperlinks = re.findall(
+                rb"\x1b\]8;[^;]*;([^\x1b\x07]*)(?:\x1b\\|\x07)", raw
+            )
+            assert sum(bool(target) for target in hyperlinks) == hyperlinks.count(b"")
+            result["findings"]["mouse_modes_restored_and_hyperlinks_closed"] = True
             assert raw.count(b"\x1b[?1049h") == raw.count(b"\x1b[?1049l") == 1
             capture("exit-restored", active=False)
             result["findings"]["shell_history_restored_on_exit"] = True

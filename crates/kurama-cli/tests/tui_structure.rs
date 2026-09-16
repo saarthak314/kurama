@@ -18,18 +18,44 @@ use kurama_protocol::{
 use ratatui::{
     Terminal,
     backend::{Backend, TestBackend},
-    buffer::{Buffer, Cell},
+    buffer::{Buffer, Cell, CellDiffOption},
     layout::Rect,
     style::{Color, Modifier},
     text::Line,
 };
 use std::time::{Duration, Instant};
 
+fn visible_symbol(cell: &Cell) -> &str {
+    let symbol = cell.symbol();
+    if let Some(link) = symbol.strip_prefix("\x1b]8;;") {
+        let (_, visible) = link.split_once("\x1b\\").expect("terminated link target");
+        visible
+            .strip_suffix("\x1b]8;;\x1b\\")
+            .expect("closed hyperlink run")
+    } else {
+        symbol
+    }
+}
+
+fn visible_row(buffer: &Buffer, y: u16) -> Vec<(u16, &Cell)> {
+    let mut cells = Vec::new();
+    let mut x = 0;
+    while x < buffer.area.width {
+        let cell = buffer.cell((x, y)).expect("cell");
+        cells.push((x, cell));
+        x += match cell.diff_option {
+            CellDiffOption::ForcedWidth(width) => width.get(),
+            _ => 1,
+        };
+    }
+    cells
+}
+
 fn buffer_text(buffer: &Buffer) -> String {
     let mut text = String::new();
     for y in 0..buffer.area.height {
-        for x in 0..buffer.area.width {
-            text.push_str(buffer.cell((x, y)).expect("cell").symbol());
+        for (_, cell) in visible_row(buffer, y) {
+            text.push_str(visible_symbol(cell));
         }
         text.push('\n');
     }
@@ -98,16 +124,19 @@ fn startup_banner_sits_above_the_onboarding_prompt() {
 
 fn cell_at_text<'a>(buffer: &'a Buffer, needle: &str) -> &'a Cell {
     for y in 0..buffer.area.height {
-        let row = (0..buffer.area.width)
-            .map(|x| buffer.cell((x, y)).expect("cell").symbol())
+        let cells = visible_row(buffer, y);
+        let row = cells
+            .iter()
+            .map(|(_, cell)| visible_symbol(cell))
             .collect::<String>();
         if let Some(byte_offset) = row.find(needle) {
             let mut consumed = 0;
-            for x in 0..buffer.area.width {
-                if consumed == byte_offset {
-                    return buffer.cell((x, y)).expect("styled cell");
+            for (_, cell) in cells {
+                let end = consumed + visible_symbol(cell).len();
+                if (consumed..end).contains(&byte_offset) {
+                    return cell;
                 }
-                consumed += buffer.cell((x, y)).expect("cell").symbol().len();
+                consumed = end;
             }
         }
     }
@@ -832,6 +861,12 @@ fn assistant_markdown_renders_inline_styles_and_links() {
     assert!(!inline_code.modifier.contains(Modifier::BOLD));
     let link = cell_at_text(&buffer, "docs");
     assert!(link.modifier.contains(Modifier::UNDERLINED));
+    assert!(
+        link.symbol()
+            .starts_with("\x1b]8;;https://example.com\x1b\\")
+    );
+    assert!(link.symbol().ends_with("\x1b]8;;\x1b\\"));
+    assert!(matches!(link.diff_option, CellDiffOption::ForcedWidth(width) if width.get() == 4));
 }
 
 #[test]
@@ -895,7 +930,8 @@ fn assistant_markdown_renders_blocks_lists_code_quotes_rules_and_tables() {
     assert!(text.contains("3. third"));
     assert!(text.contains("4. fourth"));
     assert!(text.contains("────────────────"));
-    assert!(text.contains("rust"));
+    assert!(!text.contains("```"));
+    assert!(!text.lines().any(|row| row.trim() == "rust"));
     assert!(text.contains("fn main() {"));
     assert!(text.contains("    println!(\"hi\");"));
     assert!(text.contains("Name   │ State"));
@@ -1114,6 +1150,11 @@ fn table_cells_preserve_inline_markdown_styles() {
     assert!(!inline_code.modifier.contains(Modifier::BOLD));
     let link = cell_at_text(&buffer, "docs");
     assert!(link.modifier.contains(Modifier::UNDERLINED));
+    assert!(
+        link.symbol()
+            .starts_with("\x1b]8;;https://example.com\x1b\\")
+    );
+    assert!(link.symbol().ends_with("\x1b]8;;\x1b\\"));
 }
 
 #[test]

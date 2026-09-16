@@ -1,6 +1,9 @@
 use ratatui::layout::Rect;
 
-use super::{Overlay, TuiState, composer::composer_height};
+use super::{
+    Overlay, TuiState,
+    composer::{approval_height, composer_height},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponsiveLayout {
@@ -59,23 +62,34 @@ impl ResponsiveLayout {
     }
 }
 
-pub(crate) fn visible_activity_rect(area: Rect, state: &TuiState) -> Rect {
+pub(crate) fn main_layout(area: Rect, state: &TuiState) -> ResponsiveLayout {
     let area = main_area(area);
-    if area.is_empty()
+    let input_height = match state.overlay() {
+        Overlay::Approval | Overlay::ApprovalEdit => approval_height(state, area.width),
+        Overlay::Shortcuts => 10.min(area.height).max(5),
+        _ => composer_height(state, area.width),
+    };
+    let activity_visible = state.overlay() == Overlay::None
+        && (state.activity().is_animated() || state.last_turn_elapsed().is_some());
+    ResponsiveLayout::for_area(
+        area,
+        input_height,
+        activity_visible,
+        queue_height(state, area.width),
+    )
+}
+
+pub(crate) fn visible_activity_rect(area: Rect, state: &TuiState) -> Rect {
+    let inner = main_area(area);
+    if inner.is_empty()
         || state.transcript_view_expanded()
         || state.overlay() != Overlay::None
         || !state.activity().is_animated()
     {
-        return Rect::new(area.x, area.y, area.width, 0);
+        return Rect::new(inner.x, inner.y, inner.width, 0);
     }
 
-    ResponsiveLayout::for_area(
-        area,
-        composer_height(state, area.width),
-        true,
-        queue_height(state, area.width),
-    )
-    .activity
+    main_layout(area, state).activity
 }
 
 pub(crate) fn queue_height(state: &TuiState, _width: u16) -> u16 {

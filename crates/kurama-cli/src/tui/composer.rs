@@ -268,6 +268,8 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect,
         ["Enter run · Tab complete", "Tab complete", "Tab"]
     } else if state.selected_file().is_some() {
         ["Enter/Tab complete", "Tab complete", "Tab"]
+    } else if state.scroll > 0 {
+        ["Wheel scroll · Ctrl+L latest", "Ctrl+L latest", "^L"]
     } else if state.activity().is_animated() {
         if state.composer.is_empty() {
             [
