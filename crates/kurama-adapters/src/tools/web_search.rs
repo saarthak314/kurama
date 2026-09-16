@@ -178,10 +178,7 @@ impl SearchBackend for OpenAiNativeSearch {
             let output = response_output_text(&payload).ok_or_else(|| {
                 KuramaError::Tool("native search response omitted structured output".into())
             })?;
-            let results: SearchPayload = serde_json::from_str(output).map_err(|error| {
-                KuramaError::Tool(format!("invalid native search output: {error}"))
-            })?;
-            validate_results(results.results, limit)
+            parse_search_results(output, limit)
         })
     }
 }
@@ -288,7 +285,9 @@ impl Tool for WebSearchTool {
             match parse_arguments(&invocation)? {
                 WebArguments::Search { query, limit, .. } => {
                     let backend = self.backend.as_ref().ok_or_else(|| {
-                        KuramaError::Configuration("no web search backend is configured".into())
+                        KuramaError::Configuration(
+                            "web search is unavailable for this profile; configure [search] kind = \"json\" with a search endpoint, or use an OpenAI, Codex CLI, or Claude CLI profile".into(),
+                        )
                     })?;
                     let results = backend.search(&query, limit, cancel).await?;
                     let output = results
@@ -625,7 +624,16 @@ fn validate_results(
     Ok(results)
 }
 
-fn search_result_schema(limit: usize) -> serde_json::Value {
+pub(crate) fn parse_search_results(
+    output: &str,
+    limit: usize,
+) -> Result<Vec<SearchResult>, KuramaError> {
+    let payload: SearchPayload = serde_json::from_str(output)
+        .map_err(|error| KuramaError::Tool(format!("invalid native search output: {error}")))?;
+    validate_results(payload.results, limit)
+}
+
+pub(crate) fn search_result_schema(limit: usize) -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {

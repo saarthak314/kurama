@@ -54,7 +54,9 @@ Plaintext keys are invalid. Kurama never reads Codex or Claude credential stores
 
 `[roles.<name>]` routes an orchestrator-assigned child role to a profile. The model supplies objectives, scopes, budgets, and dependencies; it cannot select roles or profiles. Kurama derives roles from each objective, applies the matching role route, and otherwise inherits the parent profile. Researcher, planner, and reviewer write scopes are forced empty regardless of the model request. An implementer with an empty scope inherits the parent write scope; a non-empty implementer scope must stay a subset. Dependency entries name the exact objective text of prerequisite agents. `escalation_profiles` is an ordered allowlist; automatic escalation never crosses to an unlisted provider or downgrade.
 
-`[search] kind = "provider"` uses provider-native search when supported. Use `kind = "json"` with an HTTP endpoint for a configured search service; it must accept `{ "query", "limit" }` and return ranked `{ "title", "url", "snippet" }` results.
+Without a `[search]` section, the CLI automatically uses native search for `openai`, `codex_cli`, and `claude_cli` profiles. OpenAI uses the profile's API credentials. Codex and Claude use the selected model and the installed CLI's existing login; no separate search API key is required. Each CLI search runs in an isolated temporary directory with only native search enabled, without continuing the coding session or passing its workspace context. Search calls consume the provider's normal usage allowance.
+
+`[search] kind = "provider"` explicitly requires native search and rejects unsupported profile kinds. Other profile kinds need `kind = "json"` with a configured search service. An explicit JSON service always takes precedence over native search and is not silently replaced if it fails. It must accept `{ "query", "limit" }` and return `{ "results": [{ "title", "url", "snippet" }] }`; optional `auth` uses the same environment/keychain/session references as profiles. Public-page `open` operations do not require a search backend.
 
 ## Auto Boundaries
 

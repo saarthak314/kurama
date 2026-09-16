@@ -11,9 +11,10 @@ use std::io::Write as _;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use kurama_adapters::{
-    AppPaths, BashTool, ConfigRepository, CredentialResolver, FsSessionStore, HttpClient,
-    JsonSearchBackend, OpenAiNativeSearch, ProviderFactory, ReadTool, SearchBackend, SecretValue,
-    SessionSecrets, WebSearchTool, WriteTool,
+    AppPaths, BashTool, ClaudeNativeSearch, CodexNativeSearch, ConfigRepository,
+    CredentialResolver, FsSessionStore, HttpClient, JsonSearchBackend, OpenAiNativeSearch,
+    ProviderFactory, ReadTool, SearchBackend, SecretValue, SessionSecrets, WebSearchTool,
+    WriteTool,
 };
 use kurama_protocol::{
     KuramaError,
@@ -2233,7 +2234,6 @@ fn search_backend(
     http: HttpClient,
 ) -> Result<Option<Arc<dyn SearchBackend>>, String> {
     match config.search.as_ref() {
-        None => Ok(None),
         Some(SearchConfig::Json { endpoint, auth }) => {
             let secret = credentials
                 .resolve_optional("search", auth.as_ref(), session_secrets)
@@ -2244,7 +2244,7 @@ fn search_backend(
                 secret,
             ))))
         }
-        Some(SearchConfig::Provider) if active.kind == ProfileKind::OpenAi => {
+        None | Some(SearchConfig::Provider) if active.kind == ProfileKind::OpenAi => {
             let auth = active
                 .auth
                 .as_ref()
@@ -2262,7 +2262,22 @@ fn search_backend(
                 active.model.clone(),
             ))))
         }
-        Some(SearchConfig::Provider) => Ok(None),
+        None | Some(SearchConfig::Provider) if active.kind == ProfileKind::CodexCli => {
+            Ok(Some(Arc::new(CodexNativeSearch::new(
+                active.command.as_deref().unwrap_or("codex"),
+                active.model.clone(),
+            ))))
+        }
+        None | Some(SearchConfig::Provider) if active.kind == ProfileKind::ClaudeCli => {
+            Ok(Some(Arc::new(ClaudeNativeSearch::new(
+                active.command.as_deref().unwrap_or("claude"),
+                active.model.clone(),
+            ))))
+        }
+        Some(SearchConfig::Provider) => Err(format!(
+            "profile {active_profile} does not support native web search; configure [search] kind = \"json\" with a search endpoint"
+        )),
+        None => Ok(None),
     }
 }
 
@@ -2561,6 +2576,91 @@ mod tests {
             exit_requested: false,
             control: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_profile_searches_without_a_separate_search_configuration() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join("codex");
+        std::fs::write(&program, r#"#!/bin/sh
+input=$(cat)
+case "$*" in
+  *'web_search="live"'*)
+    printf '%s\n' '{"type":"item.completed","item":{"type":"web_search","query":"Rust async book","action":{"type":"search"}}}'
+    printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"results\":[{\"title\":\"Async Book\",\"url\":\"https://rust-lang.github.io/async-book/\",\"snippet\":\"Official Rust async guide.\"}]}"}}'
+    ;;
+  *)
+    printf '%s\n' '{"type":"thread.started","thread_id":"search-session"}'
+    case "$input" in
+    *'https://rust-lang.github.io/async-book/'*)
+      printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"kind\":\"final\",\"text\":\"Found the guide.\"}"}}'
+      ;;
+    *)
+      printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"kind\":\"tool_calls\",\"text\":\"\",\"calls\":[{\"call_id\":\"search\",\"name\":\"web-search\",\"arguments\":\"{\\\"operation\\\":\\\"search\\\",\\\"query\\\":\\\"Rust async book\\\",\\\"limit\\\":2}\"}],\"agents\":[]}"}}'
+      ;;
+    esac
+    ;;
+esac
+printf '%s\n' '{"type":"turn.completed"}'
+"#).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = AppPaths::from_root(root.path().join("state"));
+        let mut config = empty_config();
+        config.default_profile = Some("codex".into());
+        config.profiles.insert(
+            "codex".into(),
+            ProfileConfig {
+                kind: ProfileKind::CodexCli,
+                model: "fixture".into(),
+                command: Some(program.display().to_string()),
+                endpoint: None,
+                auth: None,
+                max_input_tokens: 32_000,
+                max_output_tokens: 4_000,
+                escalation_profiles: Vec::new(),
+            },
+        );
+        ConfigRepository::open(paths.clone())
+            .unwrap()
+            .write_config(&config)
+            .unwrap();
+        let mut app = App::bootstrap_with_paths(
+            &Args::default(),
+            root.path().to_path_buf(),
+            paths,
+            SessionSecrets::default(),
+        )
+        .unwrap();
+        app.engine
+            .as_ref()
+            .unwrap()
+            .submit("Find the official Rust async book.", false)
+            .await
+            .unwrap();
+        let results = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut results = Vec::new();
+            while let Some(event) = app.runtime_events.as_mut().unwrap().recv().await {
+                match event {
+                    RuntimeEvent::ToolCompleted { result, .. } => results.push(result),
+                    RuntimeEvent::TurnCompleted => break,
+                    RuntimeEvent::Error { message } => panic!("{message}"),
+                    _ => {}
+                }
+            }
+            results
+        })
+        .await
+        .expect("search turn completes");
+        app.engine.as_ref().unwrap().shutdown().await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].is_error, "{}", results[0].output);
+        assert_eq!(
+            results[0].metadata["results"][0]["url"],
+            "https://rust-lang.github.io/async-book/"
+        );
     }
 
     fn display_app() -> (tempfile::TempDir, Arc<FsSessionStore>, App) {

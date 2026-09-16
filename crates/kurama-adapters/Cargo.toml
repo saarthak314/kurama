@@ -13,7 +13,7 @@ anthropic = ["http", "dep:futures-core", "dep:futures-util", "dep:tokio", "dep:z
 openai-compatible = ["http", "dep:futures-core", "dep:futures-util", "dep:tokio", "dep:zeroize"]
 codex-bridge = ["dep:futures-core", "dep:futures-util", "dep:libc", "dep:tokio", "dep:zeroize"]
 claude-bridge = ["dep:futures-core", "dep:futures-util", "dep:libc", "dep:tokio", "dep:zeroize"]
-tools = ["dep:diffy", "dep:futures-util", "dep:libc", "dep:reqwest", "dep:sha2", "dep:shlex", "dep:tokio", "dep:url", "dep:zeroize"]
+tools = ["dep:diffy", "dep:futures-util", "dep:libc", "dep:reqwest", "dep:sha2", "dep:shlex", "dep:tempfile", "dep:tokio", "dep:url", "dep:zeroize"]
 fs-store = ["dep:libc", "dep:sha2"]
 native-credentials = ["dep:basic-toml", "dep:libc", "dep:zeroize"]
 
@@ -31,6 +31,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2 = { workspace = true, optional = true }
 shlex = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, optional = true }
 url = { workspace = true, optional = true }

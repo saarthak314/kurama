@@ -16,7 +16,7 @@ use super::{
 };
 
 const BACKEND: &str = "codex_cli";
-const DISABLED_NATIVE_FEATURES: [&str; 8] = [
+pub(crate) const DISABLED_NATIVE_FEATURES: [&str; 8] = [
     "apps",
     "browser_use",
     "computer_use",
