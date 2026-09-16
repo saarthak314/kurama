@@ -2,9 +2,9 @@
 """Exercise the real CLI through a local SSE provider and a PTY, without credentials.
 
 Run: uv run --with pyte --with pillow scripts/check-tui.py target/release/kurama .lavish/tui-check
-Use --no-images to require only pyte. The VT model handles alternate screens and
-cursor-anchored height shrink; screenshots are decoded PTY output, not a native
-terminal-emulator window capture. This is a POSIX-only development gate.
+Use --no-images to require only pyte. The VT model tracks separate primary and
+alternate buffers; screenshots are decoded PTY output, not a native terminal
+window capture. This is a POSIX-only development gate.
 """
 
 import argparse
@@ -56,6 +56,7 @@ class Screen(pyte.HistoryScreen):
     def __init__(self, columns, lines):
         super().__init__(columns, lines, history=20000)
         self.primary = None
+        self.restored_primary = None
         self.reply = lambda value: None
 
     def resize(self, lines=None, columns=None):
@@ -101,6 +102,8 @@ class Screen(pyte.HistoryScreen):
     def set_mode(self, *modes, **kwargs):
         if kwargs.get("private") and 1049 in modes:
             if self.primary is None:
+                # Keep the saved primary buffer/history independent of every
+                # subsequent alternate-buffer reset, clear, scroll, and resize.
                 self.primary = copy.deepcopy(
                     {
                         k: v
@@ -119,6 +122,7 @@ class Screen(pyte.HistoryScreen):
                 saved, self.primary = self.primary, None
                 self.__dict__.update(saved)
                 self.resize(lines=lines, columns=columns)
+                self.restored_primary = (self.display, (self.cursor.x, self.cursor.y))
             modes = tuple(m for m in modes if m != 1049)
         super().reset_mode(*modes, **kwargs)
 
@@ -135,6 +139,16 @@ class Screen(pyte.HistoryScreen):
             for line in self.history.top
         ]
         return "\n".join(history + self.display)
+
+    def primary_text(self):
+        if self.primary is None:
+            return self.all_text()
+        rows = list(self.primary["history"].top) + [
+            self.primary["buffer"][row] for row in range(self.primary["lines"])
+        ]
+        return "\n".join(
+            "".join(cell.data for _, cell in sorted(row.items())) for row in rows
+        )
 
 
 COLORS = {
@@ -333,11 +347,6 @@ def main():
     )
     parser.add_argument(
         "--no-images", action="store_true", help="Skip optional Pillow screenshots"
-    )
-    parser.add_argument(
-        "--baseline",
-        action="store_true",
-        help="Record old history behavior without requiring preservation",
     )
     args = parser.parse_args()
     if args.seed_large_output_mib < 0:
@@ -577,22 +586,72 @@ endpoint = "http://127.0.0.1:9/search"
             before_cursor = screen.display[screen.cursor.y][: screen.cursor.x].rstrip()
             return before_cursor.endswith(">")
 
-        def capture(name):
+        def main_ready(composer_text):
+            display = screen.display
+            if screen.primary is None or "supervised" not in display[-1].lower():
+                return False
+            if set(display[-3].strip()) != {"─"}:
+                return False
+            if composer_text is None:
+                return True
+            if screen.cursor.hidden or screen.cursor.y != screen.lines - 4:
+                return False
+            if not composer_text:
+                return composer_ready()
+            expected = composer_text.split("\n")
+            start = screen.cursor.y - len(expected) + 1
+            actual = [line.strip() for line in display[start : screen.cursor.y + 1]]
+            return actual == ["> " + expected[0], *expected[1:]] and (
+                screen.cursor.x == 4 + len(expected[-1])
+            )
+
+        def capture(name, view="main", composer_text="", active=True):
             pump(0.15)
+            if active:
+                if view == "main":
+                    wait_for(lambda: main_ready(composer_text))
+                elif view == "transcript":
+                    wait_for(lambda: "esc close" in screen.display[-1].lower())
+                assert screen.primary is not None, (
+                    "application left its alternate screen"
+                )
+                assert "SHELL_HISTORY_MARKER" not in screen.all_text()
+                assert "SHELL_HISTORY_MARKER" in screen.primary_text()
+                assert raw.count(b"\x1b[?1049h") == 1, "nested alternate-screen entry"
+                assert raw.count(b"\x1b[?1049l") == 0, "overlay restored the shell"
+                if view == "main":
+                    assert "esc close · ↑↓ scroll" not in "\n".join(screen.display)
+            assert raw.count(b"\x1b[6n") + raw.count(b"\x1b[?6n") == 0, (
+                "fullscreen startup must not request a cursor-position report"
+            )
+            assert raw.count(b"\x1b[3J") == 0, "application purged shell scrollback"
             if not args.no_images:
                 image(screen, output_dir / (name + ".png"))
+            has_input = active and view == "main" and composer_text is not None
             snapshot = {
                 "name": name,
                 "columns": screen.columns,
                 "lines": screen.lines,
                 "cursor": [screen.cursor.x, screen.cursor.y],
                 "cursor_visible": not screen.cursor.hidden,
+                "input_row": screen.cursor.y if has_input else None,
+                "input_bottom_gap": screen.lines - 1 - screen.cursor.y
+                if has_input
+                else None,
+                "footer_row": screen.lines - 1
+                if active and view in ("main", "transcript")
+                else None,
+                "alternate_screen": screen.primary is not None,
+                "observed_ms": (time.monotonic() - started) * 1000,
                 "screen": screen.display,
                 "history_rows": len(screen.history.top),
             }
             snapshot["raw_bytes"] = len(raw)
-            snapshot["shell_history_present"] = (
+            snapshot["shell_history_visible"] = (
                 "SHELL_HISTORY_MARKER" in screen.all_text()
+            )
+            snapshot["shell_history_saved"] = (
+                "SHELL_HISTORY_MARKER" in screen.primary_text()
             )
             snapshot["history_head"] = [
                 "".join(cell.data for _, cell in sorted(line.items()))
@@ -600,6 +659,7 @@ endpoint = "http://127.0.0.1:9/search"
             ]
             result["frames"].append(snapshot)
             (output_dir / (name + ".txt")).write_text("\n".join(screen.display))
+            return snapshot
 
         def resize(columns, lines):
             screen.resize(lines=lines, columns=columns)
@@ -623,20 +683,22 @@ endpoint = "http://127.0.0.1:9/search"
             ]
 
         try:
-            wait_for(composer_ready)
+            wait_for(lambda: main_ready(""))
             initial_prompt = screen.display[screen.cursor.y][screen.cursor.x :].rstrip()
             result["resources"]["ready_ms"] = (time.monotonic() - started) * 1000
             result["resources"]["startup_rss_kib"] = rss_kib()
             capture("startup")
-            result["findings"]["shell_history_preserved_at_start"] = (
-                "SHELL_HISTORY_MARKER" in screen.all_text()
-            )
+            result["findings"]["shell_history_hidden_while_active"] = True
+            resize(44, 16)
+            capture("startup-narrow")
+            resize(100, 36)
+            capture("startup-restored")
             if args.seed_large_output_mib:
                 assert "LARGE_TAIL_MARKER" in screen.all_text()
                 send(b"\x0f")
                 send(b"\x1b[H")
                 wait_for(lambda: "LARGE_HEAD_MARKER" in "\n".join(screen.display))
-                capture("large-output-expanded")
+                capture("large-output-expanded", view="transcript")
                 result["resources"]["expanded_rss_kib"] = rss_kib()
                 send(b"\x1b[F")
                 wait_for(lambda: "LARGE_TAIL_MARKER" in "\n".join(screen.display))
@@ -649,13 +711,16 @@ endpoint = "http://127.0.0.1:9/search"
                 send(b"\x14")
                 send(b"\x1b[F")
                 resize(24, 6)
-                capture("todo-narrow-last")
+                wait_for(lambda: "task 19" in "\n".join(screen.display))
+                capture("todo-narrow-last", view="todos")
                 assert "task 19" in "\n".join(screen.display)
                 send(b"\x1b[H")
-                capture("todo-narrow-first")
+                wait_for(lambda: "task 0" in "\n".join(screen.display))
+                capture("todo-narrow-first", view="todos")
                 assert "task 0" in "\n".join(screen.display)
                 send(b"\x1b")
                 resize(100, 36)
+                capture("todo-dismissed")
                 result["findings"]["todo_first_and_last_accessible"] = True
             if args.check_compaction:
                 send("/compact\r")
@@ -671,38 +736,91 @@ endpoint = "http://127.0.0.1:9/search"
                 capture("repeated-compaction")
                 result["findings"]["prior_decision_survived_two_compactions"] = True
             send("/")
-            capture("command-menu")
+            capture("command-menu", composer_text="/")
             send(b"\x1b")
             send(b"\x03")
             send(b"\x1b[200~first line\nsecond line with editable text\x1b[201~")
-            capture("multiline-composer")
+            capture(
+                "multiline-composer",
+                composer_text="first line\nsecond line with editable text",
+            )
             send(b"\x03")
             send("inspect fixture\r")
             wait_for(lambda: "approve once" in "\n".join(screen.display).lower())
-            capture("approval")
+            capture("approval", composer_text=None)
+            responsive_sizes = [(48, 14), (72, 18), (120, 40)]
+            for columns, lines in responsive_sizes:
+                resize(columns, lines)
+                capture(f"approval-{columns}x{lines}", composer_text=None)
+                visible = "".join(line.strip() for line in screen.display)
+                assert "result.txt" in visible
+                assert "approve once" in visible
             resize(36, 14)
-            capture("approval-narrow")
+            capture("approval-narrow", composer_text=None)
             send("a")
             wait_for(lambda: (root / "result.txt").exists())
             wait_for(lambda: "RENDER_COMPLETE" in screen.all_text())
             capture("markdown-narrow")
+            for columns, lines in responsive_sizes:
+                resize(columns, lines)
+                capture(f"markdown-{columns}x{lines}")
+                assert "RENDER_COMPLETE" in "\n".join(screen.display)
+                send(b"\x0f")
+                send(b"\x1b[F")
+                for label, content in [
+                    (
+                        "markdown-wrapped",
+                        "First item with enough words to wrap naturally in a narrow terminal.",
+                    ),
+                    ("tool-output", "fixture input"),
+                ]:
+                    # Move by rows, not pages: a wrapped phrase must be visible
+                    # in full, including when it would straddle two pages.
+                    for _ in range(80):
+                        visible = " ".join(" ".join(screen.display).split())
+                        if content in visible:
+                            break
+                        send(b"\x1b[A")
+                    else:
+                        raise AssertionError(
+                            f"{label} lost content at {columns}x{lines}: {content}"
+                        )
+                    capture(f"{label}-{columns}x{lines}", view="transcript")
+                send(b"\x1b")
+                capture(f"content-restored-{columns}x{lines}")
+                assert "RENDER_COMPLETE" in "\n".join(screen.display)
+            result["findings"]["responsive_content_sizes"] = responsive_sizes
             resize(100, 36)
             capture("markdown-wide")
+            wait_for(lambda: "? shortcuts" in screen.display[-2])
+            draft = "OVERLAY_DRAFT_MARKER"
+            send(draft)
+            before_overlay = capture("draft-before-overlay", composer_text=draft)
             send(b"\x0f")
-            capture("transcript-overlay")
+            capture("transcript-overlay", view="transcript")
             resize(44, 16)
-            capture("overlay-resized")
+            capture("overlay-resized", view="transcript")
             send(b"\x1b")
-            capture("overlay-dismissed")
+            capture("overlay-dismissed", composer_text=draft)
             resize(100, 36)
+            after_overlay = capture("draft-after-resize", composer_text=draft)
+            assert after_overlay["screen"] == before_overlay["screen"], (
+                "overlay dismissal and resize left stale text or changed the draft"
+            )
+            result["findings"]["composer_draft_survived_overlay_and_resize"] = True
+            send(b"\x03")
             send("long answer\r")
             wait_for(lambda: "LONG_COMPLETE" in screen.all_text())
             capture("long-answer")
             send(b"\x0f")
             send(b"\x1b[H")
-            capture("transcript-home")
+            capture("transcript-home", view="transcript")
+            send(b"\x1b[F")
+            wait_for(lambda: "LONG_COMPLETE" in "\n".join(screen.display))
+            capture("transcript-end", view="transcript")
             send(b"\x1b")
             capture("transcript-restored")
+            assert "LONG_COMPLETE" in "\n".join(screen.display)
             wait_for(composer_ready)
             current_prompt = screen.display[screen.cursor.y][screen.cursor.x :].rstrip()
             assert current_prompt == initial_prompt, (initial_prompt, current_prompt)
@@ -735,18 +853,36 @@ endpoint = "http://127.0.0.1:9/search"
                     range(len(events))
                 )
                 result["findings"]["repaired_session_continued_once"] = True
-            result["findings"]["scrollback_purges"] = bytes(raw).count(b"\x1b[3J")
-            result["findings"]["shell_history_preserved_at_end"] = (
-                "SHELL_HISTORY_MARKER" in screen.all_text()
-            )
-            if not args.baseline:
-                assert result["findings"]["shell_history_preserved_at_start"]
-                assert result["findings"]["shell_history_preserved_at_end"]
-                assert result["findings"]["scrollback_purges"] == 0
+            result["findings"]["main_footer_and_input_bottom_anchored"] = True
+            result["findings"]["overlays_kept_alternate_screen"] = True
+            result["findings"]["overlay_dismissal_cleared_controls"] = True
             send("/exit\r")
             wait_for(lambda: process.poll() is not None)
             result["exit_code"] = process.returncode
             assert process.returncode == 0, process.returncode
+            pump(0.1)
+            assert screen.primary is None, "exit did not restore the primary screen"
+            restored_rows, restored_cursor = screen.restored_primary
+            assert [line.rstrip() for line in restored_rows] == [
+                "SHELL_HISTORY_MARKER",
+                "$ kurama",
+                *([""] * (screen.lines - 2)),
+            ], "exit left application text on the restored primary screen"
+            assert not screen.cursor.hidden
+            assert restored_cursor == (0, 2)
+            assert f"kurama resume {logs[0].parent.name}" in screen.all_text()
+            assert pyte.modes.DECAWM in screen.mode, "line wrapping was not restored"
+            assert raw.rfind(b"\x1b[?2004l") > raw.rfind(b"\x1b[?2004h")
+            assert raw.count(b"\x1b[?1049h") == raw.count(b"\x1b[?1049l") == 1
+            capture("exit-restored", active=False)
+            result["findings"]["shell_history_restored_on_exit"] = True
+            result["findings"]["terminal_modes_restored_on_exit"] = True
+            result["findings"]["alternate_screen_entries"] = raw.count(b"\x1b[?1049h")
+            result["findings"]["alternate_screen_exits"] = raw.count(b"\x1b[?1049l")
+            result["findings"]["scrollback_purges"] = raw.count(b"\x1b[3J")
+            result["findings"]["cursor_position_queries"] = raw.count(
+                b"\x1b[6n"
+            ) + raw.count(b"\x1b[?6n")
         finally:
             (output_dir / "terminal.raw").write_bytes(raw)
             (output_dir / "audit.json").write_text(json.dumps(result, indent=2))

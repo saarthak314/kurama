@@ -8,4 +8,3 @@ pub const RED: Color = Color::Red;
 pub const GREEN: Color = Color::Green;
 pub const BLUE: Color = Color::Cyan;
 pub const AMBER: Color = Color::Yellow;
-pub const SURFACE: Color = Color::Reset;

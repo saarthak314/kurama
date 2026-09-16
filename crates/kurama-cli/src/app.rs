@@ -9,11 +9,7 @@ use std::{
 #[cfg(not(test))]
 use std::io::Write as _;
 
-use crossterm::{
-    event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen},
-};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use kurama_adapters::{
     AppPaths, BashTool, ConfigRepository, CredentialResolver, FsSessionStore, HttpClient,
     JsonSearchBackend, OpenAiNativeSearch, ProviderFactory, ReadTool, SearchBackend, SecretValue,
@@ -33,12 +29,10 @@ use kurama_protocol::{
 };
 use kurama_sdk::{Agent, Events, Handle};
 use ratatui::{
-    Terminal, TerminalOptions, Viewport,
-    backend::{Backend, ClearType, CrosstermBackend},
-    layout::{Position, Rect},
-    style::Style,
+    Terminal,
+    backend::{Backend, CrosstermBackend},
+    layout::Rect,
     text::Line,
-    widgets::Widget,
 };
 use tokio::sync::mpsc;
 
@@ -46,17 +40,13 @@ use crate::{
     args::{Args, ResumeChoice},
     commands::{Command, GoalAction, command_missing_required_arguments, parse_command},
     tui::{
-        CursorTrackingBackend, OnboardingState, OnboardingSubmission, Overlay, SURFACE,
-        SharedBackend, TerminalGuard, TranscriptDetail, TuiState, approval_height,
-        command_palette_height, composer_cursor_vertical, composer_height, main_area,
-        next_grapheme_boundary, previous_grapheme_boundary, queue_height, render_with_transcript,
-        spawn_input_thread, transcript_lines, transcript_lines_with_entry_starts,
+        OnboardingState, OnboardingSubmission, Overlay, TerminalGuard, TranscriptDetail, TuiState,
+        composer_cursor_vertical, main_area, next_grapheme_boundary, previous_grapheme_boundary,
+        render_with_transcript, spawn_input_thread, transcript_lines_with_entry_starts,
         visible_activity_rect,
     },
 };
 
-const TRANSCRIPT_HORIZONTAL_PADDING: usize = 2;
-const MAX_TRANSCRIPT_INSERT_HEIGHT: usize = 1_024;
 const TOOL_EVENT_CAPACITY: usize = 64;
 const MAX_PASTE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const READY_EVENT_BATCH_LIMIT: usize = 128;
@@ -77,7 +67,6 @@ struct TranscriptCacheKey {
     revision: u64,
     expanded: bool,
     entries: usize,
-    first_entry: usize,
 }
 
 impl TranscriptRenderCache {
@@ -87,17 +76,11 @@ impl TranscriptRenderCache {
         }
         let expanded = state.transcript_view_expanded();
         let width = main_area(frame_area).width as usize;
-        let first_entry = if expanded {
-            0
-        } else {
-            state.transcript.len() - state.live_transcript().len()
-        };
         let key = TranscriptCacheKey {
             width,
             revision: state.transcript_revision(),
             expanded,
             entries: state.transcript.len(),
-            first_entry,
         };
         let viewport = frame_area
             .height
@@ -135,14 +118,13 @@ impl TranscriptRenderCache {
         } else {
             None
         };
-        let reuse = self.key.is_some_and(|old| {
-            old.width == width && old.expanded == expanded && old.first_entry == first_entry
-        });
+        let reuse = self
+            .key
+            .is_some_and(|old| old.width == width && old.expanded == expanded);
         let retained = if reuse {
             state
                 .transcript_dirty_from()
-                .saturating_sub(first_entry)
-                .min(state.transcript.len() - first_entry)
+                .min(state.transcript.len())
                 .min(self.entry_starts.len())
         } else {
             0
@@ -153,7 +135,7 @@ impl TranscriptRenderCache {
             .copied()
             .unwrap_or(self.lines.len());
         let (mut lines, starts) = transcript_lines_with_entry_starts(
-            &state.transcript[first_entry + retained..],
+            &state.transcript[retained..],
             width,
             if expanded {
                 TranscriptDetail::Expanded
@@ -203,20 +185,6 @@ impl TranscriptRenderCache {
 
     fn lines(&self) -> Option<&[Line<'static>]> {
         self.key.map(|_| self.lines.as_slice())
-    }
-}
-
-#[derive(Default)]
-struct AltOverlay {
-    active: bool,
-    saved: Option<Rect>,
-}
-
-impl Drop for AltOverlay {
-    fn drop(&mut self) {
-        if self.active {
-            let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        }
     }
 }
 
@@ -628,33 +596,23 @@ impl App {
 
     pub async fn run(mut self) -> Result<Option<ExitSummary>, String> {
         let _guard = TerminalGuard::enter().map_err(|error| error.to_string())?;
-        let backend = SharedBackend::new(CursorTrackingBackend::new(CrosstermBackend::new(
-            io::stdout(),
-        )));
-        let mut terminal =
-            initialize_inline_terminal(backend).map_err(|error| error.to_string())?;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).map_err(|error| error.to_string())?;
         let mut input = spawn_input_thread(32);
         loop {
             let runtime_events = self.runtime_events.take();
             let tool_events = self.tool_events.take();
-            let result = run_loop(
+            run_loop(
                 &mut self,
                 &mut terminal,
                 &mut input,
                 runtime_events,
                 tool_events,
-                true,
             )
-            .await;
-            if let Err(error) = result {
-                let _ = clear_inline_terminal(&mut terminal);
-                return Err(error);
-            }
+            .await?;
             let Some(args) = self.restart_args.take() else {
-                clear_inline_terminal(&mut terminal).map_err(|error| error.to_string())?;
                 return Ok(self.exit_requested.then(|| self.exit_summary()).flatten());
             };
-            clear_inline_terminal(&mut terminal).map_err(|error| error.to_string())?;
             let control = self
                 .control
                 .as_ref()
@@ -1768,101 +1726,6 @@ impl App {
     }
 }
 
-fn initialize_inline_terminal<B>(mut backend: B) -> Result<Terminal<B>, B::Error>
-where
-    B: Backend,
-{
-    let rows = backend.size()?.height;
-    let cursor = match backend.get_cursor_position() {
-        Ok(cursor) => cursor,
-        Err(_) => {
-            // A basic PTY may not implement cursor-position reports. Reserve a
-            // fresh bottom row without clearing user history; tracking remembers it.
-            let cursor = Position::new(0, rows.saturating_sub(1));
-            backend.set_cursor_position(cursor)?;
-            if rows > 0 {
-                backend.append_lines(1)?;
-            }
-            cursor
-        }
-    };
-    if cursor.x > 0 {
-        backend.append_lines(1)?;
-        backend.set_cursor_position(Position::new(
-            0,
-            cursor.y.saturating_add(1).min(rows.saturating_sub(1)),
-        ))?;
-    }
-    // Claim only the current row until the first frame knows its required height.
-    Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(rows.min(1)),
-        },
-    )
-}
-
-fn resize_inline_terminal<B>(
-    terminal: &mut Terminal<B>,
-    width: u16,
-    height: u16,
-) -> Result<(), B::Error>
-where
-    B: Backend + Clone,
-{
-    let current = terminal.get_frame().area();
-    let viewport_height = current.height.min(height);
-    let top = current.y.min(height.saturating_sub(viewport_height));
-    if width >= current.width && viewport_height == current.height {
-        terminal.set_cursor_position(Position::new(0, top))?;
-        return terminal.resize(Rect::new(0, 0, width, height));
-    }
-    // Ratatui 0.1.2 clears the entire screen on horizontal shrink. Reconstruct
-    // only that path (or a changed Inline height, which has no public setter).
-    replace_inline_terminal(
-        terminal,
-        Rect::new(0, 0, width, height),
-        top,
-        viewport_height,
-    )
-}
-
-fn prepare_inline_frame<B>(
-    state: &mut TuiState,
-    terminal: &mut Terminal<B>,
-    transcript_cache: &mut TranscriptRenderCache,
-) -> Result<(), String>
-where
-    B: Backend + Clone,
-{
-    if !state.stable_transcript().is_empty() && !uses_full_inline_viewport(state) {
-        let size = terminal.size().map_err(|error| error.to_string())?;
-        let viewport_height =
-            desired_inline_viewport_height_for_transcript(state, size.width, size.height, 0);
-        set_inline_viewport_height(terminal, viewport_height).map_err(|error| error.to_string())?;
-        commit_stable_transcript(state, terminal)?;
-    }
-
-    let size = terminal.size().map_err(|error| error.to_string())?;
-    if uses_full_inline_viewport(state) && !state.transcript_view_expanded() {
-        return set_inline_viewport_height(terminal, size.height)
-            .map_err(|error| error.to_string());
-    }
-    transcript_cache.prepare(state, Rect::new(0, 0, size.width, size.height));
-    let viewport_height = if uses_full_inline_viewport(state) {
-        size.height
-    } else {
-        desired_inline_viewport_height_for_transcript(
-            state,
-            size.width,
-            size.height,
-            transcript_cache.lines.len(),
-        )
-    };
-    set_inline_viewport_height(terminal, viewport_height).map_err(|error| error.to_string())?;
-    Ok(())
-}
-
 fn prepare_fullscreen_frame<B>(
     state: &mut TuiState,
     terminal: &mut Terminal<B>,
@@ -1872,211 +1735,19 @@ where
     B: Backend,
 {
     terminal.autoresize().map_err(|error| error.to_string())?;
-    if uses_full_inline_viewport(state) && !state.transcript_view_expanded() {
+    if matches!(
+        state.overlay(),
+        Overlay::Onboarding
+            | Overlay::Agents
+            | Overlay::Todos
+            | Overlay::AgentInspect
+            | Overlay::AgentMessage
+            | Overlay::ConfirmAgentCancel
+    ) {
         return Ok(());
     }
     transcript_cache.prepare(state, terminal.get_frame().area());
     Ok(())
-}
-
-#[cfg(test)]
-fn desired_inline_viewport_height(state: &TuiState, width: u16, height: u16) -> u16 {
-    if height == 0 {
-        return 0;
-    }
-    if uses_full_inline_viewport(state) {
-        return height;
-    }
-
-    let area = main_area(Rect::new(0, 0, width, height));
-    let transcript_height = transcript_lines(
-        state.live_transcript(),
-        area.width as usize,
-        TranscriptDetail::Compact,
-    )
-    .len();
-    desired_inline_viewport_height_for_transcript(state, width, height, transcript_height)
-}
-
-fn uses_full_inline_viewport(state: &TuiState) -> bool {
-    state.transcript_view_expanded()
-        || matches!(
-            state.overlay(),
-            Overlay::Onboarding
-                | Overlay::Agents
-                | Overlay::Todos
-                | Overlay::AgentInspect
-                | Overlay::AgentMessage
-                | Overlay::ConfirmAgentCancel
-        )
-}
-
-fn desired_inline_viewport_height_for_transcript(
-    state: &TuiState,
-    width: u16,
-    height: u16,
-    transcript_height: usize,
-) -> u16 {
-    if height == 0 {
-        return 0;
-    }
-
-    let area = main_area(Rect::new(0, 0, width, height));
-    let approval_visible = matches!(state.overlay(), Overlay::Approval | Overlay::ApprovalEdit);
-    let shortcuts_visible = state.overlay() == Overlay::Shortcuts;
-    let input_height = if approval_visible {
-        approval_height(state, area.width)
-    } else if shortcuts_visible {
-        10.min(height).max(5)
-    } else {
-        composer_height(state, area.width)
-    }
-    .max(1)
-    .min(height);
-    let queue = if approval_visible {
-        0
-    } else {
-        queue_height(state, area.width)
-    };
-    let activity_visible = state.overlay() == Overlay::None
-        && (state.activity().is_animated() || state.last_turn_elapsed().is_some());
-    let layout =
-        crate::tui::ResponsiveLayout::for_area(area, input_height, activity_visible, queue);
-    let chrome_height = layout
-        .input
-        .height
-        .saturating_add(layout.activity.height)
-        .saturating_add(layout.queue.height)
-        .saturating_add(layout.footer.height);
-    let palette_height = if approval_visible || shortcuts_visible {
-        0
-    } else {
-        command_palette_height(state, height.saturating_sub(chrome_height))
-    };
-    let chrome_height = chrome_height.saturating_add(palette_height);
-    let transcript_capacity = height.saturating_sub(chrome_height);
-    let transcript_height = transcript_height.min(transcript_capacity as usize) as u16;
-
-    chrome_height.saturating_add(transcript_height).min(height)
-}
-
-fn sync_alt_overlay<B>(
-    want: bool,
-    alt: &mut AltOverlay,
-    terminal: &mut Terminal<B>,
-) -> Result<(), String>
-where
-    B: Backend + Clone,
-{
-    if want == alt.active {
-        return Ok(());
-    }
-    if want {
-        alt.saved = Some(terminal.get_frame().area());
-        terminal
-            .backend_mut()
-            .flush()
-            .map_err(|error| error.to_string())?;
-        execute!(io::stdout(), EnterAlternateScreen).map_err(|error| error.to_string())?;
-        alt.active = true;
-        let size = terminal.size().map_err(|error| error.to_string())?;
-        replace_inline_terminal(
-            terminal,
-            Rect::new(0, 0, size.width, size.height),
-            0,
-            size.height,
-        )
-        .map_err(|error| error.to_string())?;
-    } else {
-        let flush_result = terminal
-            .backend_mut()
-            .flush()
-            .map_err(|error| error.to_string());
-        execute!(io::stdout(), LeaveAlternateScreen).map_err(|error| error.to_string())?;
-        alt.active = false;
-        let size = terminal.size().map_err(|error| error.to_string())?;
-        let saved = alt.saved.take().unwrap_or_default();
-        let viewport_height = saved.height.min(size.height);
-        replace_inline_terminal(
-            terminal,
-            Rect::new(0, 0, size.width, size.height),
-            saved.y.min(size.height.saturating_sub(viewport_height)),
-            viewport_height,
-        )
-        .map_err(|error| error.to_string())?;
-        flush_result?;
-    }
-    Ok(())
-}
-
-fn set_inline_viewport_height<B>(
-    terminal: &mut Terminal<B>,
-    viewport_height: u16,
-) -> Result<(), B::Error>
-where
-    B: Backend + Clone,
-{
-    let current = terminal.get_frame().area();
-    let size = terminal.size()?;
-    let viewport_height = viewport_height.min(size.height);
-    if current.height == viewport_height
-        && current.width == size.width
-        && current.bottom() <= size.height
-    {
-        // Inline dimensions can be unchanged while the physical terminal grew.
-        // Synchronize Ratatui's screen height before insert_before uses it.
-        return terminal.autoresize();
-    }
-    if current.height == viewport_height {
-        return resize_inline_terminal(terminal, size.width, size.height);
-    }
-    // Shrinking keeps the same transcript boundary. Growing reserves rows below it;
-    // only overflow scrolls existing history, never a blank insert_before batch.
-    let top = current
-        .y
-        .min(size.height.saturating_sub(current.height.min(size.height)));
-    replace_inline_terminal(
-        terminal,
-        Rect::new(0, 0, size.width, size.height),
-        top,
-        viewport_height,
-    )
-}
-
-fn replace_inline_terminal<B>(
-    terminal: &mut Terminal<B>,
-    terminal_area: Rect,
-    viewport_top: u16,
-    viewport_height: u16,
-) -> Result<(), B::Error>
-where
-    B: Backend + Clone,
-{
-    let mut backend = terminal.backend().clone();
-    backend.set_cursor_position(Position::new(
-        0,
-        viewport_top.min(terminal_area.height.saturating_sub(1)),
-    ))?;
-    // Clear live UI before reserving rows, so growth cannot push a composer into history.
-    backend.clear_region(ClearType::AfterCursor)?;
-    let replacement = Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(viewport_height.min(terminal_area.height)),
-        },
-    )?;
-    *terminal = replacement;
-    Ok(())
-}
-
-fn clear_inline_terminal<B>(terminal: &mut Terminal<B>) -> Result<(), B::Error>
-where
-    B: Backend,
-{
-    let viewport_top = terminal.get_frame().area().as_position();
-    terminal.clear()?;
-    terminal.set_cursor_position(viewport_top)?;
-    terminal.backend_mut().flush()
 }
 
 pub async fn run(args: Args) -> Result<Option<ExitSummary>, String> {
@@ -2128,17 +1799,9 @@ pub async fn run_with<B>(
     runtime_events: mpsc::Receiver<RuntimeEvent>,
 ) -> Result<App, String>
 where
-    B: Backend + Clone,
+    B: Backend,
 {
-    run_loop(
-        &mut app,
-        terminal,
-        &mut input,
-        Some(runtime_events),
-        None,
-        false,
-    )
-    .await?;
+    run_loop(&mut app, terminal, &mut input, Some(runtime_events), None).await?;
     Ok(app)
 }
 
@@ -2335,10 +1998,9 @@ async fn run_loop<B>(
     input: &mut mpsc::Receiver<Event>,
     runtime_events: Option<mpsc::Receiver<RuntimeEvent>>,
     tool_events: Option<mpsc::Receiver<RuntimeEvent>>,
-    commit_to_scrollback: bool,
 ) -> Result<(), String>
 where
-    B: Backend + Clone,
+    B: Backend,
 {
     let (runtime_tx, mut runtime_receiver) = mpsc::channel(1);
     let mut runtime_open = if let Some(events) = runtime_events {
@@ -2366,18 +2028,12 @@ where
     };
     let mut preapproval_overlay = Overlay::None;
     let mut transcript_cache = TranscriptRenderCache::default();
-    let mut alt_overlay = AltOverlay::default();
-    let result = async {
-    if commit_to_scrollback {
-        sync_alt_overlay(
-            uses_full_inline_viewport(&app.state),
-            &mut alt_overlay,
-            terminal,
-        )?;
-        prepare_inline_frame(&mut app.state, terminal, &mut transcript_cache)?;
-    } else {
-        prepare_fullscreen_frame(&mut app.state, terminal, &mut transcript_cache)?;
-    }
+    // Establish a clean canvas once per run/restart. Ratatui's frame diff clears
+    // cells removed by subsequent redraws without erasing the screen each tick.
+    // resize resets the back buffer without clear's blocking cursor-position query.
+    let area = terminal.size().map_err(|error| error.to_string())?.into();
+    terminal.resize(area).map_err(|error| error.to_string())?;
+    prepare_fullscreen_frame(&mut app.state, terminal, &mut transcript_cache)?;
     terminal
         .draw(|frame| render_with_transcript(frame, &app.state, transcript_cache.lines()))
         .map_err(|error| error.to_string())?;
@@ -2387,7 +2043,6 @@ where
 
     while input_open || runtime_open || tool_open {
         let mut exit = false;
-        let mut animation_tick = false;
         let mut force_redraw = false;
         let mut state_changed = false;
         let mut input_origin = app.state.overlay;
@@ -2420,25 +2075,14 @@ where
                     preapproval_input = preapproval_input.saturating_sub(1);
                 }
                 match event {
-                    Some(Event::Resize(mut width, mut height)) => {
+                    Some(Event::Resize(..)) => {
                         for _ in 0..READY_EVENT_BATCH_LIMIT {
                             match input.try_recv() {
-                                Ok(Event::Resize(next_width, next_height)) => {
-                                    width = next_width;
-                                    height = next_height;
+                                Ok(Event::Resize(..)) => {
                                     preapproval_input = preapproval_input.saturating_sub(1);
                                 }
                                 Ok(event) => { pending_input = Some(event); break; }
                                 Err(_) => break,
-                            }
-                        }
-                        if commit_to_scrollback {
-                            if alt_overlay.active {
-                                replace_inline_terminal(terminal, Rect::new(0, 0, width, height), 0, height)
-                                    .map_err(|error| error.to_string())?;
-                            } else {
-                                resize_inline_terminal(terminal, width, height)
-                                    .map_err(|error| error.to_string())?;
                             }
                         }
                         state_changed = true;
@@ -2528,7 +2172,6 @@ where
             }
             _ = &mut stream_redraw => force_redraw = true,
             _ = &mut animation => {
-                animation_tick = true;
                 force_redraw = true;
             }
         }
@@ -2537,7 +2180,9 @@ where
             // Keep input already queued before this prompt in its original UI
             // context, including a key held by resize coalescing. Runtime work
             // still progresses; a fresh response is required for the new prompt.
-            preapproval_input = input.len().saturating_add(usize::from(pending_input.is_some()));
+            preapproval_input = input
+                .len()
+                .saturating_add(usize::from(pending_input.is_some()));
             preapproval_overlay = input_origin;
         }
         if !app.state.sent_commands().is_empty() {
@@ -2547,20 +2192,7 @@ where
         let now = tokio::time::Instant::now();
         let channels_closed = !input_open && !runtime_open && !tool_open;
         if force_redraw || stream_redraw_due(last_draw, now, redraw_pending, channels_closed) {
-            if commit_to_scrollback && !animation_tick {
-                sync_alt_overlay(
-                    uses_full_inline_viewport(&app.state),
-                    &mut alt_overlay,
-                    terminal,
-                )?;
-                prepare_inline_frame(&mut app.state, terminal, &mut transcript_cache)?;
-            } else if !commit_to_scrollback {
-                prepare_fullscreen_frame(&mut app.state, terminal, &mut transcript_cache)?;
-            } else {
-                let height = terminal.get_frame().area().height;
-                set_inline_viewport_height(terminal, height).map_err(|error| error.to_string())?;
-                transcript_cache.prepare(&mut app.state, terminal.get_frame().area());
-            }
+            prepare_fullscreen_frame(&mut app.state, terminal, &mut transcript_cache)?;
             terminal
                 .draw(|frame| render_with_transcript(frame, &app.state, transcript_cache.lines()))
                 .map_err(|error| error.to_string())?;
@@ -2572,64 +2204,6 @@ where
             break;
         }
     }
-    Ok(())
-    }.await;
-    let restore = if commit_to_scrollback {
-        sync_alt_overlay(false, &mut alt_overlay, terminal)
-    } else {
-        Ok(())
-    };
-    result.and(restore)
-}
-
-fn commit_stable_transcript<B>(
-    state: &mut TuiState,
-    terminal: &mut Terminal<B>,
-) -> Result<(), String>
-where
-    B: Backend + Clone,
-{
-    let height = terminal.get_frame().area().height;
-    set_inline_viewport_height(terminal, height).map_err(|error| error.to_string())?;
-    let committed_end = state.stable_transcript_end();
-    if state.stable_transcript().is_empty() {
-        return Ok(());
-    }
-
-    let terminal_area = terminal.get_frame().area();
-    let terminal_width = terminal_area.width as usize;
-    if terminal_area.is_empty() || terminal_width <= TRANSCRIPT_HORIZONTAL_PADDING * 2 {
-        return Ok(());
-    }
-    let content_width = terminal_width
-        .saturating_sub(TRANSCRIPT_HORIZONTAL_PADDING * 2)
-        .max(1);
-    let lines = transcript_lines(
-        state.stable_transcript(),
-        content_width,
-        TranscriptDetail::Compact,
-    );
-
-    for chunk in lines.chunks(MAX_TRANSCRIPT_INSERT_HEIGHT) {
-        terminal
-            .insert_before(chunk.len() as u16, |buffer| {
-                buffer.set_style(*buffer.area(), Style::default().bg(SURFACE));
-                for (row, line) in chunk.iter().enumerate() {
-                    line.render(
-                        Rect::new(
-                            TRANSCRIPT_HORIZONTAL_PADDING as u16,
-                            row as u16,
-                            content_width as u16,
-                            1,
-                        ),
-                        buffer,
-                    );
-                }
-            })
-            .map_err(|error| error.to_string())?;
-    }
-
-    state.mark_transcript_committed(committed_end);
     Ok(())
 }
 
@@ -2898,15 +2472,13 @@ mod tests {
         tool::{CommandClass, Operation, ToolResult},
     };
     use ratatui::{
-        TerminalOptions, Viewport,
-        backend::{Backend, TestBackend, WindowSize},
+        backend::{Backend, ClearType, TestBackend, WindowSize},
         buffer::Cell as BufferCell,
         layout::{Position, Rect, Size},
-        style::Color,
     };
 
     use super::*;
-    use crate::tui::{ActivityState, TranscriptEntry, visible_activity_rect};
+    use crate::tui::{ActivityState, TranscriptEntry, transcript_lines, visible_activity_rect};
 
     #[derive(Clone)]
     struct DrawBudgetBackend {
@@ -3595,7 +3167,6 @@ Session ID: ses_cafebabe"
             &mut input,
             Some(runtime_events),
             Some(tool_events),
-            false,
         )
         .await
         .unwrap();
@@ -3650,7 +3221,6 @@ Session ID: ses_cafebabe"
                 &mut input,
                 Some(runtime_events),
                 None,
-                false,
             )
             .await
             .unwrap();
@@ -3702,7 +3272,6 @@ Session ID: ses_cafebabe"
             &mut input,
             Some(runtime_events),
             None,
-            false,
         )
         .await
         .expect("run loop");
@@ -3764,7 +3333,6 @@ Session ID: ses_cafebabe"
             &mut input,
             Some(runtime_events),
             Some(tool_events),
-            false,
         )
         .await
         .expect("run loop");
@@ -3858,31 +3426,6 @@ Session ID: ses_cafebabe"
             [TranscriptEntry::ToolCall(tool), TranscriptEntry::Error { body }]
                 if tool.output == "partial output" && body == "cancelled"
         ));
-        assert_eq!(state.stable_transcript_end(), 2);
-    }
-
-    #[test]
-    fn normal_view_leaves_page_keys_to_native_scrollback() {
-        let mut app = App {
-            state: TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised),
-            engine: None,
-            runtime_events: None,
-            tool_events: None,
-            orchestrator: None,
-            session_id: None,
-            restart_args: None,
-            exit_requested: false,
-            control: None,
-        };
-        app.state.scroll = usize::from(u16::MAX);
-
-        app.handle_event(Event::Key(KeyEvent::new(
-            KeyCode::PageUp,
-            KeyModifiers::NONE,
-        )))
-        .expect("page up");
-
-        assert_eq!(app.state.scroll, usize::from(u16::MAX));
     }
 
     #[test]
@@ -3919,325 +3462,20 @@ Session ID: ses_cafebabe"
     }
 
     #[test]
-    fn inline_terminal_starts_at_the_cursor_and_preserves_shell_history() {
-        let mut rows = vec![" ".repeat(80); 24];
-        rows[0] = "shell sentinel alpha".into();
-        rows[3] = "shell sentinel omega".into();
-        let mut backend = TestBackend::with_lines(rows);
-        backend.set_cursor_position(Position::new(0, 4)).unwrap();
-        let mut terminal = initialize_inline_terminal(backend).unwrap();
-        assert_eq!(terminal.get_frame().area().top(), 4);
-        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        state.prepend_startup("0.1.0", "project sentinel");
-        let mut cache = TranscriptRenderCache::default();
-        prepare_inline_frame(&mut state, &mut terminal, &mut cache).unwrap();
-        terminal
-            .draw(|frame| render_with_transcript(frame, &state, cache.lines()))
-            .unwrap();
-        let history = history_text(terminal.backend());
-        assert_eq!(history.matches("shell sentinel alpha").count(), 1);
-        assert_eq!(history.matches("shell sentinel omega").count(), 1);
-        assert_eq!(history.matches("project sentinel").count(), 1);
-    }
-
-    #[test]
-    fn active_and_expanded_views_use_the_available_terminal_height() {
-        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        state.push_assistant(
-            (0..40)
-                .map(|line| format!("- line {line}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
-        state.set_thinking();
-
-        assert_eq!(desired_inline_viewport_height(&state, 80, 24), 24);
-
-        state.toggle_transcript_view();
-        assert_eq!(desired_inline_viewport_height(&state, 80, 24), 24);
-
-        state.toggle_transcript_view();
-        state.overlay = Overlay::Agents;
-        assert_eq!(desired_inline_viewport_height(&state, 80, 24), 24);
-
-        state.overlay = Overlay::Shortcuts;
-        assert_eq!(desired_inline_viewport_height(&state, 80, 24), 24);
-        assert!(!uses_full_inline_viewport(&state));
-
-        state.overlay = Overlay::Todos;
-        assert_eq!(desired_inline_viewport_height(&state, 80, 24), 24);
-        assert!(uses_full_inline_viewport(&state));
-    }
-
-    #[test]
-    fn filtering_the_slash_palette_keeps_the_inline_viewport_stable() {
-        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        state.composer = "/".into();
-        state.cursor = state.composer.len();
-        let open_height = desired_inline_viewport_height(&state, 80, 24);
-
-        state.composer = "/res".into();
-        state.cursor = state.composer.len();
-        let filtered_height = desired_inline_viewport_height(&state, 80, 24);
-
-        assert!(open_height >= filtered_height);
-        assert!(filtered_height >= 4);
-    }
-
-    #[test]
-    fn committed_answer_precedes_the_live_composer_without_padding_to_screen_bottom() {
-        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        state.push_assistant("answer sentinel");
-        state.composer = "composer sentinel".into();
-        state.cursor = state.composer.len();
-        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24)).unwrap();
-        let mut cache = TranscriptRenderCache::default();
-        prepare_inline_frame(&mut state, &mut terminal, &mut cache).unwrap();
-        terminal
-            .draw(|frame| render_with_transcript(frame, &state, cache.lines()))
-            .unwrap();
-        let history = history_text(terminal.backend());
-        let answer = history.find("answer sentinel").unwrap();
-        let composer = history.find("composer sentinel").unwrap();
-        assert!(answer < composer);
-        assert!(terminal.get_frame().area().bottom() < 24);
-        assert!(state.live_transcript().is_empty());
-    }
-
-    #[test]
-    fn growing_inline_viewport_preserves_committed_startup_history() {
-        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        state.prepend_startup("0.1.0", "~/project");
-        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24))
-            .expect("initialize inline terminal");
-        let mut transcript_cache = TranscriptRenderCache::default();
-
-        prepare_inline_frame(&mut state, &mut terminal, &mut transcript_cache)
-            .expect("commit startup");
-        terminal
-            .draw(|frame| render_with_transcript(frame, &state, transcript_cache.lines()))
-            .expect("draw startup frame");
-
-        state.submit_turn("inspect the repository", false);
-        prepare_inline_frame(&mut state, &mut terminal, &mut transcript_cache)
-            .expect("commit user turn");
-        terminal
-            .draw(|frame| render_with_transcript(frame, &state, transcript_cache.lines()))
-            .expect("draw active frame");
-
-        let text = terminal
-            .backend()
-            .scrollback()
-            .content()
-            .iter()
-            .chain(terminal.backend().buffer().content().iter())
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert_eq!(text.matches("~/project").count(), 1, "{text}");
-        assert_eq!(text.matches("inspect the repository").count(), 1, "{text}");
-    }
-
-    #[test]
-    fn growing_viewport_does_not_leave_blank_rows_between_committed_tools() {
-        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        state.prepend_startup("0.1.9", "~/project");
-        state.push_user("inspect");
-        state.push_tool(
-            "bash",
-            (0..80)
-                .map(|index| format!("path-{index}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
-        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24))
-            .expect("initialize inline terminal");
-        let mut transcript_cache = TranscriptRenderCache::default();
-        prepare_inline_frame(&mut state, &mut terminal, &mut transcript_cache)
-            .expect("commit first tool");
-        terminal
-            .draw(|frame| render_with_transcript(frame, &state, transcript_cache.lines()))
-            .expect("draw first tool");
-
-        state.push_tool("read", "line\n".repeat(40));
-        state.set_thinking();
-        prepare_inline_frame(&mut state, &mut terminal, &mut transcript_cache)
-            .expect("grow for live tool");
-        terminal
-            .draw(|frame| render_with_transcript(frame, &state, transcript_cache.lines()))
-            .expect("draw live tool");
-
-        let text = terminal
-            .backend()
-            .scrollback()
-            .content()
-            .iter()
-            .chain(terminal.backend().buffer().content().iter())
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        let rows = terminal
-            .backend()
-            .scrollback()
-            .content()
-            .chunks(80)
-            .chain(terminal.backend().buffer().content().chunks(80))
-            .map(|row| row.iter().all(|cell| cell.symbol().trim().is_empty()))
-            .collect::<Vec<_>>();
-        let start = rows.iter().position(|blank| !blank).unwrap_or(0);
-        let end = rows.iter().rposition(|blank| !blank).unwrap_or(rows.len());
-        let blank_run = rows[start..=end]
-            .windows(5)
-            .any(|window| window.iter().all(|blank| *blank));
-        assert!(!blank_run, "{text}");
-    }
-
-    #[test]
-    fn inline_resize_preserves_committed_rows_and_does_not_commit_the_composer() {
-        let mut rows = vec![" ".repeat(80); 24];
-        rows[0] = "shell sentinel".into();
-        let mut backend = TestBackend::with_lines(rows);
-        backend.set_cursor_position(Position::new(0, 1)).unwrap();
-        let mut terminal = initialize_inline_terminal(backend).unwrap();
-        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        state.push_assistant("committed sentinel");
-        state.composer = "live composer sentinel".into();
-        state.cursor = state.composer.len();
-        let mut cache = TranscriptRenderCache::default();
-        prepare_inline_frame(&mut state, &mut terminal, &mut cache).unwrap();
-        terminal
-            .draw(|frame| render_with_transcript(frame, &state, cache.lines()))
-            .unwrap();
-        for (width, height) in [(52, 12), (100, 30), (30, 10), (80, 24)] {
-            resize_test_screen(terminal.backend_mut(), width, height);
-            resize_inline_terminal(&mut terminal, width, height).unwrap();
-            prepare_inline_frame(&mut state, &mut terminal, &mut cache).unwrap();
-            terminal
-                .draw(|frame| render_with_transcript(frame, &state, cache.lines()))
-                .unwrap();
-            let history = history_text(terminal.backend());
-            assert_eq!(history.matches("shell sentinel").count(), 1, "{history}");
-            assert_eq!(
-                history.matches("committed sentinel").count(),
-                1,
-                "{history}"
-            );
-            assert_eq!(
-                history.matches("live composer sentinel").count(),
-                1,
-                "{history}"
-            );
-            assert!(state.live_transcript().is_empty());
-        }
-    }
-
-    #[test]
-    fn clearing_inline_terminal_removes_only_the_live_ui_before_exit_output() {
-        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        state.push_assistant("committed sentinel");
-        state.composer = "live composer sentinel".into();
-        state.cursor = state.composer.len();
-        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24)).unwrap();
-        let mut cache = TranscriptRenderCache::default();
-        prepare_inline_frame(&mut state, &mut terminal, &mut cache).unwrap();
-        terminal
-            .draw(|frame| render_with_transcript(frame, &state, cache.lines()))
-            .unwrap();
-        assert!(history_text(terminal.backend()).contains("live composer sentinel"));
-        let viewport_top = terminal.get_frame().area().as_position();
-        clear_inline_terminal(&mut terminal).unwrap();
-        let history = history_text(terminal.backend());
-        assert!(!history.contains("live composer sentinel"));
-        assert_eq!(history.matches("committed sentinel").count(), 1);
-        assert_eq!(
-            terminal.backend_mut().get_cursor_position().unwrap(),
-            viewport_top
-        );
-    }
-
-    #[tokio::test]
-    async fn completed_transcript_is_inserted_above_the_inline_viewport() {
-        let mut app = App {
-            state: TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised),
-            engine: None,
-            runtime_events: None,
-            tool_events: None,
-            orchestrator: None,
-            session_id: None,
-            restart_args: None,
-            exit_requested: false,
-            control: None,
-        };
-        app.state.push_user("committed question");
-
-        let mut backend = TestBackend::new(80, 16);
-        backend
-            .set_cursor_position(Position::new(0, 4))
-            .expect("position inline viewport");
-        let mut terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(8),
-            },
-        )
-        .expect("inline terminal");
-        let (input_sender, mut input) = mpsc::channel(1);
-        let (runtime_sender, runtime_events) = mpsc::channel(1);
-        drop(input_sender);
-        drop(runtime_sender);
-
-        run_loop(
-            &mut app,
-            &mut terminal,
-            &mut input,
-            Some(runtime_events),
-            None,
-            true,
-        )
-        .await
-        .expect("run inline terminal");
-        let inserted_row = (0..16)
-            .find(|y| {
-                (0..80)
-                    .map(|x| {
-                        terminal
-                            .backend()
-                            .buffer()
-                            .cell((x, *y))
-                            .expect("inserted cell")
-                            .symbol()
-                    })
-                    .collect::<String>()
-                    .contains("> committed question")
-            })
-            .expect("committed transcript row");
-
-        assert!((0..80).all(|x| {
-            let bg = terminal
-                .backend()
-                .buffer()
-                .cell((x, inserted_row))
-                .expect("inserted background")
-                .bg;
-            bg == Color::Reset || bg == Color::Rgb(36, 40, 48)
-        }));
-        assert!(app.state.live_transcript().is_empty());
-    }
-
-    #[test]
-    fn inline_prepare_reuses_markdown_render_for_draw() {
+    fn fullscreen_prepare_reuses_markdown_render_for_draw() {
         let mut state = TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised);
         state.apply_runtime_event(RuntimeEvent::AssistantDelta {
             text: "## Heading\n\n- one\n- two\n\n```rust\nfn main() {}\n```".into(),
         });
-        let mut terminal =
-            initialize_inline_terminal(TestBackend::new(80, 24)).expect("inline terminal");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("fullscreen terminal");
 
         crate::tui::reset_transcript_render_calls();
         let mut transcript_cache = TranscriptRenderCache::default();
-        prepare_inline_frame(&mut state, &mut terminal, &mut transcript_cache)
-            .expect("prepare inline frame");
+        prepare_fullscreen_frame(&mut state, &mut terminal, &mut transcript_cache)
+            .expect("prepare fullscreen frame");
         terminal
             .draw(|frame| render_with_transcript(frame, &state, transcript_cache.lines()))
-            .expect("render inline frame");
+            .expect("render fullscreen frame");
 
         assert_eq!(crate::tui::transcript_render_calls(), 1);
     }
@@ -4248,8 +3486,7 @@ Session ID: ses_cafebabe"
         app.state.apply_runtime_event(RuntimeEvent::AssistantDelta {
             text: "## Heading\n\n- one\n- two\n\n```rust\nfn main() {}\n```".into(),
         });
-        let mut terminal =
-            initialize_inline_terminal(TestBackend::new(80, 24)).expect("inline terminal");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("fullscreen terminal");
         let (input_sender, mut input) = mpsc::channel(1);
         let closer = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(150)).await;
@@ -4257,9 +3494,9 @@ Session ID: ses_cafebabe"
         });
 
         crate::tui::reset_transcript_render_calls();
-        run_loop(&mut app, &mut terminal, &mut input, None, None, true)
+        run_loop(&mut app, &mut terminal, &mut input, None, None)
             .await
-            .expect("run animated inline frame");
+            .expect("run animated fullscreen frame");
         closer.await.expect("close input channel");
 
         assert_eq!(crate::tui::transcript_render_calls(), 1);
@@ -4271,8 +3508,7 @@ Session ID: ses_cafebabe"
         app.state.apply_runtime_event(RuntimeEvent::AssistantDelta {
             text: "## Heading\n\n- one\n- two\n\n```rust\nfn main() {}\n```".into(),
         });
-        let mut terminal =
-            initialize_inline_terminal(TestBackend::new(80, 24)).expect("inline terminal");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("fullscreen terminal");
         let (input_sender, mut input) = mpsc::channel(1);
         input_sender
             .send(Event::Key(KeyEvent::new(
@@ -4284,7 +3520,7 @@ Session ID: ses_cafebabe"
         drop(input_sender);
 
         crate::tui::reset_transcript_render_calls();
-        run_loop(&mut app, &mut terminal, &mut input, None, None, true)
+        run_loop(&mut app, &mut terminal, &mut input, None, None)
             .await
             .expect("run composer redraw");
 
@@ -4293,7 +3529,7 @@ Session ID: ses_cafebabe"
     }
 
     #[tokio::test]
-    async fn fullscreen_run_with_keeps_transcript_in_the_live_view() {
+    async fn fullscreen_run_clears_old_cells_and_anchors_the_composer() {
         let mut app = App {
             state: TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised),
             engine: None,
@@ -4306,7 +3542,12 @@ Session ID: ses_cafebabe"
             control: None,
         };
         app.state.push_user("visible fullscreen question");
-        let mut terminal = Terminal::new(TestBackend::new(80, 16)).expect("fullscreen terminal");
+        let mut rows = vec![" ".repeat(80); 16];
+        rows[0] = "stale shell header".into();
+        rows[8] = "stale screen content".into();
+        let mut backend = TestBackend::with_lines(rows);
+        backend.set_cursor_position(Position::new(22, 8)).unwrap();
+        let mut terminal = Terminal::new(backend).expect("fullscreen terminal");
         let (input_sender, input) = mpsc::channel(1);
         let (runtime_sender, runtime_events) = mpsc::channel(1);
         drop(input_sender);
@@ -4324,7 +3565,11 @@ Session ID: ses_cafebabe"
             .collect::<String>();
 
         assert!(visible.contains("visible fullscreen question"));
-        assert_eq!(app.state.live_transcript().len(), 1);
+        assert_eq!(app.state.transcript.len(), 1);
+        assert!(!visible.contains("stale shell header"));
+        assert!(!visible.contains("stale screen content"));
+        assert_eq!(terminal.get_frame().area(), Rect::new(0, 0, 80, 16));
+        assert_eq!(terminal.backend_mut().get_cursor_position().unwrap().y, 12);
     }
 
     #[tokio::test]
@@ -4354,66 +3599,7 @@ Session ID: ses_cafebabe"
         assert_eq!(terminal.get_frame().area().width, 28);
         assert!(visible.contains("lambda"), "{visible}");
         assert_eq!(crate::tui::transcript_render_calls(), 1);
-        assert_eq!(app.state.live_transcript().len(), 1);
-    }
-
-    #[test]
-    fn transcript_commit_uses_current_terminal_width_after_resize() {
-        let mut backend = TestBackend::new(30, 16);
-        backend
-            .set_cursor_position(Position::new(0, 4))
-            .expect("position inline viewport");
-        let mut terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(8),
-            },
-        )
-        .expect("inline terminal");
-        terminal.backend_mut().resize(60, 16);
-        let mut state = TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised);
-        state.push_user("123456789012345678901234567890");
-
-        commit_stable_transcript(&mut state, &mut terminal).expect("commit transcript");
-        let visible = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert!(visible.contains("> 123456789012345678901234567890"));
-    }
-
-    #[test]
-    fn tiny_inline_terminal_defers_invisible_transcript_commit() {
-        let mut backend = TestBackend::new(4, 8);
-        backend
-            .set_cursor_position(Position::new(0, 2))
-            .expect("position inline viewport");
-        let mut terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(4),
-            },
-        )
-        .expect("inline terminal");
-        let mut state = TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised);
-        state.push_user("defer me");
-
-        commit_stable_transcript(&mut state, &mut terminal).expect("defer transcript");
-
-        assert_eq!(state.live_transcript().len(), 1);
-    }
-    fn history_text(backend: &TestBackend) -> String {
-        backend
-            .scrollback()
-            .content()
-            .iter()
-            .chain(backend.buffer().content())
-            .map(|cell| cell.symbol())
-            .collect()
+        assert_eq!(app.state.transcript.len(), 1);
     }
 
     #[tokio::test]
@@ -4448,7 +3634,7 @@ Session ID: ses_cafebabe"
             sender.send(event).await.unwrap();
         }
         drop(sender);
-        run_loop(&mut app, &mut terminal, &mut input, None, None, false)
+        run_loop(&mut app, &mut terminal, &mut input, None, None)
             .await
             .unwrap();
         assert_eq!(draws.get(), 0);
@@ -4546,27 +3732,6 @@ Session ID: ses_cafebabe"
         assert_eq!(app.state.composer, "xe\u{301}");
         assert!(app.state.composer.is_char_boundary(app.state.cursor));
     }
-    #[test]
-    fn inline_initialization_keeps_a_partially_occupied_shell_row() {
-        let mut rows = vec![" ".repeat(40); 8];
-        rows[3] = "shell command sentinel".into();
-        let mut backend = TestBackend::with_lines(rows);
-        backend.set_cursor_position(Position::new(22, 3)).unwrap();
-        let mut terminal = initialize_inline_terminal(backend).unwrap();
-        assert_eq!(terminal.get_frame().area().top(), 4);
-        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        let mut cache = TranscriptRenderCache::default();
-        prepare_inline_frame(&mut state, &mut terminal, &mut cache).unwrap();
-        terminal
-            .draw(|frame| render_with_transcript(frame, &state, cache.lines()))
-            .unwrap();
-        assert_eq!(
-            history_text(terminal.backend())
-                .matches("shell command sentinel")
-                .count(),
-            1
-        );
-    }
 
     #[test]
     fn context_remaining_tracks_the_latest_model_window() {
@@ -4584,34 +3749,6 @@ Session ID: ses_cafebabe"
                 format!("{remaining}% context left")
             );
         }
-    }
-
-    // TestBackend::resize only changes the flat buffer stride, unlike a terminal.
-    // Preserve x/y cells in this fixture so widening cannot relocate old text.
-    fn resize_test_screen(backend: &mut TestBackend, width: u16, height: u16) {
-        let before = backend.buffer().clone();
-        let cursor = backend.cursor_position();
-        backend.resize(width, height);
-        backend.clear().unwrap();
-        backend
-            .draw(
-                before
-                    .content()
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, cell)| {
-                        let x = (index % before.area.width as usize) as u16;
-                        let y = (index / before.area.width as usize) as u16;
-                        (x < width && y < height).then_some((x, y, cell))
-                    }),
-            )
-            .unwrap();
-        backend
-            .set_cursor_position(Position::new(
-                cursor.x.min(width.saturating_sub(1)),
-                cursor.y.min(height.saturating_sub(1)),
-            ))
-            .unwrap();
     }
 
     #[test]
@@ -4647,36 +3784,6 @@ Session ID: ses_cafebabe"
                     .any(|span| span.content.contains("ANCHOR")),
                 "lost reading position at width {width}: {first:?}"
             );
-        }
-    }
-
-    #[test]
-    fn completion_before_resize_input_preserves_committed_output() {
-        let mut rows = vec![" ".repeat(80); 10];
-        rows[0] = "shell sentinel".into();
-        let mut backend = TestBackend::with_lines(rows);
-        backend.set_cursor_position(Position::new(0, 6)).unwrap();
-        let mut terminal = initialize_inline_terminal(backend).unwrap();
-        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        let mut cache = TranscriptRenderCache::default();
-        state.push_assistant("first committed sentinel");
-        prepare_inline_frame(&mut state, &mut terminal, &mut cache).unwrap();
-        terminal
-            .draw(|frame| render_with_transcript(frame, &state, cache.lines()))
-            .unwrap();
-        terminal.backend_mut().resize(80, 20);
-        state.push_assistant("second committed sentinel");
-        prepare_inline_frame(&mut state, &mut terminal, &mut cache).unwrap();
-        terminal
-            .draw(|frame| render_with_transcript(frame, &state, cache.lines()))
-            .unwrap();
-        let history = history_text(terminal.backend());
-        for marker in [
-            "shell sentinel",
-            "first committed sentinel",
-            "second committed sentinel",
-        ] {
-            assert_eq!(history.matches(marker).count(), 1, "{history}");
         }
     }
 
@@ -4854,24 +3961,26 @@ Session ID: ses_cafebabe"
     }
 
     #[test]
-    fn zero_height_terminal_defers_history_until_rows_return() {
-        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 0)).unwrap();
+    fn zero_height_terminal_preserves_content_until_rows_return() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 0)).unwrap();
         let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
         state.push_assistant("deferred output");
         let mut cache = TranscriptRenderCache::default();
-        prepare_inline_frame(&mut state, &mut terminal, &mut cache).unwrap();
-        assert!(!state.stable_transcript().is_empty());
+        prepare_fullscreen_frame(&mut state, &mut terminal, &mut cache).unwrap();
         terminal.backend_mut().resize(80, 12);
-        prepare_inline_frame(&mut state, &mut terminal, &mut cache).unwrap();
+        prepare_fullscreen_frame(&mut state, &mut terminal, &mut cache).unwrap();
         terminal
             .draw(|frame| render_with_transcript(frame, &state, cache.lines()))
             .unwrap();
-        assert_eq!(
-            history_text(terminal.backend())
-                .matches("deferred output")
-                .count(),
-            1
-        );
-        assert!(state.stable_transcript().is_empty());
+        let visible = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert_eq!(visible.matches("deferred output").count(), 1);
+        assert_eq!(state.transcript.len(), 1);
+        assert_eq!(terminal.backend_mut().get_cursor_position().unwrap().y, 8);
     }
 }

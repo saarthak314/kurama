@@ -321,7 +321,6 @@ pub struct TuiState {
     deferred_tool_outputs: HashMap<usize, DeferredToolOutput>,
     replayed_agent_ids: HashSet<AgentId>,
     approval_generation: u64,
-    committed_transcript_entries: usize,
     transcript_revision: u64,
     transcript_dirty_from: usize,
     transcript_geometry: RefCell<Option<TranscriptGeometry>>,
@@ -392,7 +391,6 @@ impl TuiState {
             deferred_tool_outputs: HashMap::new(),
             replayed_agent_ids: HashSet::new(),
             approval_generation: 0,
-            committed_transcript_entries: 0,
             transcript_revision: 0,
             transcript_dirty_from: 0,
             transcript_geometry: RefCell::new(None),
@@ -1054,30 +1052,6 @@ impl TuiState {
         self.transcript_changed(self.transcript.len() - 1);
     }
 
-    pub fn stable_transcript_end(&self) -> usize {
-        self.active_assistant_entry
-            .into_iter()
-            .chain(self.active_tool_entries.values().copied())
-            .min()
-            .unwrap_or(self.transcript.len())
-            .max(self.committed_transcript_entries)
-    }
-
-    pub fn stable_transcript(&self) -> &[TranscriptEntry] {
-        &self.transcript[self.committed_transcript_entries..self.stable_transcript_end()]
-    }
-
-    pub fn mark_transcript_committed(&mut self, end: usize) {
-        self.committed_transcript_entries = self
-            .committed_transcript_entries
-            .max(end.min(self.stable_transcript_end()));
-        self.scroll = 0;
-    }
-
-    pub fn live_transcript(&self) -> &[TranscriptEntry] {
-        &self.transcript[self.committed_transcript_entries..]
-    }
-
     pub(crate) fn set_display_store(&mut self, store: Arc<FsSessionStore>) {
         self.display_store = Some(store);
     }
@@ -1093,7 +1067,6 @@ impl TuiState {
         self.pending_tool_context = None;
         self.deferred_tool_outputs.clear();
         self.replayed_agent_ids.clear();
-        self.committed_transcript_entries = 0;
         self.transcript.clear();
         self.transcript_changed(0);
         self.agents.clear();
@@ -1906,21 +1879,21 @@ impl TuiState {
     fn replace_todos(&mut self, items: Vec<TodoItem>) {
         self.todos.clone_from(&items);
         self.selected_todo = self.selected_todo.min(items.len().saturating_sub(1));
-        let live_start = self.committed_transcript_entries;
-        let existing = self.transcript[live_start..]
+        let existing = self
+            .transcript
             .iter()
             .position(|entry| matches!(entry, TranscriptEntry::Todos { .. }));
         if items.is_empty() {
-            if let Some(offset) = existing {
-                self.transcript.remove(live_start + offset);
-                self.transcript_changed(live_start + offset);
-                self.reindex_active_entries(live_start + offset);
+            if let Some(index) = existing {
+                self.transcript.remove(index);
+                self.transcript_changed(index);
+                self.reindex_active_entries(index);
             }
             return;
         }
-        if let Some(offset) = existing {
-            self.transcript[live_start + offset] = TranscriptEntry::Todos { items };
-            self.transcript_changed(live_start + offset);
+        if let Some(index) = existing {
+            self.transcript[index] = TranscriptEntry::Todos { items };
+            self.transcript_changed(index);
         } else {
             self.push_transcript_entry(TranscriptEntry::Todos { items });
         }

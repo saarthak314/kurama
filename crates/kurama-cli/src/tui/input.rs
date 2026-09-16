@@ -3,7 +3,10 @@ use std::{io, thread};
 use crossterm::{
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
     execute,
-    terminal::{DisableLineWrap, EnableLineWrap, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        Clear, ClearType, DisableLineWrap, EnableLineWrap, EnterAlternateScreen,
+        LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    },
 };
 use tokio::sync::mpsc;
 use unicode_segmentation::GraphemeCursor;
@@ -82,6 +85,9 @@ impl Drop for TerminalGuard {
 fn write_enter_commands<W: io::Write>(mut writer: W) -> io::Result<()> {
     execute!(
         writer,
+        EnterAlternateScreen,
+        Clear(ClearType::All),
+        crossterm::cursor::MoveTo(0, 0),
         crossterm::cursor::Hide,
         EnableBracketedPaste,
         DisableLineWrap
@@ -93,6 +99,7 @@ fn write_exit_commands<W: io::Write>(mut writer: W) -> io::Result<()> {
         writer,
         EnableLineWrap,
         DisableBracketedPaste,
+        LeaveAlternateScreen,
         crossterm::cursor::Show
     )
 }
@@ -133,17 +140,31 @@ mod tests {
     }
 
     #[test]
-    fn terminal_commands_disable_and_restore_line_wrapping() {
+    fn terminal_commands_own_and_restore_fullscreen_lifecycle() {
         let mut enter = Vec::new();
         write_enter_commands(&mut enter).expect("enter commands");
         let mut exit = Vec::new();
         write_exit_commands(&mut exit).expect("exit commands");
+        let enter = String::from_utf8(enter).expect("ANSI entry commands");
+        let exit = String::from_utf8(exit).expect("ANSI exit commands");
 
-        assert!(enter.windows(5).any(|window| window == b"\x1b[?7l"));
-        assert!(exit.windows(5).any(|window| window == b"\x1b[?7h"));
         assert!(
-            !exit.windows(8).any(|window| window == b"\x1b[?1049l"),
-            "the raw-mode guard does not own an alternate screen"
+            enter.starts_with("\x1b[?1049h\x1b[2J\x1b[1;1H"),
+            "clear and home only after saving the primary screen"
+        );
+        assert!(enter.contains("\x1b[?25l"));
+        assert!(enter.contains("\x1b[?2004h"));
+        assert!(enter.contains("\x1b[?7l"));
+        assert!(exit.contains("\x1b[?7h"));
+        assert!(exit.contains("\x1b[?2004l"));
+        assert!(
+            exit.ends_with("\x1b[?1049l\x1b[?25h"),
+            "restore the primary screen before showing its cursor"
+        );
+        assert!(!enter.contains("\x1b[3J") && !exit.contains("\x1b[3J"));
+        assert!(
+            !enter.contains("\x1b[6n"),
+            "startup never waits for a CPR reply"
         );
     }
 }

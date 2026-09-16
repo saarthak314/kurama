@@ -111,7 +111,7 @@ fn render_main(
             transcript
         } else {
             rendered_transcript = transcript_lines(
-                state.live_transcript(),
+                &state.transcript,
                 transcript_width,
                 TranscriptDetail::Compact,
             );

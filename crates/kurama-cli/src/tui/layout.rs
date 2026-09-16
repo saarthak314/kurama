@@ -22,10 +22,10 @@ impl ResponsiveLayout {
             return Self::empty(area);
         }
 
-        let input_height = input_height.max(1).min(area.height);
-        let mut remaining = area.height.saturating_sub(input_height);
-        let footer_height = remaining.min(2);
-        remaining = remaining.saturating_sub(footer_height);
+        // Preserve two input content rows plus borders before reserving the footer.
+        let footer_height = area.height.saturating_sub(input_height.clamp(1, 4)).min(2);
+        let input_height = input_height.max(1).min(area.height - footer_height);
+        let mut remaining = area.height - input_height - footer_height;
         let queue_height = queue_height.min(remaining);
         remaining = remaining.saturating_sub(queue_height);
         let activity_height = u16::from(activity_visible && remaining > 0);

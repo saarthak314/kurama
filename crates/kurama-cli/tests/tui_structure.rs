@@ -350,7 +350,69 @@ fn completed_answer_precedes_composer_and_safety_footer() {
 
     assert!(composer_row > answer_row, "{rows:#?}");
     assert!(footer_row > composer_row, "{rows:#?}");
-    assert!(footer_row <= 15, "{rows:#?}");
+    assert_eq!(composer_row, 12, "{rows:#?}");
+    assert_eq!(footer_row, 15, "{rows:#?}");
+}
+
+#[test]
+fn composer_and_footer_stay_bottom_anchored_after_resize() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.composer = "draft".into();
+    state.cursor = state.composer.len();
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    for (width, height) in [(80, 24), (40, 10), (100, 30)] {
+        terminal.backend_mut().resize(width, height);
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        let rows = text.lines().collect::<Vec<_>>();
+
+        assert!(rows[usize::from(height) - 4].contains("draft"), "{text}");
+        assert!(
+            rows[usize::from(height) - 1].contains("supervised"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn dismissing_overlays_restores_the_entire_main_screen_without_stale_cells() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_user("keep this conversation visible");
+    state.composer = "draft".into();
+    state.cursor = state.composer.len();
+    state.set_agents(vec![AgentRow {
+        id: AgentId::from("a_1"),
+        role: "reviewer".into(),
+        profile: "work".into(),
+        task: "overlay-only task text".into(),
+        state: AgentState::Running,
+        activity: "reading".into(),
+        transcript: Vec::new(),
+    }]);
+    let expected = rendered(&state, 80, 24);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &state)).unwrap();
+
+    for overlay in [
+        Overlay::Shortcuts,
+        Overlay::Agents,
+        Overlay::Todos,
+        Overlay::Onboarding,
+    ] {
+        state.overlay = overlay;
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        assert_ne!(terminal.backend().buffer(), &expected, "{overlay:?}");
+
+        state.close_overlay();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+
+        assert_eq!(
+            terminal.backend().buffer(),
+            &expected,
+            "stale cells after {overlay:?}"
+        );
+    }
 }
 
 #[test]
@@ -690,32 +752,19 @@ fn typed_tool_transcript_preserves_normalized_tool_name() {
 }
 
 #[test]
-fn committed_transcript_is_not_redrawn_in_the_live_viewport() {
+fn compact_and_expanded_transcript_views_render_completed_history() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-    state.push_user("committed question");
-    state.mark_transcript_committed(1);
-    state.push_assistant("live answer");
-
-    let text = buffer_text(&rendered(&state, 80, 20));
-
-    assert!(!text.contains("committed question"));
-    assert!(text.contains("live answer"));
-}
-
-#[test]
-fn expanded_transcript_view_renders_committed_canonical_history() {
-    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-    state.push_user("committed question");
-    state.mark_transcript_committed(1);
+    state.push_user("completed question");
     state.push_tool("TOOL / bash", "complete output");
+    state.apply_runtime_event(RuntimeEvent::TurnCompleted);
 
     let compact = buffer_text(&rendered(&state, 80, 20));
-    assert!(!compact.contains("committed question"));
+    assert!(compact.contains("completed question"));
     assert!(compact.contains("complete output"));
 
     state.toggle_transcript_view();
     let expanded = buffer_text(&rendered(&state, 80, 20));
-    assert!(expanded.contains("committed question"));
+    assert!(expanded.contains("completed question"));
     assert!(expanded.contains("complete output"));
 }
 
@@ -1002,8 +1051,9 @@ fn transcript_scroll_reaches_visual_lines_beyond_u16_max() {
 }
 
 #[test]
-fn transcript_follows_the_latest_answer_after_long_tool_output() {
+fn compact_transcript_follows_the_latest_answer_and_can_scroll_to_earlier_history() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.push_user("earliest question");
     let output = (0..100)
         .map(|index| format!("line-{index:03}"))
         .collect::<Vec<_>>()
@@ -1015,6 +1065,11 @@ fn transcript_follows_the_latest_answer_after_long_tool_output() {
 
     assert!(text.contains("complete answer"));
     assert!(!text.contains("line-000"));
+
+    state.scroll = usize::MAX;
+    let history = buffer_text(&rendered(&state, 40, 12));
+    assert!(history.contains("earliest question"));
+    assert!(!history.contains("complete answer"));
 }
 
 #[test]
@@ -1170,6 +1225,24 @@ fn narrow_pending_approval_keeps_all_controls_visible() {
     assert!(text.contains("Edit") || text.contains("e edit"));
     assert!(text.contains("Run the focused CLI tests"));
     assert!(text.contains("narrow terminal"));
+}
+
+#[test]
+fn wrapped_approval_preserves_decisions_and_the_safety_footer() {
+    let mut request = approval_request();
+    request.summary = "Review this operation before authorizing its execution. ".repeat(5);
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.begin_approval(request);
+
+    let text = buffer_text(&rendered(&state, 36, 14));
+    assert!(text.contains("kurama-cli"), "{text}");
+    for decision in ["a approve once", "s approve session", "d deny", "e edit"] {
+        assert!(text.contains(decision), "{text}");
+    }
+    assert!(
+        text.lines().last().unwrap().contains("supervised"),
+        "{text}"
+    );
 }
 
 #[test]
