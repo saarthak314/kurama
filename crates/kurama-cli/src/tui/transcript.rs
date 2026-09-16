@@ -17,8 +17,9 @@ use std::cell::Cell;
 
 use super::{
     Overlay, ToolLifecycle, TranscriptEntry, TuiState,
+    selection::copied_feedback,
     syntax::highlight_code,
-    theme::{ACCENT, BLUE, BORDER, DIM, GREEN, RED, TEXT},
+    theme::{ACCENT, BORDER, DIM, GREEN, LINK, RED, TEXT},
 };
 
 const MAX_LINK_TARGET_BYTES: usize = 4096;
@@ -132,6 +133,11 @@ impl TranscriptLine {
         let mut column = 0;
         for fragment in fragments {
             let width = display_width(&fragment.content);
+            let style = if fragment.target.is_some() {
+                fragment.style.fg(LINK).add_modifier(Modifier::UNDERLINED)
+            } else {
+                fragment.style
+            };
             if let Some(target) = fragment.target
                 && width > 0
             {
@@ -142,9 +148,7 @@ impl TranscriptLine {
                 });
             }
             column += width;
-            line.text
-                .spans
-                .push(Span::styled(fragment.content, fragment.style));
+            line.text.spans.push(Span::styled(fragment.content, style));
         }
         line
     }
@@ -539,12 +543,7 @@ fn parse_inline_fragments<'a>(
             Event::Start(Tag::Link { dest_url, .. }) => {
                 let destination = dest_url.into_string();
                 let target = safe_link_target(&destination);
-                let mut linked = parse_inline_fragments(
-                    events,
-                    index,
-                    Some(TagEnd::Link),
-                    style.fg(BLUE).add_modifier(Modifier::UNDERLINED),
-                );
+                let mut linked = parse_inline_fragments(events, index, Some(TagEnd::Link), style);
                 let label = fragments_text(&linked);
                 for fragment in &mut linked {
                     fragment.target = target.clone();
@@ -2200,9 +2199,10 @@ pub(crate) fn render_transcript_view(
         selection.render(frame, transcript_area, start);
     }
     if hint_height > 0 {
-        let hint = if state.overlay == Overlay::None && state.selection_copied {
-            "Copied selection · Esc clear"
-        } else if state.overlay == Overlay::None
+        let copied = (state.overlay == Overlay::None)
+            .then_some(state.copied_characters)
+            .flatten();
+        let hint = if state.overlay == Overlay::None
             && state
                 .transcript_selection
                 .as_ref()
@@ -2212,8 +2212,12 @@ pub(crate) fn render_transcript_view(
         } else {
             "esc close · ↑↓ scroll · { } prompts"
         };
+        let feedback = copied.map_or_else(
+            || Line::from(Span::styled(hint, Style::default().fg(DIM))),
+            |characters| copied_feedback(characters, transcript_area.width as usize),
+        );
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(DIM)))),
+            Paragraph::new(feedback),
             Rect::new(
                 transcript_area.x,
                 transcript_area.bottom(),
@@ -2487,7 +2491,15 @@ mod tests {
         assert!(changed.link_at(usize::MAX).is_none());
         let original = render_rows(&[original], 8);
         assert_eq!(original, render_rows(&[changed], 8));
-        assert_eq!(original, render_rows(&[plain], 8));
+        let plain = render_rows(&[plain], 8);
+        assert!(
+            original
+                .content
+                .iter()
+                .zip(&plain.content)
+                .all(|(linked, unlinked)| linked.symbol() == unlinked.symbol())
+        );
+        assert_ne!(original[(0, 0)].fg, plain[(0, 0)].fg);
     }
 
     #[test]

@@ -18,7 +18,7 @@ pub use activity::{activity_line, worked_for_line};
 pub use agents::{AgentRow, sort_agents};
 pub use approval::ApprovalState;
 pub(crate) use command_palette::{command_palette_height, render_command_palette};
-pub(crate) use composer::composer_cursor_vertical;
+pub(crate) use composer::{composer_cursor_at, composer_cursor_vertical};
 pub use input::{TerminalGuard, spawn_input_thread};
 pub(crate) use input::{next_grapheme_boundary, previous_grapheme_boundary};
 pub use layout::ResponsiveLayout;
@@ -27,7 +27,7 @@ pub(crate) use mentions::{collect_files, decode_pasted_image, filter_files, ment
 pub use onboarding::{OnboardingState, OnboardingSubmission};
 pub use render::render;
 pub(crate) use render::render_with_transcript;
-pub(crate) use selection::{TranscriptPoint, TranscriptSelection};
+pub(crate) use selection::{ComposerSelection, TranscriptPoint, TranscriptSelection};
 pub use state::{ActivityState, Overlay, ToolLifecycle, ToolTranscript, TranscriptEntry, TuiState};
 pub use transcript::{TranscriptDetail, transcript_lines};
 pub(crate) use transcript::{TranscriptLine, transcript_lines_with_entry_starts};

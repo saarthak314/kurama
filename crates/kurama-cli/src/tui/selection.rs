@@ -1,9 +1,83 @@
 use std::sync::Arc;
 
-use ratatui::{Frame, layout::Rect, style::Color, text::Span};
+use ratatui::{
+    Frame,
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+};
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::{theme::ACCENT, transcript::TranscriptLine};
+use super::{
+    theme::{ACCENT, COPY_BACKGROUND, COPY_FOREGROUND, DIM},
+    transcript::{TranscriptLine, truncate_display},
+};
+
+pub(crate) fn copied_feedback(characters: usize, width: usize) -> Line<'static> {
+    if width == 0 {
+        return Line::default();
+    }
+    let unit = if characters == 1 { "char" } else { "chars" };
+    let mut label = format!(" Copied {characters} {unit} ");
+    if label.len() > width {
+        label = format!("{characters} {unit}");
+    }
+    if label.len() > width {
+        label = characters.to_string();
+    }
+    if label.len() > width {
+        label = truncate_display("Copied", width);
+    }
+    let hint = " · Esc clear";
+    let show_hint = label.len().saturating_add(Span::raw(hint).width()) <= width;
+    let mut spans = vec![Span::styled(
+        label,
+        Style::default()
+            .fg(COPY_FOREGROUND)
+            .bg(COPY_BACKGROUND)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if show_hint {
+        spans.push(Span::styled(hint, Style::default().fg(DIM)));
+    }
+    Line::from(spans)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ComposerSelection {
+    pub anchor: usize,
+    pub focus: usize,
+    pub dragging: bool,
+    pub dragged: bool,
+}
+
+impl ComposerSelection {
+    pub fn new(anchor: usize) -> Self {
+        Self {
+            anchor,
+            focus: anchor,
+            dragging: true,
+            dragged: false,
+        }
+    }
+
+    pub fn update(&mut self, focus: usize) {
+        self.focus = focus;
+        self.dragged = true;
+    }
+
+    pub fn range(&self, input: &str) -> Option<std::ops::Range<usize>> {
+        if !self.dragged {
+            return None;
+        }
+        let start = self.anchor.min(self.focus).min(input.len());
+        let end = super::input::next_grapheme_boundary(
+            input,
+            self.anchor.max(self.focus).min(input.len()),
+        );
+        (start < end).then_some(start..end)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct TranscriptPoint {
@@ -18,7 +92,6 @@ pub(crate) struct TranscriptSelection {
     pub(crate) dragging: bool,
     pub(crate) dragged: bool,
     pub(crate) pressed_link: Option<Arc<str>>,
-    pub(crate) copied: bool,
 }
 
 impl TranscriptSelection {
@@ -29,7 +102,6 @@ impl TranscriptSelection {
             dragging: true,
             dragged: false,
             pressed_link,
-            copied: false,
         }
     }
 
@@ -144,6 +216,24 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Style, text::Line};
 
     use super::*;
+
+    #[test]
+    fn copy_confirmation_keeps_the_count_visible_before_optional_hints() {
+        for width in [80, 18, 9, 3] {
+            let line = copied_feedback(128, width);
+            assert!(line.width() <= width);
+            assert!(line.to_string().contains("128"));
+            let badge = &line.spans[0];
+            assert!(badge.style.add_modifier.contains(Modifier::BOLD));
+            assert_ne!(badge.style.fg, badge.style.bg);
+            assert_ne!(badge.style.bg, Some(Color::Reset));
+        }
+        let narrow = copied_feedback(128, 2).to_string();
+        assert!(
+            !narrow.contains("12"),
+            "never show a truncated character count"
+        );
+    }
 
     fn point(row: usize, column: usize) -> TranscriptPoint {
         TranscriptPoint { row, column }

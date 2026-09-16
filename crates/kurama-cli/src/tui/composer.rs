@@ -13,6 +13,7 @@ use unicode_segmentation::{GraphemeIndices, UnicodeSegmentation};
 use super::{
     ApprovalState, Overlay, TuiState,
     input::grapheme_display_width,
+    selection::copied_feedback,
     theme::{ACCENT, AMBER, BORDER, DIM, RED},
     transcript::{sanitize_terminal_text, truncate_display},
 };
@@ -81,6 +82,48 @@ pub(crate) fn approval_height(state: &TuiState, width: u16) -> u16 {
     })
 }
 
+fn composer_content_area(area: Rect) -> Rect {
+    if area.height >= 3 {
+        Rect::new(area.x, area.y + 1, area.width, area.height - 2)
+    } else {
+        area
+    }
+}
+
+pub(crate) fn composer_cursor_at(
+    state: &TuiState,
+    area: Rect,
+    position: Position,
+    clamp: bool,
+) -> Option<usize> {
+    let content = composer_content_area(area);
+    if content.is_empty() || (!clamp && !content.contains(position)) {
+        return None;
+    }
+    let position = Position::new(
+        position.x.clamp(content.x, content.right() - 1),
+        position.y.clamp(content.y, content.bottom() - 1),
+    );
+    let width = composer_text_width(content.width as usize);
+    let gutter = composer_gutter(content.width as usize);
+    let measured = editor_measure(&state.composer, state.cursor, width);
+    let row = composer_view_start(state, &measured, content.height as usize)
+        + usize::from(position.y - content.y);
+    let Some(row) = EditorRows::new(&state.composer, width).nth(row) else {
+        return Some(state.composer.len());
+    };
+    let wanted = usize::from(position.x - content.x).saturating_sub(gutter);
+    let mut column = 0;
+    for (offset, grapheme) in row.text.grapheme_indices(true) {
+        let next = column + grapheme_display_width(grapheme, column).min(width);
+        if wanted < next {
+            return Some(row.start + offset);
+        }
+        column = next;
+    }
+    Some(row.start + row.text.len())
+}
+
 pub(crate) fn render_composer(
     frame: &mut Frame<'_>,
     state: &TuiState,
@@ -90,21 +133,20 @@ pub(crate) fn render_composer(
     if area.is_empty() {
         return None;
     }
-    let content = if area.height >= 3 {
+    if area.height >= 3 {
         frame.render_widget(
             Block::default()
                 .borders(Borders::TOP | Borders::BOTTOM)
                 .border_style(Style::default().fg(BORDER)),
             area,
         );
-        Rect::new(area.x, area.y + 1, area.width, area.height - 2)
-    } else {
-        area
-    };
+    }
+    let content = composer_content_area(area);
     let gutter = composer_gutter(content.width as usize);
     let width = composer_text_width(content.width as usize);
     let measured = editor_measure(&state.composer, state.cursor, width);
-    let start = measured.visible_start(content.height as usize);
+    let start = composer_view_start(state, &measured, content.height as usize);
+    state.composer_scroll.set(start);
     let lines = EditorRows::new(&state.composer, width)
         .skip(start)
         .take(content.height as usize)
@@ -136,6 +178,36 @@ pub(crate) fn render_composer(
         })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(Text::from(lines)), content);
+    if let Some(range) = state
+        .composer_selection
+        .as_ref()
+        .and_then(|selection| selection.range(&state.composer))
+    {
+        let buffer = frame.buffer_mut();
+        for (visible_row, row) in EditorRows::new(&state.composer, width)
+            .skip(start)
+            .take(content.height as usize)
+            .enumerate()
+        {
+            let mut column = 0;
+            for (offset, grapheme) in row.text.grapheme_indices(true) {
+                let cells = grapheme_display_width(grapheme, column).min(width);
+                if row.start + offset < range.end
+                    && row.start + offset + grapheme.len() > range.start
+                {
+                    for cell in column..column + cells {
+                        let x = content.x as usize + gutter + cell;
+                        if x < content.right() as usize {
+                            buffer[(x as u16, content.y + visible_row as u16)]
+                                .set_fg(ratatui::style::Color::Black)
+                                .set_bg(ACCENT);
+                        }
+                    }
+                }
+                column += cells;
+            }
+        }
+    }
     Some(Position::new(
         content.x + (gutter + measured.cursor_column).min(content.width as usize - 1) as u16,
         content.y
@@ -262,17 +334,21 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect,
             ],
             Overlay::None => ["", "", ""],
         }
-    } else if state.selection_copied {
-        ["Copied selection · Esc clear", "Copied selection", "Copied"]
-    } else if let Some(selection) = state
+    } else if let Some(dragging) = state
         .transcript_selection
         .as_ref()
         .filter(|selection| selection.dragged)
+        .map(|selection| selection.dragging)
+        .or_else(|| {
+            state
+                .composer_selection
+                .as_ref()
+                .filter(|selection| selection.dragged)
+                .map(|selection| selection.dragging)
+        })
     {
-        if selection.dragging {
+        if dragging {
             ["Release to copy selection", "Release to copy", "Copy"]
-        } else if selection.copied {
-            ["Copied selection · Esc clear", "Copied selection", "Copied"]
         } else {
             ["Ctrl+C copy selection · Esc clear", "Ctrl+C copy", "Copy"]
         }
@@ -334,15 +410,22 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect,
         .find(|hint| Span::raw(*hint).width() <= hint_width)
         .unwrap_or("");
     if hint_width > 0 {
+        let copied = show_help.then_some(state.copied_characters).flatten();
+        let feedback = copied.map_or_else(
+            || {
+                Line::from(Span::styled(
+                    hint,
+                    Style::default().fg(if state.overlay == Overlay::ConfirmAgentCancel {
+                        AMBER
+                    } else {
+                        DIM
+                    }),
+                ))
+            },
+            |characters| copied_feedback(characters, hint_width),
+        );
         frame.render_widget(
-            Paragraph::new(Span::styled(
-                hint,
-                Style::default().fg(if state.overlay == Overlay::ConfirmAgentCancel {
-                    AMBER
-                } else {
-                    DIM
-                }),
-            )),
+            Paragraph::new(feedback),
             Rect::new(area.x, area.y, hint_width as u16, 1),
         );
     }
@@ -483,6 +566,32 @@ impl EditorMeasurement {
             .saturating_add(1)
             .saturating_sub(height)
             .min(self.rows.saturating_sub(height))
+    }
+}
+
+fn composer_view_start(state: &TuiState, measured: &EditorMeasurement, height: usize) -> usize {
+    if state
+        .composer_selection
+        .as_ref()
+        .is_some_and(|selection| selection.dragging)
+    {
+        state
+            .composer_scroll
+            .get()
+            .min(measured.rows.saturating_sub(height))
+    } else {
+        composer_visible_start(measured, height, state.composer_scroll.get())
+    }
+}
+
+fn composer_visible_start(measured: &EditorMeasurement, height: usize, previous: usize) -> usize {
+    let start = previous.min(measured.rows.saturating_sub(height));
+    if measured.cursor_row < start {
+        measured.cursor_row
+    } else if measured.cursor_row >= start.saturating_add(height) {
+        measured.cursor_row.saturating_add(1).saturating_sub(height)
+    } else {
+        start
     }
 }
 

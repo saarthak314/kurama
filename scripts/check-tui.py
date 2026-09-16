@@ -632,9 +632,44 @@ endpoint = "http://127.0.0.1:9/search"
             ] == (copies), actions
             assert len(actions) == 1 + len(copies), actions
 
+        def contrast_ratio(foreground, background):
+            def luminance(rgb):
+                channels = [
+                    int(rgb[index : index + 2], 16) / 255 for index in (0, 2, 4)
+                ]
+                channels = [
+                    value / 12.92
+                    if value <= 0.04045
+                    else ((value + 0.055) / 1.055) ** 2.4
+                    for value in channels
+                ]
+                return sum(
+                    value * weight
+                    for value, weight in zip(channels, (0.2126, 0.7152, 0.0722))
+                )
+
+            first, second = sorted([luminance(foreground), luminance(background)])
+            return (second + 0.05) / (first + 0.05)
+
         def wait_for_copy(count):
             wait_for(lambda: len(pointer_actions()) >= count + 1)
-            wait_for(lambda: "Copied selection" in "\n".join(screen.display[-2:]))
+            text = [
+                action["text"]
+                for action in pointer_actions()
+                if action["kind"] == "copy"
+            ][-1]
+            characters = len(text)
+            label = f"Copied {characters} {'char' if characters == 1 else 'chars'}"
+            wait_for(lambda: label in "\n".join(screen.display[-2:]))
+            column, row = visible_point(label)
+            badge = [
+                screen.buffer[row][index]
+                for index in range(column, column + len(label))
+            ]
+            assert all(
+                cell.bold and contrast_ratio(cell.fg, cell.bg) >= 7 for cell in badge
+            )
+            result["findings"]["copied_count_and_high_contrast_badge"] = True
 
         def rss_kib():
             measured = subprocess.run(
@@ -676,7 +711,12 @@ endpoint = "http://127.0.0.1:9/search"
                 if view == "main":
                     wait_for(lambda: main_ready(composer_text))
                 elif view == "transcript":
-                    wait_for(lambda: "esc close" in screen.display[-1].lower())
+                    wait_for(
+                        lambda: any(
+                            label in screen.display[-1].lower()
+                            for label in ("esc close", "release to copy", "copied")
+                        )
+                    )
                 assert screen.primary is not None, (
                     "application left its alternate screen"
                 )
@@ -878,6 +918,16 @@ endpoint = "http://127.0.0.1:9/search"
             send(draft)
             capture("pointer-before", composer_text=draft)
             reference = visible_point("reference")
+            link_cell = screen.buffer[reference[1]][reference[0]]
+            url_column, url_row = visible_point("https://example.com/reference")
+            url_cell = screen.buffer[url_row][url_column]
+            assert (
+                link_cell.fg == url_cell.fg
+                and link_cell.underscore
+                and url_cell.underscore
+            )
+            assert link_cell.fg != screen.buffer[reference[1]][0].fg
+            result["findings"]["clickable_links_have_distinct_color"] = True
             assert pointer_actions() == []
             mouse(0, reference)
             assert pointer_actions() == [], "link opened before mouse release"
@@ -955,7 +1005,7 @@ endpoint = "http://127.0.0.1:9/search"
 
             send(b"\x1b")
             capture("selection-dismissed", composer_text=draft)
-            assert "Copied selection" not in "\n".join(screen.display[-2:])
+            assert "Copied" not in "\n".join(screen.display[-2:])
             assert all(
                 screen.buffer[row][column].bg != "cyan"
                 for row in range(block_start[1], block_end[1] + 1)
@@ -963,6 +1013,20 @@ endpoint = "http://127.0.0.1:9/search"
             )
             result["findings"]["selection_cleared_with_escape"] = True
             result["findings"]["composer_draft_survived_pointer_interactions"] = True
+            send(b"\x0f")
+            capture("expanded-copy-before", view="transcript")
+            expanded_start = visible_point(code_text)
+            expanded_end = (expanded_start[0] + len(code_text) - 1, expanded_start[1])
+            mouse(0, expanded_start)
+            mouse(32, expanded_end)
+            mouse(0, expanded_end, release=True)
+            copied_texts.append(code_text)
+            wait_for_copy(len(copied_texts))
+            assert_pointer_actions(copied_texts)
+            capture("expanded-copy-count", view="transcript")
+            send(b"\x1b")
+            send(b"\x1b")
+            capture("expanded-copy-restored", composer_text=draft)
             before_overlay = capture("draft-before-overlay", composer_text=draft)
             send(b"\x0f")
             capture("transcript-overlay", view="transcript")

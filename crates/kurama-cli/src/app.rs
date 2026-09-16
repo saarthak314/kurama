@@ -42,11 +42,11 @@ use crate::{
     args::{Args, ResumeChoice},
     commands::{Command, GoalAction, command_missing_required_arguments, parse_command},
     tui::{
-        OnboardingState, OnboardingSubmission, Overlay, TerminalGuard, TranscriptDetail,
-        TranscriptLine, TranscriptPoint, TranscriptSelection, TuiState, command_palette_height,
-        composer_cursor_vertical, main_area, main_layout, next_grapheme_boundary,
-        previous_grapheme_boundary, render_with_transcript, spawn_input_thread,
-        transcript_lines_with_entry_starts, visible_activity_rect,
+        ComposerSelection, OnboardingState, OnboardingSubmission, Overlay, TerminalGuard,
+        TranscriptDetail, TranscriptLine, TranscriptPoint, TranscriptSelection, TuiState,
+        command_palette_height, composer_cursor_at, composer_cursor_vertical, main_area,
+        main_layout, next_grapheme_boundary, previous_grapheme_boundary, render_with_transcript,
+        spawn_input_thread, transcript_lines_with_entry_starts, visible_activity_rect,
     },
 };
 
@@ -895,6 +895,7 @@ impl App {
                         }
                     }
                     Overlay::None if !self.state.transcript_view_expanded() => {
+                        self.state.delete_composer_selection();
                         self.ingest_composer_paste(&text);
                     }
                     Overlay::ApprovalEdit => self.state.insert_approval_text(&text),
@@ -1021,10 +1022,23 @@ impl App {
             match key.code {
                 KeyCode::Char('a') => self.state.cursor_home(),
                 KeyCode::Char('e') => self.state.cursor_end(),
-                KeyCode::Char('k') => self.state.kill_to_end(),
-                KeyCode::Char('u') => self.state.kill_to_start(),
-                KeyCode::Char('w') => self.state.kill_previous_word(),
+                KeyCode::Char('k') => {
+                    if !self.state.delete_composer_selection() {
+                        self.state.kill_to_end();
+                    }
+                }
+                KeyCode::Char('u') => {
+                    if !self.state.delete_composer_selection() {
+                        self.state.kill_to_start();
+                    }
+                }
+                KeyCode::Char('w') => {
+                    if !self.state.delete_composer_selection() {
+                        self.state.kill_previous_word();
+                    }
+                }
                 KeyCode::Char('j') => {
+                    self.state.delete_composer_selection();
                     self.state.composer.insert(self.state.cursor, '\n');
                     self.state.cursor += 1;
                     self.state.composer_edited();
@@ -1032,6 +1046,7 @@ impl App {
                 KeyCode::Char('l') => self.state.scroll = 0,
                 KeyCode::Char('t') => self.state.toggle_todos(),
                 KeyCode::Char('r') => self.state.start_history_search(),
+                KeyCode::Char('d') if self.state.delete_composer_selection() => {}
                 KeyCode::Char('d') => {
                     if self.state.composer.is_empty() {
                         self.exit_requested = true;
@@ -1058,10 +1073,12 @@ impl App {
                 self.state.open_shortcuts();
             }
             KeyCode::Char(character) => {
+                self.state.delete_composer_selection();
                 self.state.composer.insert(self.state.cursor, character);
                 self.state.cursor += character.len_utf8();
                 self.state.composer_edited();
             }
+            KeyCode::Backspace | KeyCode::Delete if self.state.delete_composer_selection() => {}
             KeyCode::Backspace if self.state.cursor > 0 => {
                 let previous = previous_grapheme_boundary(&self.state.composer, self.state.cursor);
                 self.state.composer.drain(previous..self.state.cursor);
@@ -1074,44 +1091,56 @@ impl App {
                 self.state.composer_edited();
             }
             KeyCode::Left => {
-                self.state.cursor =
-                    previous_grapheme_boundary(&self.state.composer, self.state.cursor);
+                if let Some(range) = self
+                    .state
+                    .composer_selection
+                    .take()
+                    .and_then(|selection| selection.range(&self.state.composer))
+                {
+                    self.state.cursor = range.start;
+                } else {
+                    self.state.cursor =
+                        previous_grapheme_boundary(&self.state.composer, self.state.cursor);
+                }
             }
-            KeyCode::Right if self.state.cursor < self.state.composer.len() => {
-                self.state.cursor = next_grapheme_boundary(&self.state.composer, self.state.cursor);
+            KeyCode::Right => {
+                if let Some(range) = self
+                    .state
+                    .composer_selection
+                    .take()
+                    .and_then(|selection| selection.range(&self.state.composer))
+                {
+                    self.state.cursor = range.end;
+                } else if self.state.cursor < self.state.composer.len() {
+                    self.state.cursor =
+                        next_grapheme_boundary(&self.state.composer, self.state.cursor);
+                }
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.state.delete_composer_selection();
                 self.state.composer.insert(self.state.cursor, '\n');
                 self.state.cursor += 1;
                 self.state.composer_edited();
             }
-            KeyCode::Up if self.state.select_previous_file() => {}
-            KeyCode::Up if self.state.select_previous_command() => {}
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
                 if let Some(cursor) = composer_cursor_vertical(
                     &self.state.composer,
                     self.state.cursor,
                     self.state.composer_inner_width.get() as usize,
-                    -1,
+                    if key.code == KeyCode::Up { -1 } else { 1 },
                 ) {
                     self.state.cursor = cursor;
-                } else {
-                    self.state.history_previous();
                 }
+            }
+            KeyCode::Up if self.state.select_previous_file() => {}
+            KeyCode::Up if self.state.select_previous_command() => {}
+            KeyCode::Up => {
+                self.state.history_previous();
             }
             KeyCode::Down if self.state.select_next_file() => {}
             KeyCode::Down if self.state.select_next_command() => {}
             KeyCode::Down => {
-                if let Some(cursor) = composer_cursor_vertical(
-                    &self.state.composer,
-                    self.state.cursor,
-                    self.state.composer_inner_width.get() as usize,
-                    1,
-                ) {
-                    self.state.cursor = cursor;
-                } else {
-                    self.state.history_next();
-                }
+                self.state.history_next();
             }
             KeyCode::Tab if self.state.complete_selected_file() => {}
             KeyCode::Tab if self.state.selected_command().is_some() => {
@@ -1783,13 +1812,7 @@ impl App {
             self.state.push_error("no assistant reply to copy");
             return;
         };
-        match copy_to_clipboard(&text) {
-            Ok(()) => self.state.push_notice(
-                Some("COPY".into()),
-                format!("copied {} characters", text.chars().count()),
-            ),
-            Err(error) => self.state.push_error(error),
-        }
+        apply_pointer_action(self, PointerAction::Copy(text));
     }
 
     fn push_diff_notice(&mut self) {
@@ -2061,10 +2084,28 @@ fn handle_input_with_current_geometry(
     if let Event::Key(key) = &event {
         if key.kind != KeyEventKind::Release && app.state.overlay() == Overlay::None {
             if key.code == KeyCode::Esc
-                && (app.state.transcript_selection.is_some() || app.state.selection_copied)
+                && (app.state.transcript_selection.is_some()
+                    || app.state.composer_selection.is_some()
+                    || app.state.copied_characters.is_some())
             {
                 app.state.transcript_selection = None;
-                app.state.selection_copied = false;
+                app.state.composer_selection = None;
+                app.state.copied_characters = None;
+                return Ok(false);
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.code == KeyCode::Char('c')
+                && let Some(range) = app
+                    .state
+                    .composer_selection
+                    .as_ref()
+                    .and_then(|selection| selection.range(&app.state.composer))
+            {
+                let text = app.state.composer[range].to_owned();
+                if let Some(selection) = app.state.composer_selection.as_mut() {
+                    selection.dragging = false;
+                }
+                apply_pointer_action(app, PointerAction::Copy(text));
                 return Ok(false);
             }
             if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -2084,12 +2125,27 @@ fn handle_input_with_current_geometry(
             }
         }
         if key.kind != KeyEventKind::Release {
+            let editing = if key.modifiers.contains(KeyModifiers::CONTROL) {
+                matches!(key.code, KeyCode::Char('j' | 'k' | 'u' | 'w' | 'd'))
+            } else {
+                matches!(
+                    key.code,
+                    KeyCode::Char(_)
+                        | KeyCode::Backspace
+                        | KeyCode::Delete
+                        | KeyCode::Left
+                        | KeyCode::Right
+                ) || (key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT))
+            };
+            if !editing {
+                app.state.composer_selection = None;
+            }
             app.state.transcript_selection = None;
-            app.state.selection_copied = false;
+            app.state.copied_characters = None;
         }
     } else if matches!(&event, Event::Paste(_)) {
         app.state.transcript_selection = None;
-        app.state.selection_copied = false;
+        app.state.copied_characters = None;
     }
     if app.state.transcript_view_expanded()
         && matches!(
@@ -2129,12 +2185,51 @@ fn update_transcript_pointer(
     }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            state.selection_copied = false;
+            state.copied_characters = None;
+            if !state.transcript_view_expanded()
+                && let Some(cursor) = composer_cursor_at(
+                    state,
+                    main_layout(area, state).input,
+                    ratatui::layout::Position::new(mouse.column, mouse.row),
+                    false,
+                )
+            {
+                state.transcript_selection = None;
+                state.cursor = cursor;
+                state.composer_selection = Some(ComposerSelection::new(cursor));
+                return None;
+            }
+            state.composer_selection = None;
             state.transcript_selection = cache.point_at(state, area, mouse, false).map(|point| {
                 TranscriptSelection::new(point, cache.lines[point.row].link_at(point.column))
             });
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            if state
+                .composer_selection
+                .as_ref()
+                .is_some_and(|selection| selection.dragging)
+            {
+                let cursor = composer_cursor_at(
+                    state,
+                    main_layout(area, state).input,
+                    ratatui::layout::Position::new(mouse.column, mouse.row),
+                    true,
+                );
+                if let Some(cursor) = cursor
+                    && let Some(selection) = state.composer_selection.as_mut()
+                {
+                    selection.update(cursor);
+                    if let Some(range) = selection.range(&state.composer) {
+                        state.cursor = if selection.focus >= selection.anchor {
+                            range.end
+                        } else {
+                            range.start
+                        };
+                    }
+                }
+                return None;
+            }
             let point = cache.point_at(state, area, mouse, true);
             if let Some(selection) = state
                 .transcript_selection
@@ -2146,6 +2241,40 @@ fn update_transcript_pointer(
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            let input_cursor = state
+                .composer_selection
+                .as_ref()
+                .filter(|selection| selection.dragging)
+                .and_then(|_| {
+                    composer_cursor_at(
+                        state,
+                        main_layout(area, state).input,
+                        ratatui::layout::Position::new(mouse.column, mouse.row),
+                        true,
+                    )
+                });
+            if let Some(mut selection) = state.composer_selection.take() {
+                if !selection.dragging {
+                    state.composer_selection = Some(selection);
+                    return None;
+                }
+                let cursor = input_cursor?;
+                if cursor != selection.anchor {
+                    selection.update(cursor);
+                }
+                selection.dragging = false;
+                if let Some(range) = selection.range(&state.composer) {
+                    let text = state.composer[range.clone()].to_owned();
+                    state.cursor = if selection.focus >= selection.anchor {
+                        range.end
+                    } else {
+                        range.start
+                    };
+                    state.composer_selection = Some(selection);
+                    return Some(PointerAction::Copy(text));
+                }
+                return None;
+            }
             let mut selection = state.transcript_selection.take()?;
             if !selection.dragging {
                 state.transcript_selection = Some(selection);
@@ -2199,10 +2328,7 @@ fn apply_pointer_action(app: &mut App, action: PointerAction) {
             Ok(())
         }
         PointerAction::Copy(text) => copy_to_clipboard(&text).inspect(|()| {
-            app.state.selection_copied = true;
-            if let Some(selection) = app.state.transcript_selection.as_mut() {
-                selection.copied = true;
-            }
+            app.state.copied_characters = Some(text.chars().count());
         }),
     };
     if let Err(error) = result {
@@ -3415,22 +3541,35 @@ Session ID: ses_cafebabe"
     }
 
     #[test]
-    fn up_recalls_previous_prompts() {
+    fn arrow_history_restores_replayed_multiline_prompts_and_the_draft_cursor() {
         let mut app = test_app();
-        app.state.remember_prompt("first turn");
-        app.state.remember_prompt("second turn");
-
-        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)))
-            .expect("newer history");
-        assert_eq!(app.state.composer, "second turn");
-
-        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)))
-            .expect("older history");
-        assert_eq!(app.state.composer, "first turn");
-
-        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
-            .expect("forward history");
-        assert_eq!(app.state.composer, "second turn");
+        let replay = ["first\nturn", "second turn"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| {
+                EventEnvelope::new(
+                    index as u64,
+                    0,
+                    "history".into(),
+                    None,
+                    SessionEvent::UserMessage { text: text.into() },
+                )
+            })
+            .collect::<Vec<_>>();
+        app.state.hydrate_replay(&replay);
+        app.state.composer = "unfinished draft".into();
+        app.state.cursor = 5;
+        for (key, expected) in [
+            (KeyCode::Up, "second turn"),
+            (KeyCode::Up, "first\nturn"),
+            (KeyCode::Down, "second turn"),
+            (KeyCode::Down, "unfinished draft"),
+        ] {
+            app.handle_event(Event::Key(KeyEvent::new(key, KeyModifiers::NONE)))
+                .unwrap();
+            assert_eq!(app.state.composer, expected);
+        }
+        assert_eq!(app.state.cursor, 5);
     }
 
     #[test]
@@ -3898,6 +4037,87 @@ Session ID: ses_cafebabe"
     }
 
     #[test]
+    fn mouse_selects_wrapped_input_and_typing_replaces_the_selection() {
+        let mut app = test_app();
+        app.state.composer = "abcdEFGHijkl".into();
+        app.state.cursor = app.state.composer.len();
+        let area = Rect::new(0, 0, 10, 14);
+        let mut cache = TranscriptRenderCache::default();
+        cache.prepare(&mut app.state, area);
+        let mut terminal = Terminal::new(TestBackend::new(10, 14)).unwrap();
+        terminal
+            .draw(|frame| render_with_transcript(frame, &app.state, cache.lines()))
+            .unwrap();
+        let input = main_layout(area, &app.state).input;
+        let first_row = input.y + 1;
+        let x = input.x + 2;
+        update_transcript_pointer(
+            &mut app.state,
+            &cache,
+            area,
+            pointer(MouseEventKind::Down(MouseButton::Left), x + 1, first_row),
+        );
+        update_transcript_pointer(
+            &mut app.state,
+            &cache,
+            area,
+            pointer(
+                MouseEventKind::Drag(MouseButton::Left),
+                x + 2,
+                first_row + 1,
+            ),
+        );
+        assert_eq!(
+            update_transcript_pointer(
+                &mut app.state,
+                &cache,
+                area,
+                pointer(MouseEventKind::Up(MouseButton::Left), x + 2, first_row + 1)
+            ),
+            Some(PointerAction::Copy("bcdEFG".into()))
+        );
+        handle_input_with_current_geometry(
+            &mut app,
+            &mut cache,
+            area,
+            Event::Key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE)),
+        )
+        .unwrap();
+        assert_eq!(app.state.composer, "aXHijkl");
+        assert_eq!(app.state.cursor, 2);
+    }
+
+    #[test]
+    fn clicking_multiline_input_places_the_caret_without_changing_text() {
+        let mut app = test_app();
+        app.state.composer = "first line\nsecond line".into();
+        app.state.cursor = app.state.composer.len();
+        let area = Rect::new(0, 0, 80, 16);
+        let mut cache = TranscriptRenderCache::default();
+        cache.prepare(&mut app.state, area);
+        let input = main_layout(area, &app.state).input;
+        let click = pointer(
+            MouseEventKind::Down(MouseButton::Left),
+            input.x + 2 + 6,
+            input.y + 1,
+        );
+        update_transcript_pointer(&mut app.state, &cache, area, click);
+        update_transcript_pointer(
+            &mut app.state,
+            &cache,
+            area,
+            pointer(
+                MouseEventKind::Up(MouseButton::Left),
+                click.column,
+                click.row,
+            ),
+        );
+        assert_eq!(app.state.cursor, 6);
+        app.handle_event(Event::Paste("X".into())).unwrap();
+        assert_eq!(app.state.composer, "first Xline\nsecond line");
+    }
+
+    #[test]
     fn plain_link_click_opens_but_link_drag_selects_without_changing_the_draft() {
         let mut app = test_app();
         app.state
@@ -4021,7 +4241,7 @@ Session ID: ses_cafebabe"
         app.state.apply_runtime_event(RuntimeEvent::AssistantDelta {
             text: "still working".into(),
         });
-        app.state.selection_copied = true;
+        app.state.copied_characters = Some(12);
         let mut cache = TranscriptRenderCache::default();
         handle_input_with_current_geometry(
             &mut app,
@@ -4030,9 +4250,35 @@ Session ID: ses_cafebabe"
             Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
         )
         .unwrap();
-        assert!(!app.state.selection_copied);
+        assert_eq!(app.state.copied_characters, None);
         assert!(app.state.activity().is_animated());
         assert!(app.state.sent_commands().is_empty());
+    }
+
+    #[test]
+    fn copied_character_count_is_visible_in_normal_and_expanded_views() {
+        let mut app = test_app();
+        apply_pointer_action(&mut app, PointerAction::Copy("é界\n".into()));
+        for expanded in [false, true] {
+            if expanded {
+                app.state.toggle_transcript_view();
+            }
+            let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+            terminal
+                .draw(|frame| render_with_transcript(frame, &app.state, None))
+                .unwrap();
+            let visible = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(visible.contains("Copied 3 chars"), "{visible}");
+        }
+        app.state.push_assistant("ab界");
+        app.copy_last_assistant();
+        assert_eq!(app.state.copied_characters, Some(3));
     }
 
     #[test]

@@ -846,6 +846,9 @@ fn assistant_markdown_renders_inline_styles_and_links() {
     assert!(!inline_code.modifier.contains(Modifier::BOLD));
     let link = cell_at_text(&buffer, "docs");
     assert!(link.modifier.contains(Modifier::UNDERLINED));
+    assert_ne!(link.fg, cell_at_text(&buffer, "Use bold").fg);
+    assert_ne!(link.fg, Color::DarkGray);
+    assert_ne!(link.fg, Color::Cyan);
     assert!(buffer.content.iter().all(|cell| {
         cell.symbol()
             .chars()

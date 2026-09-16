@@ -22,7 +22,9 @@ use crate::commands::{CommandSpec, command_suggestions};
 use super::input::{
     grapheme_boundary_at_or_after, next_grapheme_boundary, previous_grapheme_boundary,
 };
-use super::{AgentRow, ApprovalState, OnboardingState, TranscriptSelection, sort_agents};
+use super::{
+    AgentRow, ApprovalState, ComposerSelection, OnboardingState, TranscriptSelection, sort_agents,
+};
 
 const MAX_LIVE_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
 const LIVE_OUTPUT_OMITTED: &str = "[earlier live output omitted]\n";
@@ -282,11 +284,13 @@ pub struct TuiState {
     pub transcript: Vec<TranscriptEntry>,
     pub composer: String,
     pub composer_inner_width: Cell<u16>,
+    pub(crate) composer_scroll: Cell<usize>,
+    pub(crate) composer_selection: Option<ComposerSelection>,
     pub transcript_width: Cell<u16>,
     pub cursor: usize,
     pub scroll: usize,
     pub(crate) transcript_selection: Option<TranscriptSelection>,
-    pub(crate) selection_copied: bool,
+    pub(crate) copied_characters: Option<usize>,
     pub running_agents: usize,
     pub queued_agents: usize,
     pub overlay: Overlay,
@@ -310,6 +314,7 @@ pub struct TuiState {
     composer_history: Vec<String>,
     history_index: Option<usize>,
     history_draft: String,
+    history_draft_cursor: usize,
     activity: ActivityState,
     turn_started_at: Option<Instant>,
     last_turn_elapsed: Option<Duration>,
@@ -354,11 +359,13 @@ impl TuiState {
             transcript: Vec::new(),
             composer: String::new(),
             composer_inner_width: Cell::new(72),
+            composer_scroll: Cell::new(0),
+            composer_selection: None,
             transcript_width: Cell::new(72),
             cursor: 0,
             scroll: 0,
             transcript_selection: None,
-            selection_copied: false,
+            copied_characters: None,
             running_agents: 0,
             queued_agents: 0,
             overlay: Overlay::None,
@@ -382,6 +389,7 @@ impl TuiState {
             composer_history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
+            history_draft_cursor: 0,
             activity: ActivityState::Idle,
             turn_started_at: None,
             last_turn_elapsed: None,
@@ -438,6 +446,21 @@ impl TuiState {
         self.file_selection = 0;
         self.command_palette_dismissed = false;
         self.history_index = None;
+        self.composer_selection = None;
+    }
+
+    pub(crate) fn delete_composer_selection(&mut self) -> bool {
+        let Some(range) = self
+            .composer_selection
+            .take()
+            .and_then(|selection| selection.range(&self.composer))
+        else {
+            return false;
+        };
+        self.cursor = range.start;
+        self.composer.drain(range);
+        self.composer_edited();
+        true
     }
 
     pub fn clear_composer(&mut self) {
@@ -447,10 +470,12 @@ impl TuiState {
     }
 
     pub fn cursor_home(&mut self) {
+        self.composer_selection = None;
         self.cursor = 0;
     }
 
     pub fn cursor_end(&mut self) {
+        self.composer_selection = None;
         self.cursor = self.composer.len();
     }
 
@@ -581,6 +606,7 @@ impl TuiState {
         }
         self.history_index = None;
         self.history_draft.clear();
+        self.history_draft_cursor = 0;
     }
 
     pub fn history_previous(&mut self) -> bool {
@@ -590,6 +616,7 @@ impl TuiState {
         match self.history_index {
             None => {
                 self.history_draft.clone_from(&self.composer);
+                self.history_draft_cursor = grapheme_cursor(&self.composer, self.cursor);
                 self.history_index = Some(self.composer_history.len() - 1);
             }
             Some(0) => return false,
@@ -598,6 +625,8 @@ impl TuiState {
         if let Some(index) = self.history_index {
             self.composer.clone_from(&self.composer_history[index]);
             self.cursor = self.composer.len();
+            self.command_palette_dismissed = true;
+            self.composer_selection = None;
         }
         true
     }
@@ -609,11 +638,14 @@ impl TuiState {
         if index + 1 < self.composer_history.len() {
             self.history_index = Some(index + 1);
             self.composer.clone_from(&self.composer_history[index + 1]);
+            self.cursor = self.composer.len();
         } else {
             self.history_index = None;
             self.composer.clone_from(&self.history_draft);
+            self.cursor = self.history_draft_cursor;
         }
-        self.cursor = self.composer.len();
+        self.command_palette_dismissed = true;
+        self.composer_selection = None;
         true
     }
 
@@ -1097,10 +1129,17 @@ impl TuiState {
         self.agents.clear();
         self.todos.clear();
         self.usage = Usage::default();
+        self.composer_history.clear();
+        self.history_index = None;
+        self.history_draft.clear();
+        self.history_draft_cursor = 0;
         let mut replayed_tool_contexts = HashMap::new();
         for envelope in replay {
             match &envelope.event {
-                SessionEvent::UserMessage { text } => self.push_user(text.clone()),
+                SessionEvent::UserMessage { text } => {
+                    self.remember_prompt(text);
+                    self.push_user(text.clone());
+                }
                 SessionEvent::AssistantMessage { text } => self.push_assistant(text.clone()),
                 SessionEvent::ToolProposed {
                     operation_id,
