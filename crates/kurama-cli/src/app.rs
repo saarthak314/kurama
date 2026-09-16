@@ -531,6 +531,7 @@ impl App {
             project.display().to_string(),
             mode,
         );
+        state.set_composer_session(&session_id);
         state.max_input_tokens = active.max_input_tokens;
         state.set_display_store(Arc::clone(&store));
         state.hydrate_replay(&replay);
@@ -568,11 +569,12 @@ impl App {
     }
 
     pub fn from_runtime(
-        state: TuiState,
+        mut state: TuiState,
         engine: Handle,
         orchestrator: Arc<dyn Orchestrator>,
         session_id: SessionId,
     ) -> Self {
+        state.set_composer_session(&session_id);
         Self {
             state,
             engine: Some(engine),
@@ -1936,16 +1938,16 @@ fn desired_inline_viewport_height_for_transcript(
     } else {
         queue_height(state, area.width)
     };
-    let activity_height = u16::from(
-        state.overlay() == Overlay::None
-            && (state.activity().is_animated() || state.last_turn_elapsed().is_some())
-            && input_height < height,
-    );
-    let footer_height = u16::from(input_height.saturating_add(activity_height) < height);
-    let chrome_height = input_height
-        .saturating_add(activity_height)
-        .saturating_add(queue)
-        .saturating_add(footer_height);
+    let activity_visible = state.overlay() == Overlay::None
+        && (state.activity().is_animated() || state.last_turn_elapsed().is_some());
+    let layout =
+        crate::tui::ResponsiveLayout::for_area(area, input_height, activity_visible, queue);
+    let chrome_height = layout
+        .input
+        .height
+        .saturating_add(layout.activity.height)
+        .saturating_add(layout.queue.height)
+        .saturating_add(layout.footer.height);
     let palette_height = if approval_visible || shortcuts_visible {
         0
     } else {
@@ -1955,13 +1957,7 @@ fn desired_inline_viewport_height_for_transcript(
     let transcript_capacity = height.saturating_sub(chrome_height);
     let transcript_height = transcript_height.min(transcript_capacity as usize) as u16;
 
-    input_height
-        .saturating_add(activity_height)
-        .saturating_add(queue)
-        .saturating_add(footer_height)
-        .saturating_add(palette_height)
-        .saturating_add(transcript_height)
-        .min(height)
+    chrome_height.saturating_add(transcript_height).min(height)
 }
 
 fn sync_alt_overlay<B>(
@@ -4210,7 +4206,7 @@ Session ID: ses_cafebabe"
                             .symbol()
                     })
                     .collect::<String>()
-                    .contains("› committed question")
+                    .contains("> committed question")
             })
             .expect("committed transcript row");
 
@@ -4387,7 +4383,7 @@ Session ID: ses_cafebabe"
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(visible.contains("› 123456789012345678901234567890"));
+        assert!(visible.contains("> 123456789012345678901234567890"));
     }
 
     #[test]
@@ -4466,7 +4462,7 @@ Session ID: ses_cafebabe"
         for prompt in ["first prompt", "second prompt", "third prompt"] {
             app.state.push_user(prompt);
             app.state
-                .push_tool("bash", "› not a user prompt\n".repeat(30));
+                .push_tool("bash", "> not a user prompt\n".repeat(30));
         }
         app.state.toggle_transcript_view();
         app.state.composer_inner_width.set(90);
@@ -4682,6 +4678,68 @@ Session ID: ses_cafebabe"
         ] {
             assert_eq!(history.matches(marker).count(), 1, "{history}");
         }
+    }
+
+    #[test]
+    fn session_placeholder_is_stable_and_never_submitted_as_input() {
+        let mut app = test_app();
+        let session = SessionId::from("placeholder-session");
+        app.state.set_composer_session(&session);
+        let placeholder = app.state.composer_placeholder();
+        for (width, height) in [(80, 24), (32, 8), (100, 30)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| crate::tui::render(frame, &app.state))
+                .unwrap();
+            let visible = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            if width >= 80 {
+                assert!(visible.contains(placeholder));
+            }
+            assert_eq!(app.state.composer_placeholder(), placeholder);
+            assert!(app.state.composer.is_empty());
+        }
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        assert!(app.state.sent_commands().is_empty());
+        assert!(app.state.transcript.is_empty());
+        app.state.composer = "actual draft".into();
+        app.state.cursor = app.state.composer.len();
+        app.state.clear_composer();
+        app.state.set_thinking();
+        app.state.apply_runtime_event(RuntimeEvent::TurnCompleted);
+        assert_eq!(app.state.composer_placeholder(), placeholder);
+        let mut resumed = TuiState::new(
+            "other-profile",
+            "other-model",
+            ".",
+            ExecutionMode::Supervised,
+        );
+        resumed.set_composer_session(&session);
+        assert_eq!(resumed.composer_placeholder(), placeholder);
+    }
+
+    #[test]
+    fn distinct_sessions_can_display_different_composer_prompts() {
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        let prompts = (0..32)
+            .map(|index| {
+                state.set_composer_session(&SessionId::from(format!("session-{index}")));
+                state.composer_placeholder()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            prompts.len() > 1,
+            "session selection always returned the same prompt"
+        );
     }
 
     #[test]

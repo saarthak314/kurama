@@ -97,7 +97,9 @@ fn replay_hydrates_only_the_latest_todo_list() {
     assert!(rendered.contains("inspect parser"));
     assert!(rendered.contains("implement fix"));
     assert!(!rendered.contains("old task"));
-    assert!(!plain_transcript(&state.transcript).contains("Ran todo"));
+    assert!(!state.transcript.iter().any(|entry| matches!(
+        entry, TranscriptEntry::ToolCall(tool) if tool.name == "todo"
+    )));
 }
 
 #[test]

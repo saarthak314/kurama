@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -7,7 +8,7 @@ use std::time::{Duration, Instant};
 use kurama_adapters::FsSessionStore;
 use kurama_protocol::{
     agent::{AgentSnapshot, AgentState},
-    id::{AgentId, CallId, OperationId},
+    id::{AgentId, CallId, OperationId, SessionId},
     model::Usage,
     policy::{ApprovalRequest, ApprovalResponse, ExecutionMode},
     runtime::{AgentCommand, EngineCommand, RuntimeEvent},
@@ -26,6 +27,21 @@ use super::{AgentRow, ApprovalState, OnboardingState, sort_agents};
 const MAX_LIVE_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
 const LIVE_OUTPUT_OMITTED: &str = "[earlier live output omitted]\n";
 const OUTPUT_OMITTED: &str = "[earlier output omitted; Ctrl+O for full output]\n";
+
+const COMPOSER_PLACEHOLDERS: [&str; 12] = [
+    "What should we work on?",
+    "What needs fixing?",
+    "What would you like to build?",
+    "Which part should we inspect?",
+    "Describe the change you need.",
+    "Point me at a file or a problem.",
+    "What would you like to understand?",
+    "Where should we start?",
+    "Describe the behavior you expect.",
+    "What should be simpler?",
+    "Which task comes next?",
+    "Tell me the goal.",
+];
 
 enum DisplaySource {
     Output(BlobRef),
@@ -310,6 +326,7 @@ pub struct TuiState {
     transcript_dirty_from: usize,
     transcript_geometry: RefCell<Option<TranscriptGeometry>>,
     sent_commands: Vec<EngineCommand>,
+    composer_placeholder_index: usize,
 }
 
 struct TranscriptGeometry {
@@ -380,7 +397,21 @@ impl TuiState {
             transcript_dirty_from: 0,
             transcript_geometry: RefCell::new(None),
             sent_commands: Vec::new(),
+            composer_placeholder_index: 0,
         }
+    }
+
+    pub fn composer_placeholder(&self) -> &'static str {
+        COMPOSER_PLACEHOLDERS[self.composer_placeholder_index]
+    }
+
+    pub(crate) fn set_composer_session(&mut self, session_id: &SessionId) {
+        // Session IDs are randomized by the runtime. Derive the hint once so
+        // redraws, later turns, and resume do not change the empty-input copy.
+        let mut hash = DefaultHasher::new();
+        session_id.hash(&mut hash);
+        self.composer_placeholder_index =
+            (hash.finish() % COMPOSER_PLACEHOLDERS.len() as u64) as usize;
     }
 
     pub fn command_suggestions(&self) -> Vec<CommandSpec> {

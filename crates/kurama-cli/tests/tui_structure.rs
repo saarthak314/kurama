@@ -4,7 +4,6 @@ use kurama_cli::{
     tui::{
         ActivityState, AgentRow, Overlay, ResponsiveLayout, ToolLifecycle, ToolTranscript,
         TranscriptDetail, TranscriptEntry, TuiState, activity_line, render, transcript_lines,
-        worked_for_line,
     },
 };
 use kurama_protocol::{
@@ -328,16 +327,7 @@ fn activity_line_formats_elapsed_time_and_measures_the_interrupt_hint() {
 }
 
 #[test]
-fn worked_for_line_matches_codex_spacing_and_fills_the_row() {
-    let line = worked_for_line(Duration::from_secs(666), 36).expect("duration divider");
-    let text = plain(vec![line.clone()]);
-
-    assert_eq!(text, "─ Worked for 11m 06s ───────────────");
-    assert_eq!(line.width(), 36);
-}
-
-#[test]
-fn completed_turn_places_duration_and_composer_at_the_bottom() {
+fn completed_answer_precedes_composer_and_safety_footer() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.submit_turn("show the result", false);
     state.push_assistant("Finished cleanly.");
@@ -349,21 +339,16 @@ fn completed_turn_places_duration_and_composer_at_the_bottom() {
         .iter()
         .position(|row| row.contains("Finished cleanly."))
         .expect("assistant answer");
-    let worked_row = rows
-        .iter()
-        .position(|row| row.contains("Worked for"))
-        .expect("duration divider");
     let composer_row = rows
         .iter()
-        .position(|row| row.contains("Ask Kurama"))
+        .position(|row| row.contains(state.composer_placeholder()))
         .expect("composer");
     let footer_row = rows
         .iter()
         .position(|row| row.contains("supervised"))
         .expect("footer");
 
-    assert!(worked_row > answer_row, "{rows:#?}");
-    assert!(composer_row > worked_row, "{rows:#?}");
+    assert!(composer_row > answer_row, "{rows:#?}");
     assert!(footer_row > composer_row, "{rows:#?}");
     assert!(footer_row <= 15, "{rows:#?}");
 }
@@ -428,7 +413,7 @@ fn queued_follow_ups_are_visible_without_becoming_fake_user_turns() {
     let text = buffer_text(&rendered(&state, 80, 12));
 
     assert!(text.contains("queued  check the failing test"));
-    assert!(!text.contains("› check the failing test"));
+    assert!(!text.contains("> check the failing test"));
 }
 
 #[test]
@@ -530,11 +515,8 @@ fn compact_tool_rows_preview_output_while_expanded_preserves_it() {
     let compact = plain(transcript_lines(&entries, 80, TranscriptDetail::Compact));
     let expanded = plain(transcript_lines(&entries, 80, TranscriptDetail::Expanded));
 
-    assert!(compact.contains("› inspect"));
-    assert!(compact.contains("• Ran bash"));
     assert!(compact.contains("line one"));
     assert!(compact.contains("line two"));
-    assert!(!compact.contains("success ·"));
     assert!(expanded.contains("line one"));
     assert!(expanded.contains("line two"));
 }
@@ -574,8 +556,6 @@ fn transcript_squeezes_blank_padding_between_tool_rows() {
         .windows(3)
         .any(|window| window.iter().all(|blank| *blank));
     assert!(!blank_run, "{text}");
-    assert!(text.contains("• Ran bash"));
-    assert!(text.contains("• Running read"));
 }
 
 #[test]
@@ -589,7 +569,7 @@ fn narrow_user_prompt_keeps_punctuation_attached_and_continuation_aligned() {
     let rows = text.lines().map(str::trim_end).collect::<Vec<_>>();
 
     assert!(
-        rows.contains(&"  › Fix prompt wrapping; preserve its"),
+        rows.contains(&"  > Fix prompt wrapping; preserve its"),
         "{rows:#?}"
     );
     assert!(
@@ -623,15 +603,23 @@ fn transcript_tool_summaries_follow_lifecycle_without_truncating_expanded_output
     let compact = plain(transcript_lines(&entries, 40, TranscriptDetail::Compact));
     let expanded = plain(transcript_lines(&entries, 40, TranscriptDetail::Expanded));
 
-    assert!(compact.contains("• Ran bash"));
+    assert!(
+        compact
+            .lines()
+            .any(|line| line.starts_with("bash") && line.ends_with("done"))
+    );
     assert!(compact.contains("cargo test -p kurama-cli"));
-    assert!(compact.contains("× write failed"));
+    assert!(
+        compact
+            .lines()
+            .any(|line| line.starts_with("write") && line.ends_with("failed"))
+    );
     assert!(compact.contains("line two"));
     assert!(compact.contains("permission denied"));
     assert!(compact.contains("… 1 earlier line"));
     assert!(!compact.contains("abcdefghijklmnopqrstuvwxyz"));
-    assert!(expanded.contains("abcdefghijklmnopqrstuvwxyz0123456789"));
-    assert!(expanded.contains("ABCDEFGHIJ"));
+    let unwrapped = expanded.split_whitespace().collect::<String>();
+    assert!(unwrapped.contains("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ"));
     assert!(expanded.contains("line two"));
     assert!(expanded.contains("permission denied"));
     assert!(!expanded.contains('…'));
@@ -649,7 +637,10 @@ fn running_tool_output_shows_only_a_bounded_tail() {
 
     let text = plain(transcript_lines(&entries, 80, TranscriptDetail::Compact));
 
-    assert!(text.contains("• Running bash"));
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("bash") && line.ends_with("running"))
+    );
     assert!(text.contains("… 2 earlier lines"));
     assert!(text.contains("third"));
     assert!(text.contains("fourth"));
@@ -691,8 +682,11 @@ fn typed_tool_transcript_preserves_normalized_tool_name() {
 
     let text = buffer_text(&rendered(&state, 80, 20));
 
-    assert!(text.contains("Ran bash"));
-    assert!(!text.contains("Ran Bash"));
+    assert!(
+        text.lines()
+            .any(|line| line.trim_start().starts_with("bash "))
+    );
+    assert!(!text.contains("TOOL /"));
 }
 
 #[test]
@@ -887,8 +881,11 @@ fn assistant_markdown_preserves_viewport_wrapping_and_style() {
 
     let rows = text.lines().map(str::trim_end).collect::<Vec<_>>();
     assert!(text.contains("abcdefghijklmnopqrstuvwxyz"), "{rows:#?}");
-    assert!(text.contains("89ABCDEFGHIJ"), "{rows:#?}");
-    assert!(!rows.iter().any(|row| row.contains("• 89ABCDEFGHIJ")));
+    let unwrapped = text.split_whitespace().collect::<String>();
+    assert!(
+        unwrapped.contains("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ"),
+        "{rows:#?}"
+    );
     assert!(!text.contains("**"));
     assert!(
         cell_at_text(&buffer, "abcdefghijklmnopqrstuvwxyz")
@@ -1029,8 +1026,9 @@ fn tool_output_wraps_on_unicode_grapheme_clusters() {
     let text = buffer_text(&rendered(&state, 10, 16));
     let rows = text.lines().map(str::trim_end).collect::<Vec<_>>();
 
+    let unwrapped = text.split_whitespace().collect::<String>();
     assert!(
-        rows.iter().any(|row| row.trim_end().ends_with("AB")),
+        unwrapped.contains("AB\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}CD"),
         "{rows:#?}"
     );
     assert!(rows.iter().any(|row| row.contains("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}")), "{rows:#?}");
@@ -1108,8 +1106,8 @@ fn tool_output_preserves_every_wrapped_line() {
 
     let text = buffer_text(&rendered(&state, 40, 30));
 
-    assert!(text.contains("abcdefghijklmnopqrstuvwxyz012345"));
-    assert!(text.contains("6789ABCDEFGHIJ"));
+    let unwrapped = text.split_whitespace().collect::<String>();
+    assert!(unwrapped.contains("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ"));
     assert!(text.contains("head-two"));
     assert!(text.contains("middle-four"));
     assert!(text.contains("middle-five"));
@@ -1129,7 +1127,7 @@ fn approvals_render_inline_without_hiding_the_main_screen() {
 
     let pending = buffer_text(&rendered(&state, 100, 30));
     assert!(!pending.contains("KURAMA"));
-    assert!(pending.contains("› Run the CLI tests."));
+    assert!(pending.contains("> Run the CLI tests."));
     assert!(pending.contains("Action required"));
     assert!(pending.contains("Run the focused CLI tests"));
     assert!(pending.contains("Approve once") || pending.contains("a approve once"));
@@ -1147,7 +1145,7 @@ fn approvals_render_inline_without_hiding_the_main_screen() {
     terminal.draw(|frame| render(frame, &state)).unwrap();
     let editing = buffer_text(terminal.backend().buffer());
     assert!(!editing.contains("KURAMA"));
-    assert!(editing.contains("› Run the CLI tests."));
+    assert!(editing.contains("> Run the CLI tests."));
     assert!(editing.contains(r#""command": "cargo test -p kurama-cli""#));
     assert!(!editing.contains("Message Kurama or type / for commands"));
     assert!(format!("{:?}", terminal.backend()).contains("cursor: true"));
@@ -1426,8 +1424,8 @@ fn composer_cursor_tracks_the_visual_insertion_point() {
 
     let cursor = terminal.backend_mut().get_cursor_position().unwrap();
     let text = buffer_text(terminal.backend().buffer());
-    assert_eq!(text.matches('›').count(), 1);
-    assert!(text.contains("› first line"));
+    assert_eq!(text.matches('>').count(), 1);
+    assert!(text.contains("> first line"));
     let second_line = text
         .lines()
         .find(|line| line.contains("second line"))
@@ -1480,7 +1478,7 @@ fn composer_cursor_handles_char_boundary_inside_combining_grapheme() {
     let text = buffer_text(terminal.backend().buffer());
     let composer_y = text
         .lines()
-        .position(|line| line.contains('›'))
+        .position(|line| line.contains('>'))
         .expect("composer prompt") as u16;
     assert_eq!(cursor.y, composer_y);
 }

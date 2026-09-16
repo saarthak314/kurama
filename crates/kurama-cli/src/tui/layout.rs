@@ -24,7 +24,7 @@ impl ResponsiveLayout {
 
         let input_height = input_height.max(1).min(area.height);
         let mut remaining = area.height.saturating_sub(input_height);
-        let footer_height = u16::from(remaining > 0);
+        let footer_height = remaining.min(2);
         remaining = remaining.saturating_sub(footer_height);
         let queue_height = queue_height.min(remaining);
         remaining = remaining.saturating_sub(queue_height);

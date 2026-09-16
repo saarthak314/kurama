@@ -6,30 +6,30 @@ use ratatui::{
     layout::{Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{Block, Borders, Padding, Paragraph},
 };
 use unicode_segmentation::{GraphemeIndices, UnicodeSegmentation};
 
 use super::{
     ApprovalState, Overlay, TuiState,
     input::grapheme_display_width,
-    theme::{ACCENT, AMBER, DIM, RED},
+    theme::{ACCENT, AMBER, BORDER, DIM, RED},
     transcript::{sanitize_terminal_text, truncate_display},
 };
 
-const PROMPT: &str = "› ";
+const PROMPT: &str = "> ";
 const PROMPT_WIDTH: usize = 2;
 const MAX_COMPOSER_HEIGHT: usize = 8;
 const MAX_APPROVAL_HEIGHT: usize = 14;
-const BOX_BORDERS: u16 = 2;
+const CHROME_ROWS: u16 = 2;
 const APPROVAL_CHOICES: [&str; 4] = ["a approve once", "s approve session", "d deny", "e edit"];
 
-fn boxed(width: u16, height: u16) -> bool {
+fn ruled(width: u16, height: u16) -> bool {
     width >= 4 && height >= 3
 }
 
 fn inner_width(width: u16) -> usize {
-    width.saturating_sub(BOX_BORDERS).max(1) as usize
+    width.saturating_sub(2).max(1) as usize
 }
 
 pub(crate) fn composer_height(state: &TuiState, width: u16) -> u16 {
@@ -77,7 +77,7 @@ pub(crate) fn approval_height(state: &TuiState, width: u16) -> u16 {
                 1 + controls + summary_rows,
             )
         };
-        (rows + overhead).min(MAX_APPROVAL_HEIGHT) as u16 + BOX_BORDERS
+        (rows + overhead).min(MAX_APPROVAL_HEIGHT) as u16 + CHROME_ROWS
     })
 }
 
@@ -91,6 +91,12 @@ pub(crate) fn render_composer(
         return None;
     }
     let content = if area.height >= 3 {
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::TOP | Borders::BOTTOM)
+                .border_style(Style::default().fg(BORDER)),
+            area,
+        );
         Rect::new(area.x, area.y + 1, area.width, area.height - 2)
     } else {
         area
@@ -107,12 +113,12 @@ pub(crate) fn render_composer(
             let prefix = if gutter == 0 {
                 ""
             } else if start + index == 0 {
-                if gutter == 1 { "›" } else { PROMPT }
+                if gutter == 1 { ">" } else { PROMPT }
             } else {
                 &"  "[..gutter]
             };
             let text = if state.composer.is_empty() {
-                truncate_display("Ask Kurama to do anything", width.saturating_sub(1))
+                truncate_display(state.composer_placeholder(), width.saturating_sub(1))
             } else {
                 editor_row_text(row.text, width)
             };
@@ -149,11 +155,11 @@ pub(crate) fn render_approval(
     if area.is_empty() {
         return None;
     }
-    let (content, origin) = if boxed(area.width, area.height) {
+    let (content, origin) = if ruled(area.width, area.height) {
         let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(AMBER));
+            .borders(Borders::TOP | Borders::BOTTOM)
+            .border_style(Style::default().fg(BORDER))
+            .padding(Padding::horizontal(1));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         (inner, inner)
@@ -221,21 +227,54 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect,
             ExecutionMode::Yolo => "Y",
         }
     };
-    let hints = if state.history_search_active() {
-        ["Enter use · Esc cancel", "Enter use", "↵"]
-    } else if !show_help {
+    let cancel_prompt = (state.overlay == Overlay::ConfirmAgentCancel).then(|| {
+        let agent = state
+            .selected_agent()
+            .map_or("agent", |agent| agent.id.as_ref());
+        format!(
+            "Cancel {}? y confirm · n/esc return",
+            sanitize_terminal_text(agent)
+        )
+    });
+    let hints = if !show_help {
         match state.overlay {
             Overlay::Approval => ["↑↓ choose · Enter confirm", "Enter confirm", "↵"],
-            Overlay::ApprovalEdit => ["Enter submit · Esc back", "Enter submit", "↵"],
-            _ => ["", "", ""],
+            Overlay::ApprovalEdit => ["Enter submit · Esc back", "Enter/Esc", "↵"],
+            Overlay::Shortcuts => ["Esc close shortcuts", "Esc close", "Esc"],
+            Overlay::Onboarding if state.onboarding.is_selecting_connection() => [
+                "↑↓ choose · Enter confirm · Esc close",
+                "↑↓ Enter Esc",
+                "↵/Esc",
+            ],
+            Overlay::Onboarding => ["Enter confirm · Esc back", "Enter/Esc", "↵"],
+            Overlay::Agents => [
+                "Enter inspect · m message · x cancel · ↑↓ select · Esc close",
+                "↵ m x ↑↓ Esc",
+                "↵/Esc",
+            ],
+            Overlay::Todos => ["↑↓ scroll · Esc close", "↑↓ Esc", "Esc"],
+            Overlay::AgentInspect => ["m message · x cancel · Esc agents", "m x Esc", "Esc"],
+            Overlay::AgentMessage => ["Enter send · Esc back", "Enter/Esc", "↵"],
+            Overlay::ConfirmAgentCancel => [
+                cancel_prompt.as_deref().unwrap_or_default(),
+                "y/n cancel · Esc back",
+                "y/n",
+            ],
+            Overlay::None => ["", "", ""],
         }
+    } else if state.history_search_active() {
+        ["Enter use · Esc cancel", "Enter use", "↵"]
     } else if state.selected_command().is_some() {
         ["Enter run · Tab complete", "Tab complete", "Tab"]
     } else if state.selected_file().is_some() {
         ["Enter/Tab complete", "Tab complete", "Tab"]
     } else if state.activity().is_animated() {
         if state.composer.is_empty() {
-            ["Esc interrupt · type to queue", "Esc interrupt", "Esc"]
+            [
+                "Esc interrupt · type to queue · Ctrl+O transcript",
+                "Esc interrupt · type to queue",
+                "Esc",
+            ]
         } else {
             [
                 "Enter queue · Esc interrupt · Ctrl+J newline",
@@ -244,43 +283,105 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect,
             ]
         }
     } else if state.composer.is_empty() {
-        ["? for shortcuts", "? shortcuts", "?"]
+        [
+            "? shortcuts · / commands · Ctrl+O transcript",
+            "? shortcuts · / commands",
+            "?",
+        ]
     } else {
-        ["Enter send · Ctrl+J newline", "Enter send", "↵"]
+        [
+            "Enter send · Ctrl+J newline · Ctrl+O transcript",
+            "Enter send · Ctrl+J newline",
+            "↵",
+        ]
     };
-    let context = state
-        .context_label()
-        .filter(|context| Span::raw(context.as_str()).width() + mode.len() + 2 + 14 <= width);
-    let right_width = mode.len()
-        + context
-            .as_ref()
-            .map_or(0, |text| Span::raw(text.as_str()).width() + 2);
-    let left_width = width.saturating_sub(right_width + 2);
+    // Modal controls take precedence when a complete mode label cannot fit beside them.
+    // Normal and approval footers always retain the safety mode, even at one column.
+    let modal_controls = matches!(
+        state.overlay,
+        Overlay::Onboarding
+            | Overlay::Agents
+            | Overlay::Todos
+            | Overlay::AgentInspect
+            | Overlay::AgentMessage
+            | Overlay::ConfirmAgentCancel
+    );
+    let show_mode =
+        area.height > 1 || !modal_controls || mode.len() + Span::raw(hints[1]).width() + 2 <= width;
+    let hint_width = if area.height > 1 {
+        width
+    } else {
+        width.saturating_sub(if show_mode { mode.len() + 2 } else { 0 })
+    };
     let hint = hints
         .into_iter()
-        .find(|hint| Span::raw(*hint).width() <= left_width)
+        .find(|hint| Span::raw(*hint).width() <= hint_width)
         .unwrap_or("");
-    if left_width > 0 {
+    if hint_width > 0 {
         frame.render_widget(
-            Paragraph::new(Span::styled(hint, Style::default().fg(DIM))),
-            Rect::new(area.x, area.y, left_width as u16, 1),
+            Paragraph::new(Span::styled(
+                hint,
+                Style::default().fg(if state.overlay == Overlay::ConfirmAgentCancel {
+                    AMBER
+                } else {
+                    DIM
+                }),
+            )),
+            Rect::new(area.x, area.y, hint_width as u16, 1),
         );
     }
+    if area.height == 1 {
+        if show_mode {
+            frame.render_widget(
+                Span::styled(mode, mode_style(state.mode)),
+                Rect::new(
+                    area.right() - mode.len() as u16,
+                    area.y,
+                    mode.len() as u16,
+                    1,
+                ),
+            );
+        }
+        return;
+    }
+
+    let context = state
+        .context_label()
+        .filter(|context| Span::raw(context.as_str()).width() + mode.len() + 2 <= width);
+    let context_width = context
+        .as_ref()
+        .map_or(0, |text| Span::raw(text.as_str()).width());
+    let status_width = width.saturating_sub(context_width + 2 * usize::from(context.is_some()));
+    let branch_width = status_width.saturating_sub(mode.len() + 3);
     let mut spans = Vec::with_capacity(3);
-    if let Some(context) = context {
-        spans.push(Span::styled(context, Style::default().fg(DIM)));
-        spans.push(Span::raw("  "));
+    if branch_width > 0
+        && let Some(branch) = state
+            .git_branch
+            .as_deref()
+            .filter(|branch| !branch.is_empty())
+    {
+        spans.push(Span::styled(
+            truncate_display(&sanitize_terminal_text(branch), branch_width),
+            Style::default().fg(DIM),
+        ));
+        spans.push(Span::styled(" · ", Style::default().fg(DIM)));
     }
     spans.push(Span::styled(mode, mode_style(state.mode)));
     frame.render_widget(
         Paragraph::new(Line::from(spans)),
-        Rect::new(
-            area.right() - right_width as u16,
-            area.y,
-            right_width as u16,
-            1,
-        ),
+        Rect::new(area.x, area.y + 1, status_width as u16, 1),
     );
+    if let Some(context) = context {
+        frame.render_widget(
+            Span::styled(context, Style::default().fg(DIM)),
+            Rect::new(
+                area.right() - context_width as u16,
+                area.y + 1,
+                context_width as u16,
+                1,
+            ),
+        );
+    }
 }
 
 fn composer_gutter(width: usize) -> usize {
@@ -500,9 +601,17 @@ fn approval_layout(approval: &ApprovalState, width: usize, max_height: usize) ->
             EditorRows::new(&approval.editor, editor_width)
                 .skip(start)
                 .take(editor_height)
-                .map(|row| {
+                .enumerate()
+                .map(|(index, row)| {
                     Line::from(vec![
-                        Span::raw(&"  "[..gutter]),
+                        Span::styled(
+                            if start + index == 0 {
+                                &PROMPT[..gutter]
+                            } else {
+                                &"  "[..gutter]
+                            },
+                            Style::default().fg(ACCENT),
+                        ),
                         Span::raw(editor_row_text(row.text, editor_width)),
                     ])
                 }),
@@ -593,7 +702,7 @@ fn approval_controls(
             .enumerate()
             .map(|(index, choice)| {
                 Line::from(vec![
-                    Span::styled(if index == selected { "› " } else { "  " }, style(index)),
+                    Span::styled(if index == selected { "> " } else { "  " }, style(index)),
                     Span::styled(choice, style(index)),
                 ])
             })

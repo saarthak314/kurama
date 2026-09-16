@@ -571,6 +571,12 @@ endpoint = "http://127.0.0.1:9/search"
             )
             return int(measured.stdout.strip())
 
+        def composer_ready():
+            if screen.cursor.hidden or not 0 <= screen.cursor.y < len(screen.display):
+                return False
+            before_cursor = screen.display[screen.cursor.y][: screen.cursor.x].rstrip()
+            return before_cursor.endswith(">")
+
         def capture(name):
             pump(0.15)
             if not args.no_images:
@@ -617,7 +623,8 @@ endpoint = "http://127.0.0.1:9/search"
             ]
 
         try:
-            wait_for(lambda: "Ask Kurama" in "\n".join(screen.display))
+            wait_for(composer_ready)
+            initial_prompt = screen.display[screen.cursor.y][screen.cursor.x :].rstrip()
             result["resources"]["ready_ms"] = (time.monotonic() - started) * 1000
             result["resources"]["startup_rss_kib"] = rss_kib()
             capture("startup")
@@ -634,7 +641,7 @@ endpoint = "http://127.0.0.1:9/search"
                 send(b"\x1b[F")
                 wait_for(lambda: "LARGE_TAIL_MARKER" in "\n".join(screen.display))
                 send(b"\x1b")
-                wait_for(lambda: "Ask Kurama" in "\n".join(screen.display))
+                wait_for(composer_ready)
                 capture("large-output-collapsed")
                 result["resources"]["collapsed_rss_kib"] = rss_kib()
                 result["findings"]["full_blob_accessible_on_expansion"] = True
@@ -696,6 +703,10 @@ endpoint = "http://127.0.0.1:9/search"
             capture("transcript-home")
             send(b"\x1b")
             capture("transcript-restored")
+            wait_for(composer_ready)
+            current_prompt = screen.display[screen.cursor.y][screen.cursor.x :].rstrip()
+            assert current_prompt == initial_prompt, (initial_prompt, current_prompt)
+            result["findings"]["composer_prompt_stayed_stable"] = True
             result["findings"]["result_exact"] = (
                 root / "result.txt"
             ).read_text() == "approved result\n"

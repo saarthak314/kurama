@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph},
+    widgets::{Block, Borders, Clear, Padding, Paragraph},
 };
 
 use kurama_protocol::{agent::AgentState, session::TodoStatus};
@@ -188,8 +188,7 @@ fn render_main(
     }
 }
 
-fn render_shortcuts(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
-    let _ = state;
+fn render_shortcuts(frame: &mut Frame<'_>, _state: &TuiState, area: Rect) {
     if area.is_empty() {
         return;
     }
@@ -212,17 +211,13 @@ fn render_shortcuts(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
         ])
     })
     .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title(" shortcuts ")
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(BORDER))
-                .padding(Padding::new(1, 1, 0, 0)),
-        ),
-        area,
-    );
+    let block = modal_block(area);
+    let block = if area.height >= 3 && area.width >= 4 {
+        block.title(" shortcuts ")
+    } else {
+        block
+    };
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) -> Option<Position> {
@@ -277,7 +272,7 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) -> Option<Position
             .saturating_sub(visible / 2)
             .min(options.len().saturating_sub(visible));
         for (row, option) in options.iter().enumerate().skip(start).take(visible) {
-            let prefix = truncate(if row == selected { "› " } else { "  " }, width.min(2));
+            let prefix = truncate(if row == selected { "> " } else { "  " }, width.min(2));
             let available = width.saturating_sub(Line::from(prefix.as_str()).width());
             let line = Line::from(vec![
                 Span::styled(prefix, Style::default().fg(ACCENT)),
@@ -301,17 +296,11 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) -> Option<Position
             );
         }
         if footer != 0 {
-            let hint = if width >= 38 {
-                "↑↓ choose · enter confirm · esc close"
-            } else {
-                "↑↓ enter esc"
-            };
-            frame.render_widget(
-                Line::from(Span::styled(
-                    truncate(hint, width),
-                    Style::default().fg(DIM),
-                )),
+            render_footer(
+                frame,
+                state,
                 Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+                false,
             );
         }
         return None;
@@ -336,7 +325,7 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) -> Option<Position
     let input_row = inner.y + title as u16;
     frame.render_widget(
         Line::from(vec![
-            Span::styled(truncate("› ", gutter as usize), Style::default().fg(ACCENT)),
+            Span::styled(truncate("> ", gutter as usize), Style::default().fg(ACCENT)),
             Span::raw(shown),
         ]),
         Rect::new(inner.x, input_row, inner.width, 1),
@@ -351,12 +340,11 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) -> Option<Position
         );
     }
     if footer != 0 {
-        frame.render_widget(
-            Line::from(Span::styled(
-                truncate("enter confirm · esc back", width),
-                Style::default().fg(DIM),
-            )),
+        render_footer(
+            frame,
+            state,
             Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+            false,
         );
     }
     Some(Position::new(
@@ -428,17 +416,11 @@ fn render_agents(frame: &mut Frame<'_>, state: &TuiState) {
         }
     }
     if footer != 0 {
-        let controls = if width >= 60 {
-            "enter inspect · m message · x cancel · ↑↓ select · esc close"
-        } else {
-            "↵ inspect · m · x · ↑↓ · esc"
-        };
-        frame.render_widget(
-            Line::from(Span::styled(
-                truncate(controls, width),
-                Style::default().fg(DIM),
-            )),
+        render_footer(
+            frame,
+            state,
             Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+            false,
         );
     }
 }
@@ -510,7 +492,7 @@ fn render_todos(frame: &mut Frame<'_>, state: &TuiState) {
                 TodoStatus::InProgress => "[>]",
                 TodoStatus::Pending => "[ ]",
             };
-            let prefix = if row == selected { "› " } else { "  " };
+            let prefix = if row == selected { "> " } else { "  " };
             let label = format!(
                 "{prefix}{marker} {}",
                 truncate(&item.content, width.saturating_sub(6))
@@ -534,12 +516,11 @@ fn render_todos(frame: &mut Frame<'_>, state: &TuiState) {
         }
     }
     if footer != 0 {
-        frame.render_widget(
-            Line::from(Span::styled(
-                truncate("↑↓ scroll · esc close", width),
-                Style::default().fg(DIM),
-            )),
+        render_footer(
+            frame,
+            state,
             Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+            false,
         );
     }
 }
@@ -548,7 +529,7 @@ fn agent_row(agent: &crate::tui::AgentRow, selected: bool, width: usize) -> Line
     if width == 0 {
         return Line::default();
     }
-    let marker = truncate(if selected { "› " } else { "  " }, width.min(2));
+    let marker = truncate(if selected { "> " } else { "  " }, width.min(2));
     let marker_width = Line::from(marker.as_str()).width();
     let state_text = truncate(
         &state_label(&agent.state).to_uppercase(),
@@ -654,7 +635,8 @@ fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) -> Option<Posit
             Rect::new(inner.x, inner.y + 2, inner.width, 1),
         );
     }
-    let body_height = (inner.height as usize).saturating_sub(header + 1);
+    let message_controls = usize::from(state.overlay == Overlay::AgentMessage && inner.height >= 2);
+    let body_height = (inner.height as usize).saturating_sub(header + 1 + message_controls);
     let mut visible = Vec::with_capacity(body_height);
     for entry in agent.transcript.iter().rev().take(body_height) {
         let remaining = body_height - visible.len();
@@ -682,6 +664,14 @@ fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) -> Option<Posit
     }
     let action_area = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
     if state.overlay == Overlay::AgentMessage {
+        if message_controls > 0 {
+            render_footer(
+                frame,
+                state,
+                Rect::new(inner.x, action_area.y - 1, inner.width, 1),
+                false,
+            );
+        }
         let gutter = inner.width.saturating_sub(2).min(2);
         let (shown, column) = editor_window(
             &state.agent_message,
@@ -690,7 +680,7 @@ fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) -> Option<Posit
         );
         frame.render_widget(
             Line::from(vec![
-                Span::styled(truncate("› ", gutter as usize), Style::default().fg(ACCENT)),
+                Span::styled(truncate("> ", gutter as usize), Style::default().fg(ACCENT)),
                 Span::raw(shown),
             ]),
             action_area,
@@ -700,29 +690,7 @@ fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) -> Option<Posit
             action_area.y,
         ));
     }
-    let action = if state.overlay == Overlay::ConfirmAgentCancel {
-        if width >= 30 {
-            format!(
-                "Cancel {}? y confirm · n/esc return",
-                truncate(agent.id.as_ref(), width.saturating_sub(29))
-            )
-        } else {
-            "y/n cancel · esc back".into()
-        }
-    } else {
-        "m message · x cancel · esc agents".into()
-    };
-    frame.render_widget(
-        Line::from(Span::styled(
-            truncate(&action, width),
-            Style::default().fg(if state.overlay == Overlay::ConfirmAgentCancel {
-                AMBER
-            } else {
-                DIM
-            }),
-        )),
-        action_area,
-    );
+    render_footer(frame, state, action_area, false);
     None
 }
 
@@ -751,10 +719,9 @@ fn modal_block(area: Rect) -> Block<'static> {
     if area.width < 4 || area.height < 3 {
         return Block::default();
     }
-    let padding = u16::from(area.width >= 8);
+    let padding = 1 + u16::from(area.width >= 8);
     Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(Style::default().fg(BORDER))
         .padding(Padding::new(padding, padding, 0, 0))
 }

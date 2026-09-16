@@ -1361,62 +1361,65 @@ pub(crate) fn startup_lines(
     if width == 0 {
         return Vec::new();
     }
-    let title = format!(">_ kurama  v{}", sanitize_terminal_text(version));
-    let model = sanitize_terminal_text(model);
-    let project = sanitize_terminal_text(project);
-    let metadata = [
-        ("model", model.as_ref()),
-        ("directory", project.as_ref()),
-        ("approval", mode_label(mode)),
-    ];
-    // A bounded card stays quiet on ultrawide terminals; tiny terminals get plain rows.
-    let card_width = width.min(64);
-    let framed = card_width >= 24;
-    let inner_width = card_width.saturating_sub(if framed { 4 } else { 0 });
-    let mut contents = vec![Line::from(Span::styled(
-        truncate_display(&title, inner_width),
-        text_style().add_modifier(Modifier::BOLD),
-    ))];
-    for (label, value) in metadata {
-        let label = format!("{label}: ");
-        if display_width(&label) < inner_width {
-            let available = inner_width - display_width(&label);
-            let value = if label.starts_with("directory") {
-                truncate_display_left(value, available)
-            } else {
-                truncate_display(value, available)
-            };
-            contents.push(Line::from(vec![
-                Span::styled(label, Style::default().fg(DIM)),
-                Span::styled(value, text_style()),
-            ]));
-        } else {
-            contents.push(Line::from(Span::styled(
-                truncate_display(value, inner_width),
-                text_style(),
-            )));
+    let dim = Style::default().fg(DIM);
+    let accent = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let project = single_line_text(project);
+    let model = single_line_text(model);
+    let mode = mode_label(mode);
+    let mut lines = Vec::with_capacity(4);
+    let mut heading = Line::from(Span::styled(truncate_display("kurama", width), accent));
+    // Stack the workspace only when the masthead would leave too little useful path.
+    let inline_project = width >= 9 + display_width(&project).min(12);
+    if inline_project {
+        heading.spans.push(Span::styled(" / ", dim));
+        heading.spans.push(Span::styled(
+            truncate_display_left(&project, width - 9),
+            text_style(),
+        ));
+        // Version is optional: it must never steal space from the workspace.
+        if width >= 72 {
+            let version = single_line_text(version);
+            let version_width = display_width(&version).saturating_add(1);
+            if !version.is_empty()
+                && heading
+                    .width()
+                    .saturating_add(version_width)
+                    .saturating_add(4)
+                    <= width
+            {
+                heading.spans.push(Span::raw(
+                    " ".repeat(width - heading.width() - version_width),
+                ));
+                heading.spans.push(Span::styled(format!("v{version}"), dim));
+            }
         }
     }
-    if !framed {
-        return contents;
+    lines.push(heading);
+    if !inline_project {
+        lines.push(Line::from(Span::styled(
+            truncate_display_left(&project, width),
+            text_style(),
+        )));
     }
-    let border = Style::default().fg(BORDER);
-    let mut lines = Vec::with_capacity(contents.len() + 2);
-    lines.push(Line::from(Span::styled(
-        format!("╭{}╮", "─".repeat(card_width - 2)),
-        border,
-    )));
-    for mut line in contents {
-        let padding = inner_width.saturating_sub(line.width());
-        line.spans.insert(0, Span::styled("│ ", border));
-        line.spans
-            .push(Span::styled(format!("{} │", " ".repeat(padding)), border));
-        lines.push(line);
+    let mode_width = display_width(mode);
+    if width > mode_width + 3 {
+        lines.push(Line::from(vec![
+            Span::styled(truncate_display(&model, width - mode_width - 3), dim),
+            Span::styled(" · ", dim),
+            Span::styled(mode, accent),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            truncate_display(&model, width),
+            dim,
+        )));
+        // Even on tiny terminals the full safety mode remains readable across rows.
+        lines.extend(
+            hard_wrap(mode, width)
+                .into_iter()
+                .map(|row| Line::from(Span::styled(row, accent))),
+        );
     }
-    lines.push(Line::from(Span::styled(
-        format!("╰{}╯", "─".repeat(card_width - 2)),
-        border,
-    )));
     lines
 }
 
@@ -1489,46 +1492,18 @@ fn render_transcript_entries(
                 push_prefixed_lines(
                     &mut lines,
                     body,
-                    "› ",
+                    "> ",
                     "  ",
-                    Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                     text_style(),
                     width,
                 );
             }
             TranscriptEntry::AssistantMessage { body } => {
-                push_markdown_lines(&mut lines, body, width);
+                lines.extend(markdown_lines(body, width));
             }
             TranscriptEntry::ToolCall(tool) => {
-                let name = tool_name(&tool.name);
-                let action = match tool.lifecycle {
-                    ToolLifecycle::Running => format!("Running {name}"),
-                    ToolLifecycle::Completed => format!("Ran {name}"),
-                    ToolLifecycle::Failed => format!("{name} failed"),
-                };
-                let summary = tool
-                    .context
-                    .as_deref()
-                    .filter(|context| !context.trim().is_empty())
-                    .map_or(action.clone(), |context| format!("{action} · {context}"));
-                let summary = match detail {
-                    TranscriptDetail::Compact => {
-                        truncate_display(&summary, width.saturating_sub(2).max(1))
-                    }
-                    TranscriptDetail::Expanded => summary,
-                };
-                let failed = tool.lifecycle == ToolLifecycle::Failed;
-                push_prefixed_lines(
-                    &mut lines,
-                    &summary,
-                    if failed { "× " } else { "• " },
-                    "  ",
-                    Style::default().fg(if failed { RED } else { DIM }),
-                    Style::default()
-                        .fg(if failed { RED } else { TEXT })
-                        .add_modifier(Modifier::BOLD),
-                    width,
-                );
+                push_tool_summary(&mut lines, tool, width, detail);
                 let output_width = width.saturating_sub(tool_output_gutter(width));
                 let output = match detail {
                     TranscriptDetail::Compact => compact_tool_output(&tool.output, output_width),
@@ -1543,8 +1518,8 @@ fn render_transcript_entries(
                 push_prefixed_lines(
                     &mut lines,
                     "todo",
-                    "• ",
-                    "  ",
+                    "",
+                    "",
                     Style::default().fg(DIM),
                     Style::default().fg(DIM).add_modifier(Modifier::BOLD),
                     width,
@@ -1552,26 +1527,26 @@ fn render_transcript_entries(
                 for item in items {
                     let (marker, continuation, marker_style, body_style) = match item.status {
                         TodoStatus::Completed => (
-                            "  [x] ",
-                            "      ",
+                            "[x] ",
+                            "    ",
                             Style::default().fg(DIM),
                             Style::default().fg(DIM),
                         ),
                         TodoStatus::InProgress => (
-                            "  [>] ",
-                            "      ",
+                            "[>] ",
+                            "    ",
                             Style::default().fg(ACCENT),
                             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                         ),
                         TodoStatus::Pending => (
-                            "  [ ] ",
-                            "      ",
+                            "[ ] ",
+                            "    ",
                             Style::default().fg(TEXT),
                             Style::default().fg(TEXT),
                         ),
                         TodoStatus::Cancelled => (
-                            "  [-] ",
-                            "      ",
+                            "[-] ",
+                            "    ",
                             Style::default().fg(DIM),
                             Style::default().fg(DIM),
                         ),
@@ -1602,8 +1577,8 @@ fn render_transcript_entries(
             } => push_prefixed_lines(
                 &mut lines,
                 &format!("{label} · {body}"),
-                "• ",
-                "  ",
+                "",
+                "",
                 Style::default().fg(DIM),
                 Style::default().fg(DIM),
                 width,
@@ -1611,8 +1586,8 @@ fn render_transcript_entries(
             TranscriptEntry::Notice { label: None, body } => push_prefixed_lines(
                 &mut lines,
                 body,
-                "• ",
-                "  ",
+                "",
+                "",
                 Style::default().fg(DIM),
                 Style::default().fg(DIM),
                 width,
@@ -1632,6 +1607,68 @@ pub(crate) fn reset_transcript_render_calls() {
 #[cfg(test)]
 pub(crate) fn transcript_render_calls() -> usize {
     TRANSCRIPT_RENDER_CALLS.with(Cell::get)
+}
+
+fn push_tool_summary(
+    lines: &mut Vec<Line<'static>>,
+    tool: &super::ToolTranscript,
+    width: usize,
+    detail: TranscriptDetail,
+) {
+    let name = tool_name(&tool.name);
+    let name_width = display_width(&name);
+    let name_style = text_style().add_modifier(Modifier::BOLD);
+    let context = tool
+        .context
+        .as_deref()
+        .map(single_line_text)
+        .filter(|context| !context.trim().is_empty());
+    let (status, color) = match tool.lifecycle {
+        ToolLifecycle::Running => ("running", ACCENT),
+        ToolLifecycle::Completed => ("done", GREEN),
+        ToolLifecycle::Failed => ("failed", RED),
+    };
+    let status_style = Style::default().fg(color);
+    let status_width = display_width(status);
+    let path_context = matches!(name.as_str(), "read" | "write");
+    let truncate_context = |value: &str, available| {
+        if path_context {
+            truncate_display_left(value, available)
+        } else {
+            truncate_display(value, available)
+        }
+    };
+    let mut inline_context = false;
+    if name_width.saturating_add(status_width).saturating_add(2) <= width {
+        let mut heading = Line::from(Span::styled(name, name_style));
+        let available = width.saturating_sub(name_width + status_width + 4);
+        if let Some(context) = &context
+            && available > 0
+            && (detail == TranscriptDetail::Compact || display_width(context) <= available)
+        {
+            heading.spans.push(Span::raw("  "));
+            heading.spans.push(Span::styled(
+                truncate_context(context, available),
+                text_style(),
+            ));
+            inline_context = true;
+        }
+        heading.spans.push(Span::raw(
+            " ".repeat(width - heading.width() - status_width),
+        ));
+        heading.spans.push(Span::styled(status, status_style));
+        lines.push(heading);
+    } else {
+        push_prefixed_lines(lines, &name, "", "", name_style, name_style, width);
+        push_prefixed_lines(lines, status, "", "", status_style, status_style, width);
+    }
+    if !inline_context && let Some(context) = context {
+        let context = match detail {
+            TranscriptDetail::Compact => truncate_context(&context, width),
+            TranscriptDetail::Expanded => context.into_owned(),
+        };
+        push_prefixed_lines(lines, &context, "", "", text_style(), text_style(), width);
+    }
 }
 
 fn compact_tool_output(output: &str, width: usize) -> Vec<String> {
@@ -1705,7 +1742,7 @@ fn push_tool_output_lines(lines: &mut Vec<Line<'static>>, output: Vec<String>, w
 }
 
 fn tool_output_gutter(width: usize) -> usize {
-    if width >= 6 { 4 } else { 0 }
+    if width >= 4 { 2 } else { 0 }
 }
 
 pub(crate) fn render_transcript_view(
@@ -1769,29 +1806,6 @@ pub(crate) fn render_transcript_view(
                 1,
             ),
         );
-    }
-}
-
-fn push_markdown_lines(lines: &mut Vec<Line<'static>>, body: &str, width: usize) {
-    if width == 0 {
-        return;
-    }
-    let gutter = if width >= 4 { 2 } else { 0 };
-    let mut markdown = markdown_lines(body, width - gutter);
-    if markdown.is_empty() {
-        markdown.push(Line::default());
-    }
-    for (index, mut line) in markdown.into_iter().enumerate() {
-        if gutter > 0 {
-            line.spans.insert(
-                0,
-                Span::styled(
-                    if index == 0 { "• " } else { "  " },
-                    Style::default().fg(DIM),
-                ),
-            );
-        }
-        lines.push(line);
     }
 }
 
@@ -1916,6 +1930,7 @@ pub(crate) fn for_each_wrapped_line(value: &str, width: usize, mut visit: impl F
 }
 
 fn tool_name(label: &str) -> String {
+    let label = single_line_text(label);
     let mut parts = label.split('/').map(str::trim);
     let first = parts.next().unwrap_or("tool");
     let name = if first.eq_ignore_ascii_case("tool") {
@@ -1940,6 +1955,115 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn startup_version_never_displaces_workspace_model_or_mode() {
+        let project = "~/src/界-workspace";
+        let model = "model-α";
+        let normal = startup_lines("1.2.3", model, project, ExecutionMode::Supervised, 96);
+        let rows = plain(&normal);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].contains(project));
+        assert!(rows[0].ends_with("v1.2.3"));
+        assert!(rows[1].contains(model));
+        assert!(rows[1].ends_with("supervised"));
+
+        let long_version = "界\x1b[31m\n".repeat(100);
+        assert_eq!(
+            startup_lines(&long_version, model, project, ExecutionMode::Supervised, 96),
+            startup_lines("", model, project, ExecutionMode::Supervised, 96),
+        );
+        let long_project = format!("{}/workspace", "界/e\u{301}".repeat(100));
+        let long_model = "model-α".repeat(100);
+        for width in [24, 48, 72, 96] {
+            let lines = startup_lines(
+                "1.2.3",
+                &long_model,
+                &long_project,
+                ExecutionMode::Supervised,
+                width,
+            );
+            let rows = plain(&lines);
+            assert!(lines.iter().all(|line| line.width() <= width));
+            assert_eq!(rows.len(), 2);
+            assert!(rows[0].ends_with("/workspace"));
+            assert!(rows[1].ends_with("supervised"));
+            assert!(!rows.concat().contains("v1.2.3"));
+        }
+    }
+
+    #[test]
+    fn tiny_startup_preserves_the_complete_safety_mode() {
+        for mode in [
+            ExecutionMode::Supervised,
+            ExecutionMode::Auto,
+            ExecutionMode::Yolo,
+        ] {
+            for width in 1..24 {
+                let lines = startup_lines("9.9.9", "long-model-name", "~/workspace", mode, width);
+                assert!(lines.iter().all(|line| line.width() <= width));
+                assert!(plain(&lines).concat().ends_with(mode_label(mode)));
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_tool_summaries_keep_lifecycle_and_expanded_context() {
+        for (lifecycle, status) in [
+            (ToolLifecycle::Running, "running"),
+            (ToolLifecycle::Completed, "done"),
+            (ToolLifecycle::Failed, "failed"),
+        ] {
+            let context = format!("{}/end.rs", "long/path/".repeat(8));
+            let entry = TranscriptEntry::ToolCall(super::super::ToolTranscript {
+                call_id: None,
+                name: "read".into(),
+                context: Some(context.clone()),
+                output: String::new(),
+                lifecycle,
+            });
+            for width in 1..32 {
+                for detail in [TranscriptDetail::Compact, TranscriptDetail::Expanded] {
+                    let lines = transcript_lines(std::slice::from_ref(&entry), width, detail);
+                    let text = plain(&lines).concat();
+                    assert!(lines.iter().all(|line| line.width() <= width));
+                    assert!(text.contains(status), "width {width}: {text}");
+                    if detail == TranscriptDetail::Expanded {
+                        assert!(text.contains(&context));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failed_reads_and_display_load_diagnostics_keep_compact_output() {
+        let entries = [
+            TranscriptEntry::ToolCall(super::super::ToolTranscript {
+                call_id: None,
+                name: "read".into(),
+                context: Some("private.txt".into()),
+                output: "initial detail\nread attempt\npermission denied\nno content read".into(),
+                lifecycle: ToolLifecycle::Failed,
+            }),
+            TranscriptEntry::ToolCall(super::super::ToolTranscript {
+                call_id: None,
+                name: "read".into(),
+                context: Some("large.txt".into()),
+                output: "fallback detail\n[display output unavailable: invalid checksum]\n".into(),
+                lifecycle: ToolLifecycle::Completed,
+            }),
+        ];
+        let compact = plain(&transcript_lines(&entries, 80, TranscriptDetail::Compact)).join("\n");
+        assert!(compact.contains("permission denied"));
+        assert!(compact.contains("no content read"));
+        assert!(compact.contains("[display output unavailable: invalid checksum]"));
+        let expanded =
+            plain(&transcript_lines(&entries, 80, TranscriptDetail::Expanded)).join("\n");
+        assert!(expanded.contains("initial detail"));
+        assert!(expanded.contains("read attempt"));
+        assert!(expanded.contains("fallback detail"));
     }
 
     #[test]
@@ -1986,7 +2110,7 @@ mod tests {
         ));
         let output = rows[1..rows.len() - 1]
             .iter()
-            .map(|row| row.strip_prefix("    ").unwrap())
+            .map(|row| row.strip_prefix("  ").unwrap())
             .collect::<Vec<_>>();
         assert_eq!(output, source.split('\n').collect::<Vec<_>>());
         assert_eq!(hard_wrap("a bcd.", 5).concat(), "a bcd.");
@@ -2059,7 +2183,7 @@ mod tests {
         let hostile = "界👨‍👩‍👧‍👦e\u{301}\x1b[31m red\x07";
         let entries = [
             TranscriptEntry::Startup {
-                version: "1.0".into(),
+                version: hostile.into(),
                 model: hostile.into(),
                 project: hostile.into(),
                 mode: ExecutionMode::Supervised,
@@ -2073,6 +2197,13 @@ mod tests {
                 ),
             },
             tool(hostile),
+            TranscriptEntry::ToolCall(super::super::ToolTranscript {
+                call_id: None,
+                name: format!("tool/{hostile}"),
+                context: Some(hostile.into()),
+                output: hostile.into(),
+                lifecycle: ToolLifecycle::Running,
+            }),
             TranscriptEntry::Error {
                 body: hostile.into(),
             },
