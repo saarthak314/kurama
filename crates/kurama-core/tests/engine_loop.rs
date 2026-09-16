@@ -18,7 +18,7 @@ use kurama_core::{
 use kurama_protocol::{
     agent::{AgentBudget, AgentSnapshot, AgentSpec, AgentState, DelegationRequest, WriteScope},
     id::{CallId, OperationId, SessionId},
-    model::{BackendCapabilities, FinishReason, ModelEvent, ModelProfile, ModelRequest},
+    model::{BackendCapabilities, FinishReason, ModelEvent, ModelItem, ModelProfile, ModelRequest},
     policy::{ApprovalResponse, AutoBoundaries, ExecutionMode, PolicyContext, PolicyDecision},
     runtime::RuntimeEvent,
     session::{EventEnvelope, FileCheckpoint, SessionEvent, SessionMetadata},
@@ -117,6 +117,257 @@ fn seed_replay(store: &MemoryStore, replay: &[EventEnvelope]) {
     for event in replay {
         store.append(event).expect("seed replay event");
     }
+}
+
+struct RecordingBackend {
+    inner: ScriptedBackend,
+    requests: Mutex<Vec<ModelRequest>>,
+}
+
+impl ModelBackend for RecordingBackend {
+    fn backend_name(&self) -> &'static str {
+        self.inner.backend_name()
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: ModelRequest,
+        cancel: &'a dyn CancelSignal,
+    ) -> BoxFuture<'a, Result<ModelStream, kurama_protocol::KuramaError>> {
+        self.requests
+            .lock()
+            .expect("requests lock")
+            .push(request.clone());
+        self.inner.stream(request, cancel)
+    }
+}
+
+fn completed_compaction_turns() -> Vec<EventEnvelope> {
+    ["A", "B", "C", "D", "E"]
+        .into_iter()
+        .enumerate()
+        .flat_map(|(turn, name)| {
+            let sequence = turn as u64 * 3;
+            [
+                replay_event(sequence, SessionEvent::UserMessage { text: name.into() }),
+                replay_event(
+                    sequence + 1,
+                    SessionEvent::AssistantMessage {
+                        text: format!("decision {name}"),
+                    },
+                ),
+                replay_event(sequence + 2, SessionEvent::TurnCompleted),
+            ]
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn repeated_engine_compaction_preserves_the_first_decision_in_later_context() {
+    let first_summary = serde_json::json!({
+        "summary": "completed A", "decisions": ["decision A"],
+        "open_tasks": [], "files": [], "operation_ids": []
+    })
+    .to_string();
+    let second_summary = serde_json::json!({
+        "summary": "completed A and B", "decisions": ["decision A", "decision B"],
+        "open_tasks": [], "files": [], "operation_ids": []
+    })
+    .to_string();
+    let backend = Arc::new(RecordingBackend {
+        inner: ScriptedBackend::new(
+            [
+                first_summary,
+                "F complete".into(),
+                second_summary,
+                "G complete".into(),
+            ]
+            .into_iter()
+            .map(|text| {
+                vec![
+                    Ok(ModelEvent::TextDelta { text }),
+                    Ok(ModelEvent::ResponseCompleted {
+                        cursor: None,
+                        finish_reason: FinishReason::Stop,
+                    }),
+                ]
+            })
+            .collect(),
+        ),
+        requests: Mutex::new(Vec::new()),
+    });
+    let replay = completed_compaction_turns();
+    let store = Arc::new(MemoryStore::default());
+    seed_replay(&store, &replay);
+    let mut config = resume_config(store.clone(), Vec::new(), Arc::new(AllowAllPolicy));
+    config.backend = backend.clone();
+    let (handle, mut events) = Engine::spawn(config, replay).expect("spawn engine");
+    for (compaction_index, next_turn) in ["F", "G"].into_iter().enumerate() {
+        handle.compact().await.expect("request compaction");
+        loop {
+            match events.recv().await.expect("compaction event") {
+                RuntimeEvent::Status { .. } => {
+                    let completed = store
+                        .replay(&SessionId::from("resume"))
+                        .expect("compacted replay")
+                        .iter()
+                        .filter(|event| {
+                            matches!(event.event, SessionEvent::ContextCompacted { .. })
+                        })
+                        .count();
+                    if completed == compaction_index + 1 {
+                        break;
+                    }
+                }
+                RuntimeEvent::Error { message } => panic!("compaction error: {message}"),
+                _ => {}
+            }
+        }
+        handle
+            .submit(next_turn, false)
+            .await
+            .expect("submit next turn");
+        loop {
+            match events.recv().await.expect("runtime event") {
+                RuntimeEvent::TurnCompleted => break,
+                RuntimeEvent::Error { message } => panic!("engine error: {message}"),
+                _ => {}
+            }
+        }
+    }
+    handle.shutdown().await.expect("shutdown");
+
+    let requests = backend.requests.lock().expect("requests lock");
+    assert_eq!(
+        requests.len(),
+        4,
+        "only explicit compactions and submitted turns call the backend"
+    );
+    let second = &requests[2];
+    let second_input = serde_json::to_string(&second.items).expect("model input");
+    assert_eq!(second_input.matches("decision A").count(), 1);
+    assert!(second_input.contains("decision B"));
+    assert!(!second.system.contains("decision A"));
+    assert!(!second_input.contains("decision C"));
+    assert!(requests[3].items.iter().any(|item| matches!(
+        item,
+        ModelItem::Summary { text, covered_through_sequence: 5, .. }
+            if text.contains("decision A") && text.contains("decision B")
+    )));
+    let later_users: Vec<_> = requests[3]
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ModelItem::User { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(later_users, vec!["C", "D", "E", "F", "G"]);
+
+    let durable = store.replay(&SessionId::from("resume")).expect("replay");
+    let summaries: Vec<_> = durable
+        .iter()
+        .filter_map(|event| match &event.event {
+            SessionEvent::ContextCompacted {
+                covered_through_sequence,
+                summary,
+                ..
+            } => Some((event.sequence, *covered_through_sequence, summary)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(summaries.len(), 2);
+    assert_eq!(summaries[0].1, 2);
+    assert_eq!(summaries[1].1, 5);
+    assert!(
+        summaries[0].0 > summaries[1].1,
+        "prior summary is outside the new prefix"
+    );
+    let mut context = ContextManager::new(ContextPolicy::default());
+    context.replay(durable);
+    let assembled = context
+        .assemble(
+            &ModelProfile::new("test", "frontier", 4_000, 500),
+            Vec::new(),
+            false,
+            ".",
+        )
+        .expect("assemble replayed summaries");
+    assert!(assembled.request.items.iter().any(|item| matches!(
+        item,
+        ModelItem::Summary { text, covered_through_sequence: 5, .. } if text.contains("decision A")
+    )));
+}
+
+#[tokio::test]
+async fn compaction_overflow_preserves_the_previous_summary_and_coverage() {
+    let summary = format!("decision A: {}", "retained fact ".repeat(2_000));
+    let mut replay = completed_compaction_turns();
+    replay.extend([
+        replay_event(
+            15,
+            SessionEvent::ContextCompacted {
+                covered_through_sequence: 2,
+                summary: summary.clone(),
+                tokens: 1,
+            },
+        ),
+        replay_event(16, SessionEvent::UserMessage { text: "F".into() }),
+        replay_event(17, SessionEvent::TurnCompleted),
+    ]);
+    let store = Arc::new(MemoryStore::default());
+    seed_replay(&store, &replay);
+    let backend = Arc::new(RecordingBackend {
+        inner: ScriptedBackend::new(Vec::new()),
+        requests: Mutex::new(Vec::new()),
+    });
+    let mut config = resume_config(store.clone(), Vec::new(), Arc::new(AllowAllPolicy));
+    config.backend = backend.clone();
+    let (handle, mut events) = Engine::spawn(config, replay).expect("spawn engine");
+    handle
+        .compact()
+        .await
+        .expect("request oversized compaction");
+    loop {
+        match events.recv().await.expect("runtime event") {
+            RuntimeEvent::Error { .. } => break,
+            RuntimeEvent::Shutdown => panic!("engine stopped instead of rejecting compaction"),
+            _ => {}
+        }
+    }
+    handle.shutdown().await.expect("shutdown");
+    assert!(backend.requests.lock().expect("requests lock").is_empty());
+    let durable = store.replay(&SessionId::from("resume")).expect("replay");
+    let summaries: Vec<_> = durable
+        .iter()
+        .filter_map(|event| match &event.event {
+            SessionEvent::ContextCompacted {
+                covered_through_sequence,
+                summary,
+                ..
+            } => Some((*covered_through_sequence, summary.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(summaries, vec![(2, summary.as_str())]);
+    let mut context = ContextManager::new(ContextPolicy::default());
+    context.replay(durable);
+    let assembled = context
+        .assemble(
+            &ModelProfile::new("test", "larger", 128_000, 8_000),
+            Vec::new(),
+            false,
+            ".",
+        )
+        .expect("assemble preserved summary with a larger model");
+    assert!(assembled.request.items.iter().any(|item| matches!(
+        item,
+        ModelItem::Summary { text, covered_through_sequence: 2, .. } if text == &summary
+    )));
 }
 
 struct StagedOutputTool {

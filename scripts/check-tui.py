@@ -10,6 +10,7 @@ terminal-emulator window capture. This is a POSIX-only development gate.
 import argparse
 import copy
 import fcntl
+import hashlib
 import http.server
 import json
 import os
@@ -210,13 +211,34 @@ def image(screen, path):
 
 class Fixture(http.server.BaseHTTPRequestHandler):
     calls = 0
+    compaction_inputs = []
 
     def log_message(self, *args):
         pass
 
     def do_POST(self):
-        self.rfile.read(int(self.headers["Content-Length"]))
-        type(self).calls += 1
+        request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        messages = request.get("messages", [])
+        system = next(
+            (
+                message.get("content", "")
+                for message in messages
+                if message.get("role") == "system"
+            ),
+            "",
+        )
+        is_compaction = str(system).startswith("Compact the supplied")
+        latest_user = next(
+            (
+                message.get("content", "")
+                for message in reversed(messages)
+                if message.get("role") == "user"
+            ),
+            "",
+        )
+        advancing = latest_user == "advance compaction fixture"
+        if not is_compaction and not advancing:
+            type(self).calls += 1
         call = type(self).calls
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -231,7 +253,28 @@ class Fixture(http.server.BaseHTTPRequestHandler):
             self.wfile.write(("data: " + json.dumps(data) + "\n\n").encode())
             self.wfile.flush()
 
-        if call < 3:
+        if is_compaction:
+            retained = "COMP_KEEP_ALPHA" in json.dumps(request)
+            type(self).compaction_inputs.append(retained)
+            summary = "COMP_KEEP_ALPHA" if retained else "PRIOR_DECISION_MISSING"
+            event(
+                {
+                    "content": json.dumps(
+                        {
+                            "summary": summary,
+                            "decisions": [summary],
+                            "open_tasks": [],
+                            "files": [],
+                            "operation_ids": [],
+                        }
+                    )
+                }
+            )
+            event({}, "stop")
+        elif advancing:
+            event({"content": "COMPACTION_ADVANCED"})
+            event({}, "stop")
+        elif call < 3:
             name = "read" if call == 1 else "write"
             args = (
                 {"files": [{"path": "input.txt", "start_line": 1, "end_line": 10}]}
@@ -273,6 +316,22 @@ def main():
     parser.add_argument("--no-cpr", action="store_true")
     parser.add_argument("--seed-todos", action="store_true")
     parser.add_argument(
+        "--torn-tail",
+        action="store_true",
+        help="Resume a session with an incomplete final log record",
+    )
+    parser.add_argument(
+        "--seed-large-output-mib",
+        type=int,
+        default=0,
+        help="Resume a tool display blob of this size and exercise full-output expansion",
+    )
+    parser.add_argument(
+        "--check-compaction",
+        action="store_true",
+        help="Compact twice and require the first decision in both model requests",
+    )
+    parser.add_argument(
         "--no-images", action="store_true", help="Skip optional Pillow screenshots"
     )
     parser.add_argument(
@@ -281,12 +340,20 @@ def main():
         help="Record old history behavior without requiring preservation",
     )
     args = parser.parse_args()
+    if args.seed_large_output_mib < 0:
+        parser.error("--seed-large-output-mib cannot be negative")
+    seed_session = (
+        args.seed_todos
+        or args.torn_tail
+        or args.seed_large_output_mib > 0
+        or args.check_compaction
+    )
     output_dir = Path(args.output).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Fixture)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    result = {"frames": [], "findings": {}}
+    result = {"frames": [], "findings": {}, "resources": {}}
     with tempfile.TemporaryDirectory(prefix="kurama-tui-") as temp:
         root = Path(temp)
         state = root / ".kurama"
@@ -305,7 +372,7 @@ max_output_tokens = 4000
 kind = "json"
 endpoint = "http://127.0.0.1:9/search"
 """)
-        if args.seed_todos:
+        if seed_session:
             directory = state / "sessions" / "ui-session"
             directory.mkdir(parents=True)
             metadata = {
@@ -317,15 +384,98 @@ endpoint = "http://127.0.0.1:9/search"
                 "redaction_best_effort": False,
             }
             (directory / "metadata.json").write_text(json.dumps(metadata))
-            items = [
-                {"id": str(index), "content": f"task {index}", "status": "pending"}
-                for index in range(20)
-            ]
-            initial = [
-                {"type": "session_started", "metadata": metadata},
-                {"type": "todo_updated", "items": items},
-                {"type": "turn_completed"},
-            ]
+            initial = [{"type": "session_started", "metadata": metadata}]
+            if args.seed_todos:
+                items = [
+                    {"id": str(index), "content": f"task {index}", "status": "pending"}
+                    for index in range(20)
+                ]
+                initial.append({"type": "todo_updated", "items": items})
+            if args.seed_large_output_mib:
+                size = args.seed_large_output_mib * 1024 * 1024
+                line = b"large historical command output " + b"x" * 64 + b"\n"
+                first = b"LARGE_HEAD_MARKER\n"
+                last = b"\nLARGE_TAIL_MARKER\n"
+                middle_size = size - len(first) - len(last)
+                payload = (
+                    first
+                    + (line * ((middle_size + len(line) - 1) // len(line)))[
+                        :middle_size
+                    ]
+                    + last
+                )
+                digest = hashlib.sha256(payload).hexdigest()
+                blobs = state / "blobs"
+                blobs.mkdir()
+                (blobs / digest).write_bytes(payload)
+                reference = {"sha256": digest, "bytes": len(payload)}
+                result["resources"]["seed_blob_bytes"] = len(payload)
+                initial.extend(
+                    [
+                        {"type": "user_message", "text": "Historical command output"},
+                        {
+                            "type": "tool_proposed",
+                            "operation_id": "seed-operation",
+                            "call_id": "seed-call",
+                            "operation": {
+                                "type": "bash",
+                                "command": "printf historical",
+                                "cwd": str(root.resolve()),
+                                "class": "read_only",
+                                "timeout_ms": 1000,
+                            },
+                        },
+                        {
+                            "type": "tool_invocation_recorded",
+                            "operation_id": "seed-operation",
+                            "invocation": {
+                                "call_id": "seed-call",
+                                "name": "bash",
+                                "arguments": {
+                                    "command": "printf historical",
+                                    "timeout_ms": 1000,
+                                },
+                            },
+                        },
+                        {"type": "tool_prepared", "operation_id": "seed-operation"},
+                        {"type": "tool_started", "operation_id": "seed-operation"},
+                        {
+                            "type": "tool_completed",
+                            "operation_id": "seed-operation",
+                            "result": {
+                                "call_id": "seed-call",
+                                "output": "Historical output is stored in a display blob.",
+                                "is_error": False,
+                                "truncated": True,
+                                "blob_refs": [],
+                                "metadata": {
+                                    "tool_name": "bash",
+                                    "display_blobs": {"output": reference},
+                                },
+                            },
+                        },
+                        {
+                            "type": "assistant_message",
+                            "text": "Historical command completed.",
+                        },
+                    ]
+                )
+                del payload
+            initial.append({"type": "turn_completed"})
+            if args.check_compaction:
+                for index in range(5):
+                    initial.extend(
+                        [
+                            {
+                                "type": "user_message",
+                                "text": "COMP_KEEP_ALPHA"
+                                if index == 0
+                                else f"Historical turn {index}",
+                            },
+                            {"type": "assistant_message", "text": "Recorded."},
+                            {"type": "turn_completed"},
+                        ]
+                    )
             (directory / "events.jsonl").write_text(
                 "".join(
                     json.dumps(
@@ -342,6 +492,9 @@ endpoint = "http://127.0.0.1:9/search"
                     for sequence, event in enumerate(initial)
                 )
             )
+            if args.torn_tail:
+                with (directory / "events.jsonl").open("ab") as log:
+                    log.write(b'{"schema_version":1')
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 36, 100, 0, 0))
         command = [
@@ -351,12 +504,13 @@ endpoint = "http://127.0.0.1:9/search"
             "fixture-shell",
             str(Path(args.binary).resolve()),
         ]
-        if args.seed_todos:
+        if seed_session:
             command.extend(["--resume", "ui-session"])
         environment = dict(
             os.environ, HOME=str(root), TERM="xterm-256color", COLORTERM="truecolor"
         )
         environment.pop("NO_COLOR", None)
+        started = time.monotonic()
         process = subprocess.Popen(
             command,
             cwd=root,
@@ -396,7 +550,10 @@ endpoint = "http://127.0.0.1:9/search"
                 pump(0.03)
                 if predicate():
                     return
-                if time.monotonic() > deadline or process.poll() is not None:
+                exited = process.poll() is not None
+                if exited and predicate():
+                    return
+                if time.monotonic() > deadline or exited:
                     raise RuntimeError(
                         "terminal condition failed:\n" + "\n".join(screen.display)
                     )
@@ -404,6 +561,15 @@ endpoint = "http://127.0.0.1:9/search"
         def send(text):
             os.write(master, text if isinstance(text, bytes) else text.encode())
             pump(0.15)
+
+        def rss_kib():
+            measured = subprocess.run(
+                ["ps", "-o", "rss=", "-p", str(process.pid)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return int(measured.stdout.strip())
 
         def capture(name):
             pump(0.15)
@@ -437,12 +603,41 @@ endpoint = "http://127.0.0.1:9/search"
             os.killpg(process.pid, signal.SIGWINCH)
             pump(0.25)
 
+        def compacted_events():
+            data = (state / "sessions" / "ui-session" / "events.jsonl").read_bytes()
+            events = [
+                json.loads(line)
+                for line in data.splitlines(keepends=True)
+                if line.endswith(b"\n")
+            ]
+            return [
+                event["event"]
+                for event in events
+                if event["event"]["type"] == "context_compacted"
+            ]
+
         try:
             wait_for(lambda: "Ask Kurama" in "\n".join(screen.display))
+            result["resources"]["ready_ms"] = (time.monotonic() - started) * 1000
+            result["resources"]["startup_rss_kib"] = rss_kib()
             capture("startup")
             result["findings"]["shell_history_preserved_at_start"] = (
                 "SHELL_HISTORY_MARKER" in screen.all_text()
             )
+            if args.seed_large_output_mib:
+                assert "LARGE_TAIL_MARKER" in screen.all_text()
+                send(b"\x0f")
+                send(b"\x1b[H")
+                wait_for(lambda: "LARGE_HEAD_MARKER" in "\n".join(screen.display))
+                capture("large-output-expanded")
+                result["resources"]["expanded_rss_kib"] = rss_kib()
+                send(b"\x1b[F")
+                wait_for(lambda: "LARGE_TAIL_MARKER" in "\n".join(screen.display))
+                send(b"\x1b")
+                wait_for(lambda: "Ask Kurama" in "\n".join(screen.display))
+                capture("large-output-collapsed")
+                result["resources"]["collapsed_rss_kib"] = rss_kib()
+                result["findings"]["full_blob_accessible_on_expansion"] = True
             if args.seed_todos:
                 send(b"\x14")
                 send(b"\x1b[F")
@@ -455,6 +650,19 @@ endpoint = "http://127.0.0.1:9/search"
                 send(b"\x1b")
                 resize(100, 36)
                 result["findings"]["todo_first_and_last_accessible"] = True
+            if args.check_compaction:
+                send("/compact\r")
+                wait_for(lambda: len(compacted_events()) == 1)
+                send("advance compaction fixture\r")
+                wait_for(lambda: "COMPACTION_ADVANCED" in screen.all_text())
+                send("/compact\r")
+                wait_for(lambda: len(compacted_events()) == 2)
+                assert Fixture.compaction_inputs == [True, True], (
+                    Fixture.compaction_inputs
+                )
+                assert "COMP_KEEP_ALPHA" in compacted_events()[-1]["summary"]
+                capture("repeated-compaction")
+                result["findings"]["prior_decision_survived_two_compactions"] = True
             send("/")
             capture("command-menu")
             send(b"\x1b")
@@ -501,8 +709,21 @@ endpoint = "http://127.0.0.1:9/search"
             ]
             result["findings"]["tools_completed_without_error"] = len(
                 completions
-            ) == 2 and all(not result["is_error"] for result in completions)
+            ) == 2 + int(args.seed_large_output_mib > 0) and all(
+                not result["is_error"] for result in completions
+            )
             assert result["findings"]["tools_completed_without_error"], completions
+            if args.torn_tail:
+                repairs = [
+                    event
+                    for event in events
+                    if event["event"]["type"] == "recovery_repair"
+                ]
+                assert len(repairs) == 1, repairs
+                assert [event["sequence"] for event in events] == list(
+                    range(len(events))
+                )
+                result["findings"]["repaired_session_continued_once"] = True
             result["findings"]["scrollback_purges"] = bytes(raw).count(b"\x1b[3J")
             result["findings"]["shell_history_preserved_at_end"] = (
                 "SHELL_HISTORY_MARKER" in screen.all_text()
@@ -531,6 +752,7 @@ endpoint = "http://127.0.0.1:9/search"
                 "frames": len(result["frames"]),
                 **result.get("findings", {}),
                 "exit": result.get("exit_code"),
+                "resources": result["resources"],
             }
         )
     )

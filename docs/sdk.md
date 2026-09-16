@@ -105,6 +105,10 @@ Duplicate model profile or tool names, missing required components, an unavailab
 
 `SessionStore::append` retains explicit-sequence validation. `append_next(&mut EventEnvelope)` assigns and commits the next sequence, returning that sequence in the envelope. The child engine and agent manager use this shared allocator because they interleave events in one child log. Filesystem and memory stores allocate under their storage lock without full replay. Existing custom stores inherit a compatibility implementation that serializes replay-plus-append within this process; override it with a transaction or shared storage lock for cross-process writers or efficient allocation. Store wrappers should forward `append_next` to the underlying allocator. Do not mix uncoordinated explicit-sequence appends with allocated appends to the same log.
 
+Replay results must include any repair event committed during that replay so callers can append immediately from the returned sequence. `FsSessionStore::get_blob_tail(reference, max_bytes)` is an inherent filesystem helper, not a new `SessionStore` requirement: it verifies the complete blob stream and returns only its bounded suffix. `get_blob` still returns fully verified content.
+
+Direct `kurama-core` compaction integrations now consume `CompactionRequest.items` rather than serializing an `events` field. These model-ready items include the prior summary as data plus newly covered events; do not omit the summary when constructing the backend request. The `Agent`/`Handle` embedding entry points are unchanged.
+
 ## Providers and Tools
 
 First-party adapters cover OpenAI, Anthropic, OpenAI-compatible HTTP endpoints, Codex CLI, and Claude CLI. The provider factory consumes non-secret profile configuration plus credentials resolved outside the protocol boundary.

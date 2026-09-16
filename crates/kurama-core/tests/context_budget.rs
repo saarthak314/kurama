@@ -1,4 +1,4 @@
-use kurama_core::context::{ContextManager, ContextPolicy};
+use kurama_core::context::{CompactionRequest, ContextManager, ContextPolicy, estimate_text};
 use kurama_protocol::{
     id::{CallId, OperationId, SessionId},
     model::{ModelItem, ModelProfile},
@@ -12,6 +12,17 @@ use serde_json::json;
 
 fn event(sequence: u64, event: SessionEvent) -> EventEnvelope {
     EventEnvelope::new(sequence, sequence, SessionId::from("session"), None, event)
+}
+
+fn compaction_events(request: &CompactionRequest) -> Vec<EventEnvelope> {
+    request
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ModelItem::User { text } => Some(serde_json::from_str(text).expect("durable events")),
+            _ => None,
+        })
+        .expect("new compaction events")
 }
 
 fn long_session() -> Vec<EventEnvelope> {
@@ -242,6 +253,134 @@ fn compaction_preserves_canonical_events() {
     manager.apply_compaction(request.covered_through_sequence, "facts".into(), 2);
     assert_eq!(manager.canonical_event_count(), events.len());
     assert_eq!(manager.report().summary_tokens, 2);
+}
+
+#[test]
+fn repeated_compaction_carries_summary_outside_the_new_prefix() {
+    let mut manager = ContextManager::new(ContextPolicy::default());
+    for (turn, name) in ["A", "B", "C", "D", "E"].into_iter().enumerate() {
+        let sequence = turn as u64 * 3;
+        manager.record(event(
+            sequence,
+            SessionEvent::UserMessage { text: name.into() },
+        ));
+        manager.record(event(
+            sequence + 1,
+            SessionEvent::AssistantMessage {
+                text: format!("decision {name}"),
+            },
+        ));
+        manager.record(event(sequence + 2, SessionEvent::TurnCompleted));
+    }
+    let first = manager.compaction_request().expect("compact A");
+    assert_eq!(first.covered_through_sequence, 2);
+    let summary = format!("decision A: {}", "durable detail ".repeat(80));
+    manager.record(event(
+        15,
+        SessionEvent::ContextCompacted {
+            covered_through_sequence: first.covered_through_sequence,
+            summary: summary.clone(),
+            // Estimates must measure the actual input, not trust stored counts.
+            tokens: 1,
+        },
+    ));
+    assert!(manager.compaction_request().is_none());
+    manager.record(event(16, SessionEvent::UserMessage { text: "F".into() }));
+    manager.record(event(
+        17,
+        SessionEvent::AssistantMessage {
+            text: "decision F".into(),
+        },
+    ));
+    manager.record(event(18, SessionEvent::TurnCompleted));
+
+    let second = manager
+        .compaction_request()
+        .expect("compact B with A summary");
+    assert_eq!(second.covered_through_sequence, 5);
+    assert_eq!(
+        compaction_events(&second)
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5]
+    );
+    assert!(matches!(
+        &second.items[0],
+        ModelItem::Summary { text, covered_through_sequence: 2, .. } if text == &summary
+    ));
+    let input = serde_json::to_string(&second.items).expect("serialize model data");
+    assert_eq!(input.matches("decision A").count(), 1);
+    assert!(!second.prompt.contains("decision A"));
+    assert!(second.estimated_tokens >= estimate_text(&summary));
+
+    let assembled = manager
+        .assemble(
+            &ModelProfile::new("test", "frontier", 128_000, 8_000),
+            Vec::new(),
+            false,
+            ".",
+        )
+        .expect("assemble retained turns");
+    let users: Vec<_> = assembled
+        .request
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ModelItem::User { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(users, vec!["C", "D", "E", "F"]);
+}
+
+#[test]
+fn compaction_excludes_superseded_summary_events_from_new_data() {
+    let mut manager = ContextManager::new(ContextPolicy {
+        recent_turns: 0,
+        ..ContextPolicy::default()
+    });
+    manager.replay(vec![
+        event(0, SessionEvent::UserMessage { text: "A".into() }),
+        event(1, SessionEvent::TurnCompleted),
+        event(
+            2,
+            SessionEvent::ContextCompacted {
+                covered_through_sequence: 1,
+                summary: "stale decision".into(),
+                tokens: 5,
+            },
+        ),
+        event(
+            3,
+            SessionEvent::UserMessage {
+                text: "B replaces A".into(),
+            },
+        ),
+        event(4, SessionEvent::TurnCompleted),
+        event(
+            5,
+            SessionEvent::ContextCompacted {
+                covered_through_sequence: 4,
+                summary: "current decision".into(),
+                tokens: 5,
+            },
+        ),
+        event(6, SessionEvent::UserMessage { text: "C".into() }),
+        event(7, SessionEvent::TurnCompleted),
+    ]);
+    let request = manager.compaction_request().expect("compact C");
+    assert_eq!(request.covered_through_sequence, 7);
+    assert_eq!(
+        compaction_events(&request)
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![6, 7]
+    );
+    let input = serde_json::to_string(&request.items).expect("serialize model data");
+    assert_eq!(input.matches("current decision").count(), 1);
+    assert!(!input.contains("stale decision"));
 }
 
 #[test]
@@ -972,8 +1111,7 @@ fn zero_recent_turns_compacts_completed_history_but_not_the_current_turn() {
         .expect("compact all completed turns");
     assert_eq!(completed.covered_through_sequence, 2);
     assert_eq!(
-        completed
-            .events
+        compaction_events(&completed)
             .iter()
             .map(|event| event.sequence)
             .collect::<Vec<_>>(),
@@ -1007,7 +1145,7 @@ fn zero_recent_turns_compacts_completed_history_but_not_the_current_turn() {
         .expect("compact newly completed turn");
     assert_eq!(next.covered_through_sequence, 4);
     assert_eq!(
-        next.events
+        compaction_events(&next)
             .iter()
             .map(|event| event.sequence)
             .collect::<Vec<_>>(),

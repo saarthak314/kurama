@@ -1,16 +1,19 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use kurama_adapters::FsSessionStore;
 use kurama_protocol::{
     agent::{AgentSnapshot, AgentState},
     id::{AgentId, CallId, OperationId},
     model::Usage,
     policy::{ApprovalRequest, ApprovalResponse, ExecutionMode},
     runtime::{AgentCommand, EngineCommand, RuntimeEvent},
-    session::{EventEnvelope, GoalStatus, SessionEvent, SessionGoal, TodoItem},
+    session::{BlobRef, EventEnvelope, GoalStatus, SessionEvent, SessionGoal, TodoItem},
     tool::ToolResult,
+    traits::SessionStore,
 };
 
 use crate::commands::{CommandSpec, command_suggestions};
@@ -22,6 +25,138 @@ use super::{AgentRow, ApprovalState, OnboardingState, sort_agents};
 
 const MAX_LIVE_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
 const LIVE_OUTPUT_OMITTED: &str = "[earlier live output omitted]\n";
+const OUTPUT_OMITTED: &str = "[earlier output omitted; Ctrl+O for full output]\n";
+
+enum DisplaySource {
+    Output(BlobRef),
+    Streams {
+        stdout: Option<BlobRef>,
+        stderr: Option<BlobRef>,
+    },
+}
+
+struct DeferredToolOutput {
+    source: DisplaySource,
+    // Only retained while expanded; the full string replaces the visible preview.
+    preview: Option<String>,
+}
+
+impl DisplaySource {
+    fn from_result(result: &ToolResult) -> Result<Option<Self>, String> {
+        let Some(value) = result.metadata.get("display_blobs") else {
+            return Ok(None);
+        };
+        let blobs = value
+            .as_object()
+            .ok_or_else(|| "invalid display blob references".to_owned())?;
+        let reference = |name: &str| -> Result<Option<BlobRef>, String> {
+            blobs
+                .get(name)
+                .map(|value| {
+                    serde_json::from_value(value.clone())
+                        .map_err(|error| format!("invalid {name} display blob reference: {error}"))
+                })
+                .transpose()
+        };
+        if let Some(output) = reference("output")? {
+            return Ok(Some(Self::Output(output)));
+        }
+        let stdout = reference("stdout")?;
+        let stderr = reference("stderr")?;
+        if stdout.is_none() && stderr.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(Self::Streams { stdout, stderr }))
+    }
+
+    fn load(&self, store: &FsSessionStore, max_bytes: Option<usize>) -> Result<String, String> {
+        match self {
+            Self::Output(reference) => display_blob_text(store, reference, max_bytes),
+            Self::Streams { stdout, stderr } => {
+                const SEPARATOR: &str = "\n[stderr]\n";
+                let budget = max_bytes.map(|limit| {
+                    if stdout.is_some() && stderr.is_some() {
+                        limit.saturating_sub(SEPARATOR.len()) / 2
+                    } else {
+                        limit
+                    }
+                });
+                let load = |reference: &Option<BlobRef>| -> Result<String, String> {
+                    reference
+                        .as_ref()
+                        .map(|reference| display_blob_text(store, reference, budget))
+                        .transpose()
+                        .map(Option::unwrap_or_default)
+                };
+                let mut output = load(stdout)?;
+                let stderr = load(stderr)?;
+                if !output.is_empty() && !stderr.is_empty() {
+                    output.push_str(SEPARATOR);
+                }
+                output.push_str(&stderr);
+                Ok(output)
+            }
+        }
+    }
+}
+
+fn display_blob_text(
+    store: &FsSessionStore,
+    reference: &BlobRef,
+    max_bytes: Option<usize>,
+) -> Result<String, String> {
+    let Some(limit) = max_bytes else {
+        let bytes = store
+            .get_blob(reference)
+            .map_err(|error| error.to_string())?;
+        return Ok(String::from_utf8(bytes)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()));
+    };
+    let bytes = store
+        .get_blob_tail(reference, limit)
+        .map_err(|error| error.to_string())?;
+    let omitted = reference.bytes > bytes.len() as u64;
+    // A tail can begin inside a UTF-8 character. Drop just its continuation
+    // bytes rather than manufacturing replacement characters at the boundary.
+    let start = if omitted {
+        bytes
+            .iter()
+            .take(3)
+            .take_while(|byte| **byte & 0xc0 == 0x80)
+            .count()
+    } else {
+        0
+    };
+    let text = String::from_utf8_lossy(&bytes[start..]);
+    Ok(bounded_output(&text, limit, omitted))
+}
+
+fn bounded_output(text: &str, limit: usize, omitted: bool) -> String {
+    if !omitted && text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut start = text
+        .len()
+        .saturating_sub(limit.saturating_sub(OUTPUT_OMITTED.len()));
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut output = String::with_capacity(OUTPUT_OMITTED.len() + text.len() - start);
+    output.push_str(OUTPUT_OMITTED);
+    output.push_str(&text[start..]);
+    output
+}
+
+fn display_load_error(fallback: &str, error: &str) -> String {
+    let error = format!("\n[display output unavailable: {error}]\n");
+    let mut output = bounded_output(
+        fallback,
+        MAX_LIVE_TOOL_OUTPUT_BYTES.saturating_sub(error.len()),
+        false,
+    );
+    output.push_str(&error);
+    output
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HistorySearch {
@@ -166,7 +301,10 @@ pub struct TuiState {
     active_tool_streams: HashMap<CallId, String>,
     active_tool_contexts: HashMap<OperationId, String>,
     pending_tool_context: Option<String>,
+    display_store: Option<Arc<FsSessionStore>>,
+    deferred_tool_outputs: HashMap<usize, DeferredToolOutput>,
     replayed_agent_ids: HashSet<AgentId>,
+    approval_generation: u64,
     committed_transcript_entries: usize,
     transcript_revision: u64,
     transcript_dirty_from: usize,
@@ -233,7 +371,10 @@ impl TuiState {
             active_tool_streams: HashMap::new(),
             active_tool_contexts: HashMap::new(),
             pending_tool_context: None,
+            display_store: None,
+            deferred_tool_outputs: HashMap::new(),
             replayed_agent_ids: HashSet::new(),
+            approval_generation: 0,
             committed_transcript_entries: 0,
             transcript_revision: 0,
             transcript_dirty_from: 0,
@@ -709,6 +850,14 @@ impl TuiState {
                 mode: self.mode,
             },
         );
+        self.deferred_tool_outputs = std::mem::take(&mut self.deferred_tool_outputs)
+            .into_iter()
+            .map(|(index, output)| (index + 1, output))
+            .collect();
+        for index in self.active_tool_entries.values_mut() {
+            *index += 1;
+        }
+        self.active_assistant_entry = self.active_assistant_entry.map(|index| index + 1);
         self.transcript_changed(0);
     }
 
@@ -777,6 +926,26 @@ impl TuiState {
     pub fn toggle_transcript_view(&mut self) {
         self.transcript_view_expanded = !self.transcript_view_expanded;
         self.scroll = 0;
+        if let Some(store) = &self.display_store {
+            let mut dirty_from = self.transcript.len();
+            for (&index, deferred) in &mut self.deferred_tool_outputs {
+                if let Some(TranscriptEntry::ToolCall(tool)) = self.transcript.get_mut(index) {
+                    if self.transcript_view_expanded {
+                        let full = deferred
+                            .source
+                            .load(store, None)
+                            .unwrap_or_else(|error| display_load_error(&tool.output, &error));
+                        deferred.preview = Some(std::mem::replace(&mut tool.output, full));
+                    } else if let Some(preview) = deferred.preview.take() {
+                        tool.output = preview;
+                    }
+                    dirty_from = dirty_from.min(index);
+                }
+            }
+            if dirty_from < self.transcript.len() {
+                self.transcript_changed(dirty_from);
+            }
+        }
     }
 
     pub const fn transcript_view_expanded(&self) -> bool {
@@ -878,6 +1047,10 @@ impl TuiState {
         &self.transcript[self.committed_transcript_entries..]
     }
 
+    pub(crate) fn set_display_store(&mut self, store: Arc<FsSessionStore>) {
+        self.display_store = Some(store);
+    }
+
     pub fn hydrate_replay(&mut self, replay: &[EventEnvelope]) {
         self.activity = ActivityState::Idle;
         self.turn_started_at = None;
@@ -887,6 +1060,7 @@ impl TuiState {
         self.active_tool_streams.clear();
         self.active_tool_contexts.clear();
         self.pending_tool_context = None;
+        self.deferred_tool_outputs.clear();
         self.replayed_agent_ids.clear();
         self.committed_transcript_entries = 0;
         self.transcript.clear();
@@ -912,10 +1086,15 @@ impl TuiState {
                     result,
                 } => {
                     if todo_items(result).is_none() {
-                        self.push_transcript_entry(TranscriptEntry::ToolCall(tool_transcript(
-                            result,
-                            replayed_tool_contexts.remove(operation_id),
-                        )));
+                        let (output, deferred) = self.completed_display_output(result);
+                        self.push_transcript_entry(TranscriptEntry::ToolCall(ToolTranscript {
+                            call_id: Some(result.call_id.clone()),
+                            name: tool_name(result).to_owned(),
+                            context: replayed_tool_contexts.remove(operation_id),
+                            output,
+                            lifecycle: tool_lifecycle(result),
+                        }));
+                        self.remember_display_source(self.transcript.len() - 1, deferred);
                     }
                 }
                 SessionEvent::ToolUnknown { reason, .. } => {
@@ -1194,7 +1373,12 @@ impl TuiState {
         };
     }
 
+    pub(crate) const fn approval_generation(&self) -> u64 {
+        self.approval_generation
+    }
+
     pub fn begin_approval(&mut self, request: ApprovalRequest) {
+        self.approval_generation = self.approval_generation.wrapping_add(1);
         self.approval = Some(ApprovalState::new(request));
         self.overlay = Overlay::Approval;
         self.activity = ActivityState::AwaitingApproval;
@@ -1490,7 +1674,9 @@ impl TuiState {
             .metadata
             .get("display_output")
             .and_then(serde_json::Value::as_str);
-        let display_output = tool_display_output(&result).to_owned();
+        let (display_output, deferred) = self.completed_display_output(&result);
+        let has_display_blobs =
+            self.display_store.is_some() && result.metadata.get("display_blobs").is_some();
         let lifecycle = tool_lifecycle(&result);
         let name = tool_name(&result).to_owned();
         let pending_context = self.pending_tool_context.take();
@@ -1522,15 +1708,18 @@ impl TuiState {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
                 && !tool.output.is_empty()
+                && !has_display_blobs
             {
                 append_error_boundary(&mut tool.output, &display_output);
             } else if !result.truncated
                 || persisted_display_output.is_some()
+                || has_display_blobs
                 || tool.output.is_empty()
             {
                 tool.output = display_output;
             }
             self.transcript_changed(index);
+            self.remember_display_source(index, deferred);
             return;
         }
 
@@ -1541,6 +1730,48 @@ impl TuiState {
             output: display_output,
             lifecycle,
         }));
+        self.remember_display_source(self.transcript.len() - 1, deferred);
+    }
+
+    fn completed_display_output(
+        &self,
+        result: &ToolResult,
+    ) -> (String, Option<DeferredToolOutput>) {
+        let fallback = tool_display_output(result);
+        let Some(store) = &self.display_store else {
+            return (fallback.to_owned(), None);
+        };
+        match DisplaySource::from_result(result) {
+            Ok(Some(source)) => {
+                let output = source
+                    .load(store, Some(MAX_LIVE_TOOL_OUTPUT_BYTES))
+                    .unwrap_or_else(|error| display_load_error(fallback, &error));
+                (
+                    output,
+                    Some(DeferredToolOutput {
+                        source,
+                        preview: None,
+                    }),
+                )
+            }
+            Ok(None) => (fallback.to_owned(), None),
+            Err(error) => (display_load_error(fallback, &error), None),
+        }
+    }
+
+    fn remember_display_source(&mut self, index: usize, deferred: Option<DeferredToolOutput>) {
+        let Some(mut deferred) = deferred else { return };
+        if self.transcript_view_expanded
+            && let Some(store) = &self.display_store
+            && let Some(TranscriptEntry::ToolCall(tool)) = self.transcript.get_mut(index)
+        {
+            let full = deferred
+                .source
+                .load(store, None)
+                .unwrap_or_else(|error| display_load_error(&tool.output, &error));
+            deferred.preview = Some(std::mem::replace(&mut tool.output, full));
+        }
+        self.deferred_tool_outputs.insert(index, deferred);
     }
 
     fn reindex_active_entries(&mut self, removed: usize) {
@@ -1556,6 +1787,12 @@ impl TuiState {
         self.active_assistant_entry = self
             .active_assistant_entry
             .and_then(|index| (index != removed).then(|| index - usize::from(index > removed)));
+        self.deferred_tool_outputs = std::mem::take(&mut self.deferred_tool_outputs)
+            .into_iter()
+            .filter_map(|(index, output)| {
+                (index != removed).then(|| (index - usize::from(index > removed), output))
+            })
+            .collect();
     }
 
     pub fn submit_goal(&mut self, objective: String) -> bool {
@@ -1681,24 +1918,35 @@ fn is_non_terminal_runtime_error(message: &str) -> bool {
 }
 
 fn append_live_tool_output(output: &mut String, chunk: &str) {
+    let retained_bytes = MAX_LIVE_TOOL_OUTPUT_BYTES.saturating_sub(LIVE_OUTPUT_OMITTED.len());
+    if chunk.len() > retained_bytes {
+        let mut start = chunk.len() - retained_bytes;
+        while !chunk.is_char_boundary(start) {
+            start += 1;
+        }
+        output.clear();
+        output.push_str(LIVE_OUTPUT_OMITTED);
+        output.push_str(&chunk[start..]);
+        return;
+    }
     output.push_str(chunk);
     if output.len() <= MAX_LIVE_TOOL_OUTPUT_BYTES {
         return;
     }
-
-    let retained_bytes = MAX_LIVE_TOOL_OUTPUT_BYTES.saturating_sub(LIVE_OUTPUT_OMITTED.len());
-    let mut retained_start = output.len().saturating_sub(retained_bytes);
+    let mut retained_start = output.len() - retained_bytes;
     while !output.is_char_boundary(retained_start) {
         retained_start += 1;
     }
     output.replace_range(..retained_start, LIVE_OUTPUT_OMITTED);
 }
 
-fn bounded_live_tool_output(mut output: String) -> String {
-    if output.len() > MAX_LIVE_TOOL_OUTPUT_BYTES {
-        append_live_tool_output(&mut output, "");
+fn bounded_live_tool_output(output: String) -> String {
+    if output.len() <= MAX_LIVE_TOOL_OUTPUT_BYTES {
+        return output;
     }
-    output
+    let mut bounded = String::with_capacity(MAX_LIVE_TOOL_OUTPUT_BYTES);
+    append_live_tool_output(&mut bounded, &output);
+    bounded
 }
 
 fn append_stream_boundary(body: &mut String, stream: &str) {
@@ -1759,16 +2007,6 @@ fn tool_lifecycle(result: &ToolResult) -> ToolLifecycle {
         ToolLifecycle::Failed
     } else {
         ToolLifecycle::Completed
-    }
-}
-
-fn tool_transcript(result: &ToolResult, context: Option<String>) -> ToolTranscript {
-    ToolTranscript {
-        call_id: Some(result.call_id.clone()),
-        name: tool_name(result).to_owned(),
-        context,
-        output: tool_display_output(result).to_owned(),
-        lifecycle: tool_lifecycle(result),
     }
 }
 

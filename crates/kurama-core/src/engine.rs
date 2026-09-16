@@ -10,7 +10,7 @@ use kurama_protocol::{
     KuramaError,
     agent::{AgentSnapshot, AgentState, OrchestrationContext, ResolvedAgentSpec, WriteScope},
     id::{AgentId, OperationId},
-    model::{BackendCursor, FinishReason, ModelEvent, ModelItem, ModelProfile, ModelRequest},
+    model::{BackendCursor, FinishReason, ModelEvent, ModelProfile, ModelRequest},
     policy::{
         ApprovalRequest, ApprovalResponse, AutoBoundaries, ExecutionMode, PolicyContext,
         PolicyDecision,
@@ -1680,19 +1680,18 @@ impl EngineActor {
                 })
                 .await;
         };
-        let input = serde_json::to_string(&compaction.events)
-            .map_err(|error| KuramaError::Protocol(error.to_string()))?;
         let request = ModelRequest {
             session_id: self.session_id.clone(),
             agent_id: self.agent_id.clone(),
             workspace_root: self.workspace_root.to_string_lossy().into_owned(),
             profile: self.profile.clone(),
             system: compaction.prompt,
-            items: vec![ModelItem::User { text: input }],
+            items: compaction.items,
             tools: Vec::new(),
             delegation: None,
             continuation: None,
         };
+        self.context.check_compaction_budget(&request)?;
         let cancel = CancelToken::new();
         let round = self.stream_round(request, &cancel).await?;
         let summary = normalize_compaction_json(&round.text)?;

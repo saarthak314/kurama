@@ -1,4 +1,5 @@
 use std::{
+    io::Write,
     path::PathBuf,
     sync::{
         Arc,
@@ -199,4 +200,83 @@ async fn durable_child_progress_interleaves_with_tool_completion_without_losing_
         child.last().map(|event| &event.event),
         Some(SessionEvent::AgentCompleted { .. })
     ));
+}
+
+#[tokio::test]
+async fn sdk_resume_after_a_torn_tail_completes_the_next_turn() {
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    let workspace = directory
+        .path()
+        .canonicalize()
+        .expect("canonical workspace");
+    let store = Arc::new(FsSessionStore::open(workspace.join("state")).expect("store"));
+    let mut first = Agent::new()
+        .backend(ScriptedBackend::new(vec![vec![
+            Ok(ModelEvent::TextDelta {
+                text: "before interruption".into(),
+            }),
+            completed(FinishReason::Stop),
+        ]]))
+        .store(store.clone())
+        .workspace(workspace.clone())
+        .build()
+        .expect("first agent");
+    let session_id = first
+        .prompt("first turn")
+        .await
+        .expect("first turn")
+        .session_id;
+    drop(first);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(
+            store
+                .root()
+                .join("sessions")
+                .join(session_id.as_ref())
+                .join("events.jsonl"),
+        )
+        .expect("session log")
+        .write_all(br#"{"schema_version":1"#)
+        .expect("torn tail");
+
+    let mut resumed = Agent::new()
+        .backend(ScriptedBackend::new(vec![vec![
+            Ok(ModelEvent::TextDelta {
+                text: "after recovery".into(),
+            }),
+            completed(FinishReason::Stop),
+        ]]))
+        .store(store.clone())
+        .workspace(workspace)
+        .build()
+        .expect("resumed agent");
+    resumed
+        .resume(session_id.to_string())
+        .await
+        .expect("resume and repair");
+    let outcome = tokio::time::timeout(Duration::from_secs(5), resumed.prompt("next turn"))
+        .await
+        .expect("resumed turn must finish")
+        .expect("resumed turn succeeds");
+    assert_eq!(outcome.session_id, session_id);
+    assert_eq!(outcome.text, "after recovery");
+
+    let events = store
+        .replay(&session_id)
+        .expect("strict replay after resumed turn");
+    for (sequence, event) in events.iter().enumerate() {
+        assert_eq!(event.sequence, sequence as u64);
+    }
+    let repairs: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            matches!(event.event, SessionEvent::RecoveryRepair { .. }).then_some(index)
+        })
+        .collect();
+    assert_eq!(repairs.len(), 1);
+    assert!(events[repairs[0] + 1..].iter().any(|event| matches!(
+        &event.event, SessionEvent::AssistantMessage { text } if text == "after recovery"
+    )));
 }

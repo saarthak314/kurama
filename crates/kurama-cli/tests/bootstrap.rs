@@ -218,7 +218,7 @@ async fn resume_uses_the_recorded_profile() {
 }
 
 #[tokio::test]
-async fn resume_hydrates_the_visible_transcript_once() {
+async fn resume_previews_large_display_blob_and_expands_on_demand() {
     let (_temp, paths, project) = fixture();
     let repository = ConfigRepository::open(paths.clone()).expect("repository");
     repository
@@ -238,8 +238,12 @@ async fn resume_hydrates_the_visible_transcript_once() {
         redaction_best_effort: false,
     };
     store.create(&metadata).expect("create session");
+    let full_output = format!(
+        "head\nfull middle output\n{}tail\n",
+        "界🙂a\n".repeat(65_536)
+    );
     let output_blob = store
-        .put_blob(b"head\nfull middle output\ntail\n")
+        .put_blob(full_output.as_bytes())
         .expect("store output blob");
     for (sequence, event) in [
         SessionEvent::SessionStarted { metadata },
@@ -338,10 +342,44 @@ async fn resume_hydrates_the_visible_transcript_once() {
             && user == "inspect the parser"
             && assistant == "checking it"
             && tool.name == "read"
-            && tool.output == "head\nfull middle output\ntail\n"
+            && tool.output.len() <= 128 * 1_024
+            && !tool.output.contains("full middle output")
+            && !tool.output.contains('\u{fffd}')
+            && tool.output.ends_with("tail\n")
             && tool.lifecycle == ToolLifecycle::Completed
             && error == "provider disconnected"
     ));
+
+    let output = |app: &App| match &app.state.transcript[3] {
+        TranscriptEntry::ToolCall(tool) => tool.output.clone(),
+        _ => panic!("expected tool output"),
+    };
+    let preview = output(&app);
+    assert!(preview.contains("omitted"));
+    app.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL,
+    )))
+    .expect("expand transcript");
+    assert_eq!(output(&app), full_output);
+    app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .expect("collapse transcript");
+    assert_eq!(output(&app), preview);
+    if let TranscriptEntry::ToolCall(tool) = &app.state.transcript[3] {
+        assert!(tool.output.capacity() <= 128 * 1_024);
+    }
+    app.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL,
+    )))
+    .expect("reopen transcript");
+    assert_eq!(output(&app), full_output);
+    app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .expect("collapse transcript again");
+    assert_eq!(
+        store.get_blob(&output_blob).unwrap(),
+        full_output.as_bytes()
+    );
 
     app.state.apply_runtime_event(RuntimeEvent::AssistantDelta {
         text: "retrying now".into(),

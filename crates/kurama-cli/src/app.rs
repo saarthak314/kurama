@@ -28,7 +28,7 @@ use kurama_protocol::{
     model::{ModelProfile, Usage},
     policy::{ApprovalResponse, AutoBoundaries, ExecutionMode},
     runtime::{EngineCommand, RuntimeEvent},
-    session::{BlobRef, EventEnvelope, SessionEvent, SessionMetadata},
+    session::{EventEnvelope, SessionEvent, SessionMetadata},
     traits::{EventSink, Orchestrator, SessionStore, Tool},
 };
 use kurama_sdk::{Agent, Events, Handle};
@@ -512,10 +512,6 @@ impl App {
             mode,
             redaction_best_effort: mode == ExecutionMode::Yolo,
         };
-        let transcript_replay = replay_for_transcript(&replay, store.as_ref());
-        let (engine, runtime_events) = agent
-            .launch(metadata, replay)
-            .map_err(|error| error.to_string())?;
 
         repository
             .remember_project_profile(&project, &active_profile)
@@ -536,7 +532,11 @@ impl App {
             mode,
         );
         state.max_input_tokens = active.max_input_tokens;
-        state.hydrate_replay(&transcript_replay);
+        state.set_display_store(Arc::clone(&store));
+        state.hydrate_replay(&replay);
+        let (engine, runtime_events) = agent
+            .launch(metadata, replay)
+            .map_err(|error| error.to_string())?;
         state.refresh_git_branch();
         state.prepend_startup(env!("CARGO_PKG_VERSION"), startup_project);
         if resumed_yolo {
@@ -1766,69 +1766,6 @@ impl App {
     }
 }
 
-fn replay_for_transcript(replay: &[EventEnvelope], store: &dyn SessionStore) -> Vec<EventEnvelope> {
-    let mut transcript_replay = replay.to_vec();
-    for event in &mut transcript_replay {
-        let SessionEvent::ToolCompleted { result, .. } = &mut event.event else {
-            continue;
-        };
-        let Some(display_blobs) = result
-            .metadata
-            .get("display_blobs")
-            .and_then(serde_json::Value::as_object)
-        else {
-            continue;
-        };
-        let Ok(Some(display_output)) = display_output_from_blobs(display_blobs, store) else {
-            continue;
-        };
-        result.metadata["display_output"] = serde_json::Value::String(display_output);
-    }
-    transcript_replay
-}
-
-fn display_output_from_blobs(
-    display_blobs: &serde_json::Map<String, serde_json::Value>,
-    store: &dyn SessionStore,
-) -> Result<Option<String>, String> {
-    if let Some(output) = display_blob_text(display_blobs.get("output"), store)? {
-        return Ok(Some(output));
-    }
-    let stdout = display_blob_text(display_blobs.get("stdout"), store)?;
-    let stderr = display_blob_text(display_blobs.get("stderr"), store)?;
-    if stdout.is_none() && stderr.is_none() {
-        return Ok(None);
-    }
-    Ok(Some(combined_tool_output(
-        stdout.as_deref().unwrap_or_default(),
-        stderr.as_deref().unwrap_or_default(),
-    )))
-}
-
-fn display_blob_text(
-    value: Option<&serde_json::Value>,
-    store: &dyn SessionStore,
-) -> Result<Option<String>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let reference: BlobRef = serde_json::from_value(value.clone())
-        .map_err(|error| format!("invalid display blob reference: {error}"))?;
-    let bytes = store
-        .get_blob(&reference)
-        .map_err(|error| error.to_string())?;
-    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
-}
-
-fn combined_tool_output(stdout: &str, stderr: &str) -> String {
-    match (stdout.is_empty(), stderr.is_empty()) {
-        (false, true) => stdout.to_owned(),
-        (true, false) => stderr.to_owned(),
-        (true, true) => String::new(),
-        (false, false) => format!("{stdout}\n[stderr]\n{stderr}"),
-    }
-}
-
 fn initialize_inline_terminal<B>(mut backend: B) -> Result<Terminal<B>, B::Error>
 where
     B: Backend,
@@ -2222,7 +2159,9 @@ fn apply_runtime_event_in_order(
             | RuntimeEvent::Error { .. }
             | RuntimeEvent::Shutdown
     ) {
-        loop {
+        // The completing operation has already emitted its deltas. Drain the
+        // queued snapshot, not an endlessly refilled stream from another tool.
+        for _ in 0..tool_receiver.len() {
             match tool_receiver.try_recv() {
                 Ok(event) => state.apply_runtime_event(event),
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -2289,7 +2228,7 @@ fn drain_ready_events(
     runtime_open: &mut bool,
     tool_receiver: &mut mpsc::Receiver<RuntimeEvent>,
     tool_open: &mut bool,
-) -> (bool, bool) {
+) -> (bool, bool, bool) {
     let mut processed = 0;
     let mut immediate_redraw = false;
     let mut exit = false;
@@ -2329,7 +2268,7 @@ fn drain_ready_events(
             break;
         }
     }
-    (immediate_redraw, exit)
+    (immediate_redraw, exit, processed > 0)
 }
 
 fn handle_input_with_current_geometry(
@@ -2358,6 +2297,40 @@ fn handle_input_with_current_geometry(
         cache.prepare(&mut app.state, area);
     }
     app.handle_event(event)
+}
+
+fn handle_preapproval_input(
+    app: &mut App,
+    cache: &mut TranscriptRenderCache,
+    area: Rect,
+    origin: &mut Overlay,
+    event: Event,
+) -> Result<(bool, bool), String> {
+    let interrupt = matches!(&event, Event::Key(key)
+        if key.code == KeyCode::Esc
+            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c')));
+    if interrupt {
+        return Ok((
+            true,
+            handle_input_with_current_geometry(app, cache, area, event)?,
+        ));
+    }
+    if matches!(*origin, Overlay::Approval | Overlay::ApprovalEdit) {
+        // Responses queued for a replaced prompt cannot authorize its successor.
+        return Ok((false, false));
+    }
+    let visible_overlay = std::mem::replace(&mut app.state.overlay, *origin);
+    let accepted = app.accepts_event(&event);
+    let result = if accepted {
+        handle_input_with_current_geometry(app, cache, area, event)
+    } else {
+        Ok(false)
+    };
+    *origin = app.state.overlay;
+    if app.state.approval.is_some() {
+        app.state.overlay = visible_overlay;
+    }
+    Ok((accepted, result?))
 }
 
 async fn run_loop<B>(
@@ -2389,6 +2362,13 @@ where
     };
     let mut input_open = true;
     let mut pending_input = None;
+    let mut approval_generation = app.state.approval_generation();
+    let mut preapproval_input = if app.state.approval.is_some() {
+        input.len()
+    } else {
+        0
+    };
+    let mut preapproval_overlay = Overlay::None;
     let mut transcript_cache = TranscriptRenderCache::default();
     let mut alt_overlay = AltOverlay::default();
     let result = async {
@@ -2414,6 +2394,7 @@ where
         let mut animation_tick = false;
         let mut force_redraw = false;
         let mut state_changed = false;
+        let mut input_origin = app.state.overlay;
         let terminal_area = terminal.get_frame().area();
         let animate_activity = !visible_activity_rect(terminal_area, &app.state).is_empty();
         let activity_deadline =
@@ -2438,11 +2419,19 @@ where
         tokio::select! {
             biased;
             event = async { if pending_input.is_some() { pending_input.take() } else { input.recv().await } }, if input_open => {
+                let predates_approval = preapproval_input > 0;
+                if event.is_some() {
+                    preapproval_input = preapproval_input.saturating_sub(1);
+                }
                 match event {
                     Some(Event::Resize(mut width, mut height)) => {
                         for _ in 0..READY_EVENT_BATCH_LIMIT {
                             match input.try_recv() {
-                                Ok(Event::Resize(next_width, next_height)) => { width = next_width; height = next_height; }
+                                Ok(Event::Resize(next_width, next_height)) => {
+                                    width = next_width;
+                                    height = next_height;
+                                    preapproval_input = preapproval_input.saturating_sub(1);
+                                }
                                 Ok(event) => { pending_input = Some(event); break; }
                                 Err(_) => break,
                             }
@@ -2459,6 +2448,14 @@ where
                         state_changed = true;
                         force_redraw = true;
                     }
+                    Some(event) if predates_approval && app.state.approval.is_some() => {
+                        let outcome = handle_preapproval_input(
+                            app, &mut transcript_cache, terminal_area, &mut preapproval_overlay, event,
+                        )?;
+                        state_changed |= outcome.0;
+                        force_redraw |= outcome.0;
+                        exit |= outcome.1;
+                    }
                     Some(event) if app.accepts_event(&event) => {
                         exit = handle_input_with_current_geometry(app, &mut transcript_cache, terminal_area, event)?;
                         state_changed = true;
@@ -2466,6 +2463,22 @@ where
                     }
                     Some(_) => {}
                     None => input_open = false,
+                }
+                input_origin = if predates_approval { preapproval_overlay } else { app.state.overlay };
+                // Input keeps first refusal for interrupts, but every input event
+                // also gives ready runtime/tool events a bounded turn. Even ignored
+                // input must not postpone approval, completion, or shutdown.
+                if !exit {
+                    let batch = drain_ready_events(
+                        &mut app.state,
+                        &mut runtime_receiver,
+                        &mut runtime_open,
+                        &mut tool_receiver,
+                        &mut tool_open,
+                    );
+                    force_redraw |= batch.0;
+                    exit |= batch.1;
+                    state_changed |= batch.2;
                 }
             }
             event = runtime_receiver.recv(), if runtime_open => {
@@ -2522,6 +2535,14 @@ where
                 animation_tick = true;
                 force_redraw = true;
             }
+        }
+        if approval_generation != app.state.approval_generation() {
+            approval_generation = app.state.approval_generation();
+            // Keep input already queued before this prompt in its original UI
+            // context, including a key held by resize coalescing. Runtime work
+            // still progresses; a fresh response is required for the new prompt.
+            preapproval_input = input.len().saturating_add(usize::from(pending_input.is_some()));
+            preapproval_overlay = input_origin;
         }
         if !app.state.sent_commands().is_empty() {
             app.flush_commands().await?;
@@ -2974,6 +2995,166 @@ mod tests {
         }
     }
 
+    fn display_app() -> (tempfile::TempDir, Arc<FsSessionStore>, App) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(FsSessionStore::open(temp.path().to_path_buf()).unwrap());
+        let mut app = test_app();
+        app.state.set_display_store(Arc::clone(&store));
+        (temp, store, app)
+    }
+
+    fn displayed_tool_output(app: &App, index: usize) -> &str {
+        match &app.state.transcript[index] {
+            TranscriptEntry::ToolCall(tool) => &tool.output,
+            _ => panic!("expected tool output"),
+        }
+    }
+
+    fn toggle_transcript(app: &mut App) {
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+    }
+
+    #[test]
+    fn completed_display_previews_keep_mixed_streams_and_reused_call_ids() {
+        let (_temp, store, mut app) = display_app();
+        let stdout = format!("stdout head\n{}stdout tail\n", "界🙂a\n".repeat(32_768));
+        let stderr = format!("stderr head\n{}stderr tail\n", "warning\n".repeat(32_768));
+        let mut result = ToolResult::success(CallId::from("reused"), "model summary");
+        result.truncated = true;
+        result.metadata = serde_json::json!({
+            "tool_name": "bash",
+            "display_blobs": {
+                "stdout": store.put_blob(stdout.as_bytes()).unwrap(),
+                "stderr": store.put_blob(stderr.as_bytes()).unwrap(),
+            },
+        });
+        app.state.apply_runtime_event(RuntimeEvent::ToolCompleted {
+            operation_id: OperationId::from("first"),
+            result,
+        });
+        let preview = displayed_tool_output(&app, 0).to_owned();
+        assert!(preview.len() <= 128 * 1_024);
+        assert!(preview.contains("stdout tail\n\n[stderr]\n"));
+        assert!(preview.ends_with("stderr tail\n"));
+        assert!(!preview.contains('\u{fffd}'));
+        toggle_transcript(&mut app);
+        let full = format!("{stdout}\n[stderr]\n{stderr}");
+        assert_eq!(displayed_tool_output(&app, 0), full);
+        let mut cache = TranscriptRenderCache::default();
+        cache.prepare(&mut app.state, Rect::new(0, 0, 80, 24));
+
+        // A later operation can reuse the provider's call id. Completing it while
+        // expanded must hydrate the new entry without replacing the first source.
+        let second = format!("second head\n{}second tail\n", "line\n".repeat(32_768));
+        let mut result = ToolResult::success(CallId::from("reused"), "second summary");
+        result.truncated = true;
+        result.metadata = serde_json::json!({
+            "tool_name": "read",
+            "display_output": second,
+            "display_blobs": { "output": store.put_blob(second.as_bytes()).unwrap() },
+        });
+        app.state
+            .apply_runtime_event(RuntimeEvent::ToolOutputDelta {
+                call_id: CallId::from("reused"),
+                stream: "stdout".into(),
+                chunk: "partial".into(),
+            });
+        app.state.apply_runtime_event(RuntimeEvent::ToolCompleted {
+            operation_id: OperationId::from("second"),
+            result,
+        });
+        cache.prepare(&mut app.state, Rect::new(0, 0, 80, 24));
+        assert_eq!(displayed_tool_output(&app, 0), full);
+        assert_eq!(displayed_tool_output(&app, 1), second);
+        assert!(
+            cache
+                .lines()
+                .unwrap()
+                .iter()
+                .any(|line| line.to_string().contains("second head"))
+        );
+        toggle_transcript(&mut app);
+        cache.prepare(&mut app.state, Rect::new(0, 0, 80, 24));
+        assert_eq!(displayed_tool_output(&app, 0), preview);
+        assert!(displayed_tool_output(&app, 1).len() <= 128 * 1_024);
+        assert!(
+            !cache
+                .lines()
+                .unwrap()
+                .iter()
+                .any(|line| line.to_string().contains("second head"))
+        );
+        toggle_transcript(&mut app);
+        assert_eq!(displayed_tool_output(&app, 0), full);
+        assert_eq!(displayed_tool_output(&app, 1), second);
+        app.state.hydrate_replay(&[]);
+        toggle_transcript(&mut app);
+        assert!(app.state.transcript.is_empty());
+    }
+
+    #[test]
+    fn display_blob_corruption_is_visible_on_resume_and_expansion() {
+        let (_temp, store, mut app) = display_app();
+        let full = format!("head\n{}tail\n", "x".repeat(256 * 1_024));
+        let reference = store.put_blob(full.as_bytes()).unwrap();
+        let mut result = ToolResult::success(CallId::from("call"), "fallback summary");
+        result.truncated = true;
+        result.metadata = serde_json::json!({"display_blobs": {"output": reference}});
+        let replay = [EventEnvelope::new(
+            0,
+            1,
+            "session".into(),
+            None,
+            SessionEvent::ToolCompleted {
+                operation_id: OperationId::from("operation"),
+                result,
+            },
+        )];
+        app.state.hydrate_replay(&replay);
+        assert!(displayed_tool_output(&app, 0).ends_with("tail\n"));
+        let path = store.root().join("blobs").join(&reference.sha256);
+        let mut corrupt = full.as_bytes().to_vec();
+        corrupt[0] = b'!';
+        std::fs::write(&path, &corrupt).unwrap();
+        toggle_transcript(&mut app);
+        assert!(displayed_tool_output(&app, 0).contains("unavailable"));
+        assert!(displayed_tool_output(&app, 0).contains("mismatch"));
+        toggle_transcript(&mut app);
+        app.state.hydrate_replay(&replay);
+        assert!(displayed_tool_output(&app, 0).contains("fallback summary"));
+        assert!(displayed_tool_output(&app, 0).contains("unavailable"));
+        std::fs::write(&path, full.as_bytes()).unwrap();
+        toggle_transcript(&mut app);
+        assert_eq!(displayed_tool_output(&app, 0), full);
+    }
+
+    #[test]
+    fn completed_output_without_store_remains_available_after_collapse() {
+        let mut app = test_app();
+        let full = format!("head\n{}tail\n", "x".repeat(256 * 1_024));
+        let mut result = ToolResult::success(CallId::from("call"), "model summary");
+        result.truncated = true;
+        result.metadata = serde_json::json!({
+            "display_output": full,
+            // No filesystem control exists in an embedded App. The supplied
+            // output is the only retrievable copy, regardless of this reference.
+            "display_blobs": {"output": {"sha256": "0".repeat(64), "bytes": full.len()}},
+        });
+        app.state.apply_runtime_event(RuntimeEvent::ToolCompleted {
+            operation_id: OperationId::from("operation"),
+            result,
+        });
+        assert_eq!(displayed_tool_output(&app, 0), full);
+        toggle_transcript(&mut app);
+        assert_eq!(displayed_tool_output(&app, 0), full);
+        toggle_transcript(&mut app);
+        assert_eq!(displayed_tool_output(&app, 0), full);
+    }
+
     #[test]
     fn startup_project_path_collapses_the_home_prefix() {
         assert_eq!(
@@ -3367,6 +3548,136 @@ Session ID: ses_cafebabe"
         assert!(!requires_immediate_redraw(&RuntimeEvent::AssistantDelta {
             text: "x".into()
         }));
+    }
+
+    #[tokio::test]
+    async fn sustained_input_cannot_starve_tool_completion_approval_or_shutdown() {
+        let mut app = test_app();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let (input_sender, mut input) = mpsc::channel(513);
+        for _ in 0..512 {
+            input_sender.try_send(Event::FocusGained).unwrap();
+        }
+        input_sender
+            .try_send(Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
+        let (runtime_sender, runtime_events) = mpsc::channel(4);
+        let (tool_sender, tool_events) = mpsc::channel(1);
+        tool_sender
+            .try_send(RuntimeEvent::ToolOutputDelta {
+                call_id: CallId::from("call"),
+                stream: "stdout".into(),
+                chunk: "partial".into(),
+            })
+            .unwrap();
+        for event in [
+            RuntimeEvent::ToolCompleted {
+                operation_id: OperationId::from("tool"),
+                result: ToolResult::success(CallId::from("call"), "canonical completion"),
+            },
+            RuntimeEvent::ApprovalRequired {
+                request: ApprovalRequest {
+                    operation_id: OperationId::from("approval"),
+                    operation: Operation::Read {
+                        path: "file".into(),
+                        external: false,
+                    },
+                    summary: "Read file".into(),
+                    arguments: serde_json::json!({"path": "file"}),
+                },
+            },
+            RuntimeEvent::Shutdown,
+        ] {
+            runtime_sender.try_send(event).unwrap();
+        }
+        run_loop(
+            &mut app,
+            &mut terminal,
+            &mut input,
+            Some(runtime_events),
+            Some(tool_events),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(&app.state.transcript[..], [TranscriptEntry::ToolCall(tool)]
+            if tool.output == "canonical completion" && tool.lifecycle == crate::tui::ToolLifecycle::Completed)
+        );
+        assert!(app.state.approval.is_some());
+        assert_eq!(app.state.activity(), &ActivityState::Idle);
+        // Check progress while input is continuously ready, not elapsed time.
+        assert!(input.len() >= 510);
+        assert!(!app.exit_requested);
+    }
+
+    #[tokio::test]
+    async fn queued_composer_input_cannot_answer_a_new_approval() {
+        for first in [
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            Event::Resize(80, 24),
+        ] {
+            let resized = matches!(first, Event::Resize(..));
+            let mut app = test_app();
+            app.state.set_thinking();
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let (input_sender, mut input) = mpsc::channel(3);
+            for event in [
+                first,
+                Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE)),
+            ] {
+                input_sender.try_send(event).unwrap();
+            }
+            let (runtime_sender, runtime_events) = mpsc::channel(2);
+            runtime_sender
+                .try_send(RuntimeEvent::ApprovalRequired {
+                    request: ApprovalRequest {
+                        operation_id: OperationId::from("new-approval"),
+                        operation: Operation::Read {
+                            path: "file".into(),
+                            external: false,
+                        },
+                        summary: "Read file".into(),
+                        arguments: serde_json::json!({"path":"file"}),
+                    },
+                })
+                .unwrap();
+            runtime_sender.try_send(RuntimeEvent::Shutdown).unwrap();
+            run_loop(
+                &mut app,
+                &mut terminal,
+                &mut input,
+                Some(runtime_events),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+            assert!(
+                app.state.approval.is_some(),
+                "typeahead answered the prompt"
+            );
+            assert_eq!(app.state.composer, if resized { "a" } else { "ca" });
+            assert!(app.state.sent_commands().is_empty());
+
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+            assert!(matches!(
+                app.state.sent_commands(),
+                [EngineCommand::ResolveApproval {
+                    response: ApprovalResponse::ApproveOnce,
+                    ..
+                }]
+            ));
+        }
     }
 
     #[tokio::test]

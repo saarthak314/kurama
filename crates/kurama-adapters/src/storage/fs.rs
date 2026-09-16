@@ -21,6 +21,7 @@ const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 const METADATA_FILE: &str = "metadata.json";
 const TAIL_SCAN_BYTES: usize = 8 * 1024;
+const BLOB_SCAN_BYTES: usize = 64 * 1024;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -107,6 +108,58 @@ impl FsSessionStore {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Verify the complete blob while retaining only its final `max_bytes` bytes.
+    pub fn get_blob_tail(
+        &self,
+        reference: &BlobRef,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, KuramaError> {
+        validate_hash(&reference.sha256)?;
+        let path = self.blobs_dir().join(&reference.sha256);
+        reject_symlink(&path)?;
+        let mut file = File::open(&path)?;
+        if file.metadata()?.len() != reference.bytes {
+            return Err(KuramaError::Storage("blob length mismatch".into()));
+        }
+        let tail_len = usize::try_from(reference.bytes)
+            .unwrap_or(usize::MAX)
+            .min(max_bytes);
+        let tail_start = reference.bytes - tail_len as u64;
+        let mut tail = Vec::new();
+        let mut digest = Sha256::new();
+        let mut total = 0_u64;
+        let mut buffer = [0_u8; BLOB_SCAN_BYTES];
+        loop {
+            let bytes_read = match file.read(&mut buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if bytes_read == 0 {
+                break;
+            }
+            let next_total = total
+                .checked_add(bytes_read as u64)
+                .filter(|length| *length <= reference.bytes)
+                .ok_or_else(|| KuramaError::Storage("blob length mismatch".into()))?;
+            digest.update(&buffer[..bytes_read]);
+            let start = tail_start.saturating_sub(total).min(bytes_read as u64) as usize;
+            if start < bytes_read {
+                if tail.is_empty() {
+                    tail.reserve_exact(tail_len);
+                }
+                tail.extend_from_slice(&buffer[start..bytes_read]);
+            }
+            total = next_total;
+        }
+        if total != reference.bytes {
+            return Err(KuramaError::Storage("blob length mismatch".into()));
+        }
+        if lowercase_hex(&digest.finalize()) != reference.sha256 {
+            return Err(KuramaError::Storage("blob hash mismatch".into()));
+        }
+        Ok(tail)
     }
 
     fn sessions_dir(&self) -> PathBuf {
@@ -201,7 +254,7 @@ impl FsSessionStore {
         let path = self.log_path(session_id, agent_id)?;
         let mut file = open_locked(&path, false)?;
         let (complete_end, removed_bytes) = complete_log_end(&mut file)?;
-        let scan = scan_complete_log(
+        let mut scan = scan_complete_log(
             &mut file,
             complete_end,
             session_id,
@@ -216,8 +269,23 @@ impl FsSessionStore {
                 agent_id.cloned(),
                 SessionEvent::RecoveryRepair { removed_bytes },
             );
+            let next_sequence = scan
+                .next_sequence
+                .checked_add(1)
+                .ok_or_else(|| KuramaError::Storage("event sequence exceeds u64".into()))?;
             file.set_len(complete_end)?;
             commit_event(&mut file, &repair)?;
+            scan.next_sequence = next_sequence;
+            scan.latest_timestamp_ms = Some(
+                scan.latest_timestamp_ms
+                    .map_or(repair.timestamp_ms, |latest| {
+                        latest.max(repair.timestamp_ms)
+                    }),
+            );
+            if materialize_events {
+                count_materialized_replay_event();
+                scan.events.push(repair);
+            }
         }
         Ok(scan)
     }

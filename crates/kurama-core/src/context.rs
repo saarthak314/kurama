@@ -56,7 +56,7 @@ pub struct AssembledContext {
 #[derive(Debug, Clone)]
 pub struct CompactionRequest {
     pub covered_through_sequence: u64,
-    pub events: Vec<EventEnvelope>,
+    pub items: Vec<ModelItem>,
     pub prompt: String,
     pub estimated_tokens: u64,
 }
@@ -223,20 +223,58 @@ impl ContextManager {
         let events: Vec<_> = self.canonical[..retained_start]
             .iter()
             .filter(|event| {
-                self.summary
-                    .as_ref()
-                    .is_none_or(|summary| event.sequence > summary.covered_through_sequence)
+                !matches!(event.event, SessionEvent::ContextCompacted { .. })
+                    && self
+                        .summary
+                        .as_ref()
+                        .is_none_or(|summary| event.sequence > summary.covered_through_sequence)
             })
-            .cloned()
             .collect();
         let covered_through_sequence = events.last()?.sequence;
-        let serialized = serde_json::to_vec(&events).ok()?;
+        let mut items = Vec::with_capacity(2);
+        // The active summary can live after the newly covered prefix. Carry it
+        // explicitly, once, as data rather than relying on its event position.
+        if let Some(summary) = &self.summary {
+            items.push(ModelItem::Summary {
+                text: summary.text.clone(),
+                covered_through_sequence: summary.covered_through_sequence,
+                tokens: summary.tokens,
+            });
+        }
+        items.push(ModelItem::User {
+            text: serde_json::to_string(&events).ok()?,
+        });
         Some(CompactionRequest {
             covered_through_sequence,
-            estimated_tokens: estimate_bytes(serialized.len()),
-            events,
+            estimated_tokens: estimate_items(&items).ok()?,
+            items,
             prompt: crate::prompts::COMPACTION_PROMPT.into(),
         })
+    }
+
+    pub(crate) fn check_compaction_budget(
+        &self,
+        request: &ModelRequest,
+    ) -> Result<(), KuramaError> {
+        let tokens = estimate_serialized(serde_json::to_vec(request))?
+            .saturating_add(PROVIDER_ENVELOPE_RESERVE_TOKENS);
+        if tokens > self.usable_tokens(&request.profile) {
+            return Err(KuramaError::Session(
+                "compaction summary and events exceed the model input context budget".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn usable_tokens(&self, profile: &ModelProfile) -> u64 {
+        self.policy
+            .max_input_tokens
+            .min(profile.max_input_tokens)
+            .saturating_sub(
+                self.policy
+                    .reserve_output_tokens
+                    .min(profile.max_output_tokens),
+            )
     }
 
     pub fn assemble(
@@ -249,15 +287,7 @@ impl ContextManager {
         let (session_id, agent_id) = self.identity.clone().ok_or_else(|| {
             KuramaError::Session("cannot assemble context without a session event".into())
         })?;
-        let usable_tokens = self
-            .policy
-            .max_input_tokens
-            .min(profile.max_input_tokens)
-            .saturating_sub(
-                self.policy
-                    .reserve_output_tokens
-                    .min(profile.max_output_tokens),
-            );
+        let usable_tokens = self.usable_tokens(profile);
         let system_tokens = estimate_text(SYSTEM_PROMPT);
         let tool_tokens = estimate_serialized(serde_json::to_vec(&tools))?;
         let request_shell = ModelRequest {

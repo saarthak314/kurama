@@ -21,8 +21,10 @@ The standard binary exposes exactly four environment tools: `read`, `write`, `ba
 ## Control-plane invariants
 
 - The parent engine owns its session sequence. Child engines and their manager share a child log, so both use `SessionStore::append_next`: sequence allocation and durable append happen under one storage lock. `FsSessionStore` reads only the trailing record for allocation, serializes each new event into one buffer, and retains `sync_data` for every append. Explicit-sequence `append` still validates the supplied sequence.
+- Replay returns a consistent post-repair snapshot: a torn-tail `RecoveryRepair` is included immediately, along with the updated sequence and session timestamp. The next parent or child append does not require a second replay.
 - Recovery distinguishes a log's owner from its descendants. A child's own `AgentStarted`/progress records are not evidence of an interrupted descendant; the parent still marks unfinished children interrupted on resume.
 - The canonical in-memory event history remains authoritative for model context. Turn ranges, latest user/goal/todo positions, and evidence positions are maintained on append and rebuilt on replay. Live delegation detection does not reread the filesystem log. Recent completed turns fit as whole units or are omitted; current-turn content and the active goal keep their budget priority.
+- Explicit compaction carries the active summary as model input data alongside newly eligible events, excluding superseded compaction records. Both count toward the input allowance; oversized requests fail before contacting the backend or changing durable coverage. Compaction remains explicit, not automatic.
 - Assistant text flushes at a UTF-8-safe 4 KiB boundary or a 50 ms pending-text deadline, and at response termination. Chunking copies each emitted byte once rather than repeatedly moving the remaining suffix. No timer runs while the buffer is empty. Provider adapters may buffer their own control responses; runtime consumers must drain the bounded event channel. Received token usage is persisted before fallible display delivery.
 
 ## Terminal interface
@@ -33,20 +35,30 @@ The interface uses terminal-default foreground/background colors, restrained cya
 
 The renderer caches wrapped transcript rows for the current width and detail mode. Streaming and todo updates invalidate the changed suffix while retaining unchanged entries; scrolling changes only the visible slice. Ignored input events do not force redraws. Compact tool previews retain bounded rows instead of formatting and allocating the entire output. Terminal control sequences are filtered before text layout, and composer cursor movement/deletion respects grapheme boundaries. The wrapped-row cache trades some memory for substantially less repeated parsing; full session history remains retained.
 
+Filesystem-backed completed tool output retains a verified tail of at most 128 KiB in the normal view. Resume hydrates borrowed events without cloning the complete replay or materializing every display blob. `Ctrl+O` loads full verified output; collapse restores the bounded preview and discards the expanded render data. Blob verification still scans all bytes in bounded chunks, so this reduces allocation and retained memory, not integrity checks or verification I/O. Live output remains capped for every caller; embedded callers without a retrieval store retain full completion text when supplied.
+
+Every input event gives ready runtime/tool events a bounded processing opportunity, including ignored input. Queued tool deltas precede canonical completion. Input already queued when an approval opens stays in its previous UI context, including keys buffered during resize; it cannot authorize the new prompt. Fresh approval responses and cancellation remain available.
+
 ### Reproducing terminal checks
 
 ```sh
-cargo build --locked --release -p kurama-cli --bin kurama --example tui_bench
+cargo build --locked --release -p kurama-cli --bin kurama --example tui_bench --example control_plane_bench
 target/release/examples/tui_bench --turns 1000 --frames 100 --repetitions 5
 uv run --with pyte scripts/check-tui.py target/release/kurama .lavish/tui-check --no-images
 uv run --with pyte scripts/check-tui.py target/release/kurama .lavish/tui-fallback --no-images --no-cpr --seed-todos
+uv run --with pyte scripts/check-tui.py target/release/kurama .lavish/tui-recovery --no-images --torn-tail --seed-large-output-mib 8 --check-compaction
 python3 scripts/bench-startup.py target/release/kurama
 python3 scripts/bench-idle.py target/release/kurama
+python3 scripts/bench-harness.py --bin-dir target/release/examples --output-dir .lavish/harness-measurements
 ```
 
 The POSIX terminal gate drives the production binary through a PTY and a local SSE provider. It exercises multiline paste, read/write approval, Markdown, resize, transcript browsing/restoration, long output, and optional resumed todo navigation. It requires exact write contents, successful tool results, clean exit, preserved shell history, and no scrollback purge. Add `--with pillow` to the `uv` invocation and omit `--no-images` for screenshots decoded from the PTY stream; these are not native terminal-window captures. `--baseline` permits old scrollback behavior when capturing a before comparison. These Python dependencies are development-only.
 
+The combined recovery scenario seeds a complete tool lifecycle and a large display blob, adds a torn log suffix, resumes, expands/collapses full output, compacts twice around another turn, then exercises real read/write approval and transcript controls. It checks contiguous repaired history, exactly one repair, and the first decision in both compaction model requests and the final durable summary. It also reports observed composer readiness and process RSS before expansion, while expanded, and after collapse; fixture construction is outside the readiness interval.
+
 `tui_bench` measures the production `App` event loop with deterministic input and Ratatui's `TestBackend`, plus the compact-preview renderer. Compare identical benchmark source and release settings, run sequentially in alternating order, and retain raw samples. It isolates rendering work, not real-terminal paint time or model latency. The startup gate measures first terminal bytes, not interactive readiness; a terminal that does not answer cursor-position queries can still incur the fallback timeout. The idle gate requires a live process before accepting RSS/CPU samples.
+
+PR CI runs the real PTY checks with normal cursor reports and without reports plus resumed todos. Nightly runs actual PTYs on Linux and macOS, including the combined repair/large-output/compaction scenario. It also runs the release control-plane and rendering benchmarks sequentially through `bench-harness.py`. The standard-library runner retains exact stdout/stderr, per-child CPU and peak RSS, binary hashes, and host/toolchain provenance; malformed results, child failures, and watchdog timeouts fail the run without skipping the second benchmark. Raw artifacts upload even on failure. Shared runners have no brittle absolute rendering-latency threshold.
 
 The visual direction takes cues from [Codex's terminal ownership](https://github.com/openai/codex/blob/main/codex-rs/tui/src/tui.rs) and [composer implementation](https://github.com/openai/codex/blob/main/codex-rs/tui/src/bottom_pane/chat_composer.rs): separate inline history from overlays and keep editing in a dedicated bottom pane. Kurama applies restrained visual chrome while retaining its own tools, approval semantics, and keyboard conventions.
 

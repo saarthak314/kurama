@@ -130,14 +130,20 @@ fn replay_repairs_only_an_incomplete_trailing_record() {
         .write_all(br#"{"schema_version":1"#)
         .expect("write torn tail");
 
-    let first = store.replay(&SessionId::from("session-a")).expect("repair");
-    assert_eq!(first.len(), 1);
-    let repaired = store.replay(&SessionId::from("session-a")).expect("replay");
-    assert_eq!(repaired.len(), 2);
+    let mut first = store.replay(&SessionId::from("session-a")).expect("repair");
+    let repair = first.last().expect("committed repair in first replay");
     assert!(matches!(
-        repaired[1].event,
-        SessionEvent::RecoveryRepair { removed_bytes } if removed_bytes == 19
+        repair.event,
+        SessionEvent::RecoveryRepair { removed_bytes: 19 }
     ));
+    let next = event("session-a", repair.sequence + 1, 12, None);
+    store.append(&next).expect("append using first replay");
+    first.push(next);
+    let repaired = store.replay(&SessionId::from("session-a")).expect("replay");
+    assert_eq!(
+        repaired, first,
+        "a second replay must not add another repair"
+    );
 
     std::fs::OpenOptions::new()
         .append(true)
@@ -149,6 +155,53 @@ fn replay_repairs_only_an_incomplete_trailing_record() {
         store.replay(&SessionId::from("session-a")),
         Err(KuramaError::Storage(_))
     ));
+}
+
+#[test]
+fn replayed_child_repair_is_immediately_appendable_without_advancing_parent() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = FsSessionStore::open(temp.path().to_owned()).expect("store");
+    let session_id = SessionId::from("child-repair");
+    let agent_id = AgentId::from("child");
+    store.create(&metadata("child-repair", 10)).expect("create");
+    let parent = event("child-repair", 0, 11, None);
+    store.append(&parent).expect("parent event");
+    store
+        .append(&event("child-repair", 0, 12, Some("child")))
+        .expect("child event");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(temp.path().join("sessions/child-repair/agents/child.jsonl"))
+        .expect("child log")
+        .write_all(b"torn")
+        .expect("torn child tail");
+
+    let mut first = store.replay_agent(&session_id, &agent_id).expect("repair");
+    let repair = first.last().expect("committed child repair");
+    assert!(matches!(
+        repair.event,
+        SessionEvent::RecoveryRepair { removed_bytes: 4 }
+    ));
+    let next_child = event("child-repair", repair.sequence + 1, 13, Some("child"));
+    store
+        .append(&next_child)
+        .expect("append using first child replay");
+    first.push(next_child);
+    assert_eq!(
+        store
+            .replay_agent(&session_id, &agent_id)
+            .expect("child replay"),
+        first
+    );
+
+    let next_parent = event("child-repair", 1, 14, None);
+    store
+        .append(&next_parent)
+        .expect("parent sequence unchanged");
+    assert_eq!(
+        store.replay(&session_id).expect("parent replay"),
+        vec![parent, next_parent]
+    );
 }
 
 #[test]
@@ -406,6 +459,110 @@ fn blobs_are_content_addressed_deduplicated_and_verified() {
 }
 
 #[test]
+fn blob_tails_match_verified_full_bytes_across_chunk_boundaries() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = FsSessionStore::open(temp.path().to_owned()).expect("store");
+    let bytes: Vec<u8> = (0..3 * 64 * 1024 + 17)
+        .map(|index| ((index * 31 + index / 251) % 256) as u8)
+        .collect();
+    let reference = store.put_blob(&bytes).expect("blob");
+    let full = store.get_blob(&reference).expect("verified full blob");
+    for max_bytes in [
+        0,
+        1,
+        64 * 1024 - 1,
+        64 * 1024,
+        64 * 1024 + 1,
+        full.len(),
+        usize::MAX,
+    ] {
+        let tail = store
+            .get_blob_tail(&reference, max_bytes)
+            .expect("verified tail");
+        assert_eq!(tail, full[full.len().saturating_sub(max_bytes)..]);
+    }
+    let empty = store.put_blob(b"").expect("empty blob");
+    assert_eq!(store.get_blob_tail(&empty, 0).expect("zero limit"), b"");
+    assert_eq!(
+        store.get_blob_tail(&empty, usize::MAX).expect("empty tail"),
+        b""
+    );
+}
+
+#[test]
+fn blob_tails_reject_corruption_outside_the_retained_suffix_even_with_zero_limit() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = FsSessionStore::open(temp.path().to_owned()).expect("store");
+    let mut bytes = vec![b'x'; 3 * 64 * 1024 + 17];
+    let reference = store.put_blob(&bytes).expect("blob");
+    bytes[0] = b'y';
+    std::fs::write(temp.path().join("blobs").join(&reference.sha256), &bytes)
+        .expect("corrupt discarded prefix without changing length");
+    for max_bytes in [0, 17] {
+        assert!(matches!(
+            store.get_blob_tail(&reference, max_bytes),
+            Err(KuramaError::Storage(_))
+        ));
+    }
+}
+
+#[test]
+fn blob_tails_require_exact_length_and_valid_hash_paths() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = FsSessionStore::open(temp.path().to_owned()).expect("store");
+    let reference = store.put_blob(b"complete bytes").expect("blob");
+    for bytes in [reference.bytes - 1, reference.bytes + 1] {
+        let wrong_length = BlobRef {
+            bytes,
+            ..reference.clone()
+        };
+        assert!(matches!(
+            store.get_blob_tail(&wrong_length, 4),
+            Err(KuramaError::Storage(_))
+        ));
+    }
+    let oversized = BlobRef {
+        bytes: u64::MAX,
+        ..reference
+    };
+    assert!(matches!(
+        store.get_blob_tail(&oversized, usize::MAX),
+        Err(KuramaError::Storage(_))
+    ));
+    assert!(matches!(
+        store.get_blob_tail(
+            &BlobRef {
+                sha256: "../state.json".into(),
+                bytes: 0
+            },
+            0
+        ),
+        Err(KuramaError::Storage(_))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn blob_tails_reject_symlinks_even_when_the_target_matches() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = FsSessionStore::open(temp.path().to_owned()).expect("store");
+    let reference = store.put_blob(b"complete bytes").expect("blob");
+    let path = temp.path().join("blobs").join(&reference.sha256);
+    let target = temp.path().join("outside-blob");
+    std::fs::rename(&path, &target).expect("move original bytes");
+    std::os::unix::fs::symlink(&target, &path).expect("symlink");
+    assert!(matches!(
+        store.get_blob_tail(&reference, 4),
+        Err(KuramaError::Storage(_))
+    ));
+    std::fs::remove_file(&target).expect("remove target");
+    assert!(matches!(
+        store.get_blob_tail(&reference, 0),
+        Err(KuramaError::Storage(_))
+    ));
+}
+
+#[test]
 fn list_uses_durable_metadata_and_latest_event_time() {
     let temp = tempfile::tempdir().expect("tempdir");
     let store = FsSessionStore::open(temp.path().to_owned()).expect("store");
@@ -420,6 +577,46 @@ fn list_uses_durable_metadata_and_latest_event_time() {
     assert_eq!(sessions[0].updated_at_ms, 30);
     assert_eq!(sessions[1].id, SessionId::from("newer"));
     assert_eq!(sessions[1].updated_at_ms, 20);
+}
+
+#[test]
+fn list_includes_a_new_repair_in_the_first_summary() {
+    for agent in [None, Some("child")] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = FsSessionStore::open(temp.path().to_owned()).expect("store");
+        store
+            .create(&metadata("summary-repair", 1))
+            .expect("create");
+        store
+            .append(&event("summary-repair", 0, 2, agent))
+            .expect("event");
+        let relative_log = if agent.is_some() {
+            "sessions/summary-repair/agents/child.jsonl"
+        } else {
+            "sessions/summary-repair/events.jsonl"
+        };
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(temp.path().join(relative_log))
+            .expect("log")
+            .write_all(b"torn")
+            .expect("torn tail");
+
+        let listed = store.list().expect("repair during list");
+        let session_id = SessionId::from("summary-repair");
+        let replay = match agent {
+            Some(agent) => store.replay_agent(&session_id, &AgentId::from(agent)),
+            None => store.replay(&session_id),
+        }
+        .expect("replay after list");
+        let repair = replay.last().expect("repair");
+        assert!(matches!(
+            repair.event,
+            SessionEvent::RecoveryRepair { removed_bytes: 4 }
+        ));
+        assert_eq!(listed[0].updated_at_ms, repair.timestamp_ms);
+        assert_eq!(store.list().expect("second list"), listed);
+    }
 }
 
 #[test]
@@ -443,7 +640,10 @@ fn replay_repairs_a_torn_tail_with_one_durable_sync() {
         .replay_with_operation_counts_for_test(&SessionId::from("repair-sync"))
         .expect("repair");
 
-    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events.last().map(|event| &event.event),
+        Some(SessionEvent::RecoveryRepair { removed_bytes: 19 })
+    ));
     assert_eq!(syncs, 1);
 }
 
