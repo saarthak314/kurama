@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
-"""Measure time from process spawn to Kurama's first terminal bytes."""
+"""Measure spawn-to-first-terminal-byte latency from identical configured cold state."""
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from pathlib import Path
-import pty
 import select
-import signal
+import shutil
 import statistics
 import subprocess
-import sys
 import tempfile
 import time
+import traceback
+
+from verification import (
+    fixture_digest,
+    opened_pty,
+    prepare_home,
+    provenance,
+    terminate_process,
+)
 
 
 RUNS = 30
@@ -21,103 +29,85 @@ LIMIT_MS = 100.0
 READ_TIMEOUT_SECONDS = 5.0
 
 
-def prepare_home(root: Path) -> dict[str, str]:
-    bridge = root / "bin" / "claude"
-    bridge.parent.mkdir(parents=True)
-    bridge.write_text(
-        "#!/usr/bin/env bash\n"
-        "if [[ ${1:-} == --version ]]; then echo kurama-bench-bridge; exit 0; fi\n"
-        "cat >/dev/null\n"
-        "printf '%s\\n' '{\"type\":\"result\",\"result\":\"bench\",\"session_id\":\"bench\"}'\n",
-        encoding="utf-8",
-    )
-    bridge.chmod(0o755)
-
-    config_dir = root / ".kurama"
-    config_dir.mkdir(mode=0o700)
-    config = (
-        "version = 1\n"
-        'default_profile = "bench"\n'
-        'default_mode = "supervised"\n\n'
-        "[profiles.bench]\n"
-        'kind = "claude_cli"\n'
-        'model = "bench"\n'
-        f"command = {json.dumps(str(bridge))}\n\n"
-        "[search]\n"
-        'kind = "json"\n'
-        'endpoint = "http://127.0.0.1:9/search"\n'
-    )
-    (config_dir / "config.toml").write_text(config, encoding="utf-8")
-
-    env = os.environ.copy()
-    env.update(
-        {
-            "HOME": str(root),
-            "PATH": f"{bridge.parent}{os.pathsep}{env.get('PATH', '')}",
-            "TERM": "xterm-256color",
-            "NO_COLOR": "1",
-        }
-    )
-    return env
-
-
-def terminate_group(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=1.0)
-    except (ProcessLookupError, subprocess.TimeoutExpired):
+def measure_once(binary: Path, env: dict[str, str], cwd: Path, sample: dict) -> float:
+    with opened_pty() as (master, slave):
+        started = time.monotonic_ns()
+        process = subprocess.Popen(
+            [str(binary)],
+            cwd=cwd,
+            env=env,
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            start_new_session=True,
+            close_fds=True,
+        )
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait(timeout=1.0)
-
-
-def measure_once(binary: Path, env: dict[str, str], cwd: Path) -> float:
-    master, slave = pty.openpty()
-    started = time.monotonic_ns()
-    process = subprocess.Popen(
-        [str(binary)],
-        cwd=cwd,
-        env=env,
-        stdin=slave,
-        stdout=slave,
-        stderr=slave,
-        start_new_session=True,
-        close_fds=True,
-    )
-    os.close(slave)
-    try:
-        readable, _, _ = select.select([master], [], [], READ_TIMEOUT_SECONDS)
-        if not readable:
-            raise RuntimeError("timed out waiting for first terminal output")
-        data = os.read(master, 4096)
-        if not data:
-            raise RuntimeError("Kurama exited before rendering terminal output")
-        return (time.monotonic_ns() - started) / 1_000_000
-    finally:
-        terminate_group(process)
-        os.close(master)
+            slave.close()
+            readable, _, _ = select.select([master], [], [], READ_TIMEOUT_SECONDS)
+            if not readable:
+                raise RuntimeError("timed out waiting for first terminal output")
+            data = os.read(master.fileno(), 4096)
+            if not data:
+                raise RuntimeError("Kurama exited before rendering terminal output")
+            elapsed_ms = (time.monotonic_ns() - started) / 1_000_000
+            sample["first_bytes_hex"] = data.hex()
+            if process.poll() is not None:
+                raise RuntimeError(
+                    f"Kurama exited during startup: {process.returncode}"
+                )
+            sample["elapsed_ms"] = elapsed_ms
+            return elapsed_ms
+        finally:
+            sample["process_group_cleanup"] = terminate_process(process)
+            sample["returncode_after_cleanup"] = process.returncode
 
 
 def main() -> int:
-    binary = Path(sys.argv[1] if len(sys.argv) > 1 else "target/release/kurama").resolve()
-    if not binary.is_file():
-        print(f"missing binary: {binary}", file=sys.stderr)
-        return 2
-
-    with tempfile.TemporaryDirectory(prefix="kurama-startup-") as temp:
-        root = Path(temp)
-        env = prepare_home(root)
-        project = root / "project"
-        project.mkdir()
-        samples = [measure_once(binary, env, project) for _ in range(RUNS)]
-
-    median_ms = statistics.median(samples)
-    print(json.dumps({"metric": "startup_ms", "samples": samples, "median": median_ms, "limit": LIMIT_MS}))
-    return 0 if median_ms <= LIMIT_MS else 1
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("binary", nargs="?", default="target/release/kurama", type=Path)
+    parser.add_argument("--runs", type=int, default=RUNS)
+    args = parser.parse_args()
+    if args.runs <= 0:
+        parser.error("--runs must be positive")
+    binary = args.binary.resolve()
+    result = {
+        "schema_version": 2,
+        "metric": "startup_ms",
+        "provenance": provenance(binary),
+        "parameters": {"runs": args.runs, "read_timeout_seconds": READ_TIMEOUT_SECONDS},
+        "initial_state": "configured cold state restored before every sample; OS caches not flushed",
+        "samples": [],
+        "raw_samples": [],
+        "median": None,
+        "limit": LIMIT_MS,
+        "exit_status": 1,
+    }
+    try:
+        with tempfile.TemporaryDirectory(prefix="kurama-startup-") as temp:
+            root = Path(temp) / "home"
+            template = Path(temp) / "template"
+            env = prepare_home(root)
+            shutil.copytree(root, template)
+            expected = fixture_digest(template)
+            for index in range(args.runs):
+                sample = {"index": index, "initial_state_sha256": None}
+                result["raw_samples"].append(sample)
+                shutil.rmtree(root)
+                shutil.copytree(template, root)
+                sample["initial_state_sha256"] = fixture_digest(root)
+                if sample["initial_state_sha256"] != expected:
+                    raise RuntimeError("startup fixture restore changed initial state")
+                result["samples"].append(
+                    measure_once(binary, env, root / "project", sample)
+                )
+        result["median"] = statistics.median(result["samples"])
+        result["exit_status"] = 0 if result["median"] <= LIMIT_MS else 1
+    except Exception as error:
+        result["fatal_error"] = str(error)
+        result["traceback"] = traceback.format_exc()
+    print(json.dumps(result, allow_nan=False))
+    return result["exit_status"]
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ use futures_util::{Stream, StreamExt};
 use kurama_protocol::{
     KuramaError,
     model::ModelEvent,
-    traits::{CancelSignal, ModelStream},
+    traits::{BoxFuture, CancelSignal, ModelStream},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -155,9 +155,10 @@ pub(crate) async fn event_stream_with_inactivity<D: BridgeDecoder>(
         return Err(KuramaError::Cancelled);
     }
     let mut lines = command.spawn(secrets.clone(), inactivity_timeout).await?;
+    let mut cancelled = cancel.cancelled();
     loop {
         let line = tokio::select! {
-            _ = cancel.cancelled() => {
+            _ = &mut cancelled => {
                 lines.cancel_and_wait().await;
                 return Err(KuramaError::Cancelled);
             }
@@ -173,7 +174,7 @@ pub(crate) async fn event_stream_with_inactivity<D: BridgeDecoder>(
                     }
                     if !events.is_empty() {
                         return Ok(decoded_event_stream(
-                            lines, decoder, events, secrets, terminal,
+                            lines, decoder, events, secrets, terminal, cancelled,
                         ));
                     }
                 }
@@ -202,6 +203,7 @@ fn decoded_event_stream<D: BridgeDecoder>(
     events: Vec<ModelEvent>,
     secrets: Vec<String>,
     terminal: bool,
+    cancelled: BoxFuture<'static, ()>,
 ) -> ModelStream {
     let state = DecodedStreamState {
         lines,
@@ -209,6 +211,7 @@ fn decoded_event_stream<D: BridgeDecoder>(
         pending: events.into_iter().map(Ok).collect(),
         secrets,
         terminal,
+        cancelled,
         ended: false,
     };
     Box::pin(futures_util::stream::unfold(
@@ -225,7 +228,16 @@ fn decoded_event_stream<D: BridgeDecoder>(
                 if state.ended {
                     return None;
                 }
-                match state.lines.next().await {
+                let line = tokio::select! {
+                    biased;
+                    _ = &mut state.cancelled => {
+                        state.lines.cancel_and_wait().await;
+                        state.ended = true;
+                        return Some((Err(KuramaError::Cancelled), state));
+                    }
+                    line = state.lines.next() => line,
+                };
+                match line {
                     Some(Ok(line)) => match state.decoder.push_line(&line) {
                         Ok(events) => {
                             state.pending.extend(events.into_iter().map(Ok));
@@ -267,6 +279,7 @@ struct DecodedStreamState<D> {
     pending: VecDeque<Result<ModelEvent, KuramaError>>,
     secrets: Vec<String>,
     terminal: bool,
+    cancelled: BoxFuture<'static, ()>,
     ended: bool,
 }
 
@@ -285,6 +298,7 @@ impl BridgeLineStream {
 
     async fn cancel_and_wait(&mut self) {
         self.request_cancel();
+        self.receiver.close();
         if let Some(task) = self.task.take() {
             let _ = task.await;
         }
@@ -318,6 +332,9 @@ async fn drive_process(
     secrets: Vec<String>,
     inactivity_timeout: Duration,
 ) {
+    // Child::id becomes None once wait reaps the leader; descendants still belong
+    // to this group and can keep inherited pipes open after that point.
+    let process_group = child.id();
     let mut stdin_task = tokio::spawn(write_stdin(stdin, input));
     let mut stderr_task = tokio::spawn(drain_bounded(stderr, STDERR_DIAGNOSTIC_BYTES));
     let mut stdout = BoundedJsonlReader::new(stdout);
@@ -328,14 +345,14 @@ async fn drive_process(
     loop {
         let record = tokio::select! {
             _ = &mut cancel => {
-                terminate_process_group(&mut child).await;
+                terminate_process_group(&mut child, process_group).await;
                 stdin_task.abort();
                 stderr_task.abort();
                 return;
             }
             record = stdout.next_record(&program) => record,
             _ = inactivity.wait() => {
-                terminate_process_group(&mut child).await;
+                terminate_process_group(&mut child, process_group).await;
                 stdin_task.abort();
                 let diagnostic = bounded_stderr_diagnostic(
                     &program,
@@ -360,7 +377,7 @@ async fn drive_process(
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(error) => {
-                terminate_process_group(&mut child).await;
+                terminate_process_group(&mut child, process_group).await;
                 stdin_task.abort();
                 stderr_task.abort();
                 let _ = sender.send(Err(error)).await;
@@ -379,22 +396,22 @@ async fn drive_process(
             result = sender.send(Ok(line)) => result.is_ok(),
         };
         if !sent {
-            terminate_process_group(&mut child).await;
+            terminate_process_group(&mut child, process_group).await;
             stdin_task.abort();
             stderr_task.abort();
             return;
         }
     }
 
-    let status = tokio::select! {
+    let completion = tokio::select! {
         _ = &mut cancel => {
-            terminate_process_group(&mut child).await;
+            terminate_process_group(&mut child, process_group).await;
             stdin_task.abort();
             stderr_task.abort();
             return;
         }
         _ = inactivity.wait() => {
-            terminate_process_group(&mut child).await;
+            terminate_process_group(&mut child, process_group).await;
             stdin_task.abort();
             let diagnostic = bounded_stderr_diagnostic(
                 &program,
@@ -414,33 +431,22 @@ async fn drive_process(
             let _ = sender.send(Err(error)).await;
             return;
         }
-        status = child.wait() => status,
+        completion = async {
+            let status = child.wait().await;
+            // Keep both pipe joins inside the same deadline as the leader wait.
+            let stdin_result = (&mut stdin_task).await;
+            let stderr = (&mut stderr_task).await;
+            (status, stdin_result, stderr)
+        } => completion,
     };
+    terminate_process_group(&mut child, process_group).await;
+    let (status, stdin_result, stderr) = completion;
     let status = match status {
         Ok(status) => status,
         Err(error) => {
-            stdin_task.abort();
-            stderr_task.abort();
             let _ = sender.send(Err(error.into())).await;
             return;
         }
-    };
-    let stdin_result = tokio::select! {
-        _ = &mut cancel => {
-            terminate_process_group(&mut child).await;
-            stdin_task.abort();
-            stderr_task.abort();
-            return;
-        }
-        result = &mut stdin_task => result,
-    };
-    let stderr = tokio::select! {
-        _ = &mut cancel => {
-            terminate_process_group(&mut child).await;
-            stderr_task.abort();
-            return;
-        }
-        result = &mut stderr_task => result,
     };
     let stderr = match stderr {
         Ok(Ok(stderr)) => stderr,
@@ -538,6 +544,8 @@ fn jsonl_error(line: &str) -> Option<String> {
 struct BoundedJsonlReader<R> {
     reader: R,
     buffer: Vec<u8>,
+    consumed: usize,
+    scanned: usize,
     eof: bool,
 }
 
@@ -546,38 +554,57 @@ impl<R: AsyncRead + Unpin> BoundedJsonlReader<R> {
         Self {
             reader,
             buffer: Vec::new(),
+            consumed: 0,
+            scanned: 0,
             eof: false,
         }
     }
 
     async fn next_record(&mut self, program: &str) -> Result<Option<String>, KuramaError> {
         loop {
-            if let Some(newline) = self.buffer.iter().position(|byte| *byte == b'\n') {
-                if newline > MAX_JSONL_LINE_BYTES {
+            if let Some(offset) = self.buffer[self.scanned..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+            {
+                let newline = self.scanned + offset;
+                if newline - self.consumed > MAX_JSONL_LINE_BYTES {
                     return Err(oversized_record(program));
                 }
-                let mut record = self.buffer.drain(..=newline).collect::<Vec<_>>();
-                record.pop();
-                if record.last() == Some(&b'\r') {
-                    record.pop();
-                }
-                return String::from_utf8(record).map(Some).map_err(|_| {
-                    KuramaError::Protocol(format!("{program} emitted non-UTF-8 JSONL"))
-                });
+                let end = if newline > self.consumed && self.buffer[newline - 1] == b'\r' {
+                    newline - 1
+                } else {
+                    newline
+                };
+                let record = std::str::from_utf8(&self.buffer[self.consumed..end])
+                    .map(str::to_owned)
+                    .map_err(|_| {
+                        KuramaError::Protocol(format!("{program} emitted non-UTF-8 JSONL"))
+                    })?;
+                self.consumed = newline + 1;
+                self.scanned = self.consumed;
+                return Ok(Some(record));
             }
+            self.scanned = self.buffer.len();
             if self.eof {
-                if self.buffer.is_empty() {
+                if self.consumed == self.buffer.len() {
                     return Ok(None);
                 }
-                if self.buffer.len() > MAX_JSONL_LINE_BYTES {
-                    return Err(oversized_record(program));
-                }
-                let record = std::mem::take(&mut self.buffer);
-                return String::from_utf8(record).map(Some).map_err(|_| {
-                    KuramaError::Protocol(format!("{program} emitted non-UTF-8 JSONL"))
-                });
+                let record = std::str::from_utf8(&self.buffer[self.consumed..])
+                    .map(str::to_owned)
+                    .map_err(|_| {
+                        KuramaError::Protocol(format!("{program} emitted non-UTF-8 JSONL"))
+                    })?;
+                self.consumed = self.buffer.len();
+                return Ok(Some(record));
             }
 
+            // Compact only when another read is required, never once per record.
+            if self.consumed != 0 {
+                self.buffer.copy_within(self.consumed.., 0);
+                self.buffer.truncate(self.buffer.len() - self.consumed);
+                self.scanned -= self.consumed;
+                self.consumed = 0;
+            }
             let mut chunk = [0_u8; 8192];
             let read = self.reader.read(&mut chunk).await?;
             if read == 0 {
@@ -617,17 +644,33 @@ async fn drain_bounded(
     Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
-async fn terminate_process_group(child: &mut Child) {
+async fn terminate_process_group(child: &mut Child, process_group: Option<u32>) {
     #[cfg(unix)]
-    if let Some(pid) = child.id() {
+    if let Some(pid) = process_group {
         signal_process_group(pid, libc::SIGTERM);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if process_group_exists(pid) {
-            signal_process_group(pid, libc::SIGKILL);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        loop {
+            // Reap promptly so a responsive leader does not keep the group alive
+            // as a zombie for the entire grace period.
+            let _ = child.try_wait();
+            if !process_group_exists(pid) {
+                let _ = child.wait().await;
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                signal_process_group(pid, libc::SIGKILL);
+                break;
+            }
+            tokio::time::sleep_until(
+                deadline.min(tokio::time::Instant::now() + Duration::from_millis(2)),
+            )
+            .await;
         }
         let _ = child.wait().await;
         return;
     }
+    #[cfg(not(unix))]
+    let _ = process_group;
     if child.try_wait().ok().flatten().is_none() {
         let _ = child.start_kill();
     }
@@ -645,4 +688,58 @@ fn process_group_exists(pid: u32) -> bool {
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BoundedJsonlReader, MAX_JSONL_LINE_BYTES};
+    use kurama_protocol::KuramaError;
+
+    #[tokio::test]
+    async fn jsonl_reader_preserves_records_across_compaction_and_eof() {
+        let mut input = (0..4096)
+            .map(|index| format!("{index}\r\n"))
+            .collect::<String>()
+            .into_bytes();
+        input.extend(std::iter::repeat_n(b'x', MAX_JSONL_LINE_BYTES));
+        input.extend_from_slice(b"\nlast");
+        let mut reader = BoundedJsonlReader::new(input.as_slice());
+        for index in 0..4096 {
+            assert_eq!(
+                reader.next_record("fixture").await.expect("record"),
+                Some(index.to_string())
+            );
+        }
+        assert_eq!(
+            reader.next_record("fixture").await.expect("maximum record"),
+            Some("x".repeat(MAX_JSONL_LINE_BYTES))
+        );
+        assert_eq!(
+            reader
+                .next_record("fixture")
+                .await
+                .expect("unterminated tail"),
+            Some("last".into())
+        );
+        assert_eq!(reader.next_record("fixture").await.expect("EOF"), None);
+    }
+
+    #[tokio::test]
+    async fn jsonl_reader_rejects_oversize_and_invalid_utf8() {
+        let oversized = vec![b'x'; MAX_JSONL_LINE_BYTES + 1];
+        let mut reader = BoundedJsonlReader::new(oversized.as_slice());
+        assert!(matches!(
+            reader.next_record("fixture").await,
+            Err(KuramaError::Protocol(_))
+        ));
+        let mut reader = BoundedJsonlReader::new(b"valid\n\xff\n".as_slice());
+        assert_eq!(
+            reader.next_record("fixture").await.expect("valid prefix"),
+            Some("valid".into())
+        );
+        assert!(matches!(
+            reader.next_record("fixture").await,
+            Err(KuramaError::Protocol(_))
+        ));
+    }
 }

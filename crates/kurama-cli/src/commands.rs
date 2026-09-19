@@ -12,7 +12,7 @@ pub struct CommandSpec {
     pub requires_arguments: bool,
 }
 
-pub const COMMAND_SPECS: [CommandSpec; 16] = [
+pub const COMMAND_SPECS: [CommandSpec; 17] = [
     CommandSpec {
         name: "model",
         description: "select or list profiles",
@@ -69,7 +69,7 @@ pub const COMMAND_SPECS: [CommandSpec; 16] = [
     },
     CommandSpec {
         name: "context",
-        description: "show context and session details",
+        description: "inspect assembled context estimates and compaction coverage",
         accepts_arguments: false,
         requires_arguments: false,
     },
@@ -93,7 +93,13 @@ pub const COMMAND_SPECS: [CommandSpec; 16] = [
     },
     CommandSpec {
         name: "diff",
-        description: "show the working tree diff",
+        description: "review changes and prepare hunk feedback",
+        accepts_arguments: false,
+        requires_arguments: false,
+    },
+    CommandSpec {
+        name: "queue",
+        description: "edit, remove, or resume pending follow-ups",
         accepts_arguments: false,
         requires_arguments: false,
     },
@@ -125,6 +131,7 @@ pub enum Command {
     Compact,
     Copy,
     Diff,
+    Queue,
     Status,
     Mode(ExecutionMode),
     Help,
@@ -193,6 +200,7 @@ pub fn parse_command(input: &str) -> Result<Command, String> {
         ("/compact", []) => Ok(Command::Compact),
         ("/copy", []) => Ok(Command::Copy),
         ("/diff", []) => Ok(Command::Diff),
+        ("/queue", []) => Ok(Command::Queue),
         ("/help", []) => Ok(Command::Help),
         ("/mode", ["supervised"]) => Ok(Command::Mode(ExecutionMode::Supervised)),
         ("/mode", ["auto"]) => Ok(Command::Mode(ExecutionMode::Auto)),
@@ -239,4 +247,54 @@ fn validate_goal_objective(objective: &str) -> Result<String, String> {
             error.to_string()
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_product_commands_and_rejects_unsupported_actions() {
+        assert_eq!(parse_command("/agents").unwrap(), Command::Agents);
+        assert_eq!(
+            parse_command("/model openai-main").unwrap(),
+            Command::Model(Some("openai-main".into()))
+        );
+        assert_eq!(
+            parse_command("/resume ses_deadbeef").unwrap(),
+            Command::Resume(SessionId::from("ses_deadbeef"))
+        );
+        assert_eq!(
+            parse_command("/mode auto").unwrap(),
+            Command::Mode(ExecutionMode::Auto)
+        );
+        assert_eq!(parse_command("/help").unwrap(), Command::Help);
+        assert_eq!(parse_command("/copy").unwrap(), Command::Copy);
+        assert_eq!(parse_command("/diff").unwrap(), Command::Diff);
+        assert_eq!(parse_command("/status").unwrap(), Command::Status);
+        assert_eq!(
+            parse_command("/goal").unwrap(),
+            Command::Goal(GoalAction::View)
+        );
+        assert_eq!(
+            parse_command("/goal keep tests green").unwrap(),
+            Command::Goal(GoalAction::Set("keep tests green".into()))
+        );
+        assert_eq!(
+            parse_command("/goal set ship the e2e pass").unwrap(),
+            Command::Goal(GoalAction::Set("ship the e2e pass".into()))
+        );
+        assert_eq!(
+            parse_command("/goal view").unwrap(),
+            Command::Goal(GoalAction::View)
+        );
+        assert_eq!(
+            parse_command("/goal pause").unwrap(),
+            Command::Goal(GoalAction::Pause)
+        );
+        assert!(parse_command("/goal set").is_err());
+        assert_eq!(parse_command("/exit").unwrap(), Command::Exit);
+        assert!(parse_command("/restart").is_err());
+        assert!(parse_command("/mode yolo").is_err());
+    }
 }

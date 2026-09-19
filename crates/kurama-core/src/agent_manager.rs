@@ -97,6 +97,7 @@ struct ManagerState {
 
 struct ManagedAgent {
     spec: ResolvedAgentSpec,
+    registration_order: usize,
     snapshot: AgentSnapshot,
     transcript: Vec<String>,
     cancel: CancelToken,
@@ -299,37 +300,69 @@ impl AgentManager {
             .collect()
     }
 
+    /// Durably queue a parent message; success is not an acknowledgement of processing.
     pub async fn message(&self, agent_id: &AgentId, text: String) -> Result<(), KuramaError> {
-        let sender = {
+        let (sender, cancel) = {
             let mut state = self.state.lock().await;
             let agent = state
                 .agents
                 .get_mut(agent_id)
                 .ok_or_else(|| KuramaError::NotFound(agent_id.to_string()))?;
-            if agent.messages.is_none() && agent.pending_messages.len() >= CHILD_MESSAGE_CAPACITY {
-                return Err(KuramaError::Protocol(
-                    "too many queued child messages".into(),
-                ));
+            if agent.cancel.is_cancelled()
+                || !matches!(
+                    agent.snapshot.state,
+                    AgentState::Queued | AgentState::Running
+                )
+            {
+                return Err(KuramaError::Cancelled);
             }
-            self.append_agent_event(
-                agent,
-                SessionEvent::AgentMessage {
-                    agent_id: agent_id.clone(),
-                    text: text.clone(),
-                },
-            )?;
-            agent.transcript.push(format!("parent: {text}"));
-            if agent.messages.is_none() {
-                agent.pending_messages.push(text.clone());
+            if let Some(sender) = &agent.messages {
+                (sender.clone(), agent.cancel.clone())
+            } else {
+                if agent.pending_messages.len() >= CHILD_MESSAGE_CAPACITY {
+                    return Err(KuramaError::Protocol(
+                        "too many queued child messages".into(),
+                    ));
+                }
+                self.append_agent_event(
+                    agent,
+                    SessionEvent::AgentMessage {
+                        agent_id: agent_id.clone(),
+                        text: text.clone(),
+                    },
+                )?;
+                agent.transcript.push(format!("parent: {text}"));
+                agent.pending_messages.push(text);
+                return Ok(());
             }
-            agent.messages.clone()
         };
-        if let Some(sender) = sender {
-            sender
-                .send(text)
-                .await
-                .map_err(|_| KuramaError::Cancelled)?;
+        // Reserve before persisting, but do not send before the write-ahead record.
+        // Waiting outside the manager lock lets a full child channel drain or close.
+        let permit = tokio::select! {
+            () = cancel.cancelled() => return Err(KuramaError::Cancelled),
+            permit = sender.clone().reserve_owned() => permit.map_err(|_| KuramaError::Cancelled)?,
+        };
+        let mut state = self.state.lock().await;
+        let agent = state.agents.get_mut(agent_id).expect("registered agent");
+        if sender.is_closed()
+            || agent.cancel.is_cancelled()
+            || agent.snapshot.state != AgentState::Running
+            || !agent
+                .messages
+                .as_ref()
+                .is_some_and(|current| current.same_channel(&sender))
+        {
+            return Err(KuramaError::Cancelled);
         }
+        self.append_agent_event(
+            agent,
+            SessionEvent::AgentMessage {
+                agent_id: agent_id.clone(),
+                text: text.clone(),
+            },
+        )?;
+        agent.transcript.push(format!("parent: {text}"));
+        permit.send(text);
         Ok(())
     }
 
@@ -432,6 +465,7 @@ impl AgentManager {
                 }
                 let agent = ManagedAgent {
                     spec: spec.clone(),
+                    registration_order: state.agents.len(),
                     snapshot: snapshot.clone(),
                     transcript: Vec::new(),
                     cancel: CancelToken::new(),
@@ -486,7 +520,7 @@ impl AgentManager {
                 let candidate_id = state
                     .agents
                     .values()
-                    .find(|agent| {
+                    .filter(|agent| {
                         agent.snapshot.state == AgentState::Queued
                             && !agent.cancel.is_cancelled()
                             && agent
@@ -498,6 +532,7 @@ impl AgentManager {
                                 .iter()
                                 .all(|scope| !scopes_overlap(scope, &agent.spec.write_scope))
                     })
+                    .min_by_key(|agent| agent.registration_order)
                     .map(|agent| agent.spec.id.clone());
                 let Some(candidate_id) = candidate_id else {
                     return Ok(());
@@ -1034,19 +1069,20 @@ impl AgentManager {
         agent: &ManagedAgent,
         event: SessionEvent,
     ) -> Result<(), KuramaError> {
-        let next_sequence = self
-            .store
-            .replay_agent(&self.session_id, &agent.spec.id)?
-            .last()
-            .map_or(0, |event| event.sequence + 1);
-        let envelope = EventEnvelope::new(
-            next_sequence,
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let mut envelope = EventEnvelope::new(
             0,
+            timestamp_ms,
             self.session_id.clone(),
             Some(agent.spec.id.clone()),
             event,
         );
-        self.store.append(&envelope)?;
+        self.store.append_next(&mut envelope)?;
         Ok(())
     }
 

@@ -21,7 +21,7 @@ use tokio::{
     sync::oneshot,
 };
 
-use super::{BoundedText, PathGuard, limits::staged_output};
+use super::{BoundedOutput, BoundedText, PathGuard, limits::staged_output};
 
 const MAX_COMMAND_BYTES: usize = 32_768;
 const MAX_TIMEOUT_MS: u64 = 3_600_000;
@@ -191,6 +191,7 @@ impl Tool for BashTool {
             let mut stdout = None;
             let mut stderr = None;
             let mut wait = Box::pin(child.wait());
+            let mut cancelled = cancel.cancelled();
             let deadline = tokio::time::sleep(Duration::from_millis(arguments.timeout_ms));
             tokio::pin!(deadline);
             let outcome = loop {
@@ -202,12 +203,12 @@ impl Tool for BashTool {
                     result = &mut stdout_task, if stdout.is_none() => stdout = Some(join_capture(result)?),
                     result = &mut stderr_task, if stderr.is_none() => stderr = Some(join_capture(result)?),
                     _ = &mut deadline => break WaitOutcome::TimedOut,
-                    _ = cancel.cancelled() => break WaitOutcome::Cancelled,
+                    _ = &mut cancelled => break WaitOutcome::Cancelled,
                 }
             };
             drop(wait);
 
-            let (status, mut stdout, mut stderr, timed_out) = match outcome {
+            let (status, stdout, stderr, timed_out) = match outcome {
                 WaitOutcome::Completed => (
                     Some(status.expect("completed command has an exit status")),
                     stdout.expect("completed command has captured stdout"),
@@ -242,20 +243,39 @@ impl Tool for BashTool {
                     return Err(KuramaError::Cancelled);
                 }
             };
+            let timeout_message =
+                timed_out.then(|| format!("command timed out after {} ms", arguments.timeout_ms));
+            // Keep original bytes until the combined preview (including labels
+            // and timeout notes) decides whether both streams need recovery.
+            let aggregate = stdout
+                .full_bytes()
+                .zip(stderr.full_bytes())
+                .map(|(stdout, stderr)| {
+                    combined_output(stdout, stderr, timeout_message.as_deref(), context.limits)
+                });
+            let stage_streams = aggregate.as_ref().is_none_or(|output| output.truncated);
+            let mut stdout = CapturedStream(stdout.finish_staged(stage_streams));
+            let mut stderr = CapturedStream(stderr.finish_staged(stage_streams));
+            for (stream, captured) in [("stdout", &stdout), ("stderr", &stderr)] {
+                if let Some(error) = &captured.staging_error {
+                    return Err(KuramaError::Tool(format!(
+                        "failed to stage Bash {stream}: {error}"
+                    )));
+                }
+            }
             let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
             let exit_code = status.as_ref().and_then(ExitStatus::code);
             let signal = status.as_ref().and_then(exit_signal);
             let is_error = timed_out || status.as_ref().is_none_or(|status| !status.success());
-            let truncated = stdout.truncated || stderr.truncated;
-            let timeout_message =
-                timed_out.then(|| format!("command timed out after {} ms", arguments.timeout_ms));
-            let mut output = combined_output(&stdout.text, &stderr.text);
-            if let Some(timeout_message) = &timeout_message {
-                if !output.is_empty() && !output.ends_with('\n') {
-                    output.push('\n');
-                }
-                output.push_str(timeout_message);
-            }
+            let output = aggregate.unwrap_or_else(|| {
+                combined_output(
+                    stdout.text.as_bytes(),
+                    stderr.text.as_bytes(),
+                    timeout_message.as_deref(),
+                    context.limits,
+                )
+            });
+            let truncated = stdout.truncated || stderr.truncated || output.truncated;
             let mut metadata = serde_json::json!({
                 "command_class": classify_command(&arguments.command),
                 "cwd": cwd,
@@ -276,7 +296,8 @@ impl Tool for BashTool {
             });
             if let Some(timeout_message) = timeout_message {
                 metadata["execution_error"] = serde_json::Value::Bool(true);
-                metadata["display_output"] = serde_json::Value::String(timeout_message);
+                // Raw stream recovery must not absorb or lose execution diagnostics.
+                metadata["execution_error_suffix"] = serde_json::Value::String(timeout_message);
             }
             if truncated {
                 let mut staging = serde_json::Map::new();
@@ -299,7 +320,7 @@ impl Tool for BashTool {
 
             Ok(ToolResult {
                 call_id: invocation.call_id,
-                output,
+                output: output.text,
                 is_error,
                 metadata,
                 truncated,
@@ -434,12 +455,8 @@ async fn capture_stream<R: AsyncRead + Unpin>(
     stream: &'static str,
     event_sink: Option<Arc<dyn EventSink>>,
     mut stop: oneshot::Receiver<()>,
-) -> Result<CapturedStream, KuramaError> {
-    let mut bounded = if event_sink.is_some() {
-        staged_output(limits, "bash", stream)?
-    } else {
-        super::BoundedOutput::new(limits)
-    };
+) -> Result<BoundedOutput, KuramaError> {
+    let mut bounded = staged_output(limits, "bash", stream)?;
     let mut pending_utf8 = Vec::new();
     let mut chunk = [0_u8; READ_CHUNK_BYTES];
     loop {
@@ -472,7 +489,7 @@ async fn capture_stream<R: AsyncRead + Unpin>(
             stream,
         );
     }
-    Ok(CapturedStream(bounded.finish()))
+    Ok(bounded)
 }
 
 fn emit_decoded_output(
@@ -568,11 +585,11 @@ impl Drop for CapturedStream {
 }
 
 async fn finish_remaining_capture(
-    stdout_task: &mut tokio::task::JoinHandle<Result<CapturedStream, KuramaError>>,
-    stderr_task: &mut tokio::task::JoinHandle<Result<CapturedStream, KuramaError>>,
-    stdout: Option<CapturedStream>,
-    stderr: Option<CapturedStream>,
-) -> Result<(CapturedStream, CapturedStream), KuramaError> {
+    stdout_task: &mut tokio::task::JoinHandle<Result<BoundedOutput, KuramaError>>,
+    stderr_task: &mut tokio::task::JoinHandle<Result<BoundedOutput, KuramaError>>,
+    stdout: Option<BoundedOutput>,
+    stderr: Option<BoundedOutput>,
+) -> Result<(BoundedOutput, BoundedOutput), KuramaError> {
     let capture = async {
         let stdout = match stdout {
             Some(stdout) => stdout,
@@ -603,18 +620,31 @@ fn request_capture_stop(stop: &mut Option<oneshot::Sender<()>>) {
 }
 
 fn join_capture(
-    result: Result<Result<CapturedStream, KuramaError>, tokio::task::JoinError>,
-) -> Result<CapturedStream, KuramaError> {
+    result: Result<Result<BoundedOutput, KuramaError>, tokio::task::JoinError>,
+) -> Result<BoundedOutput, KuramaError> {
     result.map_err(|error| KuramaError::Tool(format!("output capture task failed: {error}")))?
 }
 
-fn combined_output(stdout: &str, stderr: &str) -> String {
-    match (stdout.is_empty(), stderr.is_empty()) {
-        (false, true) => stdout.to_owned(),
-        (true, false) => stderr.to_owned(),
-        (true, true) => String::new(),
-        (false, false) => format!("{stdout}\n[stderr]\n{stderr}"),
+fn combined_output(
+    stdout: &[u8],
+    stderr: &[u8],
+    timeout_message: Option<&str>,
+    limits: kurama_protocol::tool::ToolLimits,
+) -> BoundedText {
+    let mut output = BoundedOutput::new(limits);
+    output.push(stdout);
+    if !stdout.is_empty() && !stderr.is_empty() {
+        output.push(b"\n[stderr]\n");
     }
+    output.push(stderr);
+    if let Some(message) = timeout_message {
+        let last_byte = stderr.last().or_else(|| stdout.last());
+        if last_byte.is_some_and(|&byte| byte != b'\n') {
+            output.push(b"\n");
+        }
+        output.push(message.as_bytes());
+    }
+    output.finish()
 }
 
 fn utf8_chunks(value: &str, max_bytes: usize) -> Vec<&str> {

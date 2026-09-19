@@ -7,18 +7,19 @@ license.workspace = true
 
 [features]
 default = []
-http = ["dep:reqwest", "dep:rustls", "dep:url"]
+http = ["dep:bytes", "dep:reqwest", "dep:rustls", "dep:url"]
 openai = ["http", "dep:futures-core", "dep:futures-util", "dep:tokio", "dep:zeroize"]
 anthropic = ["http", "dep:futures-core", "dep:futures-util", "dep:tokio", "dep:zeroize"]
 openai-compatible = ["http", "dep:futures-core", "dep:futures-util", "dep:tokio", "dep:zeroize"]
-codex-bridge = ["dep:futures-core", "dep:futures-util", "dep:libc", "dep:tokio", "dep:zeroize"]
-claude-bridge = ["dep:futures-core", "dep:futures-util", "dep:libc", "dep:tokio", "dep:zeroize"]
-tools = ["dep:diffy", "dep:futures-util", "dep:libc", "dep:reqwest", "dep:sha2", "dep:shlex", "dep:tokio", "dep:url", "dep:zeroize"]
-fs-store = ["dep:libc", "dep:sha2"]
-native-credentials = ["dep:basic-toml", "dep:libc", "dep:zeroize"]
+codex-bridge = ["dep:futures-core", "dep:futures-util", "dep:libc", "dep:sha2", "dep:tempfile", "dep:tokio", "dep:zeroize"]
+claude-bridge = ["dep:futures-core", "dep:futures-util", "dep:libc", "dep:tempfile", "dep:tokio", "dep:zeroize"]
+tools = ["dep:diffy", "dep:futures-util", "dep:libc", "dep:reqwest", "dep:rustix", "dep:sha2", "dep:shlex", "dep:tempfile", "dep:tokio", "dep:url", "dep:zeroize"]
+fs-store = ["dep:libc", "dep:rustix", "dep:sha2"]
+native-credentials = ["dep:basic-toml", "dep:libc", "dep:rustix", "dep:security-framework", "dep:zeroize"]
 
 [dependencies]
 basic-toml = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
 diffy = { workspace = true, optional = true }
 futures-core = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
@@ -31,10 +32,17 @@ serde.workspace = true
 serde_json.workspace = true
 sha2 = { workspace = true, optional = true }
 shlex = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -27,7 +27,7 @@ fn context(mode: ExecutionMode) -> PolicyContext {
 
 fn read(path: PathBuf) -> Operation {
     Operation::Read {
-        path,
+        paths: vec![path],
         external: false,
     }
 }
@@ -35,7 +35,7 @@ fn read(path: PathBuf) -> Operation {
 #[test]
 fn supervised_allows_internal_reads_and_prompts_for_writes() {
     let context = context(ExecutionMode::Supervised);
-    let policy = DefaultPolicy::new(ExecutionMode::Supervised, context.auto.clone());
+    let policy = DefaultPolicy;
     assert_eq!(
         policy.decide(&context, &read(context.workspace_root.join("Cargo.toml"))),
         PolicyDecision::Allow
@@ -60,7 +60,7 @@ fn supervised_allows_internal_reads_and_prompts_for_writes() {
 #[test]
 fn auto_denies_boundary_expansion() {
     let context = context(ExecutionMode::Auto);
-    let policy = DefaultPolicy::new(ExecutionMode::Auto, context.auto.clone());
+    let policy = DefaultPolicy;
     assert_eq!(
         policy.decide(
             &context,
@@ -88,7 +88,7 @@ fn auto_denies_boundary_expansion() {
 fn auto_checks_every_composed_command_against_the_allowlist() {
     let mut context = context(ExecutionMode::Auto);
     context.auto.allowed_commands = vec!["pwd".into(), "rg".into(), "sed".into()];
-    let policy = DefaultPolicy::new(ExecutionMode::Auto, context.auto.clone());
+    let policy = DefaultPolicy;
     let bash = |command: &str, class| Operation::Bash {
         command: command.into(),
         cwd: context.workspace_root.clone(),
@@ -112,7 +112,7 @@ fn auto_checks_every_composed_command_against_the_allowlist() {
 #[test]
 fn yolo_allows_every_classified_operation() {
     let context = context(ExecutionMode::Yolo);
-    let policy = DefaultPolicy::new(ExecutionMode::Yolo, AutoBoundaries::default());
+    let policy = DefaultPolicy;
     let operations = [
         read(PathBuf::from("/private/outside")),
         Operation::Bash {
@@ -136,7 +136,7 @@ fn yolo_allows_every_classified_operation() {
 #[test]
 fn supervised_bash_allowlist_accepts_composed_reads_and_rejects_mutation() {
     let context = context(ExecutionMode::Supervised);
-    let policy = DefaultPolicy::new(ExecutionMode::Supervised, context.auto.clone());
+    let policy = DefaultPolicy;
     let bash = |command: &str| Operation::Bash {
         command: command.into(),
         cwd: context.workspace_root.clone(),
@@ -165,7 +165,7 @@ fn supervised_bash_allowlist_accepts_composed_reads_and_rejects_mutation() {
 fn read_only_child_cannot_write_outside_its_scope() {
     let mut context = context(ExecutionMode::Auto);
     context.write_scope = WriteScope::default();
-    let policy = DefaultPolicy::new(ExecutionMode::Auto, context.auto.clone());
+    let policy = DefaultPolicy;
     assert!(matches!(
         policy.decide(
             &context,
@@ -182,7 +182,7 @@ fn read_only_child_cannot_write_outside_its_scope() {
 #[test]
 fn policy_follows_the_runtime_context_mode() {
     let mut context = context(ExecutionMode::Supervised);
-    let policy = DefaultPolicy::new(ExecutionMode::Supervised, context.auto.clone());
+    let policy = DefaultPolicy;
     let operation = Operation::Write {
         paths: vec![context.workspace_root.join("new.txt")],
         destructive: false,
@@ -194,4 +194,25 @@ fn policy_follows_the_runtime_context_mode() {
     ));
     context.mode = ExecutionMode::Auto;
     assert_eq!(policy.decide(&context, &operation), PolicyDecision::Allow);
+}
+
+#[test]
+fn every_read_path_must_remain_inside_the_workspace() {
+    let mut context = context(ExecutionMode::Supervised);
+    let operation = Operation::Read {
+        paths: vec![
+            context.workspace_root.join("Cargo.toml"),
+            PathBuf::from("/outside/secret"),
+        ],
+        external: false,
+    };
+    assert!(matches!(
+        DefaultPolicy.decide(&context, &operation),
+        PolicyDecision::Ask { .. }
+    ));
+    context.mode = ExecutionMode::Auto;
+    assert!(matches!(
+        DefaultPolicy.decide(&context, &operation),
+        PolicyDecision::Deny { .. }
+    ));
 }

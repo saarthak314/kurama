@@ -1,12 +1,12 @@
 use ratatui::style::Color;
 
-pub const BORDER: Color = Color::Rgb(48, 53, 64);
-pub const DIM: Color = Color::Rgb(126, 132, 146);
+pub const BORDER: Color = Color::DarkGray;
+pub const DIM: Color = Color::DarkGray;
 pub const TEXT: Color = Color::Reset;
 pub const ACCENT: Color = Color::Cyan;
-pub const RED: Color = Color::Rgb(255, 92, 82);
-pub const GREEN: Color = Color::Rgb(111, 207, 151);
-pub const BLUE: Color = Color::Rgb(116, 177, 255);
-pub const AMBER: Color = Color::Rgb(230, 179, 90);
-pub const SURFACE: Color = Color::Reset;
-pub const USER_BAND: Color = Color::Rgb(36, 40, 48);
+pub const RED: Color = Color::Red;
+pub const GREEN: Color = Color::Green;
+pub const LINK: Color = Color::Rgb(117, 183, 255);
+pub const AMBER: Color = Color::Yellow;
+pub const COPY_FOREGROUND: Color = Color::Rgb(16, 26, 22);
+pub const COPY_BACKGROUND: Color = Color::Rgb(166, 227, 161);

@@ -1,24 +1,212 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use kurama_adapters::FsSessionStore;
 use kurama_protocol::{
     agent::{AgentSnapshot, AgentState},
-    id::{AgentId, CallId, OperationId},
+    id::{AgentId, CallId, OperationId, SessionId},
     model::Usage,
     policy::{ApprovalRequest, ApprovalResponse, ExecutionMode},
     runtime::{AgentCommand, EngineCommand, RuntimeEvent},
-    session::{EventEnvelope, GoalStatus, SessionEvent, SessionGoal, TodoItem},
+    session::{BlobRef, EventEnvelope, GoalStatus, SessionEvent, SessionGoal, TodoItem},
     tool::ToolResult,
+    traits::SessionStore,
 };
 
 use crate::commands::{CommandSpec, command_suggestions};
 
-use super::{AgentRow, ApprovalState, OnboardingState, sort_agents};
+use super::input::{
+    grapheme_boundary_at_or_after, next_grapheme_boundary, previous_grapheme_boundary,
+};
+use super::{
+    AgentRow, ApprovalState, ComposerSelection, OnboardingState, TranscriptSelection,
+    context::ContextView, diff::DiffReview, sort_agents,
+};
 
 const MAX_LIVE_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
+const MAX_PENDING_TURNS: usize = 32;
+const MAX_PENDING_TURN_BYTES: usize = 256 * 1024;
 const LIVE_OUTPUT_OMITTED: &str = "[earlier live output omitted]\n";
+const OUTPUT_OMITTED: &str = "[earlier output omitted; Ctrl+O for full output]\n";
+
+const COMPOSER_PLACEHOLDERS: [&str; 12] = [
+    "What should we work on?",
+    "What needs fixing?",
+    "What would you like to build?",
+    "Which part should we inspect?",
+    "Describe the change you need.",
+    "Point me at a file or a problem.",
+    "What would you like to understand?",
+    "Where should we start?",
+    "Describe the behavior you expect.",
+    "What should be simpler?",
+    "Which task comes next?",
+    "Tell me the goal.",
+];
+
+enum DisplaySource {
+    Output(BlobRef),
+    Streams {
+        stdout: Option<BlobRef>,
+        stderr: Option<BlobRef>,
+        error_suffix: Option<String>,
+    },
+}
+
+struct DeferredToolOutput {
+    source: DisplaySource,
+    // Only retained while expanded; the full string replaces the visible preview.
+    preview: Option<String>,
+}
+
+impl DisplaySource {
+    fn from_result(result: &ToolResult) -> Result<Option<Self>, String> {
+        let Some(value) = result.metadata.get("display_blobs") else {
+            return Ok(None);
+        };
+        let blobs = value
+            .as_object()
+            .ok_or_else(|| "invalid display blob references".to_owned())?;
+        let reference = |name: &str| -> Result<Option<BlobRef>, String> {
+            blobs
+                .get(name)
+                .map(|value| {
+                    serde_json::from_value(value.clone())
+                        .map_err(|error| format!("invalid {name} display blob reference: {error}"))
+                })
+                .transpose()
+        };
+        if let Some(output) = reference("output")? {
+            return Ok(Some(Self::Output(output)));
+        }
+        let stdout = reference("stdout")?;
+        let stderr = reference("stderr")?;
+        if stdout.is_none() && stderr.is_none() {
+            return Ok(None);
+        }
+        let error_suffix = result
+            .metadata
+            .get("execution_error_suffix")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        Ok(Some(Self::Streams {
+            stdout,
+            stderr,
+            error_suffix,
+        }))
+    }
+
+    fn load(&self, store: &FsSessionStore, max_bytes: Option<usize>) -> Result<String, String> {
+        match self {
+            Self::Output(reference) => display_blob_text(store, reference, max_bytes),
+            Self::Streams {
+                stdout,
+                stderr,
+                error_suffix,
+            } => {
+                const SEPARATOR: &str = "\n[stderr]\n";
+                let budget = max_bytes.map(|limit| {
+                    let limit = limit.saturating_sub(
+                        error_suffix
+                            .as_ref()
+                            .map_or(0, |suffix| suffix.len().saturating_add(1)),
+                    );
+                    if stdout.is_some() && stderr.is_some() {
+                        limit.saturating_sub(SEPARATOR.len()) / 2
+                    } else {
+                        limit
+                    }
+                });
+                let load = |reference: &Option<BlobRef>| -> Result<String, String> {
+                    reference
+                        .as_ref()
+                        .map(|reference| display_blob_text(store, reference, budget))
+                        .transpose()
+                        .map(Option::unwrap_or_default)
+                };
+                let mut output = load(stdout)?;
+                let stderr = load(stderr)?;
+                if !output.is_empty() && !stderr.is_empty() {
+                    output.push_str(SEPARATOR);
+                }
+                output.push_str(&stderr);
+                if let Some(suffix) = error_suffix {
+                    if !output.is_empty() && !output.ends_with('\n') {
+                        output.push('\n');
+                    }
+                    output.push_str(suffix);
+                }
+                if let Some(limit) = max_bytes
+                    && output.len() > limit
+                {
+                    output = bounded_output(&output, limit, false);
+                }
+                Ok(output)
+            }
+        }
+    }
+}
+
+fn display_blob_text(
+    store: &FsSessionStore,
+    reference: &BlobRef,
+    max_bytes: Option<usize>,
+) -> Result<String, String> {
+    let Some(limit) = max_bytes else {
+        let bytes = store
+            .get_blob(reference)
+            .map_err(|error| error.to_string())?;
+        return Ok(String::from_utf8(bytes)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()));
+    };
+    let bytes = store
+        .get_blob_tail(reference, limit)
+        .map_err(|error| error.to_string())?;
+    let omitted = reference.bytes > bytes.len() as u64;
+    // A tail can begin inside a UTF-8 character. Drop just its continuation
+    // bytes rather than manufacturing replacement characters at the boundary.
+    let start = if omitted {
+        bytes
+            .iter()
+            .take(3)
+            .take_while(|byte| **byte & 0xc0 == 0x80)
+            .count()
+    } else {
+        0
+    };
+    let text = String::from_utf8_lossy(&bytes[start..]);
+    Ok(bounded_output(&text, limit, omitted))
+}
+
+fn bounded_output(text: &str, limit: usize, omitted: bool) -> String {
+    if !omitted && text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut start = text
+        .len()
+        .saturating_sub(limit.saturating_sub(OUTPUT_OMITTED.len()));
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut output = String::with_capacity(OUTPUT_OMITTED.len() + text.len() - start);
+    output.push_str(OUTPUT_OMITTED);
+    output.push_str(&text[start..]);
+    output
+}
+
+fn display_load_error(fallback: &str, error: &str) -> String {
+    let error = format!("\n[display output unavailable: {error}]\n");
+    let mut output = bounded_output(
+        fallback,
+        MAX_LIVE_TOOL_OUTPUT_BYTES.saturating_sub(error.len()),
+        false,
+    );
+    output.push_str(&error);
+    output
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HistorySearch {
@@ -35,6 +223,9 @@ pub enum Overlay {
     ApprovalEdit,
     Agents,
     Todos,
+    Queue,
+    Context,
+    Diff,
     AgentInspect,
     AgentMessage,
     ConfirmAgentCancel,
@@ -91,10 +282,22 @@ struct PendingTurn {
     explicit_delegation: bool,
 }
 
+struct ComposerDraft {
+    text: String,
+    cursor: usize,
+    selection: Option<ComposerSelection>,
+}
+
+enum ComposerTask {
+    Queue { index: usize },
+    Feedback,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptEntry {
     Startup {
         version: String,
+        model: String,
         project: String,
         mode: ExecutionMode,
     },
@@ -127,8 +330,14 @@ pub struct TuiState {
     pub transcript: Vec<TranscriptEntry>,
     pub composer: String,
     pub composer_inner_width: Cell<u16>,
+    pub(crate) composer_scroll: Cell<usize>,
+    pub(crate) composer_selection: Option<ComposerSelection>,
+    pub transcript_width: Cell<u16>,
     pub cursor: usize,
     pub scroll: usize,
+    pub(crate) transcript_selection: Option<TranscriptSelection>,
+    pub(crate) copied_characters: Option<usize>,
+    pub(crate) focused_link: RefCell<Option<Arc<str>>>,
     pub running_agents: usize,
     pub queued_agents: usize,
     pub overlay: Overlay,
@@ -136,21 +345,39 @@ pub struct TuiState {
     pub approval: Option<ApprovalState>,
     pub agents: Vec<AgentRow>,
     pub todos: Vec<TodoItem>,
+    pub selected_todo: usize,
     pub goal: Option<SessionGoal>,
     pub git_branch: Option<String>,
     pub viewport_height: Cell<u16>,
     pub selected_agent: usize,
+    pub(crate) agents_page_height: Cell<usize>,
+    pub(crate) agent_inspect_scroll: Cell<usize>,
+    pub(crate) agent_inspect_max_scroll: Cell<usize>,
+    pub(crate) agent_inspect_page_height: Cell<usize>,
+    pub(crate) shortcuts_scroll: Cell<usize>,
+    pub(crate) shortcuts_max_scroll: Cell<usize>,
+    pub(crate) shortcuts_page_height: Cell<usize>,
     pub agent_message: String,
     pub agent_message_cursor: usize,
     command_selection: usize,
     command_palette_dismissed: bool,
     file_selection: usize,
-    file_index: RefCell<Option<Vec<String>>>,
+    file_index: Vec<String>,
+    pub(crate) file_index_dirty: bool,
     history_search: Option<HistorySearch>,
     pending_turns: VecDeque<PendingTurn>,
+    pub(crate) selected_follow_up: usize,
+    pub(crate) pending_steering: usize,
+    pub(crate) queue_paused: bool,
+    composer_task: Option<(ComposerTask, ComposerDraft)>,
+    pub(crate) context_view: ContextView,
+    pub(crate) diff_review: Option<DiffReview>,
+    pub(crate) diff_loading: bool,
+    pub(crate) diff_error: Option<String>,
     composer_history: Vec<String>,
     history_index: Option<usize>,
     history_draft: String,
+    history_draft_cursor: usize,
     activity: ActivityState,
     turn_started_at: Option<Instant>,
     last_turn_elapsed: Option<Duration>,
@@ -160,9 +387,22 @@ pub struct TuiState {
     active_tool_streams: HashMap<CallId, String>,
     active_tool_contexts: HashMap<OperationId, String>,
     pending_tool_context: Option<String>,
+    display_store: Option<Arc<FsSessionStore>>,
+    deferred_tool_outputs: HashMap<usize, DeferredToolOutput>,
     replayed_agent_ids: HashSet<AgentId>,
-    committed_transcript_entries: usize,
+    approval_generation: u64,
+    transcript_revision: u64,
+    transcript_dirty_from: usize,
+    transcript_geometry: RefCell<Option<TranscriptGeometry>>,
     sent_commands: Vec<EngineCommand>,
+    composer_placeholder_index: usize,
+}
+
+struct TranscriptGeometry {
+    revision: u64,
+    width: u16,
+    lines: usize,
+    prompt_starts: Vec<usize>,
 }
 
 impl TuiState {
@@ -182,8 +422,14 @@ impl TuiState {
             transcript: Vec::new(),
             composer: String::new(),
             composer_inner_width: Cell::new(72),
+            composer_scroll: Cell::new(0),
+            composer_selection: None,
+            transcript_width: Cell::new(72),
             cursor: 0,
             scroll: 0,
+            transcript_selection: None,
+            copied_characters: None,
+            focused_link: RefCell::new(None),
             running_agents: 0,
             queued_agents: 0,
             overlay: Overlay::None,
@@ -191,21 +437,39 @@ impl TuiState {
             approval: None,
             agents: Vec::new(),
             todos: Vec::new(),
+            selected_todo: 0,
             goal: None,
             git_branch: None,
             viewport_height: Cell::new(12),
             selected_agent: 0,
+            agents_page_height: Cell::new(1),
+            agent_inspect_scroll: Cell::new(0),
+            agent_inspect_max_scroll: Cell::new(0),
+            agent_inspect_page_height: Cell::new(1),
+            shortcuts_scroll: Cell::new(0),
+            shortcuts_max_scroll: Cell::new(0),
+            shortcuts_page_height: Cell::new(1),
             agent_message: String::new(),
             agent_message_cursor: 0,
             command_selection: 0,
             command_palette_dismissed: false,
             file_selection: 0,
-            file_index: RefCell::new(None),
+            file_index: Vec::new(),
+            file_index_dirty: false,
             history_search: None,
             pending_turns: VecDeque::new(),
+            selected_follow_up: 0,
+            pending_steering: 0,
+            queue_paused: false,
+            composer_task: None,
+            context_view: ContextView::default(),
+            diff_review: None,
+            diff_loading: false,
+            diff_error: None,
             composer_history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
+            history_draft_cursor: 0,
             activity: ActivityState::Idle,
             turn_started_at: None,
             last_turn_elapsed: None,
@@ -215,14 +479,34 @@ impl TuiState {
             active_tool_streams: HashMap::new(),
             active_tool_contexts: HashMap::new(),
             pending_tool_context: None,
+            display_store: None,
+            deferred_tool_outputs: HashMap::new(),
             replayed_agent_ids: HashSet::new(),
-            committed_transcript_entries: 0,
+            approval_generation: 0,
+            transcript_revision: 0,
+            transcript_dirty_from: 0,
+            transcript_geometry: RefCell::new(None),
             sent_commands: Vec::new(),
+            composer_placeholder_index: 0,
         }
+    }
+
+    pub fn composer_placeholder(&self) -> &'static str {
+        COMPOSER_PLACEHOLDERS[self.composer_placeholder_index]
+    }
+
+    pub(crate) fn set_composer_session(&mut self, session_id: &SessionId) {
+        // Session IDs are randomized by the runtime. Derive the hint once so
+        // redraws, later turns, and resume do not change the empty-input copy.
+        let mut hash = DefaultHasher::new();
+        session_id.hash(&mut hash);
+        self.composer_placeholder_index =
+            (hash.finish() % COMPOSER_PLACEHOLDERS.len() as u64) as usize;
     }
 
     pub fn command_suggestions(&self) -> Vec<CommandSpec> {
         if self.history_search.is_some()
+            || self.composer_task.is_some()
             || self.command_palette_dismissed
             || self.overlay != Overlay::None
             || self.transcript_view_expanded
@@ -238,10 +522,26 @@ impl TuiState {
     }
 
     pub fn composer_edited(&mut self) {
+        self.cursor = grapheme_boundary_at_or_after(&self.composer, self.cursor);
         self.command_selection = 0;
         self.file_selection = 0;
         self.command_palette_dismissed = false;
         self.history_index = None;
+        self.composer_selection = None;
+    }
+
+    pub(crate) fn delete_composer_selection(&mut self) -> bool {
+        let Some(range) = self
+            .composer_selection
+            .take()
+            .and_then(|selection| selection.range(&self.composer))
+        else {
+            return false;
+        };
+        self.cursor = range.start;
+        self.composer.drain(range);
+        self.composer_edited();
+        true
     }
 
     pub fn clear_composer(&mut self) {
@@ -251,25 +551,46 @@ impl TuiState {
     }
 
     pub fn cursor_home(&mut self) {
+        self.composer_selection = None;
         self.cursor = 0;
     }
 
     pub fn cursor_end(&mut self) {
+        self.composer_selection = None;
         self.cursor = self.composer.len();
     }
 
+    pub fn cursor_line_home(&mut self) {
+        self.normalize_composer_cursor();
+        self.composer_selection = None;
+        self.cursor = self.composer[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+    }
+
+    pub fn cursor_line_end(&mut self) {
+        self.normalize_composer_cursor();
+        self.composer_selection = None;
+        self.cursor += self.composer[self.cursor..]
+            .find('\n')
+            .unwrap_or(self.composer.len() - self.cursor);
+    }
+
     pub fn kill_to_end(&mut self) {
+        self.normalize_composer_cursor();
         self.composer.truncate(self.cursor);
         self.composer_edited();
     }
 
     pub fn kill_to_start(&mut self) {
+        self.normalize_composer_cursor();
         self.composer.replace_range(..self.cursor, "");
         self.cursor = 0;
         self.composer_edited();
     }
 
     pub fn kill_previous_word(&mut self) {
+        self.normalize_composer_cursor();
         if self.cursor == 0 {
             return;
         }
@@ -286,6 +607,93 @@ impl TuiState {
         self.composer_edited();
     }
 
+    pub(crate) fn normalize_composer_cursor(&mut self) {
+        self.cursor = grapheme_cursor(&self.composer, self.cursor);
+    }
+
+    pub(crate) const fn transcript_revision(&self) -> u64 {
+        self.transcript_revision
+    }
+
+    pub(crate) const fn transcript_dirty_from(&self) -> usize {
+        self.transcript_dirty_from
+    }
+
+    pub(crate) fn mark_transcript_rendered(&mut self) {
+        self.transcript_dirty_from = self.transcript.len();
+    }
+
+    fn transcript_changed(&mut self, from: usize) {
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        self.transcript_dirty_from = self.transcript_dirty_from.min(from);
+    }
+
+    pub(crate) fn set_transcript_geometry(&self, width: u16, lines: usize, entry_starts: &[usize]) {
+        *self.transcript_geometry.borrow_mut() = Some(TranscriptGeometry {
+            revision: self.transcript_revision,
+            width,
+            lines,
+            prompt_starts: self
+                .transcript
+                .iter()
+                .zip(entry_starts)
+                .filter_map(|(entry, &row)| {
+                    matches!(entry, TranscriptEntry::UserTurn { .. }).then_some(row)
+                })
+                .collect(),
+        });
+    }
+
+    fn ensure_transcript_geometry(&self, width: u16) {
+        if self
+            .transcript_geometry
+            .borrow()
+            .as_ref()
+            .is_some_and(|geometry| {
+                geometry.revision == self.transcript_revision && geometry.width == width
+            })
+        {
+            return;
+        }
+        let (lines, starts) = super::transcript::transcript_lines_with_entry_starts(
+            &self.transcript,
+            width as usize,
+            if self.transcript_view_expanded {
+                super::TranscriptDetail::Expanded
+            } else {
+                super::TranscriptDetail::Compact
+            },
+        );
+        self.set_transcript_geometry(width, lines.len(), &starts);
+    }
+
+    pub(crate) fn max_transcript_scroll(&self) -> usize {
+        self.ensure_transcript_geometry(self.transcript_width.get());
+        self.transcript_geometry
+            .borrow()
+            .as_ref()
+            .map_or(0, |geometry| {
+                geometry
+                    .lines
+                    .saturating_sub(self.viewport_height.get() as usize)
+            })
+    }
+
+    pub(crate) fn scroll_transcript(&mut self, rows: i32) -> bool {
+        if self.overlay != Overlay::None || rows == 0 {
+            return false;
+        }
+        let previous = self.scroll;
+        let max_scroll = self.max_transcript_scroll();
+        let scroll = previous.min(max_scroll);
+        self.scroll = if rows > 0 {
+            scroll.saturating_add(rows as usize).min(max_scroll)
+        } else {
+            scroll.saturating_sub(rows.unsigned_abs() as usize)
+        };
+        self.scroll != previous
+    }
+
     pub fn remember_prompt(&mut self, text: &str) {
         if text.is_empty() || text.starts_with('/') {
             return;
@@ -295,6 +703,7 @@ impl TuiState {
         }
         self.history_index = None;
         self.history_draft.clear();
+        self.history_draft_cursor = 0;
     }
 
     pub fn history_previous(&mut self) -> bool {
@@ -304,6 +713,7 @@ impl TuiState {
         match self.history_index {
             None => {
                 self.history_draft.clone_from(&self.composer);
+                self.history_draft_cursor = grapheme_cursor(&self.composer, self.cursor);
                 self.history_index = Some(self.composer_history.len() - 1);
             }
             Some(0) => return false,
@@ -312,6 +722,8 @@ impl TuiState {
         if let Some(index) = self.history_index {
             self.composer.clone_from(&self.composer_history[index]);
             self.cursor = self.composer.len();
+            self.command_palette_dismissed = true;
+            self.composer_selection = None;
         }
         true
     }
@@ -323,11 +735,14 @@ impl TuiState {
         if index + 1 < self.composer_history.len() {
             self.history_index = Some(index + 1);
             self.composer.clone_from(&self.composer_history[index + 1]);
+            self.cursor = self.composer.len();
         } else {
             self.history_index = None;
             self.composer.clone_from(&self.history_draft);
+            self.cursor = self.history_draft_cursor;
         }
-        self.cursor = self.composer.len();
+        self.command_palette_dismissed = true;
+        self.composer_selection = None;
         true
     }
 
@@ -335,8 +750,7 @@ impl TuiState {
         if self.command_palette_dismissed || self.history_search.is_some() {
             return false;
         }
-        let showing_files = super::mention_at_cursor(&self.composer, self.cursor).is_some()
-            && !self.file_suggestions().is_empty();
+        let showing_files = self.file_mention().is_some();
         let showing_commands = !command_suggestions(&self.composer).is_empty()
             && self.overlay == Overlay::None
             && !self.transcript_view_expanded;
@@ -398,7 +812,7 @@ impl TuiState {
         Some(selected)
     }
 
-    pub fn file_mention(&self) -> Option<(usize, String)> {
+    pub fn file_mention(&self) -> Option<(usize, &str)> {
         if self.history_search.is_some()
             || self.overlay != Overlay::None
             || self.command_palette_dismissed
@@ -408,25 +822,25 @@ impl TuiState {
         super::mention_at_cursor(&self.composer, self.cursor)
     }
 
-    pub fn file_suggestions(&self) -> Vec<String> {
+    pub fn file_suggestions(&self) -> Vec<&str> {
         let Some((_, query)) = self.file_mention() else {
             return Vec::new();
         };
-        if self.file_index.borrow().is_none() {
-            *self.file_index.borrow_mut() = Some(super::collect_files(Path::new(&self.project)));
-        }
-        let files = self.file_index.borrow();
-        super::filter_files(files.as_deref().unwrap_or(&[]), &query)
-            .into_iter()
-            .map(str::to_owned)
-            .collect()
+        super::filter_files(&self.file_index, query)
+    }
+
+    pub fn set_file_index(&mut self, files: Vec<String>) {
+        self.file_index = files;
+        self.file_selection = self
+            .file_selection
+            .min(self.file_suggestions().len().saturating_sub(1));
     }
 
     pub fn selected_file(&self) -> Option<String> {
         let suggestions = self.file_suggestions();
         suggestions
             .get(self.file_selection.min(suggestions.len().saturating_sub(1)))
-            .cloned()
+            .map(|path| (*path).to_owned())
     }
 
     pub fn select_previous_file(&mut self) -> bool {
@@ -478,11 +892,21 @@ impl TuiState {
         let Some(search) = &self.history_search else {
             return Vec::new();
         };
-        let query = search.query.to_ascii_lowercase();
+        let query = search.query.to_lowercase();
         self.composer_history
             .iter()
             .rev()
-            .filter(|prompt| query.is_empty() || prompt.to_ascii_lowercase().contains(&query))
+            .filter(|prompt| {
+                query.is_empty()
+                    || if prompt.is_ascii() {
+                        prompt
+                            .as_bytes()
+                            .windows(query.len())
+                            .any(|part| part.eq_ignore_ascii_case(query.as_bytes()))
+                    } else {
+                        prompt.to_lowercase().contains(&query)
+                    }
+            })
             .map(String::as_str)
             .take(8)
             .collect()
@@ -513,7 +937,8 @@ impl TuiState {
 
     pub fn pop_history_search_char(&mut self) {
         if let Some(search) = &mut self.history_search {
-            search.query.pop();
+            let boundary = previous_grapheme_boundary(&search.query, search.query.len());
+            search.query.truncate(boundary);
             search.selection = 0;
         }
     }
@@ -588,6 +1013,7 @@ impl TuiState {
     }
 
     pub fn insert_mention(&mut self, path: &str) {
+        self.normalize_composer_cursor();
         self.composer.insert_str(self.cursor, &format!("@{path} "));
         self.cursor += path.len() + 2;
         self.composer_edited();
@@ -609,10 +1035,20 @@ impl TuiState {
             0,
             TranscriptEntry::Startup {
                 version: version.into(),
+                model: self.model.clone(),
                 project: project.into(),
                 mode: self.mode,
             },
         );
+        self.deferred_tool_outputs = std::mem::take(&mut self.deferred_tool_outputs)
+            .into_iter()
+            .map(|(index, output)| (index + 1, output))
+            .collect();
+        for index in self.active_tool_entries.values_mut() {
+            *index += 1;
+        }
+        self.active_assistant_entry = self.active_assistant_entry.map(|index| index + 1);
+        self.transcript_changed(0);
     }
 
     pub fn credential(project: impl Into<String>, profile: impl Into<String>) -> Self {
@@ -647,7 +1083,29 @@ impl TuiState {
 
     pub fn submit_turn(&mut self, text: impl Into<String>, explicit_delegation: bool) {
         let text = text.into();
-        if !matches!(self.activity, ActivityState::Idle) {
+        self.scroll = 0;
+        if !matches!(self.activity, ActivityState::Idle)
+            || self.pending_steering != 0
+            || self.overlay == Overlay::Queue
+            || self.editing_follow_up()
+            || self.queue_paused
+            || !self.pending_turns.is_empty()
+        {
+            let queued_bytes = self
+                .pending_turns
+                .iter()
+                .map(|turn| turn.text.len())
+                .sum::<usize>();
+            if self.pending_turns.len() >= MAX_PENDING_TURNS
+                || queued_bytes.saturating_add(text.len()) > MAX_PENDING_TURN_BYTES
+            {
+                self.restore_unsent_input(text);
+                self.push_transcript_entry(TranscriptEntry::Notice {
+                    label: Some("QUEUE".into()),
+                    body: "Follow-up queue is full; input restored to draft. /queue can remove pending work.".into(),
+                });
+                return;
+            }
             self.pending_turns.push_back(PendingTurn {
                 text,
                 explicit_delegation,
@@ -665,26 +1123,180 @@ impl TuiState {
         self.pending_turns.iter().map(|turn| turn.text.as_str())
     }
 
+    pub fn steer_or_submit(&mut self, text: String, explicit_delegation: bool) {
+        if matches!(self.activity, ActivityState::Idle) && self.pending_steering == 0 {
+            self.scroll = 0;
+            self.start_turn(text, explicit_delegation);
+        } else {
+            self.queue_command(EngineCommand::Steer {
+                text,
+                explicit_delegation,
+            });
+        }
+    }
+
+    pub fn open_queue(&mut self) {
+        self.selected_follow_up = self
+            .selected_follow_up
+            .min(self.pending_turns.len().saturating_sub(1));
+        self.overlay = Overlay::Queue;
+    }
+
+    pub fn edit_selected_follow_up(&mut self) {
+        let Some(turn) = self.pending_turns.get(self.selected_follow_up) else {
+            return;
+        };
+        let text = turn.text.clone();
+        self.begin_composer_task(
+            ComposerTask::Queue {
+                index: self.selected_follow_up,
+            },
+            text,
+        );
+    }
+
+    pub fn remove_selected_follow_up(&mut self) {
+        self.pending_turns.remove(self.selected_follow_up);
+        self.selected_follow_up = self
+            .selected_follow_up
+            .min(self.pending_turns.len().saturating_sub(1));
+    }
+
+    pub fn resume_follow_ups(&mut self) {
+        self.queue_paused = false;
+        self.close_overlay();
+    }
+
+    pub(crate) fn editing_follow_up(&self) -> bool {
+        matches!(&self.composer_task, Some((ComposerTask::Queue { .. }, _)))
+    }
+
+    pub(crate) fn editing_feedback(&self) -> bool {
+        matches!(&self.composer_task, Some((ComposerTask::Feedback, _)))
+    }
+
+    pub(crate) fn begin_diff_feedback(&mut self, text: String) {
+        self.begin_composer_task(ComposerTask::Feedback, text);
+    }
+
+    fn begin_composer_task(&mut self, task: ComposerTask, text: String) {
+        if self.composer_task.is_some() {
+            return;
+        }
+        let draft = ComposerDraft {
+            text: std::mem::replace(&mut self.composer, text),
+            cursor: self.cursor,
+            selection: self.composer_selection.take(),
+        };
+        self.cursor = self.composer.len();
+        self.composer_edited();
+        self.composer_task = Some((task, draft));
+        self.overlay = Overlay::None;
+    }
+
+    pub(crate) fn restore_composer_draft(&mut self) -> bool {
+        let Some((task, draft)) = self.composer_task.take() else {
+            return false;
+        };
+        self.composer = draft.text;
+        self.cursor = draft.cursor;
+        self.composer_edited();
+        self.composer_selection = draft.selection;
+        if matches!(task, ComposerTask::Queue { .. }) {
+            self.overlay = Overlay::Queue;
+        }
+        true
+    }
+
+    pub(crate) fn save_follow_up(&mut self, text: String, explicit_delegation: bool) {
+        let Some((ComposerTask::Queue { index }, _)) = &self.composer_task else {
+            return;
+        };
+        let index = *index;
+        let queued_bytes = self
+            .pending_turns
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| *position != index)
+            .map(|(_, turn)| turn.text.len())
+            .sum::<usize>();
+        if queued_bytes.saturating_add(text.len()) > MAX_PENDING_TURN_BYTES {
+            self.push_transcript_entry(TranscriptEntry::Notice {
+                label: Some("QUEUE".into()),
+                body: "Edited follow-up exceeds the queue size limit; shorten it or Esc to keep the original.".into(),
+            });
+            return;
+        }
+        if let Some(turn) = self.pending_turns.get_mut(index) {
+            *turn = PendingTurn {
+                text,
+                explicit_delegation,
+            };
+        }
+        self.restore_composer_draft();
+    }
+
+    pub(crate) fn inspect_context(&mut self) {
+        self.overlay = Overlay::Context;
+        if !self.context_view.loading {
+            self.context_view.loading = true;
+            self.sent_commands.push(EngineCommand::InspectContext);
+        }
+    }
+
+    fn restore_unsent_input(&mut self, text: String) {
+        let target = if let Some((_, draft)) = &mut self.composer_task {
+            &mut draft.text
+        } else {
+            &mut self.composer
+        };
+        if !target.is_empty() {
+            target.push_str("\n\n");
+        }
+        target.push_str(&text);
+        if self.composer_task.is_none() {
+            self.cursor = self.composer.len();
+            self.composer_edited();
+        }
+    }
+
     pub fn context_label(&self) -> Option<String> {
         if self.max_input_tokens == 0 {
             return None;
         }
-        if self.usage.input_tokens == 0 {
-            return Some(compact_tokens(self.max_input_tokens));
-        }
-        let percent =
-            (self.usage.input_tokens.saturating_mul(100) / self.max_input_tokens.max(1)).min(100);
-        Some(format!("{percent}%"))
+        let used = self.usage.input_tokens.saturating_mul(100) / self.max_input_tokens;
+        Some(format!("last request: {}% of input limit", used))
     }
 
     pub fn open_shortcuts(&mut self) {
         self.overlay = Overlay::Shortcuts;
+        self.shortcuts_scroll.set(0);
     }
 
     pub fn toggle_transcript_view(&mut self) {
         self.transcript_view_expanded = !self.transcript_view_expanded;
-        if self.transcript_view_expanded {
-            self.scroll = 0;
+        *self.transcript_geometry.get_mut() = None;
+        self.scroll = 0;
+        *self.focused_link.get_mut() = None;
+        if let Some(store) = &self.display_store {
+            let mut dirty_from = self.transcript.len();
+            for (&index, deferred) in &mut self.deferred_tool_outputs {
+                if let Some(TranscriptEntry::ToolCall(tool)) = self.transcript.get_mut(index) {
+                    if self.transcript_view_expanded {
+                        let full = deferred
+                            .source
+                            .load(store, None)
+                            .unwrap_or_else(|error| display_load_error(&tool.output, &error));
+                        deferred.preview = Some(std::mem::replace(&mut tool.output, full));
+                    } else if let Some(preview) = deferred.preview.take() {
+                        tool.output = preview;
+                    }
+                    dirty_from = dirty_from.min(index);
+                }
+            }
+            if dirty_from < self.transcript.len() {
+                self.transcript_changed(dirty_from);
+            }
         }
     }
 
@@ -742,7 +1354,7 @@ impl TuiState {
             self.overlay = Overlay::None;
             self.sent_commands.push(EngineCommand::CancelTurn);
             self.activity = ActivityState::Interrupted;
-            self.pending_turns.clear();
+            self.queue_paused = true;
             return true;
         }
         if !self.activity.is_animated() {
@@ -750,45 +1362,17 @@ impl TuiState {
         }
         self.sent_commands.push(EngineCommand::CancelTurn);
         self.activity = ActivityState::Interrupted;
-        self.pending_turns.clear();
+        self.queue_paused = true;
         true
-    }
-
-    pub fn pop_queued_follow_up(&mut self) -> bool {
-        self.pending_turns.pop_back().is_some()
     }
 
     fn push_transcript_entry(&mut self, entry: TranscriptEntry) {
         self.transcript.push(entry);
+        self.transcript_changed(self.transcript.len() - 1);
     }
 
-    pub fn stable_transcript_end(&self) -> usize {
-        self.active_assistant_entry
-            .into_iter()
-            .chain(self.active_tool_entries.values().copied())
-            .min()
-            .unwrap_or(self.transcript.len())
-            .max(self.committed_transcript_entries)
-    }
-
-    pub fn stable_transcript(&self) -> &[TranscriptEntry] {
-        &self.transcript[self.committed_transcript_entries..self.stable_transcript_end()]
-    }
-
-    pub fn mark_transcript_committed(&mut self, end: usize) {
-        self.committed_transcript_entries = self
-            .committed_transcript_entries
-            .max(end.min(self.stable_transcript_end()));
-        self.scroll = 0;
-    }
-
-    pub fn reset_transcript_commit(&mut self) {
-        self.committed_transcript_entries = 0;
-        self.scroll = 0;
-    }
-
-    pub fn live_transcript(&self) -> &[TranscriptEntry] {
-        &self.transcript[self.committed_transcript_entries..]
+    pub(crate) fn set_display_store(&mut self, store: Arc<FsSessionStore>) {
+        self.display_store = Some(store);
     }
 
     pub fn hydrate_replay(&mut self, replay: &[EventEnvelope]) {
@@ -800,16 +1384,28 @@ impl TuiState {
         self.active_tool_streams.clear();
         self.active_tool_contexts.clear();
         self.pending_tool_context = None;
+        self.deferred_tool_outputs.clear();
         self.replayed_agent_ids.clear();
-        self.committed_transcript_entries = 0;
         self.transcript.clear();
+        self.transcript_changed(0);
         self.agents.clear();
         self.todos.clear();
         self.usage = Usage::default();
+        self.composer_history.clear();
+        self.history_index = None;
+        self.history_draft.clear();
+        self.history_draft_cursor = 0;
         let mut replayed_tool_contexts = HashMap::new();
         for envelope in replay {
             match &envelope.event {
-                SessionEvent::UserMessage { text } => self.push_user(text.clone()),
+                SessionEvent::UserMessage { text, .. } => {
+                    self.remember_prompt(text);
+                    self.push_user(text.clone());
+                }
+                SessionEvent::UserSteered { text, .. } => {
+                    self.remember_prompt(text);
+                    self.push_notice(Some("STEER".into()), text.clone());
+                }
                 SessionEvent::AssistantMessage { text } => self.push_assistant(text.clone()),
                 SessionEvent::ToolProposed {
                     operation_id,
@@ -824,10 +1420,15 @@ impl TuiState {
                     result,
                 } => {
                     if todo_items(result).is_none() {
-                        self.push_transcript_entry(TranscriptEntry::ToolCall(tool_transcript(
-                            result,
-                            replayed_tool_contexts.remove(operation_id),
-                        )));
+                        let (output, deferred) = self.completed_display_output(result);
+                        self.push_transcript_entry(TranscriptEntry::ToolCall(ToolTranscript {
+                            call_id: Some(result.call_id.clone()),
+                            name: tool_name(result).to_owned(),
+                            context: replayed_tool_contexts.remove(operation_id),
+                            output,
+                            lifecycle: tool_lifecycle(result),
+                        }));
+                        self.remember_display_source(self.transcript.len() - 1, deferred);
                     }
                 }
                 SessionEvent::ToolUnknown { reason, .. } => {
@@ -940,6 +1541,7 @@ impl TuiState {
     }
 
     pub fn open_todos(&mut self) {
+        self.selected_todo = 0;
         self.overlay = Overlay::Todos;
     }
 
@@ -970,48 +1572,33 @@ impl TuiState {
     }
 
     pub fn jump_user_turn(&mut self, direction: i32, width: usize) {
-        let width = width.max(8);
-        let viewport = self.viewport_height.get().max(1) as usize;
-        let rendered =
-            super::transcript_lines(&self.transcript, width, super::TranscriptDetail::Compact);
-        if rendered.len() <= viewport {
-            self.scroll = 0;
+        let width = width.min(u16::MAX as usize) as u16;
+        self.ensure_transcript_geometry(width);
+        let geometry = self.transcript_geometry.borrow();
+        let Some(geometry) = geometry.as_ref() else {
             return;
-        }
-        let mut starts = Vec::new();
-        for (index, entry) in self.transcript.iter().enumerate() {
-            if matches!(entry, TranscriptEntry::UserTurn { .. }) {
-                starts.push(
-                    super::transcript_lines(
-                        &self.transcript[..index],
-                        width,
-                        super::TranscriptDetail::Compact,
-                    )
-                    .len(),
-                );
-            }
-        }
-        if starts.is_empty() {
-            return;
-        }
-        let max_scroll = rendered.len().saturating_sub(viewport);
-        let current_start = rendered
-            .len()
-            .saturating_sub(viewport.saturating_add(self.scroll));
-        let current = starts
-            .iter()
-            .rposition(|start| *start <= current_start)
-            .unwrap_or(0);
-        let next = if direction < 0 {
-            current.saturating_sub(1)
-        } else {
-            (current + 1).min(starts.len().saturating_sub(1))
         };
-        let target = starts[next];
-        self.scroll = rendered
-            .len()
-            .saturating_sub(viewport.saturating_add(target))
-            .min(max_scroll);
+        let max_scroll = geometry
+            .lines
+            .saturating_sub(self.viewport_height.get() as usize);
+        let current_start = max_scroll.saturating_sub(self.scroll);
+        let target = if direction < 0 {
+            geometry
+                .prompt_starts
+                .iter()
+                .rev()
+                .find(|&&start| start < current_start)
+                .or_else(|| geometry.prompt_starts.first())
+        } else {
+            geometry
+                .prompt_starts
+                .iter()
+                .find(|&&start| start > current_start)
+                .or_else(|| geometry.prompt_starts.last())
+        };
+        if let Some(&target) = target {
+            self.scroll = max_scroll.saturating_sub(target);
+        }
     }
 
     pub const fn overlay(&self) -> Overlay {
@@ -1044,6 +1631,7 @@ impl TuiState {
                     .push(EngineCommand::Agent(AgentCommand::Inspect { agent_id }));
             }
             self.overlay = Overlay::AgentInspect;
+            self.agent_inspect_scroll.set(0);
         }
     }
 
@@ -1060,13 +1648,20 @@ impl TuiState {
         self.agent_message_cursor = self.agent_message.len();
     }
 
+    pub(crate) fn normalize_agent_message_cursor(&mut self) {
+        self.agent_message_cursor = grapheme_cursor(&self.agent_message, self.agent_message_cursor);
+    }
+
     pub fn insert_agent_message(&mut self, text: &str) {
+        self.normalize_agent_message_cursor();
         self.agent_message
             .insert_str(self.agent_message_cursor, text);
         self.agent_message_cursor = self
             .agent_message_cursor
             .saturating_add(text.len())
             .min(self.agent_message.len());
+        self.agent_message_cursor =
+            grapheme_boundary_at_or_after(&self.agent_message, self.agent_message_cursor);
     }
 
     pub fn submit_agent_message(&mut self) {
@@ -1099,6 +1694,7 @@ impl TuiState {
     }
 
     pub fn close_overlay(&mut self) {
+        let closing_queue = self.overlay == Overlay::Queue;
         self.overlay = match self.overlay {
             Overlay::Approval => Overlay::Approval,
             Overlay::ApprovalEdit => {
@@ -1111,9 +1707,17 @@ impl TuiState {
             Overlay::AgentInspect => Overlay::Agents,
             _ => Overlay::None,
         };
+        if closing_queue && matches!(self.activity, ActivityState::Idle) {
+            self.start_next_pending_turn();
+        }
+    }
+
+    pub(crate) const fn approval_generation(&self) -> u64 {
+        self.approval_generation
     }
 
     pub fn begin_approval(&mut self, request: ApprovalRequest) {
+        self.approval_generation = self.approval_generation.wrapping_add(1);
         self.approval = Some(ApprovalState::new(request));
         self.overlay = Overlay::Approval;
         self.activity = ActivityState::AwaitingApproval;
@@ -1146,7 +1750,6 @@ impl TuiState {
             approval.set_editor(
                 serde_json::to_string_pretty(&arguments).unwrap_or_else(|_| "{}".into()),
             );
-            approval.arguments = arguments;
         }
     }
 
@@ -1183,7 +1786,6 @@ impl TuiState {
             }
         };
         if let Some(approval) = &mut self.approval {
-            approval.arguments = arguments.clone();
             approval.validation_error = None;
         }
         self.resolve_approval(ApprovalResponse::Edit { arguments });
@@ -1195,6 +1797,9 @@ impl TuiState {
     }
 
     pub fn queue_command(&mut self, command: EngineCommand) {
+        if matches!(command, EngineCommand::Steer { .. }) {
+            self.pending_steering = self.pending_steering.saturating_add(1);
+        }
         self.sent_commands.push(command);
     }
 
@@ -1216,12 +1821,37 @@ impl TuiState {
         );
         if !matches!(
             &event,
-            RuntimeEvent::AssistantDelta { .. } | RuntimeEvent::Usage { .. }
+            RuntimeEvent::AssistantDelta { .. }
+                | RuntimeEvent::Usage { .. }
+                | RuntimeEvent::ContextInspected { .. }
+                | RuntimeEvent::SteeringQueued { .. }
+                | RuntimeEvent::SteeringRejected { .. }
         ) && !preserves_active_streams
         {
             self.active_assistant_entry = None;
         }
         match event {
+            RuntimeEvent::ContextInspected { inspection } => self.context_view.update(inspection),
+            RuntimeEvent::SteeringQueued { .. } => {}
+            RuntimeEvent::SteeringRejected { text, message } => {
+                self.pending_steering = self.pending_steering.saturating_sub(1);
+                self.restore_unsent_input(text);
+                self.push_transcript_entry(TranscriptEntry::Notice {
+                    label: Some("STEER".into()),
+                    body: format!("{message}; input restored to draft"),
+                });
+                if matches!(self.activity, ActivityState::Idle) {
+                    self.start_next_pending_turn();
+                }
+            }
+            RuntimeEvent::SteeringApplied { text } => {
+                self.pending_steering = self.pending_steering.saturating_sub(1);
+                self.remember_prompt(&text);
+                self.push_notice(Some("STEER".into()), text);
+                if matches!(self.activity, ActivityState::Idle) {
+                    self.set_thinking();
+                }
+            }
             RuntimeEvent::Status { message } => {
                 self.push_notice(None, message);
                 self.activity = ActivityState::Idle;
@@ -1262,6 +1892,9 @@ impl TuiState {
                 operation_id,
                 result,
             } => {
+                if matches!(tool_name(&result), "bash" | "write") {
+                    self.file_index_dirty = true;
+                }
                 let todo_items = todo_items(&result);
                 self.complete_tool(operation_id, result);
                 if let Some(items) = todo_items {
@@ -1332,6 +1965,13 @@ impl TuiState {
     }
 
     fn start_next_pending_turn(&mut self) {
+        if self.queue_paused
+            || self.pending_steering != 0
+            || self.overlay == Overlay::Queue
+            || self.editing_follow_up()
+        {
+            return;
+        }
         let Some(turn) = self.pending_turns.pop_front() else {
             return;
         };
@@ -1350,6 +1990,7 @@ impl TuiState {
             && let Some(TranscriptEntry::AssistantMessage { body }) = self.transcript.get_mut(index)
         {
             body.push_str(&text);
+            self.transcript_changed(index);
             return;
         }
 
@@ -1374,6 +2015,7 @@ impl TuiState {
                     append_stream_boundary(&mut tool.output, &stream);
                 }
                 append_live_tool_output(&mut tool.output, &chunk);
+                self.transcript_changed(index);
             }
             self.active_tool_streams.insert(call_id, stream);
             return;
@@ -1407,7 +2049,9 @@ impl TuiState {
             .metadata
             .get("display_output")
             .and_then(serde_json::Value::as_str);
-        let display_output = tool_display_output(&result).to_owned();
+        let (display_output, deferred) = self.completed_display_output(&result);
+        let has_display_blobs =
+            self.display_store.is_some() && result.metadata.get("display_blobs").is_some();
         let lifecycle = tool_lifecycle(&result);
         let name = tool_name(&result).to_owned();
         let pending_context = self.pending_tool_context.take();
@@ -1420,7 +2064,8 @@ impl TuiState {
         if name == "todo" && lifecycle != ToolLifecycle::Failed {
             if let Some(index) = self.active_tool_entries.remove(&result.call_id) {
                 self.transcript.remove(index);
-                self.reindex_active_tool_entries(index);
+                self.transcript_changed(index);
+                self.reindex_active_entries(index);
             }
             return;
         }
@@ -1438,14 +2083,23 @@ impl TuiState {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
                 && !tool.output.is_empty()
+                && !has_display_blobs
             {
-                append_error_boundary(&mut tool.output, &display_output);
+                let error = result
+                    .metadata
+                    .get("execution_error_suffix")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&display_output);
+                append_error_boundary(&mut tool.output, error);
             } else if !result.truncated
                 || persisted_display_output.is_some()
+                || has_display_blobs
                 || tool.output.is_empty()
             {
                 tool.output = display_output;
             }
+            self.transcript_changed(index);
+            self.remember_display_source(index, deferred);
             return;
         }
 
@@ -1456,20 +2110,76 @@ impl TuiState {
             output: display_output,
             lifecycle,
         }));
+        self.remember_display_source(self.transcript.len() - 1, deferred);
     }
 
-    fn reindex_active_tool_entries(&mut self, removed: usize) {
-        for index in self.active_tool_entries.values_mut() {
+    fn completed_display_output(
+        &self,
+        result: &ToolResult,
+    ) -> (String, Option<DeferredToolOutput>) {
+        let fallback = tool_display_output(result);
+        let Some(store) = &self.display_store else {
+            return (fallback.to_owned(), None);
+        };
+        match DisplaySource::from_result(result) {
+            Ok(Some(source)) => {
+                let output = source
+                    .load(store, Some(MAX_LIVE_TOOL_OUTPUT_BYTES))
+                    .unwrap_or_else(|error| display_load_error(fallback, &error));
+                (
+                    output,
+                    Some(DeferredToolOutput {
+                        source,
+                        preview: None,
+                    }),
+                )
+            }
+            Ok(None) => (fallback.to_owned(), None),
+            Err(error) => (display_load_error(fallback, &error), None),
+        }
+    }
+
+    fn remember_display_source(&mut self, index: usize, deferred: Option<DeferredToolOutput>) {
+        let Some(mut deferred) = deferred else { return };
+        if self.transcript_view_expanded
+            && let Some(store) = &self.display_store
+            && let Some(TranscriptEntry::ToolCall(tool)) = self.transcript.get_mut(index)
+        {
+            let full = deferred
+                .source
+                .load(store, None)
+                .unwrap_or_else(|error| display_load_error(&tool.output, &error));
+            deferred.preview = Some(std::mem::replace(&mut tool.output, full));
+        }
+        self.deferred_tool_outputs.insert(index, deferred);
+    }
+
+    fn reindex_active_entries(&mut self, removed: usize) {
+        self.active_tool_entries.retain(|_, index| {
+            if *index == removed {
+                return false;
+            }
             if *index > removed {
                 *index -= 1;
             }
-        }
+            true
+        });
+        self.active_assistant_entry = self
+            .active_assistant_entry
+            .and_then(|index| (index != removed).then(|| index - usize::from(index > removed)));
+        self.deferred_tool_outputs = std::mem::take(&mut self.deferred_tool_outputs)
+            .into_iter()
+            .filter_map(|(index, output)| {
+                (index != removed).then(|| (index - usize::from(index > removed), output))
+            })
+            .collect();
     }
 
     pub fn submit_goal(&mut self, objective: String) -> bool {
         if !matches!(self.activity, ActivityState::Idle) {
             return false;
         }
+        self.scroll = 0;
         self.apply_goal(
             Some(SessionGoal {
                 objective: objective.clone(),
@@ -1545,22 +2255,36 @@ impl TuiState {
 
     fn replace_todos(&mut self, items: Vec<TodoItem>) {
         self.todos.clone_from(&items);
-        let live_start = self.committed_transcript_entries;
-        let existing = self.transcript[live_start..]
+        self.selected_todo = self.selected_todo.min(items.len().saturating_sub(1));
+        let existing = self
+            .transcript
             .iter()
             .position(|entry| matches!(entry, TranscriptEntry::Todos { .. }));
         if items.is_empty() {
-            if let Some(offset) = existing {
-                self.transcript.remove(live_start + offset);
+            if let Some(index) = existing {
+                self.transcript.remove(index);
+                self.transcript_changed(index);
+                self.reindex_active_entries(index);
             }
             return;
         }
-        if let Some(offset) = existing {
-            self.transcript[live_start + offset] = TranscriptEntry::Todos { items };
+        if let Some(index) = existing {
+            self.transcript[index] = TranscriptEntry::Todos { items };
+            self.transcript_changed(index);
         } else {
             self.push_transcript_entry(TranscriptEntry::Todos { items });
         }
     }
+}
+
+fn grapheme_cursor(text: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(text.len());
+    if cursor == 0 {
+        return 0;
+    }
+    let previous = previous_grapheme_boundary(text, cursor);
+    let next = next_grapheme_boundary(text, previous);
+    if next == cursor { cursor } else { previous }
 }
 
 fn is_non_terminal_runtime_error(message: &str) -> bool {
@@ -1575,28 +2299,35 @@ fn is_non_terminal_runtime_error(message: &str) -> bool {
 }
 
 fn append_live_tool_output(output: &mut String, chunk: &str) {
+    let retained_bytes = MAX_LIVE_TOOL_OUTPUT_BYTES.saturating_sub(LIVE_OUTPUT_OMITTED.len());
+    if chunk.len() > retained_bytes {
+        let mut start = chunk.len() - retained_bytes;
+        while !chunk.is_char_boundary(start) {
+            start += 1;
+        }
+        output.clear();
+        output.push_str(LIVE_OUTPUT_OMITTED);
+        output.push_str(&chunk[start..]);
+        return;
+    }
     output.push_str(chunk);
     if output.len() <= MAX_LIVE_TOOL_OUTPUT_BYTES {
         return;
     }
-
-    let retained_bytes = MAX_LIVE_TOOL_OUTPUT_BYTES.saturating_sub(LIVE_OUTPUT_OMITTED.len());
-    let mut retained_start = output.len().saturating_sub(retained_bytes);
+    let mut retained_start = output.len() - retained_bytes;
     while !output.is_char_boundary(retained_start) {
         retained_start += 1;
     }
-    let retained = output[retained_start..].to_owned();
-    output.clear();
-    output.push_str(LIVE_OUTPUT_OMITTED);
-    output.push_str(&retained);
+    output.replace_range(..retained_start, LIVE_OUTPUT_OMITTED);
 }
 
-fn bounded_live_tool_output(mut output: String) -> String {
-    if output.len() > MAX_LIVE_TOOL_OUTPUT_BYTES {
-        let contents = std::mem::take(&mut output);
-        append_live_tool_output(&mut output, &contents);
+fn bounded_live_tool_output(output: String) -> String {
+    if output.len() <= MAX_LIVE_TOOL_OUTPUT_BYTES {
+        return output;
     }
-    output
+    let mut bounded = String::with_capacity(MAX_LIVE_TOOL_OUTPUT_BYTES);
+    append_live_tool_output(&mut bounded, &output);
+    bounded
 }
 
 fn append_stream_boundary(body: &mut String, stream: &str) {
@@ -1613,7 +2344,7 @@ fn append_error_boundary(body: &mut String, error: &str) {
         body.push('\n');
     }
     body.push_str("\n[error]\n");
-    body.push_str(error);
+    append_live_tool_output(body, error);
 }
 
 fn tool_display_output(result: &ToolResult) -> &str {
@@ -1660,19 +2391,13 @@ fn tool_lifecycle(result: &ToolResult) -> ToolLifecycle {
     }
 }
 
-fn tool_transcript(result: &ToolResult, context: Option<String>) -> ToolTranscript {
-    ToolTranscript {
-        call_id: Some(result.call_id.clone()),
-        name: tool_name(result).to_owned(),
-        context,
-        output: tool_display_output(result).to_owned(),
-        lifecycle: tool_lifecycle(result),
-    }
-}
-
 fn operation_context(operation: &kurama_protocol::tool::Operation) -> String {
     match operation {
-        kurama_protocol::tool::Operation::Read { path, .. } => path.display().to_string(),
+        kurama_protocol::tool::Operation::Read { paths, .. } => paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
         kurama_protocol::tool::Operation::Write { paths, .. } => paths
             .iter()
             .map(|path| path.display().to_string())
@@ -1696,10 +2421,282 @@ fn mode_label(mode: ExecutionMode) -> &'static str {
     }
 }
 
-fn compact_tokens(tokens: u64) -> String {
-    if tokens >= 1000 {
-        format!("{}k", (tokens + 500) / 1000)
-    } else {
-        tokens.to_string()
+#[cfg(test)]
+mod tests {
+    use super::{Overlay, TuiState};
+    use kurama_protocol::policy::ExecutionMode;
+
+    #[tokio::test]
+    async fn aggregate_timeout_diagnostic_survives_engine_completion_and_replay() {
+        use kurama_adapters::{BashTool, FsSessionStore};
+        use kurama_core::{
+            context::ContextPolicy,
+            engine::{Engine, EngineConfig},
+            testing::{AllowAllPolicy, CollectingSink, NoDelegation, ScriptedBackend, SequenceIds},
+        };
+        use kurama_protocol::{
+            agent::WriteScope,
+            model::{FinishReason, ModelEvent, ModelProfile},
+            policy::AutoBoundaries,
+            runtime::RuntimeEvent,
+            session::{BlobRef, SessionEvent, SessionMetadata},
+            traits::SessionStore,
+        };
+        use std::{sync::Arc, time::Duration};
+
+        let temp = tempfile::tempdir().expect("workspace");
+        let workspace = temp.path().canonicalize().expect("absolute workspace");
+        let store = Arc::new(FsSessionStore::open(workspace.join("store")).expect("store"));
+        let sink = Arc::new(CollectingSink::default());
+        let session_id = kurama_protocol::id::SessionId::from("timeout-display");
+        let config = EngineConfig {
+            session: SessionMetadata {
+                id: session_id.clone(),
+                created_at_ms: 0,
+                project_root: workspace.display().to_string(),
+                profile: "test".into(),
+                mode: ExecutionMode::Supervised,
+                redaction_best_effort: false,
+            },
+            profile: ModelProfile::new("test", "frontier", 60_000, 10_000),
+            backend: Arc::new(ScriptedBackend::new(vec![vec![
+                Ok(ModelEvent::ToolCall {
+                    call_id: "bash-timeout".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({
+                        "command": "printf '%074990d' 7; printf '%074990d' 8 >&2; sleep 5",
+                        "timeout_ms": 250,
+                    }),
+                }),
+                Ok(ModelEvent::ResponseCompleted {
+                    cursor: None,
+                    finish_reason: FinishReason::ToolCalls,
+                }),
+            ]])),
+            tools: vec![Arc::new(BashTool::with_event_sink(
+                "/bin/bash",
+                sink.clone(),
+            ))],
+            policy: Arc::new(AllowAllPolicy),
+            store: store.clone(),
+            sink: sink.clone(),
+            orchestrator: Arc::new(NoDelegation),
+            ids: Arc::new(SequenceIds::new(1)),
+            context_policy: ContextPolicy {
+                max_input_tokens: 60_000,
+                reserve_output_tokens: 10_000,
+                ..ContextPolicy::default()
+            },
+            workspace_root: workspace.clone(),
+            write_scope: WriteScope {
+                roots: vec![workspace],
+                files: Vec::new(),
+            },
+            auto: AutoBoundaries::default(),
+            agent_id: None,
+            orchestration: None,
+            provider_retry_delays_ms: Vec::new(),
+            command_capacity: 32,
+            event_capacity: 128,
+        };
+        let (handle, mut events) = Engine::spawn(config, Vec::new()).expect("engine");
+        handle
+            .submit("run the command", false)
+            .await
+            .expect("submit");
+        let live_result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.expect("runtime event") {
+                    RuntimeEvent::ToolCompleted { result, .. } => break result,
+                    RuntimeEvent::Error { message } => panic!("before tool completion: {message}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("tool completion");
+        handle.shutdown().await.expect("shutdown");
+
+        // Each stream and their separator fit 150,000 bytes; only the timeout
+        // diagnostic forces staging. The visible TUI preview has a smaller bound.
+        assert!(live_result.is_error && live_result.truncated);
+        assert!(live_result.output.len() <= 150_000);
+        assert_eq!(live_result.metadata["stdout_truncated"], false);
+        assert_eq!(live_result.metadata["stderr_truncated"], false);
+        let suffix = live_result.metadata["execution_error_suffix"]
+            .as_str()
+            .expect("diagnostic");
+        assert!(suffix.contains("timed out"));
+        let full = live_result.metadata["display_output"]
+            .as_str()
+            .expect("full runtime output");
+        assert!(full.ends_with(suffix));
+        assert_eq!(full.matches(suffix).count(), 1);
+        for (stream, digit) in [("stdout", '7'), ("stderr", '8')] {
+            let reference: BlobRef =
+                serde_json::from_value(live_result.metadata["display_blobs"][stream].clone())
+                    .expect("stream blob");
+            let expected = format!("{}{}", "0".repeat(74_989), digit);
+            assert_eq!(
+                store.get_blob(&reference).expect("raw stream"),
+                expected.as_bytes()
+            );
+        }
+
+        let tool_output = |state: &TuiState| {
+            state
+                .transcript
+                .iter()
+                .find_map(|entry| match entry {
+                    super::TranscriptEntry::ToolCall(tool) => {
+                        assert_eq!(tool.lifecycle, super::ToolLifecycle::Failed);
+                        Some(tool.output.clone())
+                    }
+                    _ => None,
+                })
+                .expect("displayed Bash output")
+        };
+        let mut live = TuiState::new("test", "frontier", ".", ExecutionMode::Supervised);
+        live.set_display_store(store.clone());
+        let mut streaming_only = TuiState::new("test", "frontier", ".", ExecutionMode::Supervised);
+        for event in sink.take() {
+            streaming_only.apply_runtime_event(event.clone());
+            live.apply_runtime_event(event);
+        }
+        let streamed = tool_output(&streaming_only);
+        assert!(streamed.len() <= super::MAX_LIVE_TOOL_OUTPUT_BYTES);
+        assert!(streamed.ends_with(suffix));
+        assert_eq!(streamed.matches(suffix).count(), 1);
+
+        let replay = store.replay(&session_id).expect("durable replay");
+        assert!(replay.iter().any(|event| matches!(&event.event, SessionEvent::ToolCompleted { result, .. } if result.is_error)));
+        let mut restored = TuiState::new("test", "frontier", ".", ExecutionMode::Supervised);
+        restored.set_display_store(store);
+        restored.hydrate_replay(&replay);
+        for state in [&mut live, &mut restored] {
+            let preview = tool_output(state);
+            assert!(preview.len() <= super::MAX_LIVE_TOOL_OUTPUT_BYTES);
+            assert!(preview.ends_with(suffix));
+            assert_eq!(preview.matches(suffix).count(), 1);
+            state.toggle_transcript_view();
+            assert_eq!(tool_output(state), full);
+            state.toggle_transcript_view();
+            assert_eq!(tool_output(state), preview);
+            state.toggle_transcript_view();
+            assert_eq!(tool_output(state), full);
+        }
+    }
+
+    fn scrollable_state() -> TuiState {
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        state.transcript_width.set(24);
+        state.viewport_height.set(4);
+        state.push_assistant(
+            "a long assistant answer that wraps across several terminal rows\n".repeat(10),
+        );
+        state
+    }
+
+    #[test]
+    fn wheel_scroll_clamps_wrapped_rows_and_preserves_history_draft() {
+        let mut state = scrollable_state();
+        state.remember_prompt("first prompt");
+        state.remember_prompt("second prompt");
+        state.composer = "unfinished draft".into();
+        assert!(state.history_previous());
+        state.cursor = 3;
+
+        let max_scroll = state.max_transcript_scroll();
+        assert!(max_scroll > 3);
+        assert!(!state.scroll_transcript(-3));
+        assert!(state.scroll_transcript(3));
+        assert_eq!(state.scroll, 3);
+        assert!(state.scroll_transcript(i32::MAX));
+        assert_eq!(state.scroll, max_scroll);
+        assert!(!state.scroll_transcript(3));
+        state.scroll = usize::MAX;
+        assert!(state.scroll_transcript(-3));
+        assert_eq!(state.scroll, max_scroll - 3);
+        assert!(state.scroll_transcript(i32::MIN));
+        assert_eq!(state.scroll, 0);
+        assert!(!state.scroll_transcript(0));
+
+        assert_eq!(state.composer, "second prompt");
+        assert_eq!(state.cursor, 3);
+        assert!(state.history_previous());
+        assert_eq!(state.composer, "first prompt");
+        assert!(state.history_next());
+        assert_eq!(state.composer, "second prompt");
+        assert!(state.history_next());
+        assert_eq!(state.composer, "unfinished draft");
+    }
+
+    #[test]
+    fn wheel_scroll_ignores_overlays_and_short_transcripts() {
+        let mut state = scrollable_state();
+        state.composer = "draft".into();
+        state.agent_message = "agent draft".into();
+        state.agent_message_cursor = 2;
+        assert!(state.scroll_transcript(3));
+        for overlay in [
+            Overlay::Onboarding,
+            Overlay::Approval,
+            Overlay::ApprovalEdit,
+            Overlay::Agents,
+            Overlay::Todos,
+            Overlay::AgentInspect,
+            Overlay::AgentMessage,
+            Overlay::ConfirmAgentCancel,
+            Overlay::Shortcuts,
+        ] {
+            state.overlay = overlay;
+            assert!(!state.scroll_transcript(3));
+            assert!(!state.scroll_transcript(-3));
+            assert_eq!(state.scroll, 3);
+        }
+        assert_eq!(state.composer, "draft");
+        assert_eq!(state.agent_message, "agent draft");
+        assert_eq!(state.agent_message_cursor, 2);
+        state.overlay = Overlay::None;
+        state.viewport_height.set(u16::MAX);
+        assert!(state.scroll_transcript(3));
+        assert_eq!(state.scroll, 0);
+        assert!(!state.scroll_transcript(3));
+        assert!(!state.scroll_transcript(-3));
+    }
+
+    #[test]
+    fn wheel_scroll_geometry_tracks_detail_width_and_new_prompts() {
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        state.transcript_width.set(24);
+        state.viewport_height.set(1);
+        state.push_tool(
+            "TOOL / bash",
+            "a long output row with enough text to wrap\n".repeat(40),
+        );
+
+        assert!(state.scroll_transcript(i32::MAX));
+        let compact_max = state.scroll;
+        state.toggle_transcript_view();
+        assert_eq!(state.scroll, 0);
+        assert!(state.scroll_transcript(i32::MAX));
+        let expanded_max = state.scroll;
+        assert!(expanded_max > compact_max);
+        state.transcript_width.set(12);
+        assert!(state.scroll_transcript(i32::MAX));
+        assert!(state.scroll > expanded_max);
+        state.transcript_width.set(24);
+        state.toggle_transcript_view();
+        assert!(state.scroll_transcript(i32::MAX));
+        assert_eq!(state.scroll, compact_max);
+
+        state.submit_turn("new prompt", false);
+        assert_eq!(state.scroll, 0);
+        state.push_assistant("live answer");
+        assert_eq!(state.scroll, 0);
+        assert!(state.scroll_transcript(3));
+        state.submit_turn("queued prompt", false);
+        assert_eq!(state.scroll, 0);
+        assert_eq!(state.pending_turn_count(), 1);
     }
 }

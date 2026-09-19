@@ -21,7 +21,7 @@ use kurama_protocol::{
     id::{CallId, OperationId, SessionId},
     model::ModelProfile,
     policy::{ApprovalRequest, ApprovalResponse, AutoBoundaries, ExecutionMode},
-    runtime::RuntimeEvent,
+    runtime::{ContextInspection, RuntimeEvent},
     session::{EventEnvelope, SessionEvent, SessionMetadata},
     tool::ToolResult,
     traits::{
@@ -60,6 +60,17 @@ impl Handle {
         explicit_delegation: bool,
     ) -> Result<(), KuramaError> {
         self.inner.submit(text, explicit_delegation).await
+    }
+    pub async fn steer(
+        &self,
+        text: impl Into<String>,
+        explicit_delegation: bool,
+    ) -> Result<(), KuramaError> {
+        self.inner.steer(text, explicit_delegation).await
+    }
+
+    pub async fn inspect_context(&self) -> Result<(), KuramaError> {
+        self.inner.inspect_context().await
     }
 
     pub async fn resolve_approval(
@@ -129,6 +140,13 @@ impl fmt::Display for TurnOutcome {
 #[derive(Debug, Clone)]
 pub enum Event {
     Status(String),
+    SteeringQueued(String),
+    SteeringApplied(String),
+    SteeringRejected {
+        text: String,
+        message: String,
+    },
+    ContextInspected(ContextInspection),
     Text(String),
     Approval(ApprovalRequest),
     ToolStarted {
@@ -178,6 +196,14 @@ impl Turn<'_> {
                 | RuntimeEvent::GoalUpdated { .. }
                 | RuntimeEvent::GoalCleared => continue,
                 RuntimeEvent::Status { message } => Event::Status(message),
+                RuntimeEvent::SteeringQueued { text } => Event::SteeringQueued(text),
+                RuntimeEvent::SteeringApplied { text } => Event::SteeringApplied(text),
+                RuntimeEvent::SteeringRejected { text, message } => {
+                    Event::SteeringRejected { text, message }
+                }
+                RuntimeEvent::ContextInspected { inspection } => {
+                    Event::ContextInspected(inspection)
+                }
                 RuntimeEvent::AssistantDelta { text } => {
                     self.text.push_str(&text);
                     Event::Text(text)
@@ -227,6 +253,24 @@ impl Turn<'_> {
                 self.finished = true;
             }
             return Ok(Some(event));
+        }
+    }
+
+    /// Request cancellation before abandoning a partially consumed turn.
+    /// Drain the turn afterwards so its terminal event cannot reach the next prompt.
+    pub async fn cancel(&self) -> Result<(), KuramaError> {
+        if self.finished {
+            return Ok(());
+        }
+        self.handle.cancel_turn().await
+    }
+
+    /// Consume this turn through its terminal event without retaining more text.
+    /// Call `cancel` first when abandoning a turn that might await approval.
+    pub async fn drain(&mut self) {
+        if !self.finished {
+            drain_until_terminal(self.events).await;
+            self.finished = true;
         }
     }
 
@@ -463,10 +507,14 @@ impl AgentSetup {
         )
     }
 
-    pub fn profile(mut self, profile: ModelProfile, backend: Arc<dyn ModelBackend>) -> Self {
+    pub fn profile(mut self, mut profile: ModelProfile, backend: Arc<dyn ModelBackend>) -> Self {
         if self.profiles.contains_key(&profile.name) {
             self.error = Some(format!("duplicate profile: {}", profile.name));
             return self;
+        }
+        if let Some((max_input_tokens, max_output_tokens)) = self.pending_limits.take() {
+            profile.max_input_tokens = max_input_tokens;
+            profile.max_output_tokens = max_output_tokens;
         }
         if self.active_profile.is_none() {
             self.active_profile = Some(profile.name.clone());
@@ -489,6 +537,13 @@ impl AgentSetup {
     }
 
     pub fn limits(mut self, max_input_tokens: u64, max_output_tokens: u64) -> Self {
+        if let Some(name) = &self.active_profile
+            && let Some((profile, _)) = self.profiles.get_mut(name)
+        {
+            profile.max_input_tokens = max_input_tokens;
+            profile.max_output_tokens = max_output_tokens;
+            return self;
+        }
         self.pending_limits = Some((max_input_tokens, max_output_tokens));
         self
     }
@@ -621,19 +676,20 @@ impl AgentSetup {
         let sink = self
             .sink
             .unwrap_or_else(|| Arc::new(NoopSink) as Arc<dyn EventSink>);
-        let policy = self.policy.unwrap_or_else(|| {
-            Arc::new(DefaultPolicy::new(self.mode, self.auto.clone())) as Arc<dyn ApprovalPolicy>
-        });
+        let policy = self
+            .policy
+            .unwrap_or_else(|| Arc::new(DefaultPolicy) as Arc<dyn ApprovalPolicy>);
         let write_scope = self.write_scope.unwrap_or_else(|| WriteScope {
             roots: vec![self.workspace.clone()],
             files: Vec::new(),
         });
-        let orchestrator = if self.orchestrate {
-            Arc::new(SmartOrchestrator::new(ids.clone())) as Arc<dyn Orchestrator>
-        } else {
-            self.orchestrator
-                .unwrap_or_else(|| Arc::new(NoDelegation) as Arc<dyn Orchestrator>)
-        };
+        let orchestrator = self.orchestrator.unwrap_or_else(|| {
+            if self.orchestrate {
+                Arc::new(SmartOrchestrator::new(ids.clone())) as Arc<dyn Orchestrator>
+            } else {
+                Arc::new(NoDelegation) as Arc<dyn Orchestrator>
+            }
+        });
 
         let mut builder = AgentBuilder::new()
             .policy(policy)
@@ -690,7 +746,37 @@ fn orchestration_context(
         .ok_or_else(|| {
             KuramaError::Configuration(format!("unknown active profile: {active_profile}"))
         })?;
-    let registered = profiles.keys().cloned().collect::<Vec<_>>();
+    let mut unknown_routes = Vec::new();
+    for (role, route) in roles {
+        if !profiles.contains_key(&route.profile) {
+            unknown_routes.push(format!(
+                "role {role} references unknown profile {}",
+                route.profile
+            ));
+        }
+        for profile in &route.escalation_profiles {
+            if !profiles.contains_key(profile) {
+                unknown_routes.push(format!(
+                    "role {role} references unknown escalation profile {profile}"
+                ));
+            }
+        }
+    }
+    for (name, escalations) in profile_escalations {
+        if !escalations.is_empty() && !profiles.contains_key(name) {
+            unknown_routes.push(format!("escalation route starts at unknown profile {name}"));
+        }
+        for profile in escalations {
+            if !profiles.contains_key(profile) {
+                unknown_routes.push(format!(
+                    "profile {name} references unknown escalation profile {profile}"
+                ));
+            }
+        }
+    }
+    if !unknown_routes.is_empty() {
+        return Err(KuramaError::Configuration(unknown_routes.join("; ")));
+    }
     let model_profiles = profiles
         .iter()
         .map(|(name, (profile, _))| (name.clone(), profile.clone()))
@@ -700,37 +786,16 @@ fn orchestration_context(
         profiles: model_profiles,
         role_routes: roles
             .iter()
-            .filter(|(_, route)| registered.iter().any(|name| name == &route.profile))
             .map(|(role, route)| (role.clone(), route.profile.clone()))
             .collect(),
         role_escalations: roles
             .iter()
-            .filter(|(_, route)| registered.iter().any(|name| name == &route.profile))
-            .map(|(role, route)| {
-                (
-                    role.clone(),
-                    route
-                        .escalation_profiles
-                        .iter()
-                        .filter(|profile| registered.iter().any(|name| name == *profile))
-                        .cloned()
-                        .collect(),
-                )
-            })
+            .map(|(role, route)| (role.clone(), route.escalation_profiles.clone()))
             .collect(),
         profile_escalations: profile_escalations
             .iter()
-            .filter(|(name, _)| registered.iter().any(|registered| registered == *name))
-            .map(|(name, profiles)| {
-                (
-                    name.clone(),
-                    profiles
-                        .iter()
-                        .filter(|profile| registered.iter().any(|name| name == *profile))
-                        .cloned()
-                        .collect(),
-                )
-            })
+            .filter(|(name, _)| profiles.contains_key(*name))
+            .map(|(name, escalations)| (name.clone(), escalations.clone()))
             .collect(),
         parent_write_scope,
         max_concurrency,

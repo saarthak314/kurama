@@ -830,3 +830,234 @@ impl ModelBackend for RecordingBackend {
         self.inner.stream(request, cancel)
     }
 }
+
+#[tokio::test]
+async fn limits_apply_independently_of_backend_or_profile_registration_order() {
+    for (explicit_profile, limits_first) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let backend = Arc::new(RecordingBackend::new(vec![vec![
+            text("ok"),
+            completed(FinishReason::Stop),
+        ]]));
+        let mut setup = kurama_sdk::Agent::new();
+        if limits_first {
+            setup = setup.limits(2_400, 300);
+        }
+        setup = if explicit_profile {
+            setup.profile(
+                ModelProfile::new("test", "frontier", 32_000, 4_000),
+                backend.clone(),
+            )
+        } else {
+            setup.backend_as("test", backend.clone())
+        };
+        if !limits_first {
+            setup = setup.limits(2_400, 300);
+        }
+        let mut agent = setup.build().expect("agent");
+        assert_eq!(agent.prompt("hello").await.expect("prompt").text, "ok");
+        let requests = backend.requests();
+        assert_eq!(
+            (
+                requests[0].profile.max_input_tokens,
+                requests[0].profile.max_output_tokens
+            ),
+            (2_400, 300)
+        );
+    }
+}
+
+#[test]
+fn zero_token_limits_are_rejected_before_starting_a_session() {
+    for (input, output) in [(0, 100), (1_000, 0)] {
+        let error = kurama_sdk::Agent::new()
+            .backend(ScriptedBackend::new(Vec::new()))
+            .limits(input, output)
+            .build()
+            .expect_err("unusable profile");
+        assert!(matches!(error, KuramaError::Configuration(_)));
+    }
+}
+
+struct CustomOrchestrator {
+    calls: AtomicUsize,
+}
+
+impl kurama_sdk::Orchestrator for CustomOrchestrator {
+    fn explicit_delegation(&self, _user_text: &str) -> bool {
+        false
+    }
+
+    fn resolve(
+        &self,
+        request: DelegationRequest,
+        context: &OrchestrationContext,
+    ) -> Result<kurama_sdk::SchedulePlan, KuramaError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let mut plan =
+            SmartOrchestrator::new(Arc::new(SequenceIds::default())).resolve(request, context)?;
+        plan.ready[0].id = "custom-child".into();
+        Ok(plan)
+    }
+
+    fn escalate(
+        &self,
+        agent: &kurama_sdk::AgentSnapshot,
+        reason: &str,
+        context: &OrchestrationContext,
+    ) -> Result<Option<String>, KuramaError> {
+        SmartOrchestrator::new(Arc::new(SequenceIds::default())).escalate(agent, reason, context)
+    }
+}
+
+#[tokio::test]
+async fn product_orchestration_preserves_the_supplied_orchestrator_and_child_result() {
+    let backend = Arc::new(RecordingBackend::new(vec![
+        vec![
+            delegation(child_budget(16_000, 2_000)),
+            completed(FinishReason::ToolCalls),
+        ],
+        vec![text("custom child result"), completed(FinishReason::Stop)],
+        vec![text("parent complete"), completed(FinishReason::Stop)],
+    ]));
+    let orchestrator = Arc::new(CustomOrchestrator {
+        calls: AtomicUsize::new(0),
+    });
+    let mut agent = kurama_sdk::Agent::new()
+        .backend_as("test", backend.clone())
+        .orchestrator(orchestrator.clone())
+        .orchestrate()
+        .build()
+        .expect("agent");
+    assert_eq!(
+        agent
+            .delegate("inspect the parser")
+            .await
+            .expect("delegate")
+            .text,
+        "parent complete"
+    );
+    assert_eq!(orchestrator.calls.load(Ordering::Relaxed), 1);
+    assert!(backend.requests().last().expect("parent request").items.iter().any(|item| matches!(item,
+        ModelItem::AgentResult { agent_id, summary, .. } if agent_id.as_ref() == "custom-child" && summary == "custom child result"
+    )));
+}
+
+fn routed_config() -> kurama_sdk::KuramaConfig {
+    kurama_sdk::KuramaConfig {
+        version: 1,
+        default_profile: None,
+        default_mode: ExecutionMode::Supervised,
+        profiles: BTreeMap::new(),
+        roles: BTreeMap::new(),
+        orchestration: Default::default(),
+        auto: Default::default(),
+        search: None,
+    }
+}
+
+#[test]
+fn unknown_role_and_escalation_profiles_are_reported_together() {
+    let mut config = routed_config();
+    config.roles.insert(
+        "reviewer".into(),
+        kurama_sdk::RoleConfig {
+            profile: "missing-review".into(),
+            escalation_profiles: vec!["missing-role-escalation".into()],
+        },
+    );
+    config.profiles.insert(
+        "test".into(),
+        kurama_sdk::ProfileConfig {
+            kind: kurama_sdk::ProfileKind::OpenAi,
+            model: "frontier".into(),
+            endpoint: None,
+            auth: None,
+            command: None,
+            max_input_tokens: 32_000,
+            max_output_tokens: 4_000,
+            escalation_profiles: vec!["missing-profile-escalation".into()],
+        },
+    );
+    let mut unregistered = config.profiles["test"].clone();
+    unregistered.escalation_profiles = vec!["test".into()];
+    config
+        .profiles
+        .insert("missing-source".into(), unregistered);
+    let error = kurama_sdk::Agent::new()
+        .backend_as("test", Arc::new(ScriptedBackend::new(Vec::new())))
+        .config(&config)
+        .orchestrate()
+        .build()
+        .expect_err("invalid routes");
+    let message = error.to_string();
+    for unknown in [
+        "reviewer",
+        "missing-review",
+        "missing-role-escalation",
+        "test",
+        "missing-profile-escalation",
+        "missing-source",
+    ] {
+        assert!(
+            message.contains(unknown),
+            "missing diagnostic for {unknown}: {message}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn registered_role_route_selects_the_child_backend() {
+    let mut config = routed_config();
+    config.roles.insert(
+        "reviewer".into(),
+        kurama_sdk::RoleConfig {
+            profile: "review".into(),
+            escalation_profiles: Vec::new(),
+        },
+    );
+    let mut request = match delegation(child_budget(16_000, 2_000)).expect("delegation") {
+        ModelEvent::Delegation { request } => request,
+        _ => unreachable!(),
+    };
+    request.agents[0].objective = "review the parser".into();
+    let parent = Arc::new(RecordingBackend::new(vec![
+        vec![
+            Ok(ModelEvent::Delegation { request }),
+            completed(FinishReason::ToolCalls),
+        ],
+        vec![text("review integrated"), completed(FinishReason::Stop)],
+    ]));
+    let review = Arc::new(RecordingBackend::new(vec![vec![
+        text("review result"),
+        completed(FinishReason::Stop),
+    ]]));
+    let mut agent = kurama_sdk::Agent::new()
+        .backend_as("parent", parent.clone())
+        .backend_as("review", review.clone())
+        .config(&config)
+        .orchestrate()
+        .build()
+        .expect("agent");
+    assert_eq!(
+        agent
+            .delegate("inspect parser")
+            .await
+            .expect("delegate")
+            .text,
+        "review integrated"
+    );
+    assert_eq!(review.requests()[0].profile.name, "review");
+    assert!(
+        parent
+            .requests()
+            .last()
+            .expect("parent request")
+            .items
+            .iter()
+            .any(|item| matches!(item,
+                ModelItem::AgentResult { summary, .. } if summary == "review result"
+            ))
+    );
+}

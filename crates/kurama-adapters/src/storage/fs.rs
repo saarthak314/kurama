@@ -1,11 +1,12 @@
 use std::{
     ffi::OsStr,
-    fs::{self, File, OpenOptions},
+    fs::File,
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::fs_safe::{Directory, owner_only};
 use kurama_protocol::{
     KuramaError,
     config::MutableState,
@@ -17,68 +18,9 @@ use kurama_protocol::{
 };
 use sha2::{Digest, Sha256};
 
-const DIRECTORY_MODE: u32 = 0o700;
-const FILE_MODE: u32 = 0o600;
 const METADATA_FILE: &str = "metadata.json";
 const TAIL_SCAN_BYTES: usize = 8 * 1024;
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default)]
-struct StorageOperationCounts {
-    tail_bytes_read: u64,
-    records_deserialized: u64,
-    replay_events_materialized: u64,
-    syncs: u64,
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static OPERATION_COUNTS: std::cell::Cell<StorageOperationCounts> =
-        std::cell::Cell::new(StorageOperationCounts::default());
-}
-
-#[cfg(test)]
-fn record_operation(update: impl FnOnce(&mut StorageOperationCounts)) {
-    OPERATION_COUNTS.with(|counts| {
-        let mut current = counts.get();
-        update(&mut current);
-        counts.set(current);
-    });
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn reset_operation_counts() {
-    OPERATION_COUNTS.with(|counts| counts.set(StorageOperationCounts::default()));
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn operation_counts() -> StorageOperationCounts {
-    OPERATION_COUNTS.with(std::cell::Cell::get)
-}
-
-fn count_tail_bytes(bytes: usize) {
-    #[cfg(test)]
-    record_operation(|counts| counts.tail_bytes_read += bytes as u64);
-    #[cfg(not(test))]
-    let _ = bytes;
-}
-
-fn count_deserialized_record() {
-    #[cfg(test)]
-    record_operation(|counts| counts.records_deserialized += 1);
-}
-
-fn count_materialized_replay_event() {
-    #[cfg(test)]
-    record_operation(|counts| counts.replay_events_materialized += 1);
-}
-
-fn count_sync() {
-    #[cfg(test)]
-    record_operation(|counts| counts.syncs += 1);
-}
+const BLOB_SCAN_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Default)]
 struct LogScan {
@@ -90,53 +32,142 @@ struct LogScan {
 #[derive(Debug, Clone)]
 pub struct FsSessionStore {
     root: PathBuf,
+    sessions: Directory,
+    blobs: Directory,
+    pending: Directory,
 }
 
 impl FsSessionStore {
     pub fn open(root: PathBuf) -> Result<Self, KuramaError> {
-        ensure_directory(&root)?;
-        ensure_file(&root.join("config.toml"), b"")?;
+        let directory = Directory::ensure_root(&root)?;
+        directory.ensure_file("config.toml", b"")?;
         let initial_state = serde_json::to_vec(&MutableState::default())
             .map_err(|error| storage_error("serialize initial state", error))?;
-        ensure_file(&root.join("state.json"), &initial_state)?;
-        for directory in ["sessions", "blobs", "cache"] {
-            ensure_directory(&root.join(directory))?;
-        }
-        Ok(Self { root })
+        directory.ensure_file("state.json", &initial_state)?;
+        let sessions = directory.ensure_dir("sessions")?;
+        let blobs = directory.ensure_dir("blobs")?;
+        directory.ensure_dir("cache")?;
+        let pending = directory.ensure_dir(".pending-sessions")?;
+        Ok(Self {
+            root,
+            sessions,
+            blobs,
+            pending,
+        })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    fn sessions_dir(&self) -> PathBuf {
-        self.root.join("sessions")
+    /// Verify the complete blob while retaining only its final `max_bytes` bytes.
+    pub fn get_blob_tail(
+        &self,
+        reference: &BlobRef,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, KuramaError> {
+        validate_hash(&reference.sha256)?;
+        let mut file = self
+            .blobs
+            .open_file(&reference.sha256, false, false)
+            .map_err(|error| storage_error("open blob", error))?;
+        if file.metadata()?.len() != reference.bytes {
+            return Err(KuramaError::Storage("blob length mismatch".into()));
+        }
+        let tail_len = usize::try_from(reference.bytes)
+            .unwrap_or(usize::MAX)
+            .min(max_bytes);
+        let tail_start = reference.bytes - tail_len as u64;
+        let mut tail = Vec::new();
+        let mut digest = Sha256::new();
+        let mut total = 0_u64;
+        let mut buffer = [0_u8; BLOB_SCAN_BYTES];
+        loop {
+            let bytes_read = match file.read(&mut buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if bytes_read == 0 {
+                break;
+            }
+            let next_total = total
+                .checked_add(bytes_read as u64)
+                .filter(|length| *length <= reference.bytes)
+                .ok_or_else(|| KuramaError::Storage("blob length mismatch".into()))?;
+            digest.update(&buffer[..bytes_read]);
+            let start = tail_start.saturating_sub(total).min(bytes_read as u64) as usize;
+            if start < bytes_read {
+                if tail.is_empty() {
+                    tail.reserve_exact(tail_len);
+                }
+                tail.extend_from_slice(&buffer[start..bytes_read]);
+            }
+            total = next_total;
+        }
+        if total != reference.bytes {
+            return Err(KuramaError::Storage("blob length mismatch".into()));
+        }
+        if crate::id::hexadecimal("", digest.finalize().as_ref()) != reference.sha256 {
+            return Err(KuramaError::Storage("blob hash mismatch".into()));
+        }
+        Ok(tail)
     }
 
-    fn blobs_dir(&self) -> PathBuf {
-        self.root.join("blobs")
-    }
-
-    fn session_dir(&self, session_id: &SessionId) -> Result<PathBuf, KuramaError> {
+    fn session_directory(&self, session_id: &SessionId) -> Result<Directory, KuramaError> {
         validate_identifier(session_id.as_ref(), "session")?;
-        Ok(self.sessions_dir().join(session_id.as_ref()))
+        self.sessions.child(session_id.as_ref()).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                KuramaError::NotFound(session_id.to_string())
+            } else {
+                storage_io_error(error)
+            }
+        })
     }
 
-    fn log_path(
+    fn open_log(
         &self,
         session_id: &SessionId,
         agent_id: Option<&AgentId>,
-    ) -> Result<PathBuf, KuramaError> {
-        let session_dir = self.session_dir(session_id)?;
-        match agent_id {
-            Some(agent_id) => {
-                validate_identifier(agent_id.as_ref(), "agent")?;
-                Ok(session_dir
-                    .join("agents")
-                    .join(format!("{}.jsonl", agent_id.as_ref())))
+        create: bool,
+        exclusive: bool,
+    ) -> Result<File, KuramaError> {
+        let session = self.session_directory(session_id)?;
+        session.open_file(METADATA_FILE, false, false)?;
+        let (directory, name) = match agent_id {
+            Some(agent) => {
+                validate_identifier(agent.as_ref(), "agent")?;
+                (
+                    session.child("agents")?,
+                    format!("{}.jsonl", agent.as_ref()),
+                )
             }
-            None => Ok(session_dir.join("events.jsonl")),
+            None => (session, "events.jsonl".to_owned()),
+        };
+        open_locked(&directory, &name, create, exclusive)
+    }
+
+    fn open_for_append(&self, event: &EventEnvelope) -> Result<(File, u64), KuramaError> {
+        if event.schema_version != SCHEMA_VERSION {
+            return Err(KuramaError::Storage(format!(
+                "unsupported session schema version {}",
+                event.schema_version
+            )));
         }
+        let mut file = self.open_log(&event.session_id, event.agent_id.as_ref(), true, true)?;
+        let prior = read_last_complete_record(&mut file)?;
+        let next_sequence = match prior {
+            Some(bytes) => deserialize_event(
+                &bytes,
+                &event.session_id,
+                event.agent_id.as_ref(),
+                "trailing",
+            )?
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| KuramaError::Storage("event sequence exceeds u64".into()))?,
+            None => 0,
+        };
+        Ok((file, next_sequence))
     }
 
     fn replay_log(
@@ -163,10 +194,16 @@ impl FsSessionStore {
         agent_id: Option<&AgentId>,
         materialize_events: bool,
     ) -> Result<LogScan, KuramaError> {
-        let path = self.log_path(session_id, agent_id)?;
-        let mut file = open_locked(&path, false)?;
-        let (complete_end, removed_bytes) = complete_log_end(&mut file)?;
-        let scan = scan_complete_log(
+        let mut file = self.open_log(session_id, agent_id, false, false)?;
+        let (mut complete_end, mut removed_bytes) = complete_log_end(&mut file)?;
+        if removed_bytes > 0 {
+            // Never mutate under a shared lock. Another reader may repair the tail
+            // during the upgrade, so recompute the boundary under exclusive ownership.
+            file.unlock()?;
+            file.lock()?;
+            (complete_end, removed_bytes) = complete_log_end(&mut file)?;
+        }
+        let mut scan = scan_complete_log(
             &mut file,
             complete_end,
             session_id,
@@ -181,64 +218,28 @@ impl FsSessionStore {
                 agent_id.cloned(),
                 SessionEvent::RecoveryRepair { removed_bytes },
             );
+            let next_sequence = scan
+                .next_sequence
+                .checked_add(1)
+                .ok_or_else(|| KuramaError::Storage("event sequence exceeds u64".into()))?;
             file.set_len(complete_end)?;
-            file.seek(SeekFrom::Start(complete_end))?;
-            serde_json::to_writer(&mut file, &repair)
-                .map_err(|error| storage_error("serialize recovery repair", error))?;
-            file.write_all(b"\n")?;
-            file.sync_data()?;
-            count_sync();
+            commit_event(&mut file, &repair)?;
+            scan.next_sequence = next_sequence;
+            scan.latest_timestamp_ms = Some(
+                scan.latest_timestamp_ms
+                    .map_or(repair.timestamp_ms, |latest| {
+                        latest.max(repair.timestamp_ms)
+                    }),
+            );
+            if materialize_events {
+                scan.events.push(repair);
+            }
         }
         Ok(scan)
     }
 
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn replay_with_operation_counts_for_test(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<(Vec<EventEnvelope>, u64), KuramaError> {
-        reset_operation_counts();
-        let events = <Self as SessionStore>::replay(self, session_id)?;
-        let counts = operation_counts();
-        Ok((events, counts.syncs))
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn append_with_operation_counts_for_test(
-        &self,
-        event: &EventEnvelope,
-    ) -> Result<(u64, u64, u64), KuramaError> {
-        reset_operation_counts();
-        <Self as SessionStore>::append(self, event)?;
-        let counts = operation_counts();
-        Ok((
-            counts.tail_bytes_read,
-            counts.records_deserialized,
-            counts.syncs,
-        ))
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn list_with_operation_counts_for_test(
-        &self,
-    ) -> Result<(Vec<SessionSummary>, u64, u64), KuramaError> {
-        reset_operation_counts();
-        let summaries = <Self as SessionStore>::list(self)?;
-        let counts = operation_counts();
-        Ok((
-            summaries,
-            counts.records_deserialized,
-            counts.replay_events_materialized,
-        ))
-    }
-
-    fn read_metadata(&self, session_dir: &Path) -> Result<SessionMetadata, KuramaError> {
-        let path = session_dir.join(METADATA_FILE);
-        reject_symlink(&path)?;
-        let bytes = fs::read(&path)?;
+    fn read_metadata(&self, session: &Directory) -> Result<SessionMetadata, KuramaError> {
+        let bytes = session.read(METADATA_FILE)?;
         serde_json::from_slice(&bytes)
             .map_err(|error| storage_error("deserialize session metadata", error))
     }
@@ -247,64 +248,82 @@ impl FsSessionStore {
 impl SessionStore for FsSessionStore {
     fn create(&self, metadata: &SessionMetadata) -> Result<(), KuramaError> {
         validate_identifier(metadata.id.as_ref(), "session")?;
-        let session_dir = self.session_dir(&metadata.id)?;
-        create_new_directory(&session_dir)?;
-        ensure_directory(&session_dir.join("agents"))?;
-        ensure_file(&session_dir.join("events.jsonl"), b"")?;
-
         let encoded = serde_json::to_vec(metadata)
             .map_err(|error| storage_error("serialize session metadata", error))?;
-        create_new_file(&session_dir.join(METADATA_FILE), &encoded)?;
-        sync_directory(&session_dir)?;
-        Ok(())
+        let directory_lock = self.sessions.lock_handle()?;
+        directory_lock.lock()?;
+        #[cfg(test)]
+        fail_create_at(CreateStep::StageDirectory)?;
+        let (temporary, session) = self.pending.temporary_directory()?;
+        let mut published = false;
+        let result = (|| {
+            #[cfg(test)]
+            fail_create_at(CreateStep::AgentsDirectory)?;
+            let agents = session.create_dir("agents")?;
+            #[cfg(test)]
+            fail_create_at(CreateStep::SyncAgents)?;
+            agents.sync()?;
+            #[cfg(test)]
+            fail_create_at(CreateStep::LogFile)?;
+            let log = session.create_file("events.jsonl")?;
+            #[cfg(test)]
+            fail_create_at(CreateStep::SyncLog)?;
+            log.sync_all()?;
+            #[cfg(test)]
+            fail_create_at(CreateStep::MetadataFile)?;
+            let mut file = session.create_file(METADATA_FILE)?;
+            #[cfg(test)]
+            fail_create_at(CreateStep::MetadataWrite)?;
+            file.write_all(&encoded)?;
+            #[cfg(test)]
+            fail_create_at(CreateStep::SyncMetadata)?;
+            file.sync_all()?;
+            #[cfg(test)]
+            fail_create_at(CreateStep::SyncSession)?;
+            session.sync()?;
+            #[cfg(test)]
+            fail_create_at(CreateStep::Publish)?;
+            self.pending.publish_directory(
+                &temporary,
+                &self.sessions,
+                OsStr::new(metadata.id.as_ref()),
+            )?;
+            published = true;
+            // Both sides of the cross-directory rename must be durable.
+            #[cfg(test)]
+            fail_create_at(CreateStep::SyncSessions)?;
+            self.sessions.sync()?;
+            #[cfg(test)]
+            fail_create_at(CreateStep::SyncPending)?;
+            self.pending.sync()?;
+            Ok(())
+        })();
+        if result.is_err() && !published {
+            // Ordinary failures leave no partial session; a crash can leave only an
+            // unpublished staging directory, never a visible half-created session.
+            let _ = session.remove_file(METADATA_FILE);
+            let _ = session.remove_file("events.jsonl");
+            let _ = session.remove_dir("agents");
+            let _ = self.pending.remove_dir(&temporary);
+        }
+        result
     }
 
     fn append(&self, event: &EventEnvelope) -> Result<(), KuramaError> {
-        if event.schema_version != SCHEMA_VERSION {
-            return Err(KuramaError::Storage(format!(
-                "unsupported session schema version {}",
-                event.schema_version
-            )));
-        }
-        let session_dir = self.session_dir(&event.session_id)?;
-        if !session_dir.join(METADATA_FILE).is_file() {
-            return Err(KuramaError::NotFound(format!(
-                "session {}",
-                event.session_id
-            )));
-        }
-        if event.agent_id.is_some() {
-            ensure_directory(&session_dir.join("agents"))?;
-        }
-        let path = self.log_path(&event.session_id, event.agent_id.as_ref())?;
-        let mut file = open_locked(&path, true)?;
-        let prior = read_last_complete_record(&mut file)?;
-        let expected = match prior {
-            Some(bytes) => deserialize_event(
-                &bytes,
-                &event.session_id,
-                event.agent_id.as_ref(),
-                "trailing",
-            )?
-            .sequence
-            .checked_add(1)
-            .ok_or_else(|| KuramaError::Storage("event sequence exceeds u64".into()))?,
-            None => 0,
-        };
+        let (mut file, expected) = self.open_for_append(event)?;
         if event.sequence != expected {
             return Err(KuramaError::Storage(format!(
                 "invalid event sequence {}; expected {expected}",
                 event.sequence
             )));
         }
+        commit_event(&mut file, event)
+    }
 
-        file.seek(SeekFrom::End(0))?;
-        serde_json::to_writer(&mut file, event)
-            .map_err(|error| storage_error("serialize session event", error))?;
-        file.write_all(b"\n")?;
-        file.sync_data()?;
-        count_sync();
-        Ok(())
+    fn append_next(&self, event: &mut EventEnvelope) -> Result<(), KuramaError> {
+        let (mut file, next_sequence) = self.open_for_append(event)?;
+        event.sequence = next_sequence;
+        commit_event(&mut file, event)
     }
 
     fn replay(&self, session_id: &SessionId) -> Result<Vec<EventEnvelope>, KuramaError> {
@@ -316,57 +335,62 @@ impl SessionStore for FsSessionStore {
         session_id: &SessionId,
         agent_id: &AgentId,
     ) -> Result<Vec<EventEnvelope>, KuramaError> {
-        let session_dir = self.session_dir(session_id)?;
-        if !session_dir.join(METADATA_FILE).is_file() {
-            return Err(KuramaError::NotFound(format!("session {session_id}")));
+        self.session_directory(session_id)?
+            .open_file(METADATA_FILE, false, false)?;
+        match self.replay_log(session_id, Some(agent_id)) {
+            Err(KuramaError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Vec::new())
+            }
+            result => result,
         }
-        if !self.log_path(session_id, Some(agent_id))?.exists() {
-            return Ok(Vec::new());
-        }
-        self.replay_log(session_id, Some(agent_id))
     }
 
     fn list(&self) -> Result<Vec<SessionSummary>, KuramaError> {
         let mut summaries = Vec::new();
-        for entry in fs::read_dir(self.sessions_dir())? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let metadata_path = entry.path().join(METADATA_FILE);
-            if !metadata_path.is_file() {
-                continue;
-            }
-            let metadata = self.read_metadata(&entry.path())?;
-            if entry.file_name() != OsStr::new(metadata.id.as_ref()) {
+        for name in self.sessions.entries()? {
+            let name = name?;
+            let session = match self.sessions.child(&name) {
+                Ok(session) => session,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotADirectory | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(storage_io_error(error)),
+            };
+            let metadata = match self.read_metadata(&session) {
+                Ok(metadata) => metadata,
+                Err(KuramaError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if name != OsStr::new(metadata.id.as_ref()) {
                 return Err(KuramaError::Storage(
                     "session metadata identifier does not match directory".into(),
                 ));
             }
-
             let mut updated_at_ms = metadata.created_at_ms;
-            if let Some(timestamp_ms) = self.summarize_log(&metadata.id, None)? {
-                updated_at_ms = updated_at_ms.max(timestamp_ms);
+            if let Some(timestamp) = self.summarize_log(&metadata.id, None)? {
+                updated_at_ms = updated_at_ms.max(timestamp);
             }
-            let agents_dir = entry.path().join("agents");
-            if agents_dir.is_dir() {
-                for agent_entry in fs::read_dir(agents_dir)? {
-                    let agent_entry = agent_entry?;
-                    if !agent_entry.file_type()?.is_file()
-                        || agent_entry.path().extension() != Some(OsStr::new("jsonl"))
-                    {
-                        continue;
-                    }
-                    let agent = agent_entry
-                        .path()
-                        .file_stem()
-                        .and_then(OsStr::to_str)
-                        .ok_or_else(|| KuramaError::Storage("invalid child log file name".into()))?
-                        .to_owned();
-                    let agent_id = AgentId::from(agent);
-                    if let Some(timestamp_ms) = self.summarize_log(&metadata.id, Some(&agent_id))? {
-                        updated_at_ms = updated_at_ms.max(timestamp_ms);
-                    }
+            for name in session.child("agents")?.entries()? {
+                let name = name?;
+                let path = Path::new(&name);
+                if path.extension() != Some(OsStr::new("jsonl")) {
+                    continue;
+                }
+                let agent = path
+                    .file_stem()
+                    .and_then(OsStr::to_str)
+                    .ok_or_else(|| KuramaError::Storage("invalid child log file name".into()))?;
+                if let Some(timestamp) =
+                    self.summarize_log(&metadata.id, Some(&AgentId::from(agent)))?
+                {
+                    updated_at_ms = updated_at_ms.max(timestamp);
                 }
             }
             summaries.push(SessionSummary {
@@ -388,36 +412,16 @@ impl SessionStore for FsSessionStore {
     }
 
     fn put_blob(&self, bytes: &[u8]) -> Result<BlobRef, KuramaError> {
-        let digest = Sha256::digest(bytes);
-        let sha256 = lowercase_hex(&digest);
-        let blobs_dir = self.blobs_dir();
-        let directory_lock = File::open(&blobs_dir)?;
-        File::lock(&directory_lock)?;
-
-        let final_path = blobs_dir.join(&sha256);
-        if final_path.exists() {
-            verify_blob(&final_path, &sha256, bytes.len() as u64)?;
-            return Ok(BlobRef {
-                sha256,
-                bytes: bytes.len() as u64,
-            });
-        }
-
-        let temporary_path = blobs_dir.join(format!(".{sha256}.tmp"));
-        if temporary_path.exists() {
-            reject_symlink(&temporary_path)?;
-            fs::remove_file(&temporary_path)?;
-        }
-        create_new_file(&temporary_path, bytes)?;
-        match fs::rename(&temporary_path, &final_path) {
-            Ok(()) => {}
-            Err(_) if final_path.exists() => {
-                let _ = fs::remove_file(&temporary_path);
-                verify_blob(&final_path, &sha256, bytes.len() as u64)?;
+        let sha256 = crate::id::hexadecimal("", Sha256::digest(bytes).as_ref());
+        let directory_lock = self.blobs.lock_handle()?;
+        directory_lock.lock()?;
+        match self.blobs.open_file(&sha256, false, false) {
+            Ok(mut file) => verify_blob(&mut file, &sha256, bytes.len() as u64)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.blobs.replace(&sha256, bytes)?;
             }
             Err(error) => return Err(error.into()),
         }
-        sync_directory(&blobs_dir)?;
         Ok(BlobRef {
             sha256,
             bytes: bytes.len() as u64,
@@ -426,12 +430,23 @@ impl SessionStore for FsSessionStore {
 
     fn get_blob(&self, reference: &BlobRef) -> Result<Vec<u8>, KuramaError> {
         validate_hash(&reference.sha256)?;
-        let path = self.blobs_dir().join(&reference.sha256);
-        reject_symlink(&path)?;
-        let bytes = fs::read(&path)?;
+        let bytes = self
+            .blobs
+            .read(&reference.sha256)
+            .map_err(|error| storage_error("read blob", error))?;
         verify_blob_bytes(&bytes, &reference.sha256, reference.bytes)?;
         Ok(bytes)
     }
+}
+
+fn commit_event(file: &mut File, event: &EventEnvelope) -> Result<(), KuramaError> {
+    let mut encoded = serde_json::to_vec(event)
+        .map_err(|error| storage_error("serialize session event", error))?;
+    encoded.push(b'\n');
+    file.seek(SeekFrom::End(0))?;
+    file.write_all(&encoded)?;
+    file.sync_data()?;
+    Ok(())
 }
 
 fn complete_log_end(file: &mut File) -> Result<(u64, u64), KuramaError> {
@@ -484,7 +499,6 @@ fn read_last_complete_record(file: &mut File) -> Result<Option<Vec<u8>>, KuramaE
             .map_err(|_| KuramaError::Storage("JSONL tail exceeds address space".into()))?;
         file.seek(SeekFrom::Start(start))?;
         file.read_exact(&mut buffer[..bytes_to_read])?;
-        count_tail_bytes(bytes_to_read);
 
         for byte in buffer[..bytes_to_read].iter().rev().copied() {
             if !saw_terminal_newline {
@@ -527,7 +541,6 @@ fn deserialize_event(
     agent_id: Option<&AgentId>,
     record: impl std::fmt::Display,
 ) -> Result<EventEnvelope, KuramaError> {
-    count_deserialized_record();
     let event: EventEnvelope = serde_json::from_slice(line).map_err(|error| {
         KuramaError::Storage(format!("malformed complete JSONL record {record}: {error}"))
     })?;
@@ -590,101 +603,40 @@ fn scan_complete_log(
                 .map_or(event.timestamp_ms, |latest| latest.max(event.timestamp_ms)),
         );
         if materialize_events {
-            count_materialized_replay_event();
             scan.events.push(event);
         }
     }
     Ok(scan)
 }
 
-fn ensure_directory(path: &Path) -> Result<(), KuramaError> {
-    if path.exists() {
-        reject_symlink(path)?;
-        if !path.is_dir() {
-            return Err(KuramaError::Storage(format!(
-                "{} is not a directory",
-                path.display()
-            )));
+fn open_locked(
+    directory: &Directory,
+    name: &str,
+    create: bool,
+    exclusive: bool,
+) -> Result<File, KuramaError> {
+    let file = match directory.open_file(name, true, false) {
+        Ok(file) => file,
+        Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+            let file = match directory.create_file(name) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    directory.open_file(name, true, false)?
+                }
+                Err(error) => return Err(error.into()),
+            };
+            directory.sync()?;
+            file
         }
+        Err(error) => return Err(storage_io_error(error)),
+    };
+    if exclusive {
+        file.lock()?;
     } else {
-        create_new_directory(path)?;
+        file.lock_shared()?;
     }
-    set_directory_permissions(path)?;
-    Ok(())
-}
-
-fn create_new_directory(path: &Path) -> Result<(), KuramaError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-
-        let mut builder = fs::DirBuilder::new();
-        builder.mode(DIRECTORY_MODE);
-        builder.create(path)?;
-    }
-    #[cfg(not(unix))]
-    fs::create_dir(path)?;
-    set_directory_permissions(path)?;
-    Ok(())
-}
-
-fn ensure_file(path: &Path, initial: &[u8]) -> Result<(), KuramaError> {
-    if path.exists() {
-        reject_symlink(path)?;
-        if !path.is_file() {
-            return Err(KuramaError::Storage(format!(
-                "{} is not a file",
-                path.display()
-            )));
-        }
-        set_file_permissions(path)?;
-        return Ok(());
-    }
-    create_new_file(path, initial)
-}
-
-fn create_new_file(path: &Path, bytes: &[u8]) -> Result<(), KuramaError> {
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(FILE_MODE);
-    let mut file = options.open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    set_file_permissions(path)?;
-    Ok(())
-}
-
-fn open_locked(path: &Path, create: bool) -> Result<File, KuramaError> {
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-
-    if path.exists() {
-        reject_symlink(path)?;
-    }
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(create);
-    #[cfg(unix)]
-    options.mode(FILE_MODE);
-    let file = options.open(path)?;
-    File::lock(&file)?;
-    set_file_permissions(path)?;
+    owner_only(&file, false)?;
     Ok(file)
-}
-
-fn reject_symlink(path: &Path) -> Result<(), KuramaError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(KuramaError::Storage(format!(
-            "refusing symbolic link {}",
-            path.display()
-        ))),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
 }
 
 fn validate_identifier(value: &str, kind: &str) -> Result<(), KuramaError> {
@@ -712,10 +664,38 @@ fn validate_hash(value: &str) -> Result<(), KuramaError> {
     Ok(())
 }
 
-fn verify_blob(path: &Path, expected_hash: &str, expected_bytes: u64) -> Result<(), KuramaError> {
-    reject_symlink(path)?;
-    let bytes = fs::read(path)?;
-    verify_blob_bytes(&bytes, expected_hash, expected_bytes)
+fn verify_blob(
+    file: &mut File,
+    expected_hash: &str,
+    expected_bytes: u64,
+) -> Result<(), KuramaError> {
+    if file.metadata()?.len() != expected_bytes {
+        return Err(KuramaError::Storage("blob length mismatch".into()));
+    }
+    let mut digest = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; BLOB_SCAN_BYTES];
+    loop {
+        let count = match file.read(&mut buffer) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            break;
+        }
+        total = total
+            .checked_add(count as u64)
+            .filter(|total| *total <= expected_bytes)
+            .ok_or_else(|| KuramaError::Storage("blob length mismatch".into()))?;
+        digest.update(&buffer[..count]);
+    }
+    if total != expected_bytes {
+        return Err(KuramaError::Storage("blob length mismatch".into()));
+    }
+    if crate::id::hexadecimal("", digest.finalize().as_ref()) != expected_hash {
+        return Err(KuramaError::Storage("blob hash mismatch".into()));
+    }
+    Ok(())
 }
 
 fn verify_blob_bytes(
@@ -726,45 +706,10 @@ fn verify_blob_bytes(
     if bytes.len() as u64 != expected_bytes {
         return Err(KuramaError::Storage("blob length mismatch".into()));
     }
-    let actual = lowercase_hex(&Sha256::digest(bytes));
+    let actual = crate::id::hexadecimal("", Sha256::digest(bytes).as_ref());
     if actual != expected_hash {
         return Err(KuramaError::Storage("blob hash mismatch".into()));
     }
-    Ok(())
-}
-
-fn lowercase_hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
-}
-
-fn set_directory_permissions(path: &Path) -> Result<(), KuramaError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::set_permissions(path, fs::Permissions::from_mode(DIRECTORY_MODE))?;
-    }
-    Ok(())
-}
-
-fn set_file_permissions(path: &Path) -> Result<(), KuramaError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::set_permissions(path, fs::Permissions::from_mode(FILE_MODE))?;
-    }
-    Ok(())
-}
-
-fn sync_directory(path: &Path) -> Result<(), KuramaError> {
-    File::open(path)?.sync_all()?;
     Ok(())
 }
 
@@ -776,6 +721,124 @@ fn now_ms() -> Result<u64, KuramaError> {
         .map_err(|_| KuramaError::Storage("timestamp exceeds u64 milliseconds".into()))
 }
 
+fn storage_io_error(error: std::io::Error) -> KuramaError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        error.into()
+    } else {
+        storage_error("filesystem access", error)
+    }
+}
+
 fn storage_error(context: &str, error: impl std::fmt::Display) -> KuramaError {
     KuramaError::Storage(format!("{context}: {error}"))
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CreateStep {
+    StageDirectory,
+    AgentsDirectory,
+    SyncAgents,
+    LogFile,
+    SyncLog,
+    MetadataFile,
+    MetadataWrite,
+    SyncMetadata,
+    SyncSession,
+    Publish,
+    SyncSessions,
+    SyncPending,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static CREATE_FAILURE: std::cell::Cell<Option<CreateStep>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn fail_create_at(step: CreateStep) -> Result<(), KuramaError> {
+    CREATE_FAILURE.with(|failure| {
+        if failure.get() == Some(step) {
+            failure.set(None);
+            Err(std::io::Error::other("injected session creation failure").into())
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kurama_protocol::policy::ExecutionMode;
+
+    #[test]
+    fn failed_session_creation_is_absent_or_complete_at_every_durability_boundary() {
+        for step in [
+            CreateStep::StageDirectory,
+            CreateStep::AgentsDirectory,
+            CreateStep::SyncAgents,
+            CreateStep::LogFile,
+            CreateStep::SyncLog,
+            CreateStep::MetadataFile,
+            CreateStep::MetadataWrite,
+            CreateStep::SyncMetadata,
+            CreateStep::SyncSession,
+            CreateStep::Publish,
+            CreateStep::SyncSessions,
+            CreateStep::SyncPending,
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let store = FsSessionStore::open(temp.path().to_owned()).expect("store");
+            let metadata = SessionMetadata {
+                id: SessionId::from("fault"),
+                created_at_ms: 1,
+                project_root: temp.path().to_string_lossy().into_owned(),
+                profile: "profile".into(),
+                mode: ExecutionMode::Supervised,
+                redaction_best_effort: false,
+            };
+            CREATE_FAILURE.with(|failure| failure.set(Some(step)));
+            assert!(store.create(&metadata).is_err());
+            let reopened = FsSessionStore::open(temp.path().to_owned()).expect("reopen");
+            let published = matches!(step, CreateStep::SyncSessions | CreateStep::SyncPending);
+            assert_eq!(
+                reopened.list().expect("no partial session").len(),
+                usize::from(published)
+            );
+            if !published {
+                assert!(!temp.path().join("sessions/fault").exists());
+                reopened.create(&metadata).expect("retry succeeds");
+            }
+            assert!(
+                reopened
+                    .replay(&metadata.id)
+                    .expect("complete log")
+                    .is_empty()
+            );
+            assert!(temp.path().join("sessions/fault/agents").is_dir());
+            assert!(
+                std::fs::read_dir(temp.path().join(".pending-sessions"))
+                    .expect("staging")
+                    .next()
+                    .is_none()
+            );
+            reopened
+                .append(&EventEnvelope::new(
+                    0,
+                    2,
+                    metadata.id.clone(),
+                    None,
+                    SessionEvent::UserMessage {
+                        text: "after failure".into(),
+                        explicit_delegation: false,
+                    },
+                ))
+                .expect("appendable session");
+            assert_eq!(
+                reopened.replay(&metadata.id).expect("durable event").len(),
+                1
+            );
+        }
+    }
 }

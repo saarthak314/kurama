@@ -1,16 +1,11 @@
 #![cfg(feature = "native-credentials")]
 
-#[path = "../src/config.rs"]
-mod config;
-#[path = "../src/credentials.rs"]
-mod credentials;
-#[path = "../src/redact.rs"]
-mod redact;
-
 use std::{collections::BTreeMap, path::PathBuf};
 
-use config::{AppPaths, ConfigRepository};
-use credentials::{CredentialResolver, SecretValue, SessionSecrets, parse_auth_ref};
+use kurama_adapters::{
+    AppPaths, ConfigRepository, CredentialResolver, Redactor, SecretValue, SessionSecrets,
+    parse_auth_ref,
+};
 use kurama_protocol::{
     KuramaError,
     config::{
@@ -20,7 +15,6 @@ use kurama_protocol::{
     id::SessionId,
     policy::{AutoBoundaries, ExecutionMode},
 };
-use redact::Redactor;
 
 fn profile(kind: ProfileKind, auth: Option<AuthRef>) -> ProfileConfig {
     ProfileConfig {
@@ -259,9 +253,6 @@ fn session_credentials_are_resolved_without_serializing_secret_values() {
         Err(KuramaError::Configuration(_))
     ));
     assert!(sessions.remove("primary").is_some());
-
-    let _: fn(&CredentialResolver, &str, &str, &SecretValue) -> Result<(), KuramaError> =
-        CredentialResolver::write_native;
 }
 
 #[test]
@@ -290,6 +281,207 @@ fn registered_secrets_are_replaced_exactly_longest_first() {
         redactor.redact_bytes(b"raw secret-value bytes"),
         b"raw [REDACTED] bytes"
     );
+}
 
-    let _: fn() -> Result<AppPaths, KuramaError> = AppPaths::discover;
+#[test]
+fn independent_repositories_preserve_concurrent_state_updates() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = AppPaths::from_root(temp.path().join("state"));
+    let repository = ConfigRepository::open(paths.clone()).expect("repository");
+    repository
+        .write_config(&fixture_config("global"))
+        .expect("config");
+    let projects: Vec<_> = (0..8)
+        .map(|index| {
+            let path = temp.path().join(format!("project-{index}"));
+            std::fs::create_dir(&path).expect("project");
+            path.canonicalize().expect("canonical project")
+        })
+        .collect();
+    let barrier = std::sync::Barrier::new(projects.len());
+    let (failures, errors) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        for (index, project) in projects.iter().enumerate() {
+            let paths = &paths;
+            let barrier = &barrier;
+            let failures = &failures;
+            scope.spawn(move || {
+                let repository = ConfigRepository::open(paths.clone());
+                if let Err(error) = &repository {
+                    failures
+                        .send(format!("open {index}: {error}"))
+                        .expect("failure receiver");
+                }
+                for round in 0..8 {
+                    barrier.wait();
+                    if let Ok(repository) = &repository {
+                        let outcome = repository
+                            .remember_project_profile(project, "project")
+                            .map_err(|error| format!("profile {index}/{round}: {error}"))
+                            .and_then(|()| {
+                                repository
+                                    .remember_latest_session(
+                                        project,
+                                        &SessionId::from(format!("session-{index}-{round}")),
+                                    )
+                                    .map_err(|error| format!("session {index}/{round}: {error}"))
+                            });
+                        if let Err(error) = outcome {
+                            failures.send(error.to_string()).expect("failure receiver");
+                        }
+                    }
+                }
+            });
+        }
+    });
+    drop(failures);
+    let errors = errors.into_iter().collect::<Vec<_>>();
+    assert!(
+        errors.is_empty(),
+        "concurrent state updates failed: {errors:?}"
+    );
+    let state = ConfigRepository::open(paths)
+        .expect("reopen")
+        .read_state()
+        .expect("state");
+    for (index, project) in projects.iter().enumerate() {
+        assert_eq!(
+            state.project_profiles.get(project).map(String::as_str),
+            Some("project")
+        );
+        assert_eq!(
+            state.latest_sessions.get(project),
+            Some(&SessionId::from(format!("session-{index}-7")))
+        );
+    }
+}
+
+#[test]
+fn concurrent_first_openers_observe_complete_initial_state() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = AppPaths::from_root(temp.path().join("new-root"));
+    let barrier = std::sync::Barrier::new(16);
+    std::thread::scope(|scope| {
+        for _ in 0..16 {
+            let paths = &paths;
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                let repository = ConfigRepository::open(paths.clone()).expect("concurrent open");
+                assert!(repository.read_config().expect("initial config").is_none());
+                let state = repository.read_state().expect("complete initial state");
+                assert!(state.project_profiles.is_empty());
+                assert!(state.latest_sessions.is_empty());
+            });
+        }
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn config_reads_reject_swapped_leaves_and_keep_the_opened_root() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("root");
+    let outside = temp.path().join("outside");
+    let repository = ConfigRepository::open(AppPaths::from_root(root.clone())).expect("repository");
+    let other =
+        ConfigRepository::open(AppPaths::from_root(outside.clone())).expect("outside repository");
+    other
+        .remember_mode(ExecutionMode::Auto)
+        .expect("outside mode");
+    for name in ["config.toml", "state.json"] {
+        let original = std::fs::read(root.join(name)).expect("original");
+        std::fs::remove_file(root.join(name)).expect("remove leaf");
+        symlink(outside.join(name), root.join(name)).expect("swap leaf");
+        assert!(if name == "config.toml" {
+            repository.read_config().is_err()
+        } else {
+            repository.read_state().is_err()
+        });
+        std::fs::remove_file(root.join(name)).expect("remove link");
+        std::fs::write(root.join(name), original).expect("restore leaf");
+    }
+    let moved = temp.path().join("opened-root");
+    std::fs::rename(&root, &moved).expect("move root");
+    symlink(&outside, &root).expect("swap ancestor");
+    repository
+        .remember_mode(ExecutionMode::Supervised)
+        .expect("update opened root");
+    assert_eq!(
+        repository.read_state().expect("opened state").last_mode,
+        Some(ExecutionMode::Supervised)
+    );
+    assert_eq!(
+        other.read_state().expect("outside untouched").last_mode,
+        Some(ExecutionMode::Auto)
+    );
+    assert_eq!(
+        ConfigRepository::open(AppPaths::from_root(moved))
+            .expect("reopen original")
+            .read_state()
+            .expect("durable original")
+            .last_mode,
+        Some(ExecutionMode::Supervised)
+    );
+}
+
+#[test]
+fn bootstrap_selection_is_all_or_nothing() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = AppPaths::from_root(temp.path().join("state"));
+    let repository = ConfigRepository::open(paths.clone()).expect("repository");
+    repository
+        .write_config(&fixture_config("global"))
+        .expect("config");
+    repository
+        .remember_session(
+            temp.path(),
+            "global",
+            &SessionId::from("old"),
+            Some(ExecutionMode::Supervised),
+        )
+        .expect("initial selection");
+    assert!(
+        repository
+            .remember_session(
+                temp.path(),
+                "project",
+                &SessionId::from("new"),
+                Some(ExecutionMode::Yolo)
+            )
+            .is_err()
+    );
+    let state = ConfigRepository::open(paths)
+        .expect("reopen")
+        .read_state()
+        .expect("state");
+    let project = temp.path().canonicalize().expect("project");
+    assert_eq!(
+        state.project_profiles.get(&project).map(String::as_str),
+        Some("global")
+    );
+    assert_eq!(
+        state.latest_sessions.get(&project),
+        Some(&SessionId::from("old"))
+    );
+    assert_eq!(state.last_mode, Some(ExecutionMode::Supervised));
+    repository
+        .remember_session(
+            temp.path(),
+            "project",
+            &SessionId::from("launch-only"),
+            None,
+        )
+        .expect("launch-only selection");
+    let state = repository.read_state().expect("launch-only state");
+    assert_eq!(
+        state.project_profiles.get(&project).map(String::as_str),
+        Some("project")
+    );
+    assert_eq!(
+        state.latest_sessions.get(&project),
+        Some(&SessionId::from("launch-only"))
+    );
+    assert_eq!(state.last_mode, Some(ExecutionMode::Supervised));
 }

@@ -1,4 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsString,
+    fs::File,
+    path::{Path, PathBuf},
+};
+
+use crate::fs_safe::Directory;
 
 use kurama_protocol::{KuramaError, agent::WriteScope, policy::ExecutionMode, tool::ToolContext};
 
@@ -6,6 +12,25 @@ use kurama_protocol::{KuramaError, agent::WriteScope, policy::ExecutionMode, too
 pub struct GuardedPath {
     pub absolute: PathBuf,
     pub external: bool,
+}
+
+impl GuardedPath {
+    pub(crate) fn parent_directory(&self) -> Result<(Directory, OsString), KuramaError> {
+        let parent = self
+            .absolute
+            .parent()
+            .ok_or_else(|| KuramaError::Tool("path has no parent".into()))?;
+        let name = self
+            .absolute
+            .file_name()
+            .ok_or_else(|| KuramaError::Tool("path has no file name".into()))?;
+        Ok((Directory::open_absolute(parent)?, name.to_owned()))
+    }
+
+    pub(crate) fn open_file(&self) -> Result<File, KuramaError> {
+        let (parent, name) = self.parent_directory()?;
+        Ok(parent.open_file(name, false, false)?)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -42,12 +67,7 @@ impl PathGuard {
         path: impl AsRef<Path>,
     ) -> Result<GuardedPath, KuramaError> {
         let guarded = self.resolve_existing(path)?;
-        if !guarded.absolute.is_file() {
-            return Err(KuramaError::Tool(format!(
-                "path is not a file: {}",
-                guarded.absolute.display()
-            )));
-        }
+        guarded.open_file()?;
         Ok(guarded)
     }
 
@@ -56,12 +76,7 @@ impl PathGuard {
         path: impl AsRef<Path>,
     ) -> Result<GuardedPath, KuramaError> {
         let guarded = self.resolve_existing(path)?;
-        if !guarded.absolute.is_dir() {
-            return Err(KuramaError::Tool(format!(
-                "working directory is not a directory: {}",
-                guarded.absolute.display()
-            )));
-        }
+        Directory::open_absolute(&guarded.absolute)?;
         if guarded.external && !self.unrestricted {
             return Err(KuramaError::Policy(format!(
                 "working directory escapes the workspace: {}",
@@ -169,11 +184,77 @@ fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf, KuramaError>
             path.display()
         ))
     })?;
-    if !canonical.is_dir() {
-        return Err(KuramaError::Tool(format!(
-            "{label} is not a directory: {}",
-            canonical.display()
-        )));
-    }
+    Directory::open_absolute(&canonical)?;
     Ok(canonical)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::{fs, os::unix::fs::symlink};
+
+    #[test]
+    fn guarded_open_rejects_leaf_and_ancestor_swaps_after_resolution() {
+        for swap_ancestor in [false, true] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let workspace = temp.path().join("workspace");
+            let outside = temp.path().join("outside");
+            fs::create_dir_all(workspace.join("dir")).expect("workspace");
+            fs::create_dir(&outside).expect("outside");
+            fs::write(workspace.join("dir/file"), b"inside").expect("inside");
+            fs::write(outside.join("file"), b"outside sentinel").expect("outside");
+            let workspace = workspace.canonicalize().expect("canonical workspace");
+            let guard = PathGuard {
+                cwd: workspace.clone(),
+                workspace_root: workspace.clone(),
+                unrestricted: false,
+            };
+            let guarded = guard
+                .resolve_existing_file("dir/file")
+                .expect("resolve before swap");
+            if swap_ancestor {
+                fs::rename(workspace.join("dir"), workspace.join("original"))
+                    .expect("move directory");
+                symlink(&outside, workspace.join("dir")).expect("ancestor swap");
+            } else {
+                fs::remove_file(workspace.join("dir/file")).expect("remove leaf");
+                symlink(outside.join("file"), workspace.join("dir/file")).expect("leaf swap");
+            }
+            assert!(guarded.open_file().is_err());
+            assert_eq!(
+                fs::read(outside.join("file")).expect("outside sentinel"),
+                b"outside sentinel"
+            );
+        }
+    }
+
+    #[test]
+    fn anchored_replacement_cannot_be_redirected_by_parent_rename() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(workspace.join("dir")).expect("workspace");
+        fs::create_dir(&outside).expect("outside");
+        fs::write(workspace.join("dir/file"), b"inside").expect("inside");
+        fs::write(outside.join("file"), b"outside sentinel").expect("outside");
+        let workspace = workspace.canonicalize().expect("canonical workspace");
+        let guarded = GuardedPath {
+            absolute: workspace.join("dir/file"),
+            external: false,
+        };
+        let (directory, name) = guarded.parent_directory().expect("anchor transaction");
+        fs::rename(workspace.join("dir"), workspace.join("original")).expect("move directory");
+        symlink(&outside, workspace.join("dir")).expect("ancestor swap");
+        directory
+            .replace(name, b"new inside")
+            .expect("anchored replacement");
+        assert_eq!(
+            fs::read(workspace.join("original/file")).expect("original directory"),
+            b"new inside"
+        );
+        assert_eq!(
+            fs::read(outside.join("file")).expect("outside sentinel"),
+            b"outside sentinel"
+        );
+    }
 }

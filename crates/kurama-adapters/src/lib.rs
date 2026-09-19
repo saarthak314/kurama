@@ -10,6 +10,13 @@
 
 mod id;
 
+#[cfg(any(
+    feature = "tools",
+    feature = "fs-store",
+    feature = "native-credentials"
+))]
+mod fs_safe;
+
 #[cfg(all(
     feature = "native-credentials",
     feature = "http",
@@ -102,6 +109,10 @@ pub use providers::sse::{SseDecoder, SseEvent};
 pub use redact::{RedactionMetadata, Redactor};
 #[cfg(feature = "fs-store")]
 pub use storage::FsSessionStore;
+#[cfg(all(feature = "claude-bridge", feature = "tools", feature = "http"))]
+pub use tools::ClaudeNativeSearch;
+#[cfg(all(feature = "codex-bridge", feature = "tools", feature = "http"))]
+pub use tools::CodexNativeSearch;
 #[cfg(feature = "tools")]
 pub use tools::{
     BashTool, BoundedOutput, BoundedText, GuardedPath, PathGuard, ReadTool, WriteTool, html_to_text,

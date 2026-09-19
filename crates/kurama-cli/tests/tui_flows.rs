@@ -4,10 +4,23 @@ use kurama_cli::tui::{
 use kurama_protocol::{
     id::{CallId, OperationId, SessionId},
     policy::{ApprovalRequest, ApprovalResponse, ExecutionMode},
-    runtime::{EngineCommand, RuntimeEvent},
+    runtime::{ContextCategory, ContextInspection, EngineCommand, RuntimeEvent},
     session::{EventEnvelope, SessionEvent},
     tool::{Operation, ToolResult},
 };
+
+#[test]
+fn history_query_matches_unicode_case_and_preserves_prompt() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.remember_prompt("review café parser");
+    state.start_history_search();
+    for character in "CAFÉ".chars() {
+        state.push_history_search_char(character);
+    }
+    assert_eq!(state.history_matches(), ["review café parser"]);
+    assert!(state.accept_history_search());
+    assert_eq!(state.composer, "review café parser");
+}
 
 #[test]
 fn onboarding_offers_only_supported_connection_types() {
@@ -160,6 +173,117 @@ fn non_terminal_command_error_preserves_the_active_assistant_stream() {
     ));
 }
 
+fn inspection() -> ContextInspection {
+    ContextInspection {
+        max_input_tokens: 1_000,
+        reserved_output_tokens: 100,
+        usable_tokens: 900,
+        estimated_tokens: 650,
+        categories: vec![ContextCategory {
+            name: "recent turns".into(),
+            tokens: 650,
+        }],
+        total_completed_turns: 4,
+        included_recent_turns: 2,
+        omitted_turns: 2,
+        summary_covered_through_sequence: Some(8),
+        compaction: None,
+        assembly_error: None,
+    }
+}
+
+#[test]
+fn inspector_and_queued_steering_preserve_stream_queue_and_closed_overlay() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.set_thinking();
+    state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+        text: "before".into(),
+    });
+    state.submit_turn("follow-up", false);
+    let activity = state.activity().clone();
+    state.overlay = Overlay::Context;
+    state.close_overlay();
+    state.apply_runtime_event(RuntimeEvent::ContextInspected {
+        inspection: inspection(),
+    });
+    state.apply_runtime_event(RuntimeEvent::SteeringQueued {
+        text: "steer".into(),
+    });
+    state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+        text: " after".into(),
+    });
+    assert_eq!(state.activity(), &activity);
+    assert_eq!(state.overlay(), Overlay::None);
+    assert_eq!(state.pending_turn_count(), 1);
+    assert!(state.sent_commands().is_empty());
+    assert!(
+        matches!(state.transcript.as_slice(), [TranscriptEntry::AssistantMessage { body }] if body == "before after")
+    );
+
+    state.begin_approval(ApprovalRequest {
+        operation_id: OperationId::from("pending-approval"),
+        operation: Operation::Read {
+            paths: vec!["outside.txt".into()],
+            external: true,
+        },
+        summary: "read outside workspace".into(),
+        arguments: serde_json::json!({"path": "outside.txt"}),
+    });
+    state.composer = "existing draft".into();
+    state.apply_runtime_event(RuntimeEvent::ContextInspected {
+        inspection: inspection(),
+    });
+    state.apply_runtime_event(RuntimeEvent::SteeringApplied {
+        text: "steer".into(),
+    });
+    state.apply_runtime_event(RuntimeEvent::SteeringRejected {
+        text: "retry later".into(),
+        message: "queue full".into(),
+    });
+    assert_eq!(state.activity(), &ActivityState::AwaitingApproval);
+    assert_eq!(state.overlay(), Overlay::Approval);
+    assert_eq!(
+        state
+            .approval
+            .as_ref()
+            .unwrap()
+            .request
+            .operation_id
+            .as_ref(),
+        "pending-approval"
+    );
+    assert_eq!(state.pending_turn_count(), 1);
+    assert!(state.sent_commands().is_empty());
+    assert_eq!(state.composer, "existing draft\n\nretry later");
+}
+
+#[test]
+fn applied_steering_is_visible_once_live_and_once_on_replay() {
+    let mut live = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    live.apply_runtime_event(RuntimeEvent::SteeringQueued {
+        text: "use the existing API".into(),
+    });
+    live.apply_runtime_event(RuntimeEvent::SteeringApplied {
+        text: "use the existing API".into(),
+    });
+    let mut replay = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    replay.hydrate_replay(&[EventEnvelope::new(
+        1,
+        1,
+        SessionId::from("s"),
+        None,
+        SessionEvent::UserSteered {
+            text: "use the existing API".into(),
+            explicit_delegation: false,
+        },
+    )]);
+    for state in [live, replay] {
+        assert!(
+            matches!(state.transcript.as_slice(), [TranscriptEntry::Notice { body, .. }] if body == "use the existing API")
+        );
+    }
+}
+
 #[test]
 fn terminal_turn_error_advances_the_queue_once() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
@@ -248,6 +372,7 @@ fn replay_hydrates_explicit_transcript_variants() {
     state.hydrate_replay(&[
         replay_event(SessionEvent::UserMessage {
             text: "inspect".into(),
+            explicit_delegation: false,
         }),
         replay_event(SessionEvent::AssistantMessage {
             text: "checking".into(),
@@ -256,7 +381,7 @@ fn replay_hydrates_explicit_transcript_variants() {
             operation_id: OperationId::from("operation_1"),
             call_id: CallId::from("call_1"),
             operation: Operation::Read {
-                path: "src/lib.rs".into(),
+                paths: vec!["src/lib.rs".into()],
                 external: false,
             },
         }),
@@ -363,7 +488,6 @@ fn runtime_approval_hydrates_editor_from_request_arguments() {
 
     assert_eq!(state.activity(), &ActivityState::AwaitingApproval);
     let approval = state.approval.as_ref().expect("approval");
-    assert_eq!(approval.arguments, arguments);
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&approval.editor).expect("editor JSON"),
         arguments
@@ -632,61 +756,6 @@ fn runtime_errors_are_appended_to_the_transcript() {
         TranscriptEntry::Error { body }
             if body == "protocol error: malformed bridge output"
     ));
-}
-
-#[test]
-fn stable_transcript_prefix_excludes_mutable_assistant_and_tool_entries() {
-    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-    state.push_user("inspect it");
-    assert_eq!(state.stable_transcript_end(), 1);
-
-    state.apply_runtime_event(RuntimeEvent::AssistantDelta {
-        text: "working".into(),
-    });
-    assert_eq!(state.stable_transcript_end(), 1);
-
-    state.mark_transcript_committed(1);
-    assert_eq!(state.live_transcript().len(), 1);
-    assert!(matches!(
-        &state.live_transcript()[0],
-        TranscriptEntry::AssistantMessage { body } if body == "working"
-    ));
-
-    state.apply_runtime_event(RuntimeEvent::TurnCompleted);
-    assert_eq!(state.stable_transcript_end(), 2);
-
-    state.apply_runtime_event(tool_delta("call_1", "stdout", "partial"));
-    assert_eq!(state.stable_transcript_end(), 2);
-    state.apply_runtime_event(RuntimeEvent::ToolCompleted {
-        operation_id: OperationId::from("operation_1"),
-        result: tool_result("call_1", "complete", "bash"),
-    });
-    assert_eq!(state.stable_transcript_end(), 3);
-}
-
-#[test]
-fn committed_transcript_marker_never_moves_backwards() {
-    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-    state.push_user("first");
-    state.push_user("second");
-    state.mark_transcript_committed(2);
-    state.mark_transcript_committed(1);
-
-    assert!(state.live_transcript().is_empty());
-}
-
-#[test]
-fn resize_reflow_can_replay_the_committed_transcript_from_source() {
-    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-    state.push_user("retained prompt");
-    state.mark_transcript_committed(1);
-    assert!(state.stable_transcript().is_empty());
-    assert!(state.live_transcript().is_empty());
-
-    state.reset_transcript_commit();
-
-    assert_eq!(state.stable_transcript().len(), 1);
-    assert_eq!(state.live_transcript().len(), 1);
 }
 
 #[test]

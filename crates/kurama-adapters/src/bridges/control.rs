@@ -1,4 +1,4 @@
-use std::{borrow::Cow, fs, path::Path};
+use std::{borrow::Cow, collections::HashSet, fs, io::Write, path::Path};
 
 use kurama_protocol::{
     KuramaError,
@@ -30,7 +30,7 @@ pub fn control_schema(delegation_enabled: bool) -> Value {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "call_id": {"type": "string"},
+                        "call_id": {"type": "string", "minLength": 1},
                         "name": {"type": "string", "enum": ["read", "write", "bash", "web-search"]},
                         "arguments": {
                             "type": "string",
@@ -67,21 +67,40 @@ pub fn control_schema(delegation_enabled: bool) -> Value {
 }
 
 pub fn write_control_schema(path: &Path, delegation_enabled: bool) -> Result<(), KuramaError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
     let encoded = serde_json::to_vec(&control_schema(delegation_enabled))
         .map_err(|error| KuramaError::Configuration(format!("bridge control schema: {error}")))?;
-    if fs::read(path).ok().as_deref() == Some(encoded.as_slice()) {
-        return Ok(());
+    match fs::read(path) {
+        Ok(existing) if existing == encoded => return Ok(()),
+        Ok(_) => {
+            return Err(KuramaError::Configuration(
+                "bridge schema path already contains a different schema".into(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
-    fs::write(path, encoded)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    // Readers see either no file or a complete owner-only schema, never a
+    // truncate/write window. Concurrent initialization can only publish once.
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(&encoded)?;
+    match temporary.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if fs::read(path)? == encoded {
+                Ok(())
+            } else {
+                Err(KuramaError::Configuration(
+                    "bridge schema path already contains a different schema".into(),
+                ))
+            }
+        }
+        Err(error) => Err(error.error.into()),
     }
-    Ok(())
 }
 
 pub fn bridge_system_prompt(request: &ModelRequest) -> String {
@@ -159,6 +178,14 @@ pub fn parse_control(text: &str, delegation_enabled: bool) -> Result<Vec<ModelEv
                 return Err(KuramaError::Protocol(
                     "bridge returned an invalid tool-call count".into(),
                 ));
+            }
+            let mut ids = HashSet::with_capacity(calls.len());
+            for call in &calls {
+                if call.call_id.is_empty() || !ids.insert(call.call_id.as_str()) {
+                    return Err(KuramaError::Protocol(
+                        "bridge tool call IDs must be nonempty and unique".into(),
+                    ));
+                }
             }
             calls.into_iter().map(ControlCall::event).collect()
         }

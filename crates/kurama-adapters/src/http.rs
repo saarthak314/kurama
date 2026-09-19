@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, time::Duration};
+use std::time::Duration;
 
 use kurama_protocol::KuramaError;
 use reqwest::{Client, RequestBuilder, Response, redirect::Policy};
@@ -34,12 +34,6 @@ const MAX_ERROR_BYTES: usize = 16 * 1024;
     feature = "anthropic",
     feature = "openai-compatible"
 ))]
-const MAX_SSE_RECORD_BYTES: usize = 1024 * 1024;
-#[cfg(any(
-    feature = "openai",
-    feature = "anthropic",
-    feature = "openai-compatible"
-))]
 const MAX_DELEGATION_CANDIDATE_EVENTS: usize = 64;
 #[cfg(any(
     feature = "openai",
@@ -47,6 +41,12 @@ const MAX_DELEGATION_CANDIDATE_EVENTS: usize = 64;
     feature = "openai-compatible"
 ))]
 const MAX_DELEGATION_CANDIDATE_EVENT_BYTES: usize = 64 * 1024;
+#[cfg(any(
+    feature = "openai",
+    feature = "anthropic",
+    feature = "openai-compatible"
+))]
+const MAX_DELEGATION_RESPONSE_BYTES: usize = 1024 * 1024;
 #[cfg(any(
     feature = "openai",
     feature = "anthropic",
@@ -92,7 +92,10 @@ impl HttpFailure {
     }
 
     pub fn into_kurama(self) -> KuramaError {
-        KuramaError::Model(self.to_string())
+        KuramaError::Provider {
+            message: self.to_string(),
+            retryable: self.is_transient(),
+        }
     }
 }
 
@@ -104,8 +107,8 @@ impl std::fmt::Display for HttpFailure {
             HttpErrorClass::Permanent => "permanent",
         };
         match self.status {
-            Some(status) => write!(formatter, "{class} HTTP error {status}: {}", self.message),
-            None => write!(formatter, "{class} HTTP error: {}", self.message),
+            Some(status) => write!(formatter, "{class}: HTTP error {status}: {}", self.message),
+            None => write!(formatter, "{class}: HTTP error: {}", self.message),
         }
     }
 }
@@ -116,6 +119,8 @@ impl std::error::Error for HttpFailure {}
 pub struct HttpClient {
     client: Client,
     user_agent: String,
+    #[cfg(feature = "tools")]
+    timeout: Duration,
 }
 
 impl HttpClient {
@@ -131,16 +136,42 @@ impl HttpClient {
     pub fn with_timeout(timeout: Duration) -> Result<Self, KuramaError> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let user_agent = format!("kurama/{}", env!("CARGO_PKG_VERSION"));
-        let client = Client::builder()
+        let client = Self::client_builder(timeout, &user_agent)
+            .build()
+            .map_err(|error| KuramaError::Configuration(format!("HTTP client: {error}")))?;
+        Ok(Self {
+            client,
+            user_agent,
+            #[cfg(feature = "tools")]
+            timeout,
+        })
+    }
+
+    fn client_builder(timeout: Duration, user_agent: &str) -> reqwest::ClientBuilder {
+        Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(timeout)
             .tcp_nodelay(true)
             .redirect(Policy::none())
             .no_proxy()
-            .user_agent(&user_agent)
+            .user_agent(user_agent)
+    }
+
+    #[cfg(feature = "tools")]
+    pub(crate) fn pinned_client(
+        &self,
+        host: &str,
+        addresses: &[std::net::SocketAddr],
+    ) -> Result<Client, KuramaError> {
+        if addresses.is_empty() {
+            return Err(KuramaError::Configuration(
+                "HTTP DNS pin has no addresses".into(),
+            ));
+        }
+        Self::client_builder(self.timeout, &self.user_agent)
+            .resolve_to_addrs(host, addresses)
             .build()
-            .map_err(|error| KuramaError::Configuration(format!("HTTP client: {error}")))?;
-        Ok(Self { client, user_agent })
+            .map_err(|error| KuramaError::Configuration(format!("HTTP client: {error}")))
     }
 
     pub fn client(&self) -> &Client {
@@ -216,19 +247,35 @@ impl HttpClient {
         loop {
             match response.chunk().await {
                 Ok(Some(chunk)) => {
-                    let remaining = MAX_ERROR_BYTES.saturating_sub(body.len());
+                    let remaining = (MAX_ERROR_BYTES + 1).saturating_sub(body.len());
                     body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-                    if body.len() == MAX_ERROR_BYTES {
+                    if body.len() > MAX_ERROR_BYTES {
                         break;
                     }
                 }
                 Ok(None) => break,
                 Err(error) => {
-                    return Self::transport_error(provider, &error, secrets);
+                    let body = redact_error_prefix(&error_body_text(&body), secrets, true);
+                    let detail = bounded_redacted(&error.to_string(), secrets);
+                    return Self::provider_error(
+                        provider,
+                        status,
+                        &format!("body read failed: {detail}; {body}"),
+                        secrets,
+                    );
                 }
             }
         }
-        Self::provider_error(provider, status, &String::from_utf8_lossy(&body), secrets)
+        let message = redact_error_prefix(
+            &error_body_text(&body),
+            secrets,
+            body.len() > MAX_ERROR_BYTES,
+        );
+        HttpFailure {
+            class: Self::classify_status(status),
+            status: Some(status),
+            message: format!("{provider}: {message}"),
+        }
     }
 }
 
@@ -270,42 +317,39 @@ pub(crate) async fn sse_model_stream<N: SseNormalizer>(
         request.delegation.is_some(),
         normalize_events,
     );
+    let mut cancelled = cancel.cancelled();
     loop {
         let batch = tokio::select! {
-            _ = cancel.cancelled() => return Err(KuramaError::Cancelled),
+            biased;
+            _ = &mut cancelled => return Err(KuramaError::Cancelled),
             batch = state.next_batch() => batch,
         }
         .map_err(|error| bounded_redacted_error(error, &state.secrets))?;
         match batch {
             Some(events) if !events.is_empty() => {
-                state.pending.extend(events.into_iter().map(Ok));
+                state.pending.extend(events);
                 return Ok(Box::pin(futures_util::stream::unfold(
-                    state,
-                    |mut state| async move {
-                        loop {
-                            if let Some(event) = state.pending.pop_front() {
-                                return Some((event, state));
-                            }
-                            if state.ended {
-                                return None;
-                            }
-                            match state.next_batch().await {
-                                Ok(Some(events)) => {
-                                    state.pending.extend(events.into_iter().map(Ok));
-                                }
-                                Ok(None) => state.ended = true,
-                                Err(error) => {
-                                    state.ended = true;
-                                    let error = bounded_redacted_error(error, &state.secrets);
-                                    return Some((Err(error), state));
-                                }
+                    Some((state, cancelled)),
+                    |state| async move {
+                        let (mut state, mut cancelled) = state?;
+                        let next = tokio::select! {
+                            biased;
+                            _ = &mut cancelled => return Some((Err(KuramaError::Cancelled), None)),
+                            next = state.next_event() => next,
+                        };
+                        match next {
+                            Ok(Some(event)) => Some((Ok(event), Some((state, cancelled)))),
+                            Ok(None) => None,
+                            Err(error) => {
+                                let error = bounded_redacted_error(error, &state.secrets);
+                                Some((Err(error), None))
                             }
                         }
                     },
                 )));
             }
             Some(_) => {}
-            None => return Ok(crate::providers::event_stream(Vec::new())),
+            None => return Ok(Box::pin(futures_util::stream::empty())),
         }
     }
 }
@@ -319,14 +363,13 @@ struct SseStreamState<N> {
     response: Response,
     provider: &'static str,
     secrets: Vec<Zeroizing<String>>,
-    decoder: BoundedSseDecoder,
+    decoder: SseDecoder,
     normalizer: N,
     event_gate: EventGate,
-    chunk: Vec<u8>,
+    chunk: bytes::Bytes,
     chunk_offset: usize,
     decoder_finished: bool,
-    pending: VecDeque<Result<ModelEvent, KuramaError>>,
-    ended: bool,
+    pending: std::collections::VecDeque<ModelEvent>,
 }
 
 #[cfg(any(
@@ -347,14 +390,25 @@ impl<N: SseNormalizer> SseStreamState<N> {
             response,
             provider,
             secrets,
-            decoder: BoundedSseDecoder::default(),
+            decoder: SseDecoder::default(),
             normalizer,
             event_gate: EventGate::new(delegation_enabled, normalize_events),
-            chunk: Vec::new(),
+            chunk: bytes::Bytes::new(),
             chunk_offset: 0,
             decoder_finished: false,
-            pending: VecDeque::new(),
-            ended: false,
+            pending: std::collections::VecDeque::new(),
+        }
+    }
+
+    async fn next_event(&mut self) -> Result<Option<ModelEvent>, KuramaError> {
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                return Ok(Some(event));
+            }
+            match self.next_batch().await? {
+                Some(events) => self.pending.extend(events),
+                None => return Ok(None),
+            }
         }
     }
 
@@ -391,17 +445,17 @@ impl<N: SseNormalizer> SseStreamState<N> {
                 }
                 continue;
             }
-            self.chunk.clear();
+            self.chunk = bytes::Bytes::new();
             self.chunk_offset = 0;
 
             if self.decoder_finished {
                 return Ok(None);
             }
             match self.response.chunk().await {
-                Ok(Some(chunk)) => self.chunk.extend_from_slice(&chunk),
+                Ok(Some(chunk)) => self.chunk = chunk,
                 Ok(None) => {
                     self.decoder_finished = true;
-                    return self.decoder.finish();
+                    return self.decoder.finish_event();
                 }
                 Err(error) => {
                     return Err(
@@ -411,74 +465,6 @@ impl<N: SseNormalizer> SseStreamState<N> {
                 }
             }
         }
-    }
-}
-
-#[cfg(any(
-    feature = "openai",
-    feature = "anthropic",
-    feature = "openai-compatible"
-))]
-#[derive(Default)]
-struct BoundedSseDecoder {
-    decoder: SseDecoder,
-    record: Vec<u8>,
-    tail: [u8; 4],
-    tail_len: usize,
-}
-
-#[cfg(any(
-    feature = "openai",
-    feature = "anthropic",
-    feature = "openai-compatible"
-))]
-impl BoundedSseDecoder {
-    fn push_chunk(&mut self, chunk: &[u8]) -> Result<(usize, Option<SseEvent>), KuramaError> {
-        for (index, byte) in chunk.iter().copied().enumerate() {
-            self.push_tail(byte);
-            let boundary = self.tail_ends_with(b"\n\n") || self.tail_ends_with(b"\r\n\r\n");
-            let record_len = self.record.len().saturating_add(index + 1);
-            if !boundary && record_len > MAX_SSE_RECORD_BYTES + 4 {
-                return Err(KuramaError::Protocol(format!(
-                    "SSE record exceeds {MAX_SSE_RECORD_BYTES} bytes"
-                )));
-            }
-            if boundary {
-                self.record.extend_from_slice(&chunk[..=index]);
-                let event = self.decoder.push(&self.record)?.into_iter().next();
-                self.record.clear();
-                self.tail_len = 0;
-                return Ok((index + 1, event));
-            }
-        }
-        self.record.extend_from_slice(chunk);
-        Ok((chunk.len(), None))
-    }
-
-    fn finish(&mut self) -> Result<Option<SseEvent>, KuramaError> {
-        if self.record.len() > MAX_SSE_RECORD_BYTES {
-            return Err(KuramaError::Protocol(format!(
-                "SSE record exceeds {MAX_SSE_RECORD_BYTES} bytes"
-            )));
-        }
-        self.decoder.push(&self.record)?;
-        self.record.clear();
-        Ok(self.decoder.finish()?.into_iter().next())
-    }
-
-    fn push_tail(&mut self, byte: u8) {
-        if self.tail_len < self.tail.len() {
-            self.tail[self.tail_len] = byte;
-            self.tail_len += 1;
-        } else {
-            self.tail.rotate_left(1);
-            self.tail[3] = byte;
-        }
-    }
-
-    fn tail_ends_with(&self, suffix: &[u8]) -> bool {
-        self.tail_len >= suffix.len()
-            && self.tail[self.tail_len - suffix.len()..self.tail_len] == *suffix
     }
 }
 
@@ -665,9 +651,9 @@ impl EventGate {
     }
 
     fn check_buffer_bound(&self) -> Result<(), KuramaError> {
-        if self.buffered_text.len() > MAX_SSE_RECORD_BYTES {
+        if self.buffered_text.len() > MAX_DELEGATION_RESPONSE_BYTES {
             return Err(KuramaError::Protocol(format!(
-                "delegation control response exceeds {MAX_SSE_RECORD_BYTES} bytes"
+                "delegation control response exceeds {MAX_DELEGATION_RESPONSE_BYTES} bytes"
             )));
         }
         Ok(())
@@ -729,24 +715,69 @@ fn delegation_marker_error() -> KuramaError {
     KuramaError::Protocol("delegation marker appeared after ordinary text".into())
 }
 
-pub fn bounded_redacted(text: &str, secrets: &[impl AsRef<str>]) -> String {
-    let mut bounded = if text.len() > MAX_ERROR_BYTES {
-        let mut end = MAX_ERROR_BYTES;
-        while !text.is_char_boundary(end) {
-            end -= 1;
+fn error_body_text(mut body: &[u8]) -> std::borrow::Cow<'_, str> {
+    // Do not replace a cut-off UTF-8 code point with U+FFFD: that would hide
+    // a credential-prefix match at a transport or size boundary.
+    let mut suffix = body;
+    while let Err(error) = std::str::from_utf8(suffix) {
+        match error.error_len() {
+            Some(length) => suffix = &suffix[error.valid_up_to() + length..],
+            None => {
+                body = &body[..body.len() - suffix.len() + error.valid_up_to()];
+                break;
+            }
         }
-        format!("{}…", &text[..end])
-    } else {
-        text.to_owned()
-    };
+    }
+    String::from_utf8_lossy(body)
+}
 
+pub fn bounded_redacted(text: &str, secrets: &[impl AsRef<str>]) -> String {
+    redact_error_prefix(text, secrets, text.len() > MAX_ERROR_BYTES)
+}
+
+fn redact_error_prefix(text: &str, secrets: &[impl AsRef<str>], incomplete: bool) -> String {
+    let mut end = text.len().min(MAX_ERROR_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut redacted = text[..end].to_owned();
     for secret in secrets {
         let secret = secret.as_ref();
         if !secret.is_empty() {
-            bounded = bounded.replace(secret, "[REDACTED]");
+            redacted = redacted.replace(secret, "[REDACTED]");
         }
     }
-    redact_authorization_values(&bounded)
+    // A bounded/error-interrupted body may end inside a credential. Redact the
+    // possible prefix conservatively instead of retaining unbounded overlap.
+    if incomplete {
+        let mut safe_end = redacted.len();
+        for secret in secrets {
+            let secret = secret.as_ref();
+            let start = redacted.len().saturating_sub(secret.len());
+            if let Some((index, _)) = redacted
+                .char_indices()
+                .find(|(index, _)| *index >= start && secret.starts_with(&redacted[*index..]))
+            {
+                safe_end = safe_end.min(index);
+            }
+        }
+        if safe_end < redacted.len() {
+            redacted.truncate(safe_end);
+            redacted.push_str("[REDACTED]");
+        }
+    }
+    let mut redacted = redact_authorization_values(&redacted);
+    if redacted.len() > MAX_ERROR_BYTES {
+        let mut end = MAX_ERROR_BYTES;
+        while !redacted.is_char_boundary(end) {
+            end -= 1;
+        }
+        redacted.truncate(end);
+    }
+    if incomplete || text.len() > MAX_ERROR_BYTES {
+        redacted.push('…');
+    }
+    redacted
 }
 
 pub fn bounded_redacted_error(error: KuramaError, secrets: &[impl AsRef<str>]) -> KuramaError {
@@ -789,4 +820,56 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
         .as_bytes()
         .windows(needle.len())
         .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+#[cfg(all(test, feature = "tools"))]
+mod tests {
+    use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    #[tokio::test]
+    async fn pinned_client_preserves_host_and_refuses_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("server");
+        let address = listener.local_addr().expect("address");
+        let destination = TcpListener::bind("127.0.0.1:0").await.expect("destination");
+        let destination_address = destination.local_addr().expect("destination address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("pinned request");
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).await.expect("request bytes");
+                assert_ne!(count, 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            socket.write_all(format!(
+                "HTTP/1.1 302 Found\r\nlocation: http://{destination_address}/redirected\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            ).as_bytes()).await.expect("response");
+            String::from_utf8(request).expect("request UTF-8")
+        });
+        let http = HttpClient::with_timeout(Duration::from_secs(1)).expect("client");
+        let client = http
+            .pinned_client("unresolvable.test", &[address])
+            .expect("pinned client");
+        let response = client
+            .get(format!("http://unresolvable.test:{}/", address.port()))
+            .send()
+            .await
+            .expect("pinned response");
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        assert!(
+            server
+                .await
+                .expect("server task")
+                .contains(&format!("host: unresolvable.test:{}\r\n", address.port()))
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), destination.accept())
+                .await
+                .is_err()
+        );
+    }
 }

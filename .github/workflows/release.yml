@@ -88,6 +88,7 @@ jobs:
           version=${GITHUB_REF_NAME#v}
           archive="kurama-${version}-${{ matrix.target }}.tar.gz"
           stage=$(mktemp -d)
+          trap 'rm -rf "$stage"' EXIT
           mkdir -p dist
           cp target/${{ matrix.target }}/release/kurama "$stage/kurama"
           cp README.md "$stage/README.md"

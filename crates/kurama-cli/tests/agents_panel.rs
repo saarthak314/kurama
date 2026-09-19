@@ -51,7 +51,7 @@ fn snapshot(id: &str, state: AgentState) -> AgentSnapshot {
 }
 
 #[test]
-fn panel_shows_control_fields_but_not_tool_statistics() {
+fn panel_shows_agent_identity_state_and_controls() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.set_agents(vec![
         row("a_1", AgentState::Running),
@@ -70,10 +70,6 @@ fn panel_shows_control_fields_but_not_tool_statistics() {
     ] {
         assert!(text.contains(expected), "missing {expected}: {text}");
     }
-    assert!(!text.contains("tool calls"));
-    assert!(!text.contains("SCOPE"));
-    assert!(!text.contains("TIME"));
-    assert!(text.contains("ID        ROLE          PROFILE      TASK                  STATE"));
     assert!(text.contains("read-only"));
 }
 
@@ -108,11 +104,10 @@ fn short_agent_panel_keeps_the_selected_row_visible() {
         state.select_next_agent();
     }
 
-    let text = rendered_at(&state, 80, 16);
+    let text = rendered_at(&state, 80, 8);
 
     assert!(text.contains("a_11"), "selected agent was clipped: {text}");
     assert!(!text.contains("a_00"), "panel did not scroll: {text}");
-    assert!(text.contains("enter  inspect"));
 }
 
 #[test]
@@ -293,8 +288,8 @@ fn runtime_updates_populate_and_update_agents_panel() {
     assert_eq!(state.agents[0].activity, "summarizing findings");
     state.open_agents();
     let text = rendered(&state);
-    assert!(!text.contains("1 file"));
-    assert!(!text.contains("elapsed"));
+    assert!(text.contains("a_1"));
+    assert!(text.contains("COMPLETED"));
 }
 
 #[test]

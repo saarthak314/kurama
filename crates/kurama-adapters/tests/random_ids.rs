@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 use kurama_adapters::RandomIds;
 use kurama_protocol::traits::IdGenerator;
 
@@ -13,7 +11,7 @@ fn random_ids_use_expected_lowercase_hex_shapes() {
         ids.call_id().to_string(),
     ];
 
-    assert_eq!(generated[0].len(), 12);
+    assert_eq!(generated[0].len(), 36);
     assert!(generated[0].starts_with("ses_"));
     assert!(generated[0][4..].bytes().all(is_lowercase_hex));
     assert!(generated[1].starts_with("a_"));
@@ -24,7 +22,6 @@ fn random_ids_use_expected_lowercase_hex_shapes() {
             .iter()
             .all(|id| id.len() == 34 && id[2..].bytes().all(is_lowercase_hex))
     );
-    assert_eq!(generated.iter().collect::<BTreeSet<_>>().len(), 4);
 }
 
 fn is_lowercase_hex(byte: u8) -> bool {

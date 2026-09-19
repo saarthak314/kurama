@@ -80,10 +80,28 @@ fn recovery_marks_a_durable_queued_child_as_interrupted() {
 
     assert_eq!(plan.interrupted_agents.len(), 1);
     assert_eq!(plan.interrupted_agents[0].state, AgentState::Failed);
-    assert_eq!(
-        plan.interrupted_agents[0].last_error.as_deref(),
-        Some("interrupted during previous process")
-    );
+}
+
+#[test]
+fn child_recovery_does_not_interrupt_its_own_manager_lifecycle() {
+    let snapshot = queued_agent();
+    let child_id = snapshot.id.clone();
+    let events = [EventEnvelope::new(
+        0,
+        0,
+        SessionId::from("session"),
+        Some(child_id),
+        SessionEvent::AgentStarted { snapshot },
+    )];
+    let plan = RecoveryPlanner::new()
+        .plan(
+            &events,
+            &NoopRecoveryProbe,
+            BackendCapabilities::remote_default(),
+        )
+        .expect("child recovery plan");
+    assert!(plan.interrupted_agents.is_empty());
+    assert_eq!(plan.stream, StreamRecovery::None);
 }
 
 #[test]
@@ -168,7 +186,7 @@ fn recovery_retries_interrupted_reads_with_same_operation_id() {
                 operation_id: operation_id.clone(),
                 call_id: "call".into(),
                 operation: Operation::Read {
-                    path: "Cargo.toml".into(),
+                    paths: vec!["Cargo.toml".into()],
                     external: false,
                 },
             },

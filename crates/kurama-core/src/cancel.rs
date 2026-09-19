@@ -34,15 +34,18 @@ impl CancelToken {
         self.inner.cancelled.load(Ordering::Acquire)
     }
 
-    pub async fn cancelled(&self) {
-        if self.is_cancelled() {
-            return;
+    pub fn cancelled(&self) -> impl Future<Output = ()> + Send + 'static + use<> {
+        let inner = self.inner.clone();
+        async move {
+            if inner.cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = inner.notify.notified();
+            if inner.cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
         }
-        let notified = self.inner.notify.notified();
-        if self.is_cancelled() {
-            return;
-        }
-        notified.await;
     }
 }
 
@@ -51,7 +54,7 @@ impl CancelSignal for CancelToken {
         CancelToken::is_cancelled(self)
     }
 
-    fn cancelled(&self) -> BoxFuture<'_, ()> {
+    fn cancelled(&self) -> BoxFuture<'static, ()> {
         Box::pin(CancelToken::cancelled(self))
     }
 }
@@ -63,10 +66,13 @@ mod tests {
     #[tokio::test]
     async fn cancellation_is_sticky_and_wakes_all_waiters() {
         let token = CancelToken::new();
-        let first = token.clone();
-        let second = token.clone();
+        let first: Arc<dyn CancelSignal> = Arc::new(token.clone());
+        let second: Arc<dyn CancelSignal> = Arc::new(token.clone());
+        let first_wait = first.cancelled();
+        let second_wait = second.cancelled();
+        drop((first, second));
         let waiters = tokio::spawn(async move {
-            tokio::join!(first.cancelled(), second.cancelled());
+            tokio::join!(first_wait, second_wait);
         });
         assert!(token.cancel());
         assert!(!token.cancel());

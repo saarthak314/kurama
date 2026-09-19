@@ -1,5 +1,5 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
@@ -15,7 +15,10 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, LOCATION};
 use serde::{Deserialize, Serialize};
 use url::{Host, Url};
 
-use crate::{credentials::SecretValue, http::HttpClient};
+use crate::{
+    credentials::SecretValue,
+    http::{HttpClient, bounded_redacted},
+};
 
 use super::{
     html_text::html_to_text,
@@ -77,6 +80,7 @@ impl SearchBackend for JsonSearchBackend {
         cancel: &'a dyn CancelSignal,
     ) -> BoxFuture<'a, Result<Vec<SearchResult>, KuramaError>> {
         Box::pin(async move {
+            validate_search_limit(limit)?;
             let endpoint = Url::parse(&self.endpoint).map_err(|error| {
                 KuramaError::Configuration(format!("invalid search endpoint: {error}"))
             })?;
@@ -138,6 +142,7 @@ impl SearchBackend for OpenAiNativeSearch {
         cancel: &'a dyn CancelSignal,
     ) -> BoxFuture<'a, Result<Vec<SearchResult>, KuramaError>> {
         Box::pin(async move {
+            validate_search_limit(limit)?;
             let base = Url::parse(&self.endpoint).map_err(|error| {
                 KuramaError::Configuration(format!("invalid OpenAI endpoint: {error}"))
             })?;
@@ -175,13 +180,11 @@ impl SearchBackend for OpenAiNativeSearch {
             let payload: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
                 KuramaError::Tool(format!("invalid native search response: {error}"))
             })?;
+            require_completed_search(&payload, self.secret.expose())?;
             let output = response_output_text(&payload).ok_or_else(|| {
                 KuramaError::Tool("native search response omitted structured output".into())
             })?;
-            let results: SearchPayload = serde_json::from_str(output).map_err(|error| {
-                KuramaError::Tool(format!("invalid native search output: {error}"))
-            })?;
-            validate_results(results.results, limit)
+            parse_search_results(output, limit)
         })
     }
 }
@@ -288,38 +291,60 @@ impl Tool for WebSearchTool {
             match parse_arguments(&invocation)? {
                 WebArguments::Search { query, limit, .. } => {
                     let backend = self.backend.as_ref().ok_or_else(|| {
-                        KuramaError::Configuration("no web search backend is configured".into())
+                        KuramaError::Configuration(
+                            "web search is unavailable for this profile; configure [search] kind = \"json\" with a search endpoint, or use an OpenAI, Codex CLI, or Claude CLI profile".into(),
+                        )
                     })?;
-                    let results = backend.search(&query, limit, cancel).await?;
-                    let output = results
-                        .iter()
-                        .enumerate()
-                        .map(|(index, result)| {
-                            format!(
-                                "{}. {}\n{}\n{}",
-                                index + 1,
-                                result.title,
-                                result.url,
-                                result.snippet
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
+                    let results =
+                        validate_results(backend.search(&query, limit, cancel).await?, limit)?;
+                    let mut bounded = staged_output(context.limits, "web-search", "output")?;
+                    for (index, result) in results.iter().enumerate() {
+                        if index != 0 {
+                            bounded.push(b"\n\n");
+                        }
+                        bounded.push(format!("{}. ", index + 1).as_bytes());
+                        bounded.push(result.title.as_bytes());
+                        bounded.push(b"\n");
+                        bounded.push(result.url.as_bytes());
+                        bounded.push(b"\n");
+                        bounded.push(result.snippet.as_bytes());
+                    }
+                    let mut bounded = bounded.finish();
+                    let staged_path = take_truncated_staging(&mut bounded)?;
+                    let mut metadata = serde_json::json!({
+                        "result_count": results.len(),
+                        "readable_bytes": bounded.total_bytes,
+                        "readable_lines": bounded.total_lines,
+                        "omitted_bytes": bounded.omitted_bytes,
+                        "omitted_lines": bounded.omitted_lines
+                    });
+                    // Metadata must not bypass the visible output budget with full snippets.
+                    if !bounded.truncated {
+                        metadata["results"] = serde_json::to_value(results).map_err(|error| {
+                            KuramaError::Tool(format!("search result metadata: {error}"))
+                        })?;
+                    }
+                    if let Some(path) = staged_path {
+                        metadata["_display_staging"] = serde_json::json!({"output": path});
+                    }
                     Ok(ToolResult {
                         call_id: invocation.call_id,
-                        output,
+                        output: bounded.text,
                         is_error: false,
-                        metadata: serde_json::json!({"results": results}),
-                        truncated: false,
+                        metadata,
+                        truncated: bounded.truncated,
                         blob_refs: Vec::new(),
                     })
                 }
                 WebArguments::Open { url } => {
                     let url = parse_http_url(&url)?;
                     let page = open_page(self.http()?, url, context.mode, cancel).await?;
+                    let page_bytes = page.bytes.len();
                     let readable = match page.content_type.as_str() {
                         "text/html" => html_to_text(&String::from_utf8_lossy(&page.bytes)),
-                        _ => String::from_utf8_lossy(&page.bytes).into_owned(),
+                        _ => String::from_utf8(page.bytes).unwrap_or_else(|error| {
+                            String::from_utf8_lossy(error.as_bytes()).into_owned()
+                        }),
                     };
                     let mut bounded = staged_output(context.limits, "web-open", "output")?;
                     bounded.push(readable.as_bytes());
@@ -328,7 +353,7 @@ impl Tool for WebSearchTool {
                     let mut metadata = serde_json::json!({
                         "url": page.url,
                         "content_type": page.content_type,
-                        "bytes": page.bytes.len(),
+                        "bytes": page_bytes,
                         "readable_bytes": bounded.total_bytes,
                         "readable_lines": bounded.total_lines,
                         "omitted_bytes": bounded.omitted_bytes,
@@ -394,10 +419,9 @@ fn parse_arguments(invocation: &ToolInvocation) -> Result<WebArguments, KuramaEr
         .map_err(|error| KuramaError::Tool(format!("invalid web-search arguments: {error}")))?;
     match &arguments {
         WebArguments::Search { query, limit, .. } => {
-            if query.is_empty() || query.len() > 2048 || !(1..=8).contains(limit) {
-                return Err(KuramaError::Tool(
-                    "search query or result limit is outside bounds".into(),
-                ));
+            validate_search_limit(*limit)?;
+            if query.is_empty() || query.len() > 2048 {
+                return Err(KuramaError::Tool("search query is outside bounds".into()));
             }
         }
         WebArguments::Open { url } => {
@@ -432,10 +456,23 @@ async fn open_page(
     cancel: &dyn CancelSignal,
 ) -> Result<Page, KuramaError> {
     for redirects in 0..=MAX_REDIRECTS {
-        validate_remote_url(&url, mode).await?;
+        let client = if mode == ExecutionMode::Yolo {
+            http.client().clone()
+        } else {
+            let addresses = tokio::select! {
+                _ = cancel.cancelled() => return Err(KuramaError::Cancelled),
+                addresses = resolve_remote_url(&url) => addresses?,
+            };
+            validate_remote_addresses(&addresses)?;
+            http.pinned_client(
+                url.host_str()
+                    .ok_or_else(|| KuramaError::Tool("URL host is missing".into()))?,
+                &addresses,
+            )?
+        };
         let response = tokio::select! {
             _ = cancel.cancelled() => return Err(KuramaError::Cancelled),
-            response = http.client().get(url.clone()).send() => response.map_err(|error| KuramaError::Tool(format!("page request failed: {error}")))?,
+            response = client.get(url.clone()).send() => response.map_err(|error| KuramaError::Tool(format!("page request failed: {error}")))?,
         };
         if response.status().is_redirection() {
             if redirects == MAX_REDIRECTS {
@@ -451,6 +488,7 @@ async fn open_page(
             url = url
                 .join(location)
                 .map_err(|error| KuramaError::Tool(format!("invalid redirect URL: {error}")))?;
+            url = parse_http_url(url.as_str())?;
             continue;
         }
         if !response.status().is_success() {
@@ -515,23 +553,20 @@ async fn read_response_bytes(
     Ok(output)
 }
 
-async fn validate_remote_url(url: &Url, mode: ExecutionMode) -> Result<(), KuramaError> {
-    if mode == ExecutionMode::Yolo {
-        return Ok(());
-    }
+async fn resolve_remote_url(url: &Url) -> Result<Vec<SocketAddr>, KuramaError> {
     let host = url
         .host()
         .ok_or_else(|| KuramaError::Tool("URL host is missing".into()))?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| KuramaError::Tool("URL has no resolvable port".into()))?;
     match host {
-        Host::Ipv4(address) => reject_private(IpAddr::V4(address)),
-        Host::Ipv6(address) => reject_private(IpAddr::V6(address)),
+        Host::Ipv4(address) => Ok(vec![SocketAddr::new(IpAddr::V4(address), port)]),
+        Host::Ipv6(address) => Ok(vec![SocketAddr::new(IpAddr::V6(address), port)]),
         Host::Domain(domain) => {
             if domain.eq_ignore_ascii_case("localhost") || domain.ends_with(".localhost") {
                 return Err(KuramaError::Policy("private network target denied".into()));
             }
-            let port = url
-                .port_or_known_default()
-                .ok_or_else(|| KuramaError::Tool("URL has no resolvable port".into()))?;
             let addresses = tokio::time::timeout(
                 Duration::from_secs(10),
                 tokio::net::lookup_host((domain, port)),
@@ -539,19 +574,21 @@ async fn validate_remote_url(url: &Url, mode: ExecutionMode) -> Result<(), Kuram
             .await
             .map_err(|_| KuramaError::Tool("DNS resolution timed out".into()))?
             .map_err(|error| KuramaError::Tool(format!("DNS resolution failed: {error}")))?;
-            let mut resolved = false;
-            for address in addresses {
-                resolved = true;
-                reject_private(address.ip())?;
-            }
-            if !resolved {
-                return Err(KuramaError::Tool(
-                    "DNS resolution returned no addresses".into(),
-                ));
-            }
-            Ok(())
+            Ok(addresses.collect())
         }
     }
+}
+
+fn validate_remote_addresses(addresses: &[SocketAddr]) -> Result<(), KuramaError> {
+    if addresses.is_empty() {
+        return Err(KuramaError::Tool(
+            "DNS resolution returned no addresses".into(),
+        ));
+    }
+    for address in addresses {
+        reject_private(address.ip())?;
+    }
+    Ok(())
 }
 
 fn literal_private_target(url: &Url) -> bool {
@@ -604,6 +641,15 @@ fn is_public_ipv6(address: Ipv6Addr) -> bool {
         && address.to_ipv4_mapped().is_none_or(is_public_ipv4)
 }
 
+pub(crate) fn validate_search_limit(limit: usize) -> Result<(), KuramaError> {
+    if !(1..=8).contains(&limit) {
+        return Err(KuramaError::Tool(
+            "search result limit must be between 1 and 8".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_results(
     results: Vec<SearchResult>,
     limit: usize,
@@ -625,7 +671,16 @@ fn validate_results(
     Ok(results)
 }
 
-fn search_result_schema(limit: usize) -> serde_json::Value {
+pub(crate) fn parse_search_results(
+    output: &str,
+    limit: usize,
+) -> Result<Vec<SearchResult>, KuramaError> {
+    let payload: SearchPayload = serde_json::from_str(output)
+        .map_err(|error| KuramaError::Tool(format!("invalid native search output: {error}")))?;
+    validate_results(payload.results, limit)
+}
+
+pub(crate) fn search_result_schema(limit: usize) -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -647,6 +702,54 @@ fn search_result_schema(limit: usize) -> serde_json::Value {
         "required": ["results"],
         "additionalProperties": false
     })
+}
+
+fn require_completed_search(value: &serde_json::Value, secret: &str) -> Result<(), KuramaError> {
+    let failure = |item: &serde_json::Value| {
+        let diagnostic = item
+            .get("error")
+            .filter(|error| !error.is_null())
+            .or_else(|| item.get("incomplete_details"))
+            .unwrap_or_else(|| &item["status"]);
+        // Match the credential in the same JSON representation as every nested
+        // value and object key. Register even short secrets, and let the bounded
+        // redactor remove partial matches that straddle the diagnostic limit.
+        let encoded_secret = serde_json::to_string(secret).expect("strings serialize");
+        let encoded_secret = &encoded_secret[1..encoded_secret.len() - 1];
+        KuramaError::Tool(format!(
+            "native search did not complete: {}",
+            bounded_redacted(&diagnostic.to_string(), &[encoded_secret])
+        ))
+    };
+    if value
+        .get("status")
+        .is_some_and(|status| status != "completed")
+        || value.get("error").is_some_and(|error| !error.is_null())
+    {
+        return Err(failure(value));
+    }
+    let mut completed = false;
+    for item in value
+        .get("output")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if item["type"] == "web_search_call" {
+            if item["status"] != "completed"
+                || item.get("error").is_some_and(|error| !error.is_null())
+            {
+                return Err(failure(item));
+            }
+            completed = true;
+        }
+    }
+    if !completed {
+        return Err(KuramaError::Tool(
+            "native search response omitted a completed web search call".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn response_output_text(value: &serde_json::Value) -> Option<&str> {
@@ -674,4 +777,39 @@ fn append_endpoint(base: &Url, suffix: &str) -> Result<Url, KuramaError> {
     value.push_str(suffix);
     Url::parse(&value)
         .map_err(|error| KuramaError::Configuration(format!("invalid provider endpoint: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_resolved_address_must_be_public() {
+        let public: SocketAddr = "8.8.8.8:443".parse().expect("public address");
+        for private in [
+            "127.0.0.1:443",
+            "10.0.0.1:443",
+            "[::1]:443",
+            "[::ffff:127.0.0.1]:443",
+        ] {
+            let private: SocketAddr = private.parse().expect("private address");
+            for addresses in [[public, private], [private, public]] {
+                assert!(matches!(
+                    validate_remote_addresses(&addresses),
+                    Err(KuramaError::Policy(_))
+                ));
+            }
+        }
+        assert!(matches!(
+            validate_remote_addresses(&[]),
+            Err(KuramaError::Tool(_))
+        ));
+        assert!(
+            validate_remote_addresses(&[
+                public,
+                "[2001:4860:4860::8888]:443".parse().expect("public IPv6")
+            ])
+            .is_ok()
+        );
+    }
 }

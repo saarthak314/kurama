@@ -50,6 +50,11 @@ impl TodoItem {
                     "todo items need a non-empty id and content".into(),
                 ));
             }
+            if item.id != item.id.trim() {
+                return Err(crate::KuramaError::Protocol(
+                    "todo ids must not have leading or trailing whitespace".into(),
+                ));
+            }
             if !ids.insert(&item.id) {
                 return Err(crate::KuramaError::Protocol(format!(
                     "duplicate todo id {}",
@@ -230,6 +235,13 @@ pub enum SessionEvent {
     },
     UserMessage {
         text: String,
+        #[serde(default)]
+        explicit_delegation: bool,
+    },
+    UserSteered {
+        text: String,
+        #[serde(default)]
+        explicit_delegation: bool,
     },
     AssistantMessage {
         text: String,

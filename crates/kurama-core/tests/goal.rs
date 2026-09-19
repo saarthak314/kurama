@@ -305,6 +305,7 @@ async fn child_engine_does_not_receive_update_goal_descriptor() {
             Some(child_id.clone()),
             SessionEvent::UserMessage {
                 text: "previous".into(),
+                explicit_delegation: false,
             },
         ),
         event(1, Some(child_id.clone()), SessionEvent::TurnCompleted),

@@ -56,7 +56,7 @@ agent.prompt("continue from there").await?;
 
 `resume` refuses a session from another workspace or profile, and it does not restore YOLO unless this Agent was built with `.yolo()` / `ExecutionMode::Yolo`.
 
-Defaults: `DefaultPolicy` in supervised mode, `MemoryStore`, a no-op event sink, `NoDelegation`, and `RandomIds`. `.orchestrate()` installs `SmartOrchestrator` and builds the orchestration context from the active profile, workspace write scope, and configured roles. Researcher, planner, and reviewer children are forced read-only; an implementer with an empty scope inherits the parent write scope. The parent may run up to three delegation waves in one user turn. Children wrap up at 80% of budget; a hard limit cancels unless a summary can be salvaged. `.delegate()` requires `.orchestrate()`. `.config(&kurama_config)` copies role routes, escalations, auto boundaries, and concurrency from `~/.kurama/config.toml`.
+Defaults: supervised `DefaultPolicy`, `MemoryStore`, a no-op event sink, `NoDelegation`, and 128-bit `RandomIds`. `.orchestrate()` preserves a supplied orchestrator or installs `SmartOrchestrator`, and creates the child context from the active profile, workspace scope, and configured roles. Researcher, planner, and reviewer children are read-only; implementers inherit or narrow the parent scope. The parent may run three delegation waves per turn; children wrap up at 80% of budget and cannot spawn children. `.delegate()` requires `.orchestrate()`. Unknown configured role/escalation profiles fail setup rather than silently falling back. `.limits()` applies regardless of whether the backend/profile was registered first; zero token limits are rejected.
 
 Streaming, approvals, and children stay one method down. Break on `Done` (and `Error`); a later `next()` returns `None`:
 
@@ -77,6 +77,14 @@ while let Some(event) = turn.next().await? {
 ```
 
 Event-driven UIs (the Kurama CLI) call `agent.launch(metadata, replay)` and drive `Handle` plus the typed event stream.
+
+Assistant text is coalesced to at most 4 KiB UTF-8-safe chunks, with a 50 ms flush deadline while text is pending. This is an engine buffering bound, not an end-to-end provider latency guarantee. Drain runtime events continuously: the bounded channel applies backpressure rather than dropping text or terminal events.
+
+`Handle::steer(text, explicit_delegation)` redirects an active turn at the next complete model/tool/delegation boundary; an idle handle starts a normal turn. Internal retries retain their in-flight request. `SteeringQueued` is a receipt, `SteeringApplied` marks durable application, and `SteeringRejected` returns input that could not be applied. These are nonterminal events; callers must preserve rejected text rather than resubmitting it automatically. Only applied steering enters durable history.
+
+`Handle::inspect_context()` emits `ContextInspected` without calling the model or ending the turn. Its `ContextInspection` partitions an estimated request budget into categories, reports omitted/included completed turns and summary coverage, and previews explicit compaction. `assembly_error` explains a request that cannot fit while preserving inspection data. Token estimates are not provider billing counts.
+
+To abandon a partially consumed `Turn`, call `turn.cancel().await?`, then `turn.drain().await` before starting another prompt. Draining consumes the terminal event without accumulating more reply text; it does not itself request cancellation.
 
 ## Explicit composition
 
@@ -99,12 +107,32 @@ let runtime = AgentBuilder::new()
 
 Duplicate model profile or tool names, missing required components, an unavailable active profile, and zero channel limits are errors.
 
+### Custom session stores
+
+`SessionStore::append` retains explicit-sequence validation. `append_next(&mut EventEnvelope)` assigns and commits the next sequence, returning that sequence in the envelope. The child engine and agent manager use this shared allocator because they interleave events in one child log. Filesystem and memory stores allocate under their storage lock without full replay. Existing custom stores inherit a compatibility implementation that serializes replay-plus-append within this process; override it with a transaction or shared storage lock for cross-process writers or efficient allocation. Store wrappers should forward `append_next` to the underlying allocator. Do not mix uncoordinated explicit-sequence appends with allocated appends to the same log.
+
+Replay results must include any repair event committed during that replay so callers can append immediately from the returned sequence. `FsSessionStore::get_blob_tail(reference, max_bytes)` is an inherent filesystem helper, not a new `SessionStore` requirement: it verifies the complete blob stream and returns only its bounded suffix. `get_blob` still returns fully verified content.
+
+Direct `kurama-core` compaction integrations now consume `CompactionRequest.items` rather than serializing an `events` field. These model-ready items include the prior summary as data plus newly covered events; do not omit the summary when constructing the backend request. The `Agent`/`Handle` embedding entry points are unchanged.
+
 ## Providers and Tools
 
 First-party adapters cover OpenAI, Anthropic, OpenAI-compatible HTTP endpoints, Codex CLI, and Claude CLI. The provider factory consumes non-secret profile configuration plus credentials resolved outside the protocol boundary.
 
 Custom SDK tools do not enter the standard Kurama CLI automatically. The CLI registers exactly `read`, `write`, `bash`, and `web-search`. The engine adds `todo` for the parent session only; it is not an environment tool and does not change that CLI registry.
 
+Provider streams retain an owned cancellation future after establishment. `SseDecoder` bounds each wire record to 1 MiB and accepts BOM/CR/LF/CRLF streams; provider normalizers reject incomplete tool calls. The default HTTP timeout is still a 120-second absolute request/body deadline, not an inactivity timer. `KuramaError::Provider` carries an authoritative retryability flag so permanent HTTP failures cannot be retried based on words in their diagnostic bodies.
+
+`BoundedOutput::with_staging` records staging intent; it creates a file only when output really truncates. Deferred filesystem errors appear in `finish().staging_error`. Below-limit output has no staging path or blob reference. Byte and LF-delimited line limits include omission markers and, for Bash, stream labels and timeout notes. Complete raw streams remain retrievable when truncated; execution-error suffixes are separate metadata, not part of raw stream hashes.
+
 ## Compatibility
 
 Kurama follows semantic versioning with `0.x` expectations. Breaking public API changes require a minor-version bump and migration notes. Patch releases preserve the public contracts, while trait additions are driven by working first-party implementations rather than speculative extension points.
+
+The control additions extend `EngineCommand`, `RuntimeEvent`, SDK `Event`, `SessionEvent`, and `KuramaError`; downstream exhaustive matches need the new variants. `UserMessage` and `UserSteered` carry default-false `explicit_delegation` flags. `UserSteered` stays within its original turn. `Operation::Read` now contains `paths: Vec<PathBuf>`; deserialization accepts old single-path records, while new records emit only `paths`. Direct compaction constructors provide `CompactionRequest::event_count`. Older sessions remain readable; older binaries do not understand new steering records.
+
+Every registered profile must provide non-zero input and output token limits, including CLI-backed profiles. Configuration examples and verification fixtures specify both limits explicitly; an omitted limit is not an automatic model-capacity lookup.
+
+Implement `CancelSignal::cancelled` as `BoxFuture<'static, ()>` by cloning owned cancellation state before constructing the future. `DefaultPolicy` is a unit struct: use `DefaultPolicy` rather than the removed constructor/accessor with stale mode state. Provider `parse_fixture` helpers were removed; tests and embedders use the production stream API.
+
+OpenAI/Anthropic key constructors accept values convertible to `Zeroizing<String>`; compatible providers accept `Option<Zeroizing<String>>`. `SecretValue::into_zeroizing` transfers an existing protected allocation. `ClaudeBridge::new()` and `command_for(request, cursor)` no longer take an unused schema path. Codex uses immutable mode-specific schema files; the public schema writer rejects replacement with different content. Unsafe/long profile cache names use a reserved `~` plus SHA-256 component; existing safe cache paths remain stable.

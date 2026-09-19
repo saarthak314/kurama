@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -10,7 +10,7 @@ use kurama_protocol::{
     KuramaError,
     agent::{AgentSnapshot, AgentState, OrchestrationContext, ResolvedAgentSpec, WriteScope},
     id::{AgentId, OperationId},
-    model::{BackendCursor, FinishReason, ModelEvent, ModelItem, ModelProfile, ModelRequest},
+    model::{BackendCursor, FinishReason, ModelEvent, ModelProfile, ModelRequest},
     policy::{
         ApprovalRequest, ApprovalResponse, AutoBoundaries, ExecutionMode, PolicyContext,
         PolicyDecision,
@@ -39,6 +39,10 @@ use crate::{
 pub type RuntimeEvents = mpsc::Receiver<RuntimeEvent>;
 
 const MAX_DELEGATION_WAVES: u8 = 3;
+const ASSISTANT_DELTA_BYTES: usize = 4_096;
+const ASSISTANT_DELTA_DELAY: Duration = Duration::from_millis(50);
+const MAX_PENDING_STEERING: usize = 32;
+const MAX_PENDING_STEERING_BYTES: usize = 262_144;
 
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -56,6 +60,21 @@ impl EngineHandle {
             explicit_delegation,
         })
         .await
+    }
+    pub async fn steer(
+        &self,
+        text: impl Into<String>,
+        explicit_delegation: bool,
+    ) -> Result<(), KuramaError> {
+        self.send(EngineCommand::Steer {
+            text: text.into(),
+            explicit_delegation,
+        })
+        .await
+    }
+
+    pub async fn inspect_context(&self) -> Result<(), KuramaError> {
+        self.send(EngineCommand::InspectContext).await
     }
 
     pub async fn resolve_approval(
@@ -274,7 +293,10 @@ impl Engine {
                 .collect(),
             context,
             sequence,
-            command_rx,
+            command_rx: CommandInbox {
+                receiver: command_rx,
+                deferred: VecDeque::new(),
+            },
             runtime_tx,
             session_approvals: BTreeSet::new(),
             completed_tool_calls,
@@ -284,6 +306,9 @@ impl Engine {
             interrupted_agents: recovery.interrupted_agents,
             resume_incomplete_turn,
             shutdown_requested: false,
+            pending_steering: VecDeque::new(),
+            pending_steering_bytes: 0,
+            delegation_available: false,
             goal,
             goal_pause_requested: false,
             goal_clear_requested: false,
@@ -320,7 +345,7 @@ struct EngineActor {
     retry_delays: Vec<Duration>,
     context: ContextManager,
     sequence: u64,
-    command_rx: mpsc::Receiver<EngineCommand>,
+    command_rx: CommandInbox,
     runtime_tx: mpsc::Sender<RuntimeEvent>,
     session_approvals: BTreeSet<String>,
     completed_tool_calls: BTreeMap<kurama_protocol::id::CallId, (OperationId, ToolResult)>,
@@ -330,16 +355,50 @@ struct EngineActor {
     interrupted_agents: Vec<kurama_protocol::agent::AgentSnapshot>,
     resume_incomplete_turn: bool,
     shutdown_requested: bool,
+    pending_steering: VecDeque<(String, bool)>,
+    pending_steering_bytes: usize,
+    delegation_available: bool,
     goal: Option<SessionGoal>,
     goal_pause_requested: bool,
     goal_clear_requested: bool,
 }
 
+struct CommandInbox {
+    receiver: mpsc::Receiver<EngineCommand>,
+    deferred: VecDeque<EngineCommand>,
+}
+
+impl CommandInbox {
+    async fn recv(&mut self) -> Option<EngineCommand> {
+        match self.deferred.pop_front() {
+            Some(command) => Some(command),
+            None => self.receiver.recv().await,
+        }
+    }
+
+    fn try_recv(&mut self) -> Result<EngineCommand, mpsc::error::TryRecvError> {
+        match self.deferred.pop_front() {
+            Some(command) => Ok(command),
+            None => self.receiver.try_recv(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.deferred.len() + self.receiver.len()
+    }
+}
+
 impl EngineActor {
     async fn run(mut self) {
+        let had_startup_work = !self.interrupted_agents.is_empty()
+            || self
+                .recovery_operations
+                .iter()
+                .any(|(_, action)| !matches!(action, RecoveryAction::Completed { .. }));
         let recovered = match self.recover_startup().await {
             Ok(()) => true,
             Err(error) => {
+                let _ = self.reject_ended_steering().await;
                 let _ = self
                     .emit(RuntimeEvent::Error {
                         message: error.to_string(),
@@ -348,9 +407,14 @@ impl EngineActor {
                 false
             }
         };
+        if self.shutdown_requested {
+            let _ = self.emit(RuntimeEvent::Shutdown).await;
+            return;
+        }
         if recovered && self.resume_incomplete_turn {
             self.resume_incomplete_turn = false;
             if let Err(error) = self.resume_turn().await {
+                let _ = self.reject_ended_steering().await;
                 if self.shutdown_requested {
                     let _ = self.emit(RuntimeEvent::Shutdown).await;
                     return;
@@ -361,13 +425,24 @@ impl EngineActor {
                     })
                     .await;
             }
+        } else if recovered && had_startup_work {
+            // Tool recovery can run after a terminal turn. There is no model
+            // boundary at which accepted steering could be applied in that case.
+            let _ = self.reject_ended_steering().await;
+            let _ = self.emit(RuntimeEvent::TurnCompleted).await;
         }
         while let Some(command) = self.command_rx.recv().await {
+            let starts_batch = starts_command_batch(&command);
             let result = match command {
                 EngineCommand::SubmitTurn {
                     text,
                     explicit_delegation,
                 } => self.run_turn(text, explicit_delegation).await,
+                EngineCommand::Steer {
+                    text,
+                    explicit_delegation,
+                } => self.start_steered_turn(text, explicit_delegation).await,
+                EngineCommand::InspectContext => self.inspect_context().await,
                 EngineCommand::ResolveApproval { .. } => {
                     self.emit(RuntimeEvent::Error {
                         message: "there is no pending approval".into(),
@@ -380,7 +455,18 @@ impl EngineActor {
                     })
                     .await
                 }
-                EngineCommand::Compact => self.compact_context().await,
+                EngineCommand::Compact => match self.compact_context().await {
+                    Ok(()) => {
+                        if let Some((text, explicit_delegation)) = self.pending_steering.pop_front()
+                        {
+                            self.pending_steering_bytes -= text.len();
+                            self.start_steered_turn(text, explicit_delegation).await
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    Err(error) => Err(error),
+                },
                 EngineCommand::SetMode(mode) => self.change_mode(mode).await,
                 EngineCommand::SetGoal { objective } => self.set_goal(objective).await,
                 EngineCommand::EditGoal { objective } => self.edit_goal(objective).await,
@@ -393,6 +479,14 @@ impl EngineActor {
                     Ok(())
                 }
             };
+            self.delegation_available = false;
+            if result.is_err() || self.shutdown_requested {
+                let _ = if starts_batch {
+                    self.reject_ended_steering().await
+                } else {
+                    self.reject_pending_steering().await
+                };
+            }
             if self.shutdown_requested {
                 let _ = self.emit(RuntimeEvent::Shutdown).await;
                 break;
@@ -859,7 +953,10 @@ impl EngineActor {
     ) -> Result<(), KuramaError> {
         self.completed_tool_calls.clear();
         self.seen_tool_calls.clear();
-        self.append(SessionEvent::UserMessage { text })?;
+        self.append(SessionEvent::UserMessage {
+            text,
+            explicit_delegation,
+        })?;
         self.continue_turn(explicit_delegation).await
     }
 
@@ -871,10 +968,11 @@ impl EngineActor {
         loop {
             let cancel = CancelToken::new();
             let capability_enabled = explicit_delegation
-                || self
-                    .orchestrator
-                    .explicit_delegation(self.latest_user_text().unwrap_or_default().as_str());
+                || self.context.latest_turn_allows_delegation(|text| {
+                    self.orchestrator.explicit_delegation(text)
+                });
             let outcome = self.drive_turn(capability_enabled, &cancel).await;
+            self.delegation_available = false;
             explicit_delegation = false;
 
             match outcome {
@@ -903,18 +1001,155 @@ impl EngineActor {
         }
     }
 
+    async fn start_steered_turn(
+        &mut self,
+        text: String,
+        explicit_delegation: bool,
+    ) -> Result<(), KuramaError> {
+        self.completed_tool_calls.clear();
+        self.seen_tool_calls.clear();
+        self.append(SessionEvent::UserMessage {
+            text: text.clone(),
+            explicit_delegation,
+        })?;
+        self.emit(RuntimeEvent::SteeringApplied { text }).await?;
+        self.continue_turn(explicit_delegation).await
+    }
+
+    async fn queue_steering(
+        &mut self,
+        text: String,
+        explicit_delegation: bool,
+    ) -> Result<(), KuramaError> {
+        if self.pending_steering.len() >= MAX_PENDING_STEERING
+            || text.len() > MAX_PENDING_STEERING_BYTES.saturating_sub(self.pending_steering_bytes)
+        {
+            return self
+                .emit(RuntimeEvent::SteeringRejected {
+                    text,
+                    message: "pending steering limit reached; input returned to draft".into(),
+                })
+                .await;
+        }
+        self.pending_steering_bytes += text.len();
+        self.pending_steering
+            .push_back((text.clone(), explicit_delegation));
+        self.emit(RuntimeEvent::SteeringQueued { text }).await
+    }
+
+    async fn apply_pending_steering(
+        &mut self,
+        capability_enabled: &mut bool,
+    ) -> Result<(), KuramaError> {
+        while let Some((text, explicit_delegation)) = self.pending_steering.front() {
+            let delegation = *explicit_delegation || self.orchestrator.explicit_delegation(text);
+            self.append(SessionEvent::UserSteered {
+                text: text.clone(),
+                explicit_delegation: *explicit_delegation,
+            })?;
+            let (text, _) = self.pending_steering.pop_front().expect("pending steering");
+            self.pending_steering_bytes -= text.len();
+            *capability_enabled |= delegation;
+            // A recovered provider cursor predates this new user input. The
+            // canonical history, including completed tool results, is authoritative.
+            self.recovery_continuation = None;
+            self.emit(RuntimeEvent::SteeringApplied { text }).await?;
+        }
+        Ok(())
+    }
+
+    async fn reject_pending_steering(&mut self) -> Result<(), KuramaError> {
+        while let Some((text, _)) = self.pending_steering.pop_front() {
+            self.pending_steering_bytes -= text.len();
+            self.emit(RuntimeEvent::SteeringRejected {
+                text,
+                message: "turn ended before steering could be applied; input returned to draft"
+                    .into(),
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn reject_ended_steering(&mut self) -> Result<(), KuramaError> {
+        // Capture the ready batch before emitting anything: backpressure must
+        // not extend the scan to input submitted after the failure. A later
+        // explicit batch owns its own steering, so leave that suffix untouched.
+        // Deferred commands end at the first batch starter and are consumed by
+        // every receive path before the channel; none remain when it starts.
+        let ready = self.command_rx.len();
+        let mut deferred = VecDeque::new();
+        let mut rejected = Vec::new();
+        for _ in 0..ready {
+            let Ok(command) = self.command_rx.try_recv() else {
+                break;
+            };
+            if let EngineCommand::Steer { text, .. } = command {
+                rejected.push(text);
+            } else {
+                let starts_batch = starts_command_batch(&command);
+                deferred.push_back(command);
+                if starts_batch {
+                    break;
+                }
+            }
+        }
+        deferred.append(&mut self.command_rx.deferred);
+        self.command_rx.deferred = deferred;
+        self.reject_pending_steering().await?;
+        for text in rejected {
+            self.emit(RuntimeEvent::SteeringRejected {
+                text,
+                message: "turn ended before steering could be applied; input returned to draft"
+                    .into(),
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn drain_turn_commands(&mut self, cancel: &CancelToken) -> Result<(), KuramaError> {
+        // Snapshot the bounded channel: a producer cannot starve a ready round
+        // by continuously sending commands while this boundary is drained.
+        for _ in 0..self.command_rx.len() {
+            match self.command_rx.try_recv() {
+                Ok(command) => self.handle_turn_command(Some(command), cancel).await?,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.handle_turn_command(None, cancel).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn inspect_context(&self) -> Result<(), KuramaError> {
+        let inspection = self.context.inspect(
+            &self.profile,
+            self.tool_descriptors.clone(),
+            self.delegation_available,
+            &self.workspace_root.to_string_lossy(),
+        );
+        self.emit(RuntimeEvent::ContextInspected { inspection })
+            .await
+    }
+
     async fn drive_turn(
         &mut self,
-        capability_enabled: bool,
+        mut capability_enabled: bool,
         cancel: &CancelToken,
     ) -> Result<(), KuramaError> {
         let mut waves = 0u8;
-        let mut delegation_available = capability_enabled && self.agent_id.is_none();
+        self.delegation_available = capability_enabled && self.agent_id.is_none();
         loop {
+            self.drain_turn_commands(cancel).await?;
+            self.apply_pending_steering(&mut capability_enabled).await?;
+            self.delegation_available =
+                capability_enabled && self.agent_id.is_none() && waves < MAX_DELEGATION_WAVES;
             let mut assembled = self.context.assemble(
                 &self.profile,
                 self.tool_descriptors.clone(),
-                delegation_available,
+                self.delegation_available,
                 &self.workspace_root.to_string_lossy(),
             )?;
             if assembled.request.continuation.is_none() {
@@ -941,16 +1176,23 @@ impl EngineActor {
             }
             for request in round.delegations {
                 if self
-                    .execute_delegation(request, delegation_available, cancel)
+                    .execute_delegation(request, self.delegation_available, cancel)
                     .await?
                 {
                     waves += 1;
-                    delegation_available = capability_enabled
+                    self.delegation_available = capability_enabled
                         && self.agent_id.is_none()
                         && waves < MAX_DELEGATION_WAVES;
                 }
             }
-            if !round.tool_calls_empty || !round.delegations_empty {
+            // A complete model/tool batch is the only steering boundary. Drain
+            // commands once more before committing a text-only Stop, including
+            // commands queued while the final delta or tool result was emitted.
+            self.drain_turn_commands(cancel).await?;
+            if !self.pending_steering.is_empty()
+                || !round.tool_calls_empty
+                || !round.delegations_empty
+            {
                 continue;
             }
             match finish_reason {
@@ -984,9 +1226,26 @@ impl EngineActor {
             };
             let mut round = ModelRound::default();
             let mut runtime_buffer = String::new();
+            let mut flush_deadline = None;
             let mut progressed = false;
             loop {
                 tokio::select! {
+                    biased;
+                    () = async {
+                        match flush_deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        self.flush_deltas(&mut runtime_buffer, true).await?;
+                        flush_deadline = None;
+                    }
+                    command = self.command_rx.recv() => {
+                        if let Err(error) = self.handle_turn_command(command, cancel).await {
+                            self.preserve_partial_assistant(round, &mut runtime_buffer).await?;
+                            return Err(error);
+                        }
+                    }
                     item = stream.next() => {
                         match item {
                             Some(Ok(event)) => {
@@ -995,12 +1254,18 @@ impl EngineActor {
                                     ModelEvent::ResponseStarted { .. } => {}
                                     ModelEvent::TextDelta { text } => {
                                         round.text.push_str(&text);
+                                        if runtime_buffer.is_empty() && !text.is_empty() {
+                                            flush_deadline = Some(tokio::time::Instant::now() + ASSISTANT_DELTA_DELAY);
+                                        }
                                         runtime_buffer.push_str(&text);
                                         self.flush_deltas(&mut runtime_buffer, false).await?;
+                                        if runtime_buffer.is_empty() {
+                                            flush_deadline = None;
+                                        }
                                     }
                                     ModelEvent::ToolCall { call_id, name, arguments } => {
                                         if !round.tool_call_ids.insert(call_id.clone()) {
-                                            self.preserve_partial_assistant(&round, &mut runtime_buffer).await?;
+                                            self.preserve_partial_assistant(round, &mut runtime_buffer).await?;
                                             return Err(KuramaError::Model(format!(
                                                 "model emitted duplicate tool call id {call_id} in one response"
                                             )));
@@ -1010,6 +1275,8 @@ impl EngineActor {
                                     ModelEvent::Delegation { request } => round.delegations.push(request),
                                     ModelEvent::Usage { usage } => {
                                         self.append(SessionEvent::ModelUsage { usage })?;
+                                        self.flush_deltas(&mut runtime_buffer, true).await?;
+                                        flush_deadline = None;
                                         self.emit(RuntimeEvent::Usage { usage }).await?;
                                     }
                                     ModelEvent::ResponseCompleted { cursor, finish_reason } => {
@@ -1030,21 +1297,15 @@ impl EngineActor {
                                 break;
                             }
                             Some(Err(error)) => {
-                                self.preserve_partial_assistant(&round, &mut runtime_buffer).await?;
+                                self.preserve_partial_assistant(round, &mut runtime_buffer).await?;
                                 return Err(error);
                             }
                             None => {
-                                self.preserve_partial_assistant(&round, &mut runtime_buffer).await?;
+                                self.preserve_partial_assistant(round, &mut runtime_buffer).await?;
                                 return Err(KuramaError::Model(
                                     "model stream ended before response completion".into(),
                                 ));
                             }
-                        }
-                    }
-                    command = self.command_rx.recv() => {
-                        if let Err(error) = self.handle_turn_command(command, cancel).await {
-                            self.preserve_partial_assistant(&round, &mut runtime_buffer).await?;
-                            return Err(error);
                         }
                     }
                 }
@@ -1393,6 +1654,10 @@ impl EngineActor {
                 combined_tool_output(
                     stdout.as_deref().unwrap_or_default(),
                     stderr.as_deref().unwrap_or_default(),
+                    result
+                        .metadata
+                        .get("execution_error_suffix")
+                        .and_then(serde_json::Value::as_str),
                 )
             })
         }))
@@ -1417,6 +1682,10 @@ impl EngineActor {
                 Some(combined_tool_output(
                     stdout.as_deref().unwrap_or_default(),
                     stderr.as_deref().unwrap_or_default(),
+                    result
+                        .metadata
+                        .get("execution_error_suffix")
+                        .and_then(serde_json::Value::as_str),
                 ))
             } else {
                 None
@@ -1432,7 +1701,7 @@ impl EngineActor {
 
     async fn execute_delegation(
         &mut self,
-        request: kurama_protocol::agent::DelegationRequest,
+        mut request: kurama_protocol::agent::DelegationRequest,
         capability_enabled: bool,
         cancel: &CancelToken,
     ) -> Result<bool, KuramaError> {
@@ -1441,7 +1710,7 @@ impl EngineActor {
                 "model emitted delegation without an enabled parent capability".into(),
             ));
         }
-        let (orchestration_context, child_runner) = self
+        let (mut orchestration_context, child_runner) = self
             .orchestration
             .as_ref()
             .map(|orchestration| (orchestration.context.clone(), orchestration.runner.clone()))
@@ -1452,6 +1721,27 @@ impl EngineActor {
             self.agent_manager.as_ref().cloned().ok_or_else(|| {
                 KuramaError::Configuration("agent manager is not configured".into())
             })?;
+        // Parent and model paths share the explicit workspace base, including paths
+        // that do not exist yet. Only the cloned context is normalized.
+        for (owner, scope) in
+            std::iter::once(("parent", &mut orchestration_context.parent_write_scope)).chain(
+                request
+                    .agents
+                    .iter_mut()
+                    .map(|spec| ("child", &mut spec.write_scope)),
+            )
+        {
+            for path in scope.roots.iter_mut().chain(&mut scope.files) {
+                *path = crate::policy::canonical_candidate(path, &self.workspace_root).ok_or_else(
+                    || {
+                        KuramaError::Policy(format!(
+                            "cannot resolve {owner} write scope path {}",
+                            path.display()
+                        ))
+                    },
+                )?;
+            }
+        }
         let plan = self.orchestrator.resolve(request, &orchestration_context)?;
         let scheduled = !plan.ready.is_empty() || !plan.queued.is_empty();
         for spec in plan.ready.iter().chain(&plan.queued).chain(&plan.blocked) {
@@ -1466,6 +1756,10 @@ impl EngineActor {
                 result = &mut execution => break result?,
                 command = self.command_rx.recv() => {
                     match command {
+                        Some(EngineCommand::Steer { text, explicit_delegation }) => {
+                            self.queue_steering(text, explicit_delegation).await?;
+                        }
+                        Some(EngineCommand::InspectContext) => self.inspect_context().await?,
                         Some(EngineCommand::Agent(command)) => manager.command(command).await?,
                         Some(EngineCommand::ResolveApproval {
                             operation_id,
@@ -1529,6 +1823,13 @@ impl EngineActor {
                     operation_id,
                     response,
                 }) if &operation_id == expected_operation_id => return Ok(response),
+                Some(EngineCommand::Steer {
+                    text,
+                    explicit_delegation,
+                }) => {
+                    self.queue_steering(text, explicit_delegation).await?;
+                }
+                Some(EngineCommand::InspectContext) => self.inspect_context().await?,
                 Some(EngineCommand::ResolveApproval { .. }) => {
                     self.emit(RuntimeEvent::Error {
                         message: "approval request is no longer pending".into(),
@@ -1576,6 +1877,11 @@ impl EngineActor {
                 }
                 Err(KuramaError::Cancelled)
             }
+            Some(EngineCommand::Steer {
+                text,
+                explicit_delegation,
+            }) => self.queue_steering(text, explicit_delegation).await,
+            Some(EngineCommand::InspectContext) => self.inspect_context().await,
             Some(EngineCommand::Agent(command)) => self.agent_command(command).await,
             Some(EngineCommand::EditGoal { objective }) => self.edit_goal(objective).await,
             Some(EngineCommand::PauseGoal) => {
@@ -1621,36 +1927,33 @@ impl EngineActor {
         buffer: &mut String,
         flush_all: bool,
     ) -> Result<(), KuramaError> {
-        while buffer.len() >= 4_096 || (flush_all && !buffer.is_empty()) {
-            let requested = if flush_all {
-                buffer.len().min(4_096)
-            } else {
-                4_096
-            };
-            let mut boundary = requested;
+        let mut emitted = 0;
+        while buffer.len() - emitted >= ASSISTANT_DELTA_BYTES
+            || (flush_all && emitted < buffer.len())
+        {
+            let mut boundary = (emitted + ASSISTANT_DELTA_BYTES).min(buffer.len());
             while !buffer.is_char_boundary(boundary) {
                 boundary -= 1;
             }
-            let remainder = buffer.split_off(boundary);
-            let chunk = std::mem::replace(buffer, remainder);
-            self.emit(RuntimeEvent::AssistantDelta { text: chunk })
-                .await?;
+            let text = buffer[emitted..boundary].to_owned();
+            self.emit(RuntimeEvent::AssistantDelta { text }).await?;
+            emitted = boundary;
         }
+        // Move the remaining tail once, not once per emitted chunk.
+        buffer.drain(..emitted);
         Ok(())
     }
 
     async fn preserve_partial_assistant(
         &mut self,
-        round: &ModelRound,
+        round: ModelRound,
         runtime_buffer: &mut String,
     ) -> Result<(), KuramaError> {
         if round.text.is_empty() {
             return Ok(());
         }
         self.flush_deltas(runtime_buffer, true).await?;
-        self.append(SessionEvent::AssistantMessage {
-            text: round.text.clone(),
-        })?;
+        self.append(SessionEvent::AssistantMessage { text: round.text })?;
         Ok(())
     }
 
@@ -1662,19 +1965,18 @@ impl EngineActor {
                 })
                 .await;
         };
-        let input = serde_json::to_string(&compaction.events)
-            .map_err(|error| KuramaError::Protocol(error.to_string()))?;
         let request = ModelRequest {
             session_id: self.session_id.clone(),
             agent_id: self.agent_id.clone(),
             workspace_root: self.workspace_root.to_string_lossy().into_owned(),
             profile: self.profile.clone(),
             system: compaction.prompt,
-            items: vec![ModelItem::User { text: input }],
+            items: compaction.items,
             tools: Vec::new(),
             delegation: None,
             continuation: None,
         };
+        self.context.check_compaction_budget(&request)?;
         let cancel = CancelToken::new();
         let round = self.stream_round(request, &cancel).await?;
         let summary = normalize_compaction_json(&round.text)?;
@@ -1907,18 +2209,22 @@ impl EngineActor {
             .await
     }
 
-    fn append(&mut self, event: SessionEvent) -> Result<EventEnvelope, KuramaError> {
-        let envelope = EventEnvelope::new(
+    fn append(&mut self, event: SessionEvent) -> Result<(), KuramaError> {
+        let mut envelope = EventEnvelope::new(
             self.sequence,
             now_ms(),
             self.session_id.clone(),
             self.agent_id.clone(),
             event,
         );
-        self.store.append(&envelope)?;
-        self.sequence += 1;
-        self.context.record(envelope.clone());
-        Ok(envelope)
+        if self.agent_id.is_some() {
+            self.store.append_next(&mut envelope)?;
+        } else {
+            self.store.append(&envelope)?;
+        }
+        self.sequence = envelope.sequence.saturating_add(1);
+        self.context.record(envelope);
+        Ok(())
     }
 
     async fn emit(&self, event: RuntimeEvent) -> Result<(), KuramaError> {
@@ -1940,21 +2246,17 @@ impl EngineActor {
             write_scope: self.write_scope.clone(),
         }
     }
+}
 
-    fn latest_user_text(&self) -> Option<String> {
-        self.store
-            .replay(&self.session_id)
-            .ok()?
-            .into_iter()
-            .rev()
-            .find_map(|event| {
-                if let SessionEvent::UserMessage { text } = event.event {
-                    Some(text)
-                } else {
-                    None
-                }
-            })
-    }
+fn starts_command_batch(command: &EngineCommand) -> bool {
+    matches!(
+        command,
+        EngineCommand::SubmitTurn { .. }
+            | EngineCommand::Steer { .. }
+            | EngineCommand::Compact
+            | EngineCommand::SetGoal { .. }
+            | EngineCommand::ResumeGoal
+    )
 }
 
 fn queued_agent_snapshot(spec: &ResolvedAgentSpec) -> AgentSnapshot {
@@ -2028,13 +2330,20 @@ fn display_text(bytes: Vec<u8>) -> String {
     }
 }
 
-fn combined_tool_output(stdout: &str, stderr: &str) -> String {
-    match (stdout.is_empty(), stderr.is_empty()) {
+fn combined_tool_output(stdout: &str, stderr: &str, error_suffix: Option<&str>) -> String {
+    let mut output = match (stdout.is_empty(), stderr.is_empty()) {
         (false, true) => stdout.to_owned(),
         (true, false) => stderr.to_owned(),
         (true, true) => String::new(),
         (false, false) => format!("{stdout}\n[stderr]\n{stderr}"),
+    };
+    if let Some(suffix) = error_suffix {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(suffix);
     }
+    output
 }
 
 fn completed_tool_calls_for_active_turn(
@@ -2209,7 +2518,7 @@ fn attach_tool_name(result: &mut ToolResult, tool_name: &str) {
 
 fn operation_summary(operation: &Operation) -> String {
     match operation {
-        Operation::Read { path, .. } => format!("read {}", path.display()),
+        Operation::Read { .. } => format!("read {}", operation_context(operation)),
         Operation::Write { paths, .. } => format!("write {} path(s)", paths.len()),
         Operation::Bash { command, .. } => format!("run {command}"),
         Operation::WebSearch { query, .. } => format!("search for {query}"),
@@ -2219,8 +2528,7 @@ fn operation_summary(operation: &Operation) -> String {
 
 fn operation_context(operation: &Operation) -> String {
     match operation {
-        Operation::Read { path, .. } => path.display().to_string(),
-        Operation::Write { paths, .. } => paths
+        Operation::Read { paths, .. } | Operation::Write { paths, .. } => paths
             .iter()
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>()
@@ -2242,6 +2550,9 @@ fn operation_tool_name(operation: &Operation) -> &'static str {
 }
 
 fn is_transient(error: &KuramaError) -> bool {
+    if let KuramaError::Provider { retryable, .. } = error {
+        return *retryable;
+    }
     let KuramaError::Model(message) = error else {
         return false;
     };

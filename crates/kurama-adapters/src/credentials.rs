@@ -1,12 +1,11 @@
-use std::{
-    collections::BTreeMap,
-    fmt,
-    io::Write,
-    process::{Command, Stdio},
-};
+use std::{collections::BTreeMap, fmt};
 
 use kurama_protocol::{KuramaError, config::AuthRef};
 use zeroize::Zeroizing;
+
+#[cfg(all(feature = "native-credentials", target_os = "linux"))]
+#[path = "credentials/linux.rs"]
+mod linux_native;
 
 pub struct SecretValue(Zeroizing<String>);
 
@@ -17,6 +16,10 @@ impl SecretValue {
 
     pub fn expose(&self) -> &str {
         self.0.as_str()
+    }
+
+    pub fn into_zeroizing(self) -> Zeroizing<String> {
+        self.0
     }
 }
 
@@ -99,37 +102,38 @@ impl CredentialResolver {
             .transpose()
     }
 
+    /// Resolves a native credential synchronously. Linux subprocess work has a
+    /// ten-second deadline; macOS Security.framework may block for OS keychain
+    /// authorization and does not expose a cancellable operation or deadline.
     pub fn read_native(&self, service: &str, account: &str) -> Result<SecretValue, KuramaError> {
         validate_keychain_parts(service, account)?;
-        let output = match std::env::consts::OS {
-            "macos" => Command::new("security")
-                .args(["find-generic-password", "-s", service, "-a", account, "-w"])
-                .output(),
-            "linux" => Command::new("secret-tool")
-                .args(["lookup", "service", service, "account", account])
-                .output(),
-            _ => {
-                return Err(KuramaError::Configuration(
-                    "native keychain unavailable".into(),
-                ));
-            }
+        #[cfg(all(feature = "native-credentials", target_os = "macos"))]
+        {
+            let bytes = Zeroizing::new(
+                security_framework::passwords::generic_password(
+                    security_framework::passwords::PasswordOptions::new_generic_password(
+                        service, account,
+                    ),
+                )
+                .map_err(|_| KuramaError::Configuration("native keychain lookup failed".into()))?,
+            );
+            native_secret(&bytes, false)
         }
-        .map_err(|error| {
-            KuramaError::Configuration(format!("native keychain command failed: {error}"))
-        })?;
-
-        if !output.status.success() {
-            return Err(KuramaError::Configuration(format!(
-                "native keychain lookup failed with status {}",
-                output.status
-            )));
+        #[cfg(all(feature = "native-credentials", target_os = "linux"))]
+        {
+            linux_native::read(service, account)
         }
-        let value = String::from_utf8(output.stdout).map_err(|_| {
-            KuramaError::Configuration("native keychain returned non-UTF-8 secret".into())
-        })?;
-        non_empty_secret(trim_command_newline(value), "native keychain credential")
+        #[cfg(not(all(
+            feature = "native-credentials",
+            any(target_os = "macos", target_os = "linux")
+        )))]
+        Err(KuramaError::Configuration(
+            "native keychain unavailable".into(),
+        ))
     }
 
+    /// Stores secret bytes without placing them in command arguments. The same
+    /// synchronous OS authorization limitations as `read_native` apply.
     pub fn write_native(
         &self,
         service: &str,
@@ -143,71 +147,26 @@ impl CredentialResolver {
             ));
         }
 
-        let status = match std::env::consts::OS {
-            "macos" => Command::new("security")
-                .args([
-                    "add-generic-password",
-                    "-U",
-                    "-s",
-                    service,
-                    "-a",
-                    account,
-                    "-w",
-                    secret.expose(),
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status(),
-            "linux" => {
-                let mut child = Command::new("secret-tool")
-                    .args([
-                        "store",
-                        "--label=Kurama",
-                        "service",
-                        service,
-                        "account",
-                        account,
-                    ])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .map_err(|error| {
-                        KuramaError::Configuration(format!(
-                            "native keychain command failed: {error}"
-                        ))
-                    })?;
-                let write_result = child
-                    .stdin
-                    .take()
-                    .ok_or_else(|| {
-                        KuramaError::Configuration(
-                            "native keychain command stdin unavailable".into(),
-                        )
-                    })?
-                    .write_all(secret.expose().as_bytes());
-                let status = child.wait();
-                write_result?;
-                status
-            }
-            _ => {
-                return Err(KuramaError::Configuration(
-                    "native keychain unavailable".into(),
-                ));
-            }
+        #[cfg(all(feature = "native-credentials", target_os = "macos"))]
+        {
+            security_framework::passwords::set_generic_password(
+                service,
+                account,
+                secret.expose().as_bytes(),
+            )
+            .map_err(|_| KuramaError::Configuration("native keychain write failed".into()))
         }
-        .map_err(|error| {
-            KuramaError::Configuration(format!("native keychain command failed: {error}"))
-        })?;
-
-        if status.success() {
-            Ok(())
-        } else {
-            Err(KuramaError::Configuration(format!(
-                "native keychain write failed with status {status}"
-            )))
+        #[cfg(all(feature = "native-credentials", target_os = "linux"))]
+        {
+            linux_native::write(service, account, secret)
         }
+        #[cfg(not(all(
+            feature = "native-credentials",
+            any(target_os = "macos", target_os = "linux")
+        )))]
+        Err(KuramaError::Configuration(
+            "native keychain unavailable".into(),
+        ))
     }
 }
 
@@ -276,12 +235,93 @@ fn invalid_auth_ref() -> KuramaError {
     KuramaError::Configuration("auth must be env:NAME, keychain:SERVICE/ACCOUNT, or session".into())
 }
 
-fn trim_command_newline(mut value: String) -> String {
-    if value.ends_with('\n') {
-        value.pop();
-        if value.ends_with('\r') {
-            value.pop();
-        }
+#[cfg(any(
+    test,
+    all(
+        feature = "native-credentials",
+        any(target_os = "macos", target_os = "linux")
+    )
+))]
+fn native_secret(bytes: &[u8], command_newline: bool) -> Result<SecretValue, KuramaError> {
+    let value = std::str::from_utf8(bytes).map_err(|_| {
+        KuramaError::Configuration("native keychain returned non-UTF-8 secret".into())
+    })?;
+    let value = if command_newline {
+        value.strip_suffix('\n').unwrap_or(value)
+    } else {
+        value
+    };
+    let value = if command_newline && bytes.ends_with(b"\r\n") {
+        value.strip_suffix('\r').unwrap_or(value)
+    } else {
+        value
+    };
+    non_empty_secret(value.to_owned(), "native keychain credential")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_secret_decoding_preserves_api_bytes_and_trims_only_cli_terminator() {
+        assert_eq!(
+            native_secret(b"secret-value\r\n", false).unwrap().expose(),
+            "secret-value\r\n"
+        );
+        assert_eq!(
+            native_secret(b"secret-value\r\n", true).unwrap().expose(),
+            "secret-value"
+        );
+        assert_eq!(
+            native_secret(b"secret-value\n\n", true).unwrap().expose(),
+            "secret-value\n"
+        );
+        assert_eq!(
+            native_secret(b"secret-value\r", true).unwrap().expose(),
+            "secret-value\r"
+        );
+        assert!(native_secret(b"\r\n", true).is_err());
+        let error = native_secret(b"secret-value\xff", false).unwrap_err();
+        assert!(!error.to_string().contains("secret-value"));
+        assert!(!format!("{error:?}").contains("secret-value"));
     }
-    value
+
+    #[test]
+    fn invalid_native_requests_are_rejected_without_accessing_credentials() {
+        let resolver = CredentialResolver;
+        let secret = SecretValue::new("test-owned-secret".into());
+        assert!(resolver.read_native("invalid/service", "account").is_err());
+        assert!(
+            resolver
+                .write_native("service", "invalid/account", &secret)
+                .is_err()
+        );
+        assert!(
+            resolver
+                .write_native("service", "account", &SecretValue::new(String::new()))
+                .is_err()
+        );
+        assert!(!format!("{secret:?}").contains("test-owned-secret"));
+    }
+
+    #[cfg(not(feature = "native-credentials"))]
+    #[test]
+    fn native_requests_require_the_native_credentials_feature() {
+        let resolver = CredentialResolver;
+        assert!(
+            resolver
+                .read_native("test-service", "test-account")
+                .is_err()
+        );
+        assert!(
+            resolver
+                .write_native(
+                    "test-service",
+                    "test-account",
+                    &SecretValue::new("test-owned-secret".into())
+                )
+                .is_err()
+        );
+    }
 }

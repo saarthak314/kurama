@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use kurama_protocol::{
     KuramaError,
     agent::{AgentBudget, AgentSpec, DelegationRequest, WriteScope},
@@ -55,7 +57,7 @@ pub fn responses_input(request: &ModelRequest) -> Vec<Value> {
             } => json!({
                 "type": "function_call_output",
                 "call_id": call_id.as_ref(),
-                "output": if *is_error { format!("ERROR: {content}") } else { content.clone() }
+                "output": if *is_error { Cow::Owned(format!("ERROR: {content}")) } else { Cow::Borrowed(content.as_str()) }
             }),
             other => message("user", "input_text", &context_text(other)),
         })
@@ -63,8 +65,9 @@ pub fn responses_input(request: &ModelRequest) -> Vec<Value> {
 }
 
 #[cfg(feature = "openai-compatible")]
-pub fn chat_messages(request: &ModelRequest) -> Vec<Value> {
-    let mut messages = vec![json!({"role": "system", "content": request.system})];
+pub fn chat_messages(request: &ModelRequest, system: &str) -> Vec<Value> {
+    let mut messages = Vec::with_capacity(request.items.len() + 1);
+    messages.push(json!({"role": "system", "content": system}));
     messages.extend(request.items.iter().map(|item| match item {
         ModelItem::User { text } => json!({"role": "user", "content": text}),
         ModelItem::Assistant { text } => json!({"role": "assistant", "content": text}),
@@ -76,7 +79,7 @@ pub fn chat_messages(request: &ModelRequest) -> Vec<Value> {
         } => json!({
             "role": "tool",
             "tool_call_id": call_id.as_ref(),
-            "content": if *is_error { format!("ERROR: {content}") } else { content.clone() }
+            "content": if *is_error { Cow::Owned(format!("ERROR: {content}")) } else { Cow::Borrowed(content.as_str()) }
         }),
         other => json!({"role": "user", "content": context_text(other)}),
     }));
@@ -110,11 +113,7 @@ pub fn anthropic_messages(request: &ModelRequest) -> Vec<Value> {
         .collect()
 }
 
-#[cfg(any(
-    feature = "openai",
-    feature = "anthropic",
-    feature = "openai-compatible"
-))]
+#[cfg(feature = "openai")]
 pub fn responses_tools(tools: &[ToolDescriptor]) -> Vec<Value> {
     tools
         .iter()
@@ -132,15 +131,15 @@ pub fn responses_tools(tools: &[ToolDescriptor]) -> Vec<Value> {
 
 #[cfg(feature = "openai-compatible")]
 pub fn chat_tools(tools: &[ToolDescriptor]) -> Vec<Value> {
-    responses_tools(tools)
-        .into_iter()
+    tools
+        .iter()
         .map(|tool| {
             json!({
                 "type": "function",
                 "function": {
-                    "name": tool["name"],
-                    "description": tool["description"],
-                    "parameters": tool["parameters"],
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
                     "strict": true
                 }
             })
@@ -150,27 +149,27 @@ pub fn chat_tools(tools: &[ToolDescriptor]) -> Vec<Value> {
 
 #[cfg(feature = "anthropic")]
 pub fn anthropic_tools(tools: &[ToolDescriptor]) -> Vec<Value> {
-    responses_tools(tools)
-        .into_iter()
+    tools
+        .iter()
         .map(|tool| {
             json!({
-                "name": tool["name"],
-                "description": tool["description"],
-                "input_schema": tool["parameters"],
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.parameters,
                 "strict": true
             })
         })
         .collect()
 }
 
-pub fn provider_instructions(request: &ModelRequest) -> String {
+pub fn provider_instructions(request: &ModelRequest) -> Cow<'_, str> {
     let Some(delegation) = request.delegation.as_ref() else {
-        return request.system.clone();
+        return Cow::Borrowed(&request.system);
     };
-    format!(
+    Cow::Owned(format!(
         "{}\n\nDelegation is not a tool. To delegate, return exactly {DELEGATION_OPEN}JSON{DELEGATION_CLOSE} as the entire assistant text, with JSON matching this schema: {}. Do not add prose or Markdown around the control block. Kurama assigns child roles and profiles; dependencies must name exact prerequisite objective strings.",
         request.system, delegation.parameters
-    )
+    ))
 }
 
 pub fn normalize_delegation_events(
@@ -330,10 +329,4 @@ fn context_text(item: &ModelItem) -> String {
         }
         _ => unreachable!("message-like items are handled directly"),
     }
-}
-
-pub(crate) fn event_stream(
-    events: Vec<Result<kurama_protocol::model::ModelEvent, KuramaError>>,
-) -> kurama_protocol::traits::ModelStream {
-    Box::pin(futures_util::stream::iter(events))
 }

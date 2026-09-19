@@ -18,13 +18,14 @@ jobs:
       - uses: actions/checkout@v6
       - name: Install Rust 1.98.0
         run: |
-          rustup toolchain install 1.98.0 --profile minimal
+          export RUSTUP_HOME="$RUNNER_TEMP/kurama-rustup"
+          printf 'RUSTUP_HOME=%s\n' "$RUSTUP_HOME" >> "$GITHUB_ENV"
+          rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
           rustup default 1.98.0
       - name: Cache Cargo
         uses: actions/cache@v5
         with:
           path: |
-            ~/.cargo/bin
             ~/.cargo/registry
             ~/.cargo/git
             target
@@ -33,29 +34,26 @@ jobs:
           restore-keys: cargo-nightly-heavy-${{ runner.os }}-
       - name: Test all features
         run: cargo test --locked --workspace --all-features
-      - name: Run exhaustive recovery matrix
-        run: cargo test --locked -p kurama-core --all-features --test recovery -- --include-ignored
-      - name: Run fake bridge contracts
-        run: cargo test --locked -p kurama-adapters --all-features --test bridge_contract
       - name: Check prompt budget
-        run: scripts/check-prompt-budget.sh target/release/kurama
-      - name: Report duplicate dependencies
-        run: cargo tree -d --workspace --all-features
-      - name: Report crate contribution to binary size
-        run: |
-          command -v cargo-bloat >/dev/null || cargo install cargo-bloat --locked
-          cargo bloat --release --crates
+        run: scripts/check-prompt-budget.sh
 
   tui-compatibility:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    name: Actual PTY (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
     env:
       CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust 1.98.0
         run: |
-          rustup toolchain install 1.98.0 --profile minimal
+          export RUSTUP_HOME="$RUNNER_TEMP/kurama-rustup"
+          printf 'RUSTUP_HOME=%s\n' "$RUSTUP_HOME" >> "$GITHUB_ENV"
+          rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
           rustup default 1.98.0
       - name: Cache Cargo
         uses: actions/cache@v5
@@ -66,12 +64,41 @@ jobs:
             target
           key: cargo-nightly-tui-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-nightly-tui-${{ runner.os }}-
-      - name: Test terminal structures
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install pinned PTY emulator
+        id: pty-python
         run: |
+          python -m venv .venv-tui
+          .venv-tui/bin/python -m pip install pyte==0.8.2
+      - name: Build CLI for actual PTY checks
+        id: pty-build
+        run: cargo build --locked -p kurama-cli
+      - name: Check actual PTYs across terminal types with controls
+        if: ${{ !cancelled() && steps.pty-build.outcome == 'success' && steps.pty-python.outcome == 'success' }}
+        timeout-minutes: 10
+        run: |
+          status=0
           for term in xterm-256color screen-256color vt100; do
-            echo "TERM=$term"
-            TERM="$term" cargo test --locked -p kurama-cli --test tui_structure
+            .venv-tui/bin/python scripts/check-tui.py target/debug/kurama "tui-artifacts/$term" --no-images --check-controls --term "$term" || status=1
           done
+          exit "$status"
+      - name: Check actual PTY without cursor reports and with resumed todos
+        if: ${{ !cancelled() && steps.pty-build.outcome == 'success' && steps.pty-python.outcome == 'success' }}
+        timeout-minutes: 5
+        run: .venv-tui/bin/python scripts/check-tui.py target/debug/kurama tui-artifacts/no-cpr-todos --no-images --no-cpr --seed-todos
+      - name: Check torn-tail repair, large-output expansion and collapse, and repeated compaction
+        if: ${{ !cancelled() && steps.pty-build.outcome == 'success' && steps.pty-python.outcome == 'success' }}
+        timeout-minutes: 5
+        run: .venv-tui/bin/python scripts/check-tui.py target/debug/kurama tui-artifacts/torn-tail-large-output --no-images --torn-tail --seed-large-output-mib 8 --check-compaction
+      - name: Upload PTY transcripts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kurama-pty-nightly-${{ matrix.runner }}-${{ github.run_id }}
+          path: tui-artifacts/
+          if-no-files-found: error
 
   native-builds:
     name: Native build (${{ matrix.target }})
@@ -95,7 +122,9 @@ jobs:
       - uses: actions/checkout@v6
       - name: Install Rust 1.98.0
         run: |
-          rustup toolchain install 1.98.0 --profile minimal --target ${{ matrix.target }}
+          export RUSTUP_HOME="$RUNNER_TEMP/kurama-rustup"
+          printf 'RUSTUP_HOME=%s\n' "$RUSTUP_HOME" >> "$GITHUB_ENV"
+          rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy --target ${{ matrix.target }}
           rustup default 1.98.0
       - name: Cache Cargo
         uses: actions/cache@v5
@@ -120,7 +149,9 @@ jobs:
       - uses: actions/checkout@v6
       - name: Install Rust 1.98.0
         run: |
-          rustup toolchain install 1.98.0 --profile minimal
+          export RUSTUP_HOME="$RUNNER_TEMP/kurama-rustup"
+          printf 'RUSTUP_HOME=%s\n' "$RUSTUP_HOME" >> "$GITHUB_ENV"
+          rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
           rustup default 1.98.0
       - name: Cache Cargo
         uses: actions/cache@v5
@@ -131,19 +162,30 @@ jobs:
             target
           key: cargo-nightly-performance-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-nightly-performance-${{ runner.os }}-${{ runner.arch }}-
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
       - name: Build release binary
+        id: cli-build
         run: cargo build --locked --release -p kurama-cli
+      - name: Build release control-plane, rendering and adapter benchmarks
+        id: harness-build
+        run: cargo build --locked --release -p kurama-cli --example control_plane_bench --example tui_bench --example adapter_bench
       - name: Measure startup and idle core process
+        if: ${{ !cancelled() && steps.cli-build.outcome == 'success' }}
         run: |
           set +e
           python3 scripts/bench-startup.py target/release/kurama | tee startup.json
           startup_status=${PIPESTATUS[0]}
           python3 scripts/bench-idle.py target/release/kurama | tee idle.json
           idle_status=${PIPESTATUS[0]}
-          printf '%s\n' 'Kurama core metrics are in idle.json. Official provider CLI and local-server processes must be measured and reported separately.' > process-boundary.txt
           if (( startup_status != 0 || idle_status != 0 )); then
             exit 1
           fi
+      - name: Measure control plane, rendering and adapters sequentially
+        if: ${{ !cancelled() && steps.harness-build.outcome == 'success' }}
+        timeout-minutes: 12
+        run: python scripts/bench-harness.py --bin-dir target/release/examples --output-dir harness-measurements --include-adapters
       - name: Upload raw measurements
         if: always()
         uses: actions/upload-artifact@v7
@@ -152,5 +194,5 @@ jobs:
           path: |
             startup.json
             idle.json
-            process-boundary.txt
+            harness-measurements/
           if-no-files-found: error

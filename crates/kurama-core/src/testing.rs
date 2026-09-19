@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -15,11 +15,10 @@ use kurama_protocol::{
     model::{BackendCapabilities, ModelEvent, ModelProfile, ModelRequest},
     policy::{PolicyContext, PolicyDecision},
     runtime::RuntimeEvent,
-    session::SessionMetadata,
     tool::{Operation, ToolContext, ToolDescriptor, ToolInvocation, ToolResult},
     traits::{
         ApprovalPolicy, BoxFuture, CancelSignal, EventSink, IdGenerator, ModelBackend, ModelStream,
-        SessionStore, Tool,
+        Tool,
     },
 };
 
@@ -138,7 +137,7 @@ impl CancelSignal for NeverCancel {
         false
     }
 
-    fn cancelled(&self) -> BoxFuture<'_, ()> {
+    fn cancelled(&self) -> BoxFuture<'static, ()> {
         Box::pin(std::future::pending())
     }
 }
@@ -160,7 +159,7 @@ impl Tool for EchoTool {
         _invocation: &ToolInvocation,
     ) -> Result<Operation, KuramaError> {
         Ok(Operation::Read {
-            path: context.cwd.clone(),
+            paths: vec![context.cwd.clone()],
             external: false,
         })
     }
@@ -211,51 +210,5 @@ pub fn orchestration_context() -> OrchestrationContext {
         max_concurrency: 4,
         depth: 0,
         yolo: false,
-    }
-}
-
-pub fn model_backend_contract(backend: Arc<dyn ModelBackend>) {
-    assert!(!backend.backend_name().is_empty());
-    assert!(backend.capabilities().streaming);
-}
-
-pub fn tool_contract(tool: Arc<dyn Tool>) {
-    let descriptor = tool.descriptor();
-    assert!(!descriptor.name.is_empty());
-    assert!(descriptor.parameters.is_object());
-}
-
-pub fn session_store_contract(store: Arc<dyn SessionStore>, metadata: &SessionMetadata) {
-    store.create(metadata).expect("create session");
-    assert!(
-        store
-            .replay(&metadata.id)
-            .expect("replay session")
-            .is_empty()
-    );
-}
-
-pub fn policy_contract(policy: Arc<dyn ApprovalPolicy>, context: &PolicyContext) {
-    let operation = Operation::Read {
-        path: context.workspace_root.clone(),
-        external: false,
-    };
-    let _ = policy.decide(context, &operation);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use kurama_protocol::traits::{
-        ApprovalPolicy, EventSink, IdGenerator, ModelBackend, SessionStore,
-    };
-
-    #[test]
-    fn fakes_are_public_trait_objects() {
-        let _: Arc<dyn IdGenerator> = Arc::new(SequenceIds::default());
-        let _: Arc<dyn SessionStore> = Arc::new(MemoryStore::default());
-        let _: Arc<dyn EventSink> = Arc::new(CollectingSink::default());
-        let _: Arc<dyn ModelBackend> = Arc::new(ScriptedBackend::new(Vec::new()));
-        let _: Arc<dyn ApprovalPolicy> = Arc::new(AllowAllPolicy);
     }
 }

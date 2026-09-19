@@ -88,7 +88,7 @@ impl CancelSignal for NeverCancel {
         false
     }
 
-    fn cancelled(&self) -> BoxFuture<'_, ()> {
+    fn cancelled(&self) -> BoxFuture<'static, ()> {
         Box::pin(pending())
     }
 }
@@ -190,7 +190,9 @@ async fn read_supports_binary_byte_ranges_and_bounds_visible_output() {
     let bounded = bounded.finish();
     assert!(bounded.truncated);
     assert!(bounded.text.starts_with("head1"));
-    assert!(bounded.text.contains("omitted 19 bytes / 3 lines"));
+    assert_eq!(bounded.omitted_bytes, 19);
+    assert_eq!(bounded.omitted_lines, 3);
+    assert!(bounded.text.lines().count() <= 2);
     assert!(bounded.text.ends_with("tail2\n"));
     assert!(bounded.text.len() <= 64);
 }
@@ -213,19 +215,12 @@ fn bounded_output_marks_omissions_without_truncating_the_staged_blob() {
     let bounded = bounded.finish();
 
     assert!(bounded.truncated);
-    assert!(bounded.text.contains("omitted 19 bytes / 3 lines"));
+    assert_eq!(bounded.omitted_bytes, 19);
+    assert_eq!(bounded.omitted_lines, 3);
+    assert!(bounded.text.len() <= 64);
+    assert!(bounded.text.lines().count() <= 2);
     assert_eq!(fs::read(&staged_path).expect("staged output"), full_output);
     assert_eq!(bounded.blob_ref.expect("blob reference").bytes, 31);
-}
-
-#[test]
-fn bounded_output_does_not_preallocate_the_configured_ceiling() {
-    let output = BoundedOutput::new(ToolLimits {
-        max_bytes: usize::MAX,
-        max_lines: usize::MAX,
-    });
-
-    drop(output);
 }
 
 #[tokio::test]
@@ -461,4 +456,154 @@ fn html_extraction_drops_active_content_and_preserves_preformatted_lines() {
                 <style>hidden</style><ul><li>one</li><li>two &#x1F600; &amp; &#169;</li></ul>";
 
     assert_eq!(html_to_text(html), "A B\nx  y\nz\none\ntwo 😀 & ©");
+}
+
+#[test]
+fn read_approval_contains_every_internal_and_external_path() {
+    let fixture = Fixture::with_file("inside", b"in");
+    let outside_a = fixture._temp.path().join("outside-a");
+    let outside_b = fixture._temp.path().join("outside-b");
+    fs::write(&outside_a, b"a").expect("external a");
+    fs::write(&outside_b, b"b").expect("external b");
+    let call = invocation(
+        "read",
+        serde_json::json!({"files": [
+            {"path": "inside", "start_byte": 0, "end_byte": 1},
+            {"path": outside_a, "start_byte": 0, "end_byte": 1},
+            {"path": outside_b, "start_byte": 0, "end_byte": 1}
+        ]}),
+    );
+    let Operation::Read { paths, external } = ReadTool::default()
+        .classify(&fixture.context(normal_limits()), &call)
+        .expect("classify")
+    else {
+        panic!("expected read approval");
+    };
+    assert!(external);
+    assert_eq!(
+        paths,
+        vec![
+            fixture.path("inside").canonicalize().unwrap(),
+            outside_a.canonicalize().unwrap(),
+            outside_b.canonicalize().unwrap()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn selected_read_tracks_chunk_boundaries_and_full_file_utf8() {
+    let mut bytes = vec![b'a'; 65_535];
+    bytes.extend_from_slice("é\nselected\nlast".as_bytes());
+    let fixture = Fixture::with_file("text", &bytes);
+    let call = invocation(
+        "read",
+        serde_json::json!({"files": [{"path":"text", "start_line":2, "end_line":99}]}),
+    );
+    let result = ReadTool::default()
+        .execute(fixture.context(normal_limits()), call, &NeverCancel)
+        .await
+        .expect("selected read");
+    assert_eq!(result.output, "== text ==\nselected\nlast\n");
+    assert_eq!(
+        result.metadata["files"][0]["range"],
+        serde_json::json!({"kind":"lines", "start":2, "end":3})
+    );
+    assert_eq!(result.metadata["files"][0]["total_bytes"], bytes.len());
+    assert_eq!(result.metadata["files"][0]["utf8"], true);
+    bytes[0] = 0xff;
+    fs::write(fixture.path("text"), &bytes).expect("invalid byte outside selection");
+    let call = invocation(
+        "read",
+        serde_json::json!({"files": [{"path":"text", "start_line":2, "end_line":2}]}),
+    );
+    let result = ReadTool::default()
+        .execute(fixture.context(normal_limits()), call, &NeverCancel)
+        .await
+        .expect("selected invalid UTF-8 file");
+    assert_eq!(result.output, "== text ==\nselected\n");
+    assert_eq!(result.metadata["files"][0]["utf8"], false);
+}
+
+#[tokio::test]
+async fn cooperating_writes_accept_uppercase_hash_and_only_one_same_version_commit() {
+    let fixture = Fixture::with_file("file", b"old\n");
+    let expected = "01d09d19c2139a46aebfb577780d123d7396e97201bc7ead210a2ebff8239dee";
+    let tool = WriteTool::default();
+    let first = invocation(
+        "write",
+        serde_json::json!({"path":"file", "expected_sha256":expected.to_uppercase(), "content":"first"}),
+    );
+    let second = invocation(
+        "write",
+        serde_json::json!({"path":"file", "expected_sha256":expected.to_uppercase(), "content":"second"}),
+    );
+    let (first, second) = tokio::join!(
+        tool.execute(fixture.context(normal_limits()), first, &NeverCancel),
+        tool.execute(fixture.context(normal_limits()), second, &NeverCancel),
+    );
+    assert_ne!(first.is_ok(), second.is_ok());
+    let winner = if first.is_ok() {
+        b"first".as_slice()
+    } else {
+        b"second".as_slice()
+    };
+    assert_eq!(
+        fs::read(fixture.path("file")).expect("committed winner"),
+        winner
+    );
+    let failure = first.err().or_else(|| second.err()).expect("one conflict");
+    assert!(matches!(failure, KuramaError::Tool(_)));
+    let names: Vec<_> = fs::read_dir(&fixture.root)
+        .expect("workspace")
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("file")]);
+}
+
+struct WatchCancel(tokio::sync::watch::Receiver<bool>);
+
+impl CancelSignal for WatchCancel {
+    fn is_cancelled(&self) -> bool {
+        *self.0.borrow()
+    }
+    fn cancelled(&self) -> BoxFuture<'static, ()> {
+        let mut receiver = self.0.clone();
+        Box::pin(async move {
+            while !*receiver.borrow_and_update() {
+                if receiver.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancellation_while_waiting_for_writer_lock_leaves_original_unchanged() {
+    let fixture = Fixture::with_file("file", b"old\n");
+    let lock = fs::File::open(&fixture.root).expect("parent");
+    lock.lock().expect("hold transaction lock");
+    let (sender, receiver) = tokio::sync::watch::channel(false);
+    let cancel = WatchCancel(receiver);
+    let tool = WriteTool::default();
+    let call = invocation(
+        "write",
+        serde_json::json!({"path":"file", "expected_sha256":"01d09d19c2139a46aebfb577780d123d7396e97201bc7ead210a2ebff8239dee", "content":"new"}),
+    );
+    let write = tool.execute(fixture.context(normal_limits()), call, &cancel);
+    tokio::pin!(write);
+    tokio::select! {
+        result = &mut write => panic!("write bypassed locked parent: {result:?}"),
+        () = tokio::task::yield_now() => {},
+    }
+    sender.send(true).expect("cancel");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), &mut write)
+        .await
+        .expect("bounded cancellation");
+    assert!(matches!(result, Err(KuramaError::Cancelled)));
+    assert_eq!(
+        fs::read(fixture.path("file")).expect("unchanged original"),
+        b"old\n"
+    );
 }

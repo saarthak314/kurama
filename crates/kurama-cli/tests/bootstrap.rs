@@ -87,6 +87,7 @@ fn missing_configuration_opens_onboarding_without_a_runtime() {
             version,
             project,
             mode: ExecutionMode::Supervised,
+            ..
         }] if version == env!("CARGO_PKG_VERSION") && project.ends_with("/project")
     ));
 }
@@ -111,6 +112,7 @@ async fn configured_profile_composes_the_real_four_tool_runtime() {
             version,
             project,
             mode: ExecutionMode::Supervised,
+            ..
         }) if version == env!("CARGO_PKG_VERSION") && project.ends_with("/project")
     ));
     assert_eq!(App::tool_names(), ["bash", "read", "web-search", "write"]);
@@ -216,7 +218,7 @@ async fn resume_uses_the_recorded_profile() {
 }
 
 #[tokio::test]
-async fn resume_hydrates_the_visible_transcript_once() {
+async fn resume_previews_large_display_blob_and_expands_on_demand() {
     let (_temp, paths, project) = fixture();
     let repository = ConfigRepository::open(paths.clone()).expect("repository");
     repository
@@ -236,13 +238,18 @@ async fn resume_hydrates_the_visible_transcript_once() {
         redaction_best_effort: false,
     };
     store.create(&metadata).expect("create session");
+    let full_output = format!(
+        "head\nfull middle output\n{}tail\n",
+        "界🙂a\n".repeat(65_536)
+    );
     let output_blob = store
-        .put_blob(b"head\nfull middle output\ntail\n")
+        .put_blob(full_output.as_bytes())
         .expect("store output blob");
     for (sequence, event) in [
         SessionEvent::SessionStarted { metadata },
         SessionEvent::UserMessage {
             text: "inspect the parser".into(),
+            explicit_delegation: false,
         },
         SessionEvent::AssistantMessage {
             text: "checking it".into(),
@@ -251,7 +258,7 @@ async fn resume_hydrates_the_visible_transcript_once() {
             operation_id: OperationId::from("operation"),
             call_id: CallId::from("call"),
             operation: Operation::Read {
-                path: "parser.rs".into(),
+                paths: vec!["parser.rs".into()],
                 external: false,
             },
         },
@@ -325,6 +332,7 @@ async fn resume_hydrates_the_visible_transcript_once() {
                 version,
                 project,
                 mode: ExecutionMode::Supervised,
+                ..
             },
             TranscriptEntry::UserTurn { body: user },
             TranscriptEntry::AssistantMessage { body: assistant },
@@ -335,10 +343,44 @@ async fn resume_hydrates_the_visible_transcript_once() {
             && user == "inspect the parser"
             && assistant == "checking it"
             && tool.name == "read"
-            && tool.output == "head\nfull middle output\ntail\n"
+            && tool.output.len() <= 128 * 1_024
+            && !tool.output.contains("full middle output")
+            && !tool.output.contains('\u{fffd}')
+            && tool.output.ends_with("tail\n")
             && tool.lifecycle == ToolLifecycle::Completed
             && error == "provider disconnected"
     ));
+
+    let output = |app: &App| match &app.state.transcript[3] {
+        TranscriptEntry::ToolCall(tool) => tool.output.clone(),
+        _ => panic!("expected tool output"),
+    };
+    let preview = output(&app);
+    assert!(preview.contains("omitted"));
+    app.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL,
+    )))
+    .expect("expand transcript");
+    assert_eq!(output(&app), full_output);
+    app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .expect("collapse transcript");
+    assert_eq!(output(&app), preview);
+    if let TranscriptEntry::ToolCall(tool) = &app.state.transcript[3] {
+        assert!(tool.output.capacity() <= 128 * 1_024);
+    }
+    app.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL,
+    )))
+    .expect("reopen transcript");
+    assert_eq!(output(&app), full_output);
+    app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .expect("collapse transcript again");
+    assert_eq!(
+        store.get_blob(&output_blob).unwrap(),
+        full_output.as_bytes()
+    );
 
     app.state.apply_runtime_event(RuntimeEvent::AssistantDelta {
         text: "retrying now".into(),
@@ -464,7 +506,7 @@ async fn slash_palette_completes_selection_and_waits_for_required_arguments() {
 }
 
 #[tokio::test]
-async fn live_controls_list_context_persist_mode_and_switch_profile() {
+async fn live_controls_list_sessions_persist_mode_and_switch_profile() {
     let (_temp, paths, project) = fixture();
     let repository = ConfigRepository::open(paths.clone()).expect("repository");
     let mut config = bridge_config();
@@ -482,9 +524,6 @@ async fn live_controls_list_context_persist_mode_and_switch_profile() {
     let session_id = app.session_id().expect("session id").to_string();
 
     submit_command(&mut app, "/sessions");
-    assert!(transcript_has_notice(&app, &session_id));
-    submit_command(&mut app, "/context");
-    assert!(transcript_has_notice(&app, "100000 token input limit"));
     assert!(transcript_has_notice(&app, &session_id));
     submit_command(&mut app, "/mode auto");
     assert_eq!(
@@ -506,7 +545,7 @@ async fn live_controls_list_context_persist_mode_and_switch_profile() {
 }
 
 #[tokio::test]
-async fn normal_submit_queues_the_turn_and_sets_thinking() {
+async fn enter_starts_a_turn_then_steers_without_queueing_a_follow_up() {
     let (_temp, paths, project) = fixture();
     let repository = ConfigRepository::open(paths.clone()).expect("repository");
     repository
@@ -526,6 +565,13 @@ async fn normal_submit_queues_the_turn_and_sets_thinking() {
         app.state.sent_commands().last(),
         Some(EngineCommand::SubmitTurn { text, .. }) if text == "inspect the repository"
     ));
+    app.state.take_commands();
+    submit_command(&mut app, "change direction now");
+    assert_eq!(app.state.pending_turn_count(), 0);
+    assert!(
+        matches!(app.state.sent_commands(), [EngineCommand::Steer { text, .. }] if text == "change direction now")
+    );
+    assert!(!app.state.transcript.iter().any(|entry| matches!(entry, TranscriptEntry::UserTurn { body } if body == "change direction now")));
 }
 
 #[tokio::test]
@@ -540,8 +586,11 @@ async fn follow_up_turns_wait_for_the_active_turn_and_dispatch_in_order() {
             .expect("bootstrap");
     app.state.set_thinking();
 
-    submit_command(&mut app, "second turn");
-    submit_command(&mut app, "third turn");
+    for text in ["second turn", "third turn"] {
+        type_command(&mut app, text);
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)))
+            .expect("queue follow-up");
+    }
 
     assert_eq!(app.state.pending_turn_count(), 2);
     assert!(app.state.sent_commands().is_empty());
@@ -748,6 +797,7 @@ async fn at_sign_tab_completes_a_project_file() {
     let mut app =
         App::bootstrap_with_paths(&Args::default(), project, paths, SessionSecrets::default())
             .expect("bootstrap");
+    app.state.set_file_index(vec!["src/lib.rs".into()]);
 
     type_command(&mut app, "@lib");
     app.handle_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
@@ -819,6 +869,7 @@ async fn escape_dismisses_file_mentions_without_clearing_composer() {
     let mut app =
         App::bootstrap_with_paths(&Args::default(), project, paths, SessionSecrets::default())
             .expect("bootstrap");
+    app.state.set_file_index(vec!["src/lib.rs".into()]);
 
     type_command(&mut app, "@lib");
     assert!(

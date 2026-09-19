@@ -1,22 +1,24 @@
 use std::{
     collections::BTreeMap,
-    fmt,
-    io::{self, Write},
+    fmt, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crossterm::{
-    event::{Event, KeyCode, KeyEvent, KeyModifiers},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen},
+#[cfg(not(test))]
+use std::io::Write as _;
+
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use kurama_adapters::{
-    AppPaths, BashTool, ConfigRepository, CredentialResolver, FsSessionStore, HttpClient,
-    JsonSearchBackend, OpenAiNativeSearch, ProviderFactory, ReadTool, SearchBackend, SecretValue,
-    SessionSecrets, WebSearchTool, WriteTool,
+    AppPaths, BashTool, ClaudeNativeSearch, CodexNativeSearch, ConfigRepository,
+    CredentialResolver, FsSessionStore, HttpClient, JsonSearchBackend, OpenAiNativeSearch,
+    ProviderFactory, ReadTool, SearchBackend, SecretValue, SessionSecrets, WebSearchTool,
+    WriteTool,
 };
+use kurama_core::cancel::CancelToken;
 use kurama_protocol::{
     KuramaError,
     config::{
@@ -26,17 +28,14 @@ use kurama_protocol::{
     model::{ModelProfile, Usage},
     policy::{ApprovalResponse, AutoBoundaries, ExecutionMode},
     runtime::{EngineCommand, RuntimeEvent},
-    session::{BlobRef, EventEnvelope, SessionEvent, SessionMetadata},
+    session::{EventEnvelope, SessionEvent, SessionMetadata},
     traits::{EventSink, Orchestrator, SessionStore, Tool},
 };
 use kurama_sdk::{Agent, Events, Handle};
 use ratatui::{
-    Terminal, TerminalOptions, Viewport,
-    backend::{Backend, ClearType, CrosstermBackend},
-    layout::{Position, Rect},
-    style::Style,
-    text::Line,
-    widgets::{Block, Padding, Paragraph, Widget},
+    Terminal,
+    backend::{Backend, CrosstermBackend},
+    layout::Rect,
 };
 use tokio::sync::mpsc;
 
@@ -44,82 +43,238 @@ use crate::{
     args::{Args, ResumeChoice},
     commands::{Command, GoalAction, command_missing_required_arguments, parse_command},
     tui::{
-        CursorTrackingBackend, OnboardingState, OnboardingSubmission, Overlay, SURFACE,
-        SharedBackend, TerminalGuard, TranscriptDetail, TuiState, approval_height,
-        command_palette_height, composer_cursor_vertical, composer_height, main_area, queue_height,
-        render_with_transcript, spawn_input_thread, transcript_lines, visible_activity_rect,
+        ComposerSelection, DiffAction, DiffReview, OnboardingState, OnboardingSubmission, Overlay,
+        TerminalGuard, TranscriptDetail, TranscriptLine, TranscriptPoint, TranscriptSelection,
+        TuiState, command_palette_height, composer_cursor_at, composer_cursor_vertical, load_diff,
+        main_area, main_layout, next_grapheme_boundary, previous_grapheme_boundary,
+        render_with_transcript, spawn_input_thread, transcript_lines_with_entry_starts,
+        visible_activity_rect,
     },
 };
 
-#[cfg(test)]
-use crate::tui::render;
-
-const TRANSCRIPT_HORIZONTAL_PADDING: usize = 2;
-const MAX_TRANSCRIPT_INSERT_HEIGHT: usize = 1_024;
-const INLINE_VIEWPORT_MAX_HEIGHT: u16 = 12;
 const TOOL_EVENT_CAPACITY: usize = 64;
-const MAX_PASTE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const READY_EVENT_BATCH_LIMIT: usize = 128;
 const STREAM_REDRAW_INTERVAL: Duration = Duration::from_millis(33);
 const ACTIVITY_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
 struct TranscriptRenderCache {
-    width: Option<usize>,
-    lines: Vec<Line<'static>>,
+    key: Option<TranscriptCacheKey>,
+    lines: Vec<TranscriptLine>,
+    entry_starts: Vec<usize>,
+    viewport_height: u16,
+    last_assistant_entry: Option<usize>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TranscriptCacheKey {
+    width: usize,
+    revision: u64,
+    expanded: bool,
+    entries: usize,
 }
 
 impl TranscriptRenderCache {
-    fn invalidate(&mut self) {
-        self.width = None;
-        self.lines.clear();
-    }
-
-    fn prepare(&mut self, state: &TuiState, frame_area: Rect) {
-        if state.transcript_view_expanded() {
-            self.invalidate();
+    fn prepare(&mut self, state: &mut TuiState, frame_area: Rect) {
+        if frame_area.is_empty() {
+            state.transcript_selection = None;
             return;
         }
-
+        let expanded = state.transcript_view_expanded();
         let width = main_area(frame_area).width as usize;
-        if self.width == Some(width) {
+        let key = TranscriptCacheKey {
+            width,
+            revision: state.transcript_revision(),
+            expanded,
+            entries: state.transcript.len(),
+        };
+        let same_layout = self
+            .key
+            .is_some_and(|old| old.width == width && old.expanded == expanded);
+        if !same_layout || state.overlay() != Overlay::None {
+            state.transcript_selection = None;
+        }
+        let frozen = state
+            .transcript_selection
+            .as_ref()
+            .is_some_and(|selection| selection.dragging);
+        let viewport = if expanded {
+            frame_area
+                .height
+                .saturating_sub(u16::from(frame_area.height > 1))
+        } else {
+            main_layout(frame_area, state).transcript.height
+        };
+        state.transcript_width.set(width as u16);
+        state.viewport_height.set(viewport);
+        let previous_start = self
+            .lines
+            .len()
+            .saturating_sub(self.viewport_height as usize)
+            .saturating_sub(state.scroll);
+        if frozen {
+            // Keep the text under a held pointer stable while the engine continues running.
+            if viewport != self.viewport_height {
+                state.scroll = self
+                    .lines
+                    .len()
+                    .saturating_sub(viewport as usize)
+                    .saturating_sub(previous_start);
+            }
+            state.set_transcript_geometry(width as u16, self.lines.len(), &self.entry_starts);
+            self.viewport_height = viewport;
             return;
         }
-        self.lines = transcript_lines(state.live_transcript(), width, TranscriptDetail::Compact);
-        self.width = Some(width);
+        if self.key == Some(key) {
+            let max_scroll = self.lines.len().saturating_sub(viewport as usize);
+            if state.scroll > 0 && viewport != self.viewport_height {
+                state.scroll = max_scroll.saturating_sub(previous_start);
+            }
+            state.scroll = state.scroll.min(max_scroll);
+            self.viewport_height = viewport;
+            return;
+        }
+        state.transcript_selection = None;
+        let anchor = if self.key.is_some_and(|key| key.expanded == expanded) && state.scroll > 0 {
+            self.entry_starts
+                .partition_point(|&row| row <= previous_start)
+                .checked_sub(1)
+                .map(|entry| {
+                    (
+                        entry,
+                        previous_start.saturating_sub(self.entry_starts[entry]),
+                    )
+                })
+        } else {
+            None
+        };
+        let reuse = self
+            .key
+            .is_some_and(|old| old.width == width && old.expanded == expanded);
+        let mut retained = if reuse {
+            state
+                .transcript_dirty_from()
+                .min(state.transcript.len())
+                .min(self.entry_starts.len())
+        } else {
+            0
+        };
+        // A new answer makes the former latest answer gain its ending rule.
+        if reuse
+            && state
+                .transcript
+                .iter()
+                .skip(self.entry_starts.len())
+                .any(|entry| matches!(entry, crate::tui::TranscriptEntry::AssistantMessage { .. }))
+            && let Some(previous) = self.last_assistant_entry
+        {
+            retained = retained.min(previous);
+        }
+        let prefix_rows = self
+            .entry_starts
+            .get(retained)
+            .copied()
+            .unwrap_or(self.lines.len());
+        let (mut lines, starts) = transcript_lines_with_entry_starts(
+            &state.transcript[retained..],
+            width,
+            if expanded {
+                TranscriptDetail::Expanded
+            } else {
+                TranscriptDetail::Compact
+            },
+        );
+        if retained == 0 {
+            self.lines = lines;
+            self.entry_starts = starts;
+        } else {
+            self.lines.truncate(prefix_rows);
+            self.lines.append(&mut lines);
+            self.entry_starts.truncate(retained);
+            self.entry_starts
+                .extend(starts.into_iter().map(|row| prefix_rows + row));
+        }
+        if let Some((entry, offset)) = anchor {
+            let start = self
+                .entry_starts
+                .get(entry)
+                .map(|&start| {
+                    let end = self
+                        .entry_starts
+                        .get(entry + 1)
+                        .copied()
+                        .unwrap_or(self.lines.len());
+                    start + offset.min(end.saturating_sub(start).saturating_sub(1))
+                })
+                .unwrap_or(previous_start);
+            state.scroll = self
+                .lines
+                .len()
+                .saturating_sub(viewport as usize)
+                .saturating_sub(start);
+        }
+        state.set_transcript_geometry(width as u16, self.lines.len(), &self.entry_starts);
+        state.scroll = state
+            .scroll
+            .min(self.lines.len().saturating_sub(viewport as usize));
+        state.mark_transcript_rendered();
+        self.last_assistant_entry = state.transcript.iter().rposition(|entry| {
+            matches!(entry, crate::tui::TranscriptEntry::AssistantMessage { .. })
+        });
+        self.viewport_height = viewport;
+        self.key = Some(key);
     }
 
-    fn lines(&self) -> Option<&[Line<'static>]> {
-        self.width.map(|_| self.lines.as_slice())
+    fn point_at(
+        &self,
+        state: &TuiState,
+        area: Rect,
+        mouse: MouseEvent,
+        clamp: bool,
+    ) -> Option<TranscriptPoint> {
+        let mut view = main_area(area);
+        view.height = self.viewport_height;
+        if view.is_empty() || self.lines.is_empty() {
+            return None;
+        }
+        if !state.transcript_view_expanded() {
+            let layout = main_layout(area, state);
+            let palette_height =
+                command_palette_height(state, layout.input.y.saturating_sub(view.y));
+            if palette_height > 0
+                && mouse.row >= layout.input.y.saturating_sub(palette_height)
+                && mouse.row < layout.input.y
+            {
+                return None;
+            }
+        }
+        let inside = mouse.column >= view.x
+            && mouse.column < view.right()
+            && mouse.row >= view.y
+            && mouse.row < view.bottom();
+        if !clamp && !inside {
+            return None;
+        }
+        let column = mouse.column.clamp(view.x, view.right() - 1) - view.x;
+        let visible_row = mouse.row.clamp(view.y, view.bottom() - 1) - view.y;
+        let first = self
+            .lines
+            .len()
+            .saturating_sub(view.height as usize)
+            .saturating_sub(state.scroll);
+        let row = first.saturating_add(visible_row as usize);
+        if !clamp && row >= self.lines.len() {
+            return None;
+        }
+        Some(TranscriptPoint {
+            row: row.min(self.lines.len() - 1),
+            column: column as usize,
+        })
     }
-}
 
-#[derive(Clone, Copy)]
-struct ResizeMode {
-    replay: bool,
-    purge_history: bool,
-}
-
-#[derive(Default)]
-struct AltOverlay {
-    active: bool,
-    saved: Option<Rect>,
-}
-
-impl ResizeMode {
-    const PRESERVE: Self = Self {
-        replay: false,
-        purge_history: false,
-    };
-    const PURGE_AND_REPLAY: Self = Self {
-        replay: true,
-        purge_history: true,
-    };
-    #[cfg(test)]
-    const REPLAY: Self = Self {
-        replay: true,
-        purge_history: false,
-    };
+    fn lines(&self) -> Option<&[TranscriptLine]> {
+        self.key.map(|_| self.lines.as_slice())
+    }
 }
 
 pub struct App {
@@ -132,6 +287,36 @@ pub struct App {
     restart_args: Option<Args>,
     exit_requested: bool,
     control: Option<AppControl>,
+    link_tasks: tokio::task::JoinSet<Result<(), String>>,
+    diff_load: Option<DiffLoad>,
+}
+
+struct DiffLoad {
+    events: mpsc::Receiver<Result<DiffReview, String>>,
+    _tasks: tokio::task::JoinSet<()>,
+}
+
+struct FileIndexLoad {
+    cancel: CancelToken,
+    task: tokio::task::JoinHandle<Vec<String>>,
+}
+
+impl FileIndexLoad {
+    fn start(root: PathBuf) -> Self {
+        let cancel = CancelToken::new();
+        let worker_cancel = cancel.clone();
+        let task =
+            tokio::task::spawn_blocking(move || crate::tui::collect_files(&root, &worker_cancel));
+        Self { cancel, task }
+    }
+}
+
+impl Drop for FileIndexLoad {
+    fn drop(&mut self) {
+        // Abort handles queued work; the token also stops an already-running scan.
+        self.cancel.cancel();
+        self.task.abort();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -414,22 +599,15 @@ impl App {
             mode,
             redaction_best_effort: mode == ExecutionMode::Yolo,
         };
-        let transcript_replay = replay_for_transcript(&replay, store.as_ref());
-        let (engine, runtime_events) = agent
-            .launch(metadata, replay)
-            .map_err(|error| error.to_string())?;
 
         repository
-            .remember_project_profile(&project, &active_profile)
+            .remember_session(
+                &project,
+                &active_profile,
+                &session_id,
+                (mode != ExecutionMode::Yolo).then_some(mode),
+            )
             .map_err(|error| error.to_string())?;
-        repository
-            .remember_latest_session(&project, &session_id)
-            .map_err(|error| error.to_string())?;
-        if mode != ExecutionMode::Yolo {
-            repository
-                .remember_mode(mode)
-                .map_err(|error| error.to_string())?;
-        }
 
         let mut state = TuiState::new(
             active_profile,
@@ -437,8 +615,13 @@ impl App {
             project.display().to_string(),
             mode,
         );
+        state.set_composer_session(&session_id);
         state.max_input_tokens = active.max_input_tokens;
-        state.hydrate_replay(&transcript_replay);
+        state.set_display_store(Arc::clone(&store));
+        state.hydrate_replay(&replay);
+        let (engine, runtime_events) = agent
+            .launch(metadata, replay)
+            .map_err(|error| error.to_string())?;
         state.refresh_git_branch();
         state.prepend_startup(env!("CARGO_PKG_VERSION"), startup_project);
         if resumed_yolo {
@@ -456,6 +639,8 @@ impl App {
             session_id: Some(session_id),
             restart_args: None,
             exit_requested: false,
+            link_tasks: tokio::task::JoinSet::new(),
+            diff_load: None,
             control: Some(AppControl {
                 project,
                 paths,
@@ -470,11 +655,12 @@ impl App {
     }
 
     pub fn from_runtime(
-        state: TuiState,
+        mut state: TuiState,
         engine: Handle,
         orchestrator: Arc<dyn Orchestrator>,
         session_id: SessionId,
     ) -> Self {
+        state.set_composer_session(&session_id);
         Self {
             state,
             engine: Some(engine),
@@ -485,6 +671,8 @@ impl App {
             restart_args: None,
             exit_requested: false,
             control: None,
+            link_tasks: tokio::task::JoinSet::new(),
+            diff_load: None,
         }
     }
 
@@ -499,6 +687,8 @@ impl App {
             restart_args: None,
             exit_requested: false,
             control: Some(control),
+            link_tasks: tokio::task::JoinSet::new(),
+            diff_load: None,
         }
     }
 
@@ -528,12 +718,8 @@ impl App {
 
     pub async fn run(mut self) -> Result<Option<ExitSummary>, String> {
         let _guard = TerminalGuard::enter().map_err(|error| error.to_string())?;
-        purge_terminal_history().map_err(|error| error.to_string())?;
-        let backend = SharedBackend::new(CursorTrackingBackend::new(CrosstermBackend::new(
-            io::stdout(),
-        )));
-        let mut terminal =
-            initialize_inline_terminal(backend).map_err(|error| error.to_string())?;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).map_err(|error| error.to_string())?;
         let mut input = spawn_input_thread(32);
         loop {
             let runtime_events = self.runtime_events.take();
@@ -544,12 +730,9 @@ impl App {
                 &mut input,
                 runtime_events,
                 tool_events,
-                true,
-                ResizeMode::PURGE_AND_REPLAY,
             )
             .await?;
             let Some(args) = self.restart_args.take() else {
-                clear_inline_terminal(&mut terminal).map_err(|error| error.to_string())?;
                 return Ok(self.exit_requested.then(|| self.exit_summary()).flatten());
             };
             let control = self
@@ -565,8 +748,243 @@ impl App {
         }
     }
 
+    fn accepts_event(&self, event: &Event) -> bool {
+        let key = match event {
+            Event::Mouse(mouse) => {
+                return self.state.overlay() == Overlay::None
+                    && matches!(
+                        mouse.kind,
+                        MouseEventKind::ScrollUp
+                            | MouseEventKind::ScrollDown
+                            | MouseEventKind::Down(MouseButton::Left)
+                            | MouseEventKind::Drag(MouseButton::Left)
+                            | MouseEventKind::Up(MouseButton::Left)
+                    );
+            }
+            Event::Resize(..) => return true,
+            Event::Paste(text) => {
+                return !text.is_empty()
+                    && (matches!(
+                        self.state.overlay(),
+                        Overlay::ApprovalEdit | Overlay::Onboarding | Overlay::AgentMessage
+                    ) || (self.state.overlay() == Overlay::None
+                        && !self.state.transcript_view_expanded()));
+            }
+            Event::Key(key) if key.kind != KeyEventKind::Release => key,
+            _ => return false,
+        };
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('c') => return true,
+                KeyCode::Char('o') => return self.state.overlay() == Overlay::None,
+                _ if self.state.overlay() == Overlay::None
+                    && !self.state.transcript_view_expanded() =>
+                {
+                    return if self.state.history_search_active() {
+                        key.code == KeyCode::Char('r')
+                    } else {
+                        matches!(
+                            key.code,
+                            KeyCode::Char(
+                                'a' | 'e' | 'k' | 'u' | 'w' | 'j' | 'l' | 't' | 'r' | 'd'
+                            )
+                        )
+                    };
+                }
+                _ => {}
+            }
+        }
+        if self.state.transcript_view_expanded() {
+            return matches!(
+                key.code,
+                KeyCode::Esc
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::Tab
+                    | KeyCode::BackTab
+                    | KeyCode::Enter
+                    | KeyCode::Char('y')
+                    | KeyCode::Char('{' | '}')
+            );
+        }
+        match self.state.overlay() {
+            Overlay::None => matches!(
+                key.code,
+                KeyCode::Char(_)
+                    | KeyCode::Backspace
+                    | KeyCode::Delete
+                    | KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::Enter
+                    | KeyCode::Esc
+                    | KeyCode::Tab
+                    | KeyCode::BackTab
+            ),
+            Overlay::Diff => matches!(
+                key.code,
+                KeyCode::Esc
+                    | KeyCode::Enter
+                    | KeyCode::Char('n' | 'p')
+                    | KeyCode::Tab
+                    | KeyCode::BackTab
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
+            ),
+            Overlay::Context => matches!(
+                key.code,
+                KeyCode::Esc
+                    | KeyCode::Char('r')
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
+            ),
+            Overlay::Queue => matches!(
+                key.code,
+                KeyCode::Esc
+                    | KeyCode::Enter
+                    | KeyCode::Delete
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::Char('s')
+            ),
+            Overlay::Todos => matches!(
+                key.code,
+                KeyCode::Esc
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+            ),
+            Overlay::Shortcuts => {
+                matches!(
+                    key.code,
+                    KeyCode::Esc
+                        | KeyCode::Enter
+                        | KeyCode::Char('?')
+                        | KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                        | KeyCode::Home
+                        | KeyCode::End
+                )
+            }
+            Overlay::Agents => matches!(
+                key.code,
+                KeyCode::Esc
+                    | KeyCode::Enter
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Char('m' | 'x')
+            ),
+            Overlay::AgentInspect => matches!(
+                key.code,
+                KeyCode::Esc
+                    | KeyCode::Char('m' | 'x')
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
+            ),
+            Overlay::ConfirmAgentCancel => {
+                matches!(key.code, KeyCode::Esc | KeyCode::Char('y' | 'n'))
+            }
+            Overlay::AgentMessage => {
+                matches!(
+                    key.code,
+                    KeyCode::Esc
+                        | KeyCode::Enter
+                        | KeyCode::Backspace
+                        | KeyCode::Delete
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::Home
+                        | KeyCode::End
+                ) || matches!(key.code, KeyCode::Char(_))
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+            }
+            Overlay::Approval => {
+                matches!(key.code, KeyCode::Esc | KeyCode::Up | KeyCode::Down)
+                    || key.modifiers.is_empty()
+                        && matches!(
+                            key.code,
+                            KeyCode::Enter | KeyCode::Char('a' | 's' | 'd' | 'e')
+                        )
+            }
+            Overlay::ApprovalEdit => {
+                matches!(
+                    key.code,
+                    KeyCode::Esc
+                        | KeyCode::Enter
+                        | KeyCode::Backspace
+                        | KeyCode::Delete
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::Home
+                        | KeyCode::End
+                        | KeyCode::Up
+                        | KeyCode::Down
+                ) || matches!(key.code, KeyCode::Char(_))
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            }
+            Overlay::Onboarding => matches!(
+                key.code,
+                KeyCode::Char(_)
+                    | KeyCode::Backspace
+                    | KeyCode::Delete
+                    | KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::Enter
+                    | KeyCode::Esc
+                    | KeyCode::Up
+                    | KeyCode::Down
+            ),
+        }
+    }
+
     pub fn handle_event(&mut self, event: Event) -> Result<bool, String> {
         let key = match event {
+            Event::Mouse(mouse) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        self.state.scroll_transcript(3);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        self.state.scroll_transcript(-3);
+                    }
+                    _ => {}
+                }
+                return Ok(false);
+            }
             Event::Paste(text) => {
                 match self.state.overlay {
                     Overlay::None if self.state.history_search_active() => {
@@ -577,6 +995,7 @@ impl App {
                         }
                     }
                     Overlay::None if !self.state.transcript_view_expanded() => {
+                        self.state.delete_composer_selection();
                         self.ingest_composer_paste(&text);
                     }
                     Overlay::ApprovalEdit => self.state.insert_approval_text(&text),
@@ -586,7 +1005,7 @@ impl App {
                 }
                 return Ok(false);
             }
-            Event::Key(key) => key,
+            Event::Key(key) if key.kind != KeyEventKind::Release => key,
             _ => return Ok(false),
         };
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -604,27 +1023,27 @@ impl App {
                 KeyCode::Esc => self.state.toggle_transcript_view(),
                 KeyCode::Up => self.state.scroll = self.state.scroll.saturating_add(1),
                 KeyCode::Down => self.state.scroll = self.state.scroll.saturating_sub(1),
-                KeyCode::PageUp => self.state.scroll = self.state.scroll.saturating_add(5),
-                KeyCode::PageDown => self.state.scroll = self.state.scroll.saturating_sub(5),
-                KeyCode::Home => {
-                    let width = self.state.composer_inner_width.get().max(8) as usize;
-                    let rendered = crate::tui::transcript_lines(
-                        &self.state.transcript,
-                        width,
-                        crate::tui::TranscriptDetail::Expanded,
-                    );
-                    let viewport = self.state.viewport_height.get().max(1) as usize;
-                    self.state.scroll = rendered.len().saturating_sub(viewport);
+                KeyCode::PageUp => {
+                    self.state.scroll = self.state.scroll.saturating_add(
+                        self.state.viewport_height.get().saturating_sub(1).max(1) as usize,
+                    )
                 }
+                KeyCode::PageDown => {
+                    self.state.scroll = self.state.scroll.saturating_sub(
+                        self.state.viewport_height.get().saturating_sub(1).max(1) as usize,
+                    )
+                }
+                KeyCode::Home => self.state.scroll = self.state.max_transcript_scroll(),
                 KeyCode::End => self.state.scroll = 0,
                 KeyCode::Char('{') => self
                     .state
-                    .jump_user_turn(-1, self.state.composer_inner_width.get().max(8) as usize),
+                    .jump_user_turn(-1, self.state.transcript_width.get() as usize),
                 KeyCode::Char('}') => self
                     .state
-                    .jump_user_turn(1, self.state.composer_inner_width.get().max(8) as usize),
+                    .jump_user_turn(1, self.state.transcript_width.get() as usize),
                 _ => {}
             }
+            self.state.scroll = self.state.scroll.min(self.state.max_transcript_scroll());
             return Ok(false);
         }
         match self.state.overlay {
@@ -634,14 +1053,90 @@ impl App {
             | Overlay::AgentInspect
             | Overlay::AgentMessage
             | Overlay::ConfirmAgentCancel => self.handle_agents_key(key),
-            Overlay::Todos => {
-                if key.code == KeyCode::Esc {
-                    self.state.close_overlay();
+            Overlay::Diff => {
+                let action = self.state.diff_review.as_mut().map_or_else(
+                    || {
+                        if key.code == KeyCode::Esc {
+                            DiffAction::Close
+                        } else {
+                            DiffAction::None
+                        }
+                    },
+                    |review| review.handle_key(key),
+                );
+                match action {
+                    DiffAction::None => {}
+                    DiffAction::Close => {
+                        self.diff_load = None;
+                        self.state.diff_loading = false;
+                        self.state.close_overlay();
+                    }
+                    DiffAction::Feedback(text) => self.state.begin_diff_feedback(text),
                 }
+            }
+            Overlay::Context => match key.code {
+                KeyCode::Esc => self.state.close_overlay(),
+                KeyCode::Char('r') => self.request_context_inspection(),
+                code => self.state.context_view.handle_key(code),
+            },
+            Overlay::Queue => match key.code {
+                KeyCode::Esc => self.state.close_overlay(),
+                KeyCode::Up => {
+                    self.state.selected_follow_up = self.state.selected_follow_up.saturating_sub(1)
+                }
+                KeyCode::Down => {
+                    self.state.selected_follow_up = self
+                        .state
+                        .selected_follow_up
+                        .saturating_add(1)
+                        .min(self.state.pending_turn_count().saturating_sub(1))
+                }
+                KeyCode::Home => self.state.selected_follow_up = 0,
+                KeyCode::End => {
+                    self.state.selected_follow_up =
+                        self.state.pending_turn_count().saturating_sub(1)
+                }
+                KeyCode::Enter => self.state.edit_selected_follow_up(),
+                KeyCode::Delete => self.state.remove_selected_follow_up(),
+                KeyCode::Char('s') => self.state.resume_follow_ups(),
+                _ => {}
+            },
+            Overlay::Todos => {
+                let page = self.state.viewport_height.get().saturating_sub(1).max(1) as usize;
+                self.state.selected_todo = match key.code {
+                    KeyCode::Esc => {
+                        self.state.close_overlay();
+                        self.state.selected_todo
+                    }
+                    KeyCode::Up => self.state.selected_todo.saturating_sub(1),
+                    KeyCode::Down => self.state.selected_todo.saturating_add(1),
+                    KeyCode::PageUp => self.state.selected_todo.saturating_sub(page),
+                    KeyCode::PageDown => self.state.selected_todo.saturating_add(page),
+                    KeyCode::Home => 0,
+                    KeyCode::End => self.state.todos.len().saturating_sub(1),
+                    _ => self.state.selected_todo,
+                }
+                .min(self.state.todos.len().saturating_sub(1));
             }
             Overlay::Shortcuts => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter) {
                     self.state.close_overlay();
+                } else {
+                    let current = self.state.shortcuts_scroll.get();
+                    let max = self.state.shortcuts_max_scroll.get();
+                    let page = self.state.shortcuts_page_height.get();
+                    self.state.shortcuts_scroll.set(
+                        match key.code {
+                            KeyCode::Up => current.saturating_sub(1),
+                            KeyCode::Down => current.saturating_add(1),
+                            KeyCode::PageUp => current.saturating_sub(page),
+                            KeyCode::PageDown => current.saturating_add(page),
+                            KeyCode::Home => 0,
+                            KeyCode::End => max,
+                            _ => current,
+                        }
+                        .min(max),
+                    );
                 }
             }
             Overlay::None => self.handle_main_key(key)?,
@@ -650,6 +1145,13 @@ impl App {
     }
 
     fn handle_ctrl_c(&mut self) -> bool {
+        if matches!(
+            self.state.overlay(),
+            Overlay::Approval | Overlay::ApprovalEdit
+        ) {
+            self.state.interrupt_active();
+            return false;
+        }
         if self.state.overlay() == Overlay::Onboarding {
             self.state.onboarding = OnboardingState::new();
             self.state.overlay = Overlay::None;
@@ -660,11 +1162,21 @@ impl App {
             Overlay::Shortcuts
                 | Overlay::Agents
                 | Overlay::Todos
+                | Overlay::Diff
+                | Overlay::Context
+                | Overlay::Queue
                 | Overlay::AgentInspect
                 | Overlay::AgentMessage
                 | Overlay::ConfirmAgentCancel
         ) {
+            if self.state.overlay() == Overlay::Diff {
+                self.diff_load = None;
+                self.state.diff_loading = false;
+            }
             self.state.close_overlay();
+            return false;
+        }
+        if self.state.restore_composer_draft() {
             return false;
         }
         if self.state.interrupt_active() {
@@ -680,6 +1192,7 @@ impl App {
     }
 
     fn handle_main_key(&mut self, key: KeyEvent) -> Result<(), String> {
+        self.state.normalize_composer_cursor();
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             if self.state.history_search_active() {
                 if key.code == KeyCode::Char('r') {
@@ -690,10 +1203,23 @@ impl App {
             match key.code {
                 KeyCode::Char('a') => self.state.cursor_home(),
                 KeyCode::Char('e') => self.state.cursor_end(),
-                KeyCode::Char('k') => self.state.kill_to_end(),
-                KeyCode::Char('u') => self.state.kill_to_start(),
-                KeyCode::Char('w') => self.state.kill_previous_word(),
+                KeyCode::Char('k') => {
+                    if !self.state.delete_composer_selection() {
+                        self.state.kill_to_end();
+                    }
+                }
+                KeyCode::Char('u') => {
+                    if !self.state.delete_composer_selection() {
+                        self.state.kill_to_start();
+                    }
+                }
+                KeyCode::Char('w') => {
+                    if !self.state.delete_composer_selection() {
+                        self.state.kill_previous_word();
+                    }
+                }
                 KeyCode::Char('j') => {
+                    self.state.delete_composer_selection();
                     self.state.composer.insert(self.state.cursor, '\n');
                     self.state.cursor += 1;
                     self.state.composer_edited();
@@ -701,17 +1227,13 @@ impl App {
                 KeyCode::Char('l') => self.state.scroll = 0,
                 KeyCode::Char('t') => self.state.toggle_todos(),
                 KeyCode::Char('r') => self.state.start_history_search(),
+                KeyCode::Char('d') if self.state.delete_composer_selection() => {}
                 KeyCode::Char('d') => {
                     if self.state.composer.is_empty() {
                         self.exit_requested = true;
                         self.state.queue_command(EngineCommand::Shutdown);
                     } else if self.state.cursor < self.state.composer.len() {
-                        let next = self.state.cursor
-                            + self.state.composer[self.state.cursor..]
-                                .chars()
-                                .next()
-                                .map(char::len_utf8)
-                                .unwrap_or(0);
+                        let next = next_grapheme_boundary(&self.state.composer, self.state.cursor);
                         self.state.composer.drain(self.state.cursor..next);
                         self.state.composer_edited();
                     }
@@ -726,82 +1248,83 @@ impl App {
         }
         match key.code {
             KeyCode::BackTab => self.cycle_mode()?,
-            KeyCode::Home => self.state.cursor_home(),
-            KeyCode::End => self.state.cursor_end(),
+            KeyCode::Home => self.state.cursor_line_home(),
+            KeyCode::End => self.state.cursor_line_end(),
             KeyCode::Char('?') if self.state.composer.is_empty() => {
                 self.state.open_shortcuts();
             }
             KeyCode::Char(character) => {
+                self.state.delete_composer_selection();
                 self.state.composer.insert(self.state.cursor, character);
                 self.state.cursor += character.len_utf8();
                 self.state.composer_edited();
             }
+            KeyCode::Backspace | KeyCode::Delete if self.state.delete_composer_selection() => {}
             KeyCode::Backspace if self.state.cursor > 0 => {
-                let previous = self.state.composer[..self.state.cursor]
-                    .char_indices()
-                    .last()
-                    .map(|(index, _)| index)
-                    .unwrap_or(0);
+                let previous = previous_grapheme_boundary(&self.state.composer, self.state.cursor);
                 self.state.composer.drain(previous..self.state.cursor);
                 self.state.cursor = previous;
                 self.state.composer_edited();
             }
             KeyCode::Delete if self.state.cursor < self.state.composer.len() => {
-                let next = self.state.cursor
-                    + self.state.composer[self.state.cursor..]
-                        .chars()
-                        .next()
-                        .map(char::len_utf8)
-                        .unwrap_or(0);
+                let next = next_grapheme_boundary(&self.state.composer, self.state.cursor);
                 self.state.composer.drain(self.state.cursor..next);
                 self.state.composer_edited();
             }
             KeyCode::Left => {
-                self.state.cursor = self.state.composer[..self.state.cursor]
-                    .char_indices()
-                    .last()
-                    .map(|(index, _)| index)
-                    .unwrap_or(0);
+                if let Some(range) = self
+                    .state
+                    .composer_selection
+                    .take()
+                    .and_then(|selection| selection.range(&self.state.composer))
+                {
+                    self.state.cursor = range.start;
+                } else {
+                    self.state.cursor =
+                        previous_grapheme_boundary(&self.state.composer, self.state.cursor);
+                }
             }
-            KeyCode::Right if self.state.cursor < self.state.composer.len() => {
-                self.state.cursor += self.state.composer[self.state.cursor..]
-                    .chars()
-                    .next()
-                    .map(char::len_utf8)
-                    .unwrap_or(0);
+            KeyCode::Right => {
+                if let Some(range) = self
+                    .state
+                    .composer_selection
+                    .take()
+                    .and_then(|selection| selection.range(&self.state.composer))
+                {
+                    self.state.cursor = range.end;
+                } else if self.state.cursor < self.state.composer.len() {
+                    self.state.cursor =
+                        next_grapheme_boundary(&self.state.composer, self.state.cursor);
+                }
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.state.delete_composer_selection();
                 self.state.composer.insert(self.state.cursor, '\n');
                 self.state.cursor += 1;
                 self.state.composer_edited();
             }
-            KeyCode::Up if self.state.select_previous_file() => {}
-            KeyCode::Up if self.state.select_previous_command() => {}
-            KeyCode::Up => {
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.submit_composer_with_mode(true)?;
+            }
+            KeyCode::Up | KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
                 if let Some(cursor) = composer_cursor_vertical(
                     &self.state.composer,
                     self.state.cursor,
-                    self.state.composer_inner_width.get().max(4) as usize,
-                    -1,
+                    self.state.composer_inner_width.get() as usize,
+                    if key.code == KeyCode::Up { -1 } else { 1 },
                 ) {
                     self.state.cursor = cursor;
-                } else {
-                    self.state.history_previous();
                 }
+            }
+            KeyCode::Up if self.state.select_previous_file() => {}
+            KeyCode::Up if self.state.select_previous_command() => {}
+            KeyCode::Up => {
+                self.state.history_previous();
             }
             KeyCode::Down if self.state.select_next_file() => {}
             KeyCode::Down if self.state.select_next_command() => {}
             KeyCode::Down => {
-                if let Some(cursor) = composer_cursor_vertical(
-                    &self.state.composer,
-                    self.state.cursor,
-                    self.state.composer_inner_width.get().max(4) as usize,
-                    1,
-                ) {
-                    self.state.cursor = cursor;
-                } else {
-                    self.state.history_next();
-                }
+                self.state.history_next();
             }
             KeyCode::Tab if self.state.complete_selected_file() => {}
             KeyCode::Tab if self.state.selected_command().is_some() => {
@@ -819,11 +1342,10 @@ impl App {
                 }
                 self.submit_composer()?;
             }
+            KeyCode::Esc if self.state.restore_composer_draft() => {}
             KeyCode::Esc if self.state.cancel_history_search() => {}
             KeyCode::Esc if !self.state.dismiss_command_palette() => {
-                if !self.state.interrupt_active() {
-                    self.state.pop_queued_follow_up();
-                }
+                self.state.interrupt_active();
             }
             KeyCode::Esc => {}
             _ => {}
@@ -832,7 +1354,24 @@ impl App {
     }
 
     fn submit_composer(&mut self) -> Result<(), String> {
-        if command_missing_required_arguments(&self.state.composer) {
+        self.submit_composer_with_mode(false)
+    }
+
+    fn submit_composer_with_mode(&mut self, queue: bool) -> Result<(), String> {
+        let editing_follow_up = self.state.editing_follow_up();
+        let editing_feedback = self.state.editing_feedback();
+        if editing_follow_up {
+            let text = self.state.composer.trim().to_owned();
+            if !text.is_empty() {
+                let explicit_delegation = self
+                    .orchestrator
+                    .as_ref()
+                    .is_some_and(|orchestrator| orchestrator.explicit_delegation(&text));
+                self.state.save_follow_up(text, explicit_delegation);
+            }
+            return Ok(());
+        }
+        if !editing_feedback && command_missing_required_arguments(&self.state.composer) {
             return Ok(());
         }
         let text = std::mem::take(&mut self.state.composer);
@@ -842,7 +1381,7 @@ impl App {
         if trimmed.is_empty() {
             return Ok(());
         }
-        if trimmed.starts_with('/') {
+        if !editing_feedback && trimmed.starts_with('/') {
             let command = match parse_command(trimmed) {
                 Ok(command) => command,
                 Err(error) => {
@@ -853,6 +1392,7 @@ impl App {
             match command {
                 Command::Agents => self.state.open_agents(),
                 Command::Todo => self.state.open_todos(),
+                Command::Queue => self.state.open_queue(),
                 Command::Goal(action) => self.handle_goal_command(action)?,
                 Command::Model(profile) => {
                     if let Some(profile) = profile {
@@ -909,23 +1449,10 @@ impl App {
                         "starting a new session",
                     );
                 }
-                Command::Context => {
-                    if let Some(control) = &self.control {
-                        self.state.push_notice(
-                            Some("CONTEXT".into()),
-                            format!(
-                                "{} token input limit; automatic compaction; session {}",
-                                control.max_input_tokens,
-                                self.session_id.as_ref().map_or("none", AsRef::as_ref)
-                            ),
-                        );
-                    } else {
-                        self.state.push_error("context details are unavailable");
-                    }
-                }
+                Command::Context => self.request_context_inspection(),
                 Command::Status => self.push_status_notice(),
                 Command::Copy => self.copy_last_assistant(),
-                Command::Diff => self.push_diff_notice(),
+                Command::Diff => self.open_diff_review(),
                 Command::Compact => {
                     self.state.queue_command(EngineCommand::Compact);
                     self.state
@@ -961,13 +1488,24 @@ impl App {
         } else if self.engine.is_none() {
             self.state
                 .push_error("not connected; configure ~/.kurama/config.toml");
+            self.state.composer = text;
+            self.state.cursor = self.state.composer.len();
+            self.state.composer_edited();
         } else {
             let explicit_delegation = self
                 .orchestrator
                 .as_ref()
                 .is_some_and(|orchestrator| orchestrator.explicit_delegation(trimmed));
             self.state.remember_prompt(trimmed);
-            self.state.submit_turn(trimmed, explicit_delegation);
+            if queue {
+                self.state.submit_turn(trimmed, explicit_delegation);
+            } else {
+                self.state
+                    .steer_or_submit(trimmed.to_owned(), explicit_delegation);
+            }
+            if editing_feedback {
+                self.state.restore_composer_draft();
+            }
         }
         Ok(())
     }
@@ -1041,6 +1579,11 @@ impl App {
             }
             KeyCode::Char(character) => self.state.onboarding.push(character),
             KeyCode::Backspace => self.state.onboarding.backspace(),
+            KeyCode::Left => self.state.onboarding.move_left(),
+            KeyCode::Right => self.state.onboarding.move_right(),
+            KeyCode::Home => self.state.onboarding.move_home(),
+            KeyCode::End => self.state.onboarding.move_end(),
+            KeyCode::Delete => self.state.onboarding.delete_forward(),
             KeyCode::Enter => match self.state.onboarding.submit() {
                 Ok(Some(submission)) => {
                     if let Err(error) = self.apply_onboarding_submission(submission) {
@@ -1254,9 +1797,52 @@ impl App {
     }
 
     fn handle_agents_key(&mut self, key: KeyEvent) {
+        self.state.normalize_agent_message_cursor();
         match (self.state.overlay, key.code) {
             (Overlay::Agents, KeyCode::Up) => self.state.select_previous_agent(),
             (Overlay::Agents, KeyCode::Down) => self.state.select_next_agent(),
+            (Overlay::Agents, KeyCode::Home) => self.state.selected_agent = 0,
+            (Overlay::Agents, KeyCode::End) => {
+                self.state.selected_agent = self.state.agents.len().saturating_sub(1)
+            }
+            (Overlay::Agents, KeyCode::PageUp) => {
+                self.state.selected_agent = self
+                    .state
+                    .selected_agent
+                    .saturating_sub(self.state.agents_page_height.get())
+            }
+            (Overlay::Agents, KeyCode::PageDown) => {
+                self.state.selected_agent = self
+                    .state
+                    .selected_agent
+                    .saturating_add(self.state.agents_page_height.get())
+                    .min(self.state.agents.len().saturating_sub(1))
+            }
+            (
+                Overlay::AgentInspect,
+                KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Home
+                | KeyCode::End,
+            ) => {
+                let current = self.state.agent_inspect_scroll.get();
+                let max = self.state.agent_inspect_max_scroll.get();
+                let page = self.state.agent_inspect_page_height.get();
+                self.state.agent_inspect_scroll.set(
+                    match key.code {
+                        KeyCode::Up => current.saturating_add(1),
+                        KeyCode::Down => current.saturating_sub(1),
+                        KeyCode::PageUp => current.saturating_add(page),
+                        KeyCode::PageDown => current.saturating_sub(page),
+                        KeyCode::Home => max,
+                        KeyCode::End => 0,
+                        _ => current,
+                    }
+                    .min(max),
+                );
+            }
             (Overlay::Agents, KeyCode::Enter) => self.state.inspect_selected_agent(),
             (Overlay::Agents | Overlay::AgentInspect, KeyCode::Char('m')) => {
                 self.state.begin_agent_message()
@@ -1270,11 +1856,10 @@ impl App {
             }
             (Overlay::AgentMessage, KeyCode::Backspace) => {
                 if self.state.agent_message_cursor > 0 {
-                    let previous = self.state.agent_message[..self.state.agent_message_cursor]
-                        .char_indices()
-                        .next_back()
-                        .map(|(index, _)| index)
-                        .unwrap_or(0);
+                    let previous = previous_grapheme_boundary(
+                        &self.state.agent_message,
+                        self.state.agent_message_cursor,
+                    );
                     self.state
                         .agent_message
                         .drain(previous..self.state.agent_message_cursor);
@@ -1282,23 +1867,31 @@ impl App {
                 }
             }
             (Overlay::AgentMessage, KeyCode::Left) => {
-                if let Some((index, _)) = self.state.agent_message
-                    [..self.state.agent_message_cursor]
-                    .char_indices()
-                    .next_back()
-                {
-                    self.state.agent_message_cursor = index;
-                }
+                self.state.agent_message_cursor = previous_grapheme_boundary(
+                    &self.state.agent_message,
+                    self.state.agent_message_cursor,
+                );
             }
             (Overlay::AgentMessage, KeyCode::Right)
                 if self.state.agent_message_cursor < self.state.agent_message.len() =>
             {
-                let next = self.state.agent_message[self.state.agent_message_cursor..]
-                    .chars()
-                    .next()
-                    .map(char::len_utf8)
-                    .unwrap_or(0);
-                self.state.agent_message_cursor += next;
+                self.state.agent_message_cursor = next_grapheme_boundary(
+                    &self.state.agent_message,
+                    self.state.agent_message_cursor,
+                );
+            }
+            (Overlay::AgentMessage, KeyCode::Delete) => {
+                let next = next_grapheme_boundary(
+                    &self.state.agent_message,
+                    self.state.agent_message_cursor,
+                );
+                self.state
+                    .agent_message
+                    .drain(self.state.agent_message_cursor..next);
+            }
+            (Overlay::AgentMessage, KeyCode::Home) => self.state.agent_message_cursor = 0,
+            (Overlay::AgentMessage, KeyCode::End) => {
+                self.state.agent_message_cursor = self.state.agent_message.len()
             }
             (Overlay::AgentMessage, KeyCode::Enter) => self.state.submit_agent_message(),
             (Overlay::Agents | Overlay::AgentInspect, KeyCode::Char('x')) => {
@@ -1338,11 +1931,15 @@ impl App {
     }
 
     fn ingest_composer_paste(&mut self, text: &str) {
-        if let Some((bytes, ext)) = crate::tui::decode_pasted_image(text) {
-            if bytes.len() > MAX_PASTE_IMAGE_BYTES {
-                self.state.push_error("pasted image is too large");
+        self.state.normalize_composer_cursor();
+        let image = match crate::tui::decode_pasted_image(text) {
+            Ok(image) => image,
+            Err(error) => {
+                self.state.push_error(error);
                 return;
             }
+        };
+        if let Some((bytes, ext)) = image {
             match save_pasted_image(&self.state.project, &bytes, ext) {
                 Ok(path) => {
                     self.state.insert_mention(&path);
@@ -1464,23 +2061,33 @@ impl App {
             self.state.push_error("no assistant reply to copy");
             return;
         };
-        match copy_to_clipboard(&text) {
-            Ok(()) => self.state.push_notice(
-                Some("COPY".into()),
-                format!("copied {} characters", text.chars().count()),
-            ),
-            Err(error) => self.state.push_error(error),
+        apply_pointer_action(self, PointerAction::Copy(text));
+    }
+
+    fn request_context_inspection(&mut self) {
+        if self.engine.is_some() {
+            self.state.inspect_context();
+        } else {
+            self.state
+                .push_error("context inspection requires a connected session");
         }
     }
 
-    fn push_diff_notice(&mut self) {
-        match git_diff_stat(&self.state.project) {
-            Ok(diff) if diff.trim().is_empty() => self
-                .state
-                .push_notice(Some("DIFF".into()), "working tree is clean"),
-            Ok(diff) => self.state.push_notice(Some("DIFF".into()), diff),
-            Err(error) => self.state.push_error(error),
-        }
+    fn open_diff_review(&mut self) {
+        self.state.overlay = Overlay::Diff;
+        self.state.diff_review = None;
+        self.state.diff_error = None;
+        self.state.diff_loading = true;
+        let project = PathBuf::from(&self.state.project);
+        let (sender, events) = mpsc::channel(1);
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            let _ = sender.send(load_diff(project).await).await;
+        });
+        self.diff_load = Some(DiffLoad {
+            events,
+            _tasks: tasks,
+        });
     }
 
     async fn flush_commands(&mut self) -> Result<(), String> {
@@ -1501,6 +2108,11 @@ impl App {
                     text,
                     explicit_delegation,
                 } => engine.submit(text, explicit_delegation).await,
+                EngineCommand::Steer {
+                    text,
+                    explicit_delegation,
+                } => engine.steer(text, explicit_delegation).await,
+                EngineCommand::InspectContext => engine.inspect_context().await,
                 EngineCommand::ResolveApproval {
                     operation_id,
                     response,
@@ -1522,152 +2134,8 @@ impl App {
     }
 }
 
-fn replay_for_transcript(replay: &[EventEnvelope], store: &dyn SessionStore) -> Vec<EventEnvelope> {
-    let mut transcript_replay = replay.to_vec();
-    for event in &mut transcript_replay {
-        let SessionEvent::ToolCompleted { result, .. } = &mut event.event else {
-            continue;
-        };
-        let Some(display_blobs) = result
-            .metadata
-            .get("display_blobs")
-            .and_then(serde_json::Value::as_object)
-        else {
-            continue;
-        };
-        let Ok(Some(display_output)) = display_output_from_blobs(display_blobs, store) else {
-            continue;
-        };
-        result.metadata["display_output"] = serde_json::Value::String(display_output);
-    }
-    transcript_replay
-}
-
-fn display_output_from_blobs(
-    display_blobs: &serde_json::Map<String, serde_json::Value>,
-    store: &dyn SessionStore,
-) -> Result<Option<String>, String> {
-    if let Some(output) = display_blob_text(display_blobs.get("output"), store)? {
-        return Ok(Some(output));
-    }
-    let stdout = display_blob_text(display_blobs.get("stdout"), store)?;
-    let stderr = display_blob_text(display_blobs.get("stderr"), store)?;
-    if stdout.is_none() && stderr.is_none() {
-        return Ok(None);
-    }
-    Ok(Some(combined_tool_output(
-        stdout.as_deref().unwrap_or_default(),
-        stderr.as_deref().unwrap_or_default(),
-    )))
-}
-
-fn display_blob_text(
-    value: Option<&serde_json::Value>,
-    store: &dyn SessionStore,
-) -> Result<Option<String>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let reference: BlobRef = serde_json::from_value(value.clone())
-        .map_err(|error| format!("invalid display blob reference: {error}"))?;
-    let bytes = store
-        .get_blob(&reference)
-        .map_err(|error| error.to_string())?;
-    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
-}
-
-fn combined_tool_output(stdout: &str, stderr: &str) -> String {
-    match (stdout.is_empty(), stderr.is_empty()) {
-        (false, true) => stdout.to_owned(),
-        (true, false) => stderr.to_owned(),
-        (true, true) => String::new(),
-        (false, false) => format!("{stdout}\n[stderr]\n{stderr}"),
-    }
-}
-
-fn initialize_inline_terminal<B>(mut backend: B) -> Result<Terminal<B>, B::Error>
-where
-    B: Backend,
-{
-    let rows = backend.size()?.height;
-    let viewport_height = rows.min(INLINE_VIEWPORT_MAX_HEIGHT);
-    backend.clear_region(ClearType::All)?;
-    backend.set_cursor_position(Position::new(0, rows.saturating_sub(viewport_height)))?;
-    Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(viewport_height),
-        },
-    )
-}
-
-fn resize_inline_terminal<B>(
-    terminal: &mut Terminal<B>,
-    width: u16,
-    height: u16,
-    reset_origin: bool,
-) -> Result<(), B::Error>
-where
-    B: Backend + Clone,
-{
-    let viewport_height = height.min(INLINE_VIEWPORT_MAX_HEIGHT);
-    let current_viewport_top = terminal.get_frame().area().top();
-    let viewport_top = height.saturating_sub(viewport_height);
-    let clear_top = if reset_origin {
-        0
-    } else {
-        current_viewport_top.min(viewport_top)
-    };
-    terminal
-        .backend_mut()
-        .set_cursor_position(Position::new(0, clear_top))?;
-    terminal
-        .backend_mut()
-        .clear_region(ClearType::AfterCursor)?;
-    terminal.backend_mut().flush()?;
-    replace_inline_terminal(
-        terminal,
-        Rect::new(0, 0, width, height),
-        viewport_top,
-        viewport_height,
-    )
-}
-
-fn prepare_inline_frame<B>(
-    state: &mut TuiState,
-    terminal: &mut Terminal<B>,
-    transcript_cache: &mut TranscriptRenderCache,
-) -> Result<(), String>
-where
-    B: Backend + Clone,
-{
-    if !state.stable_transcript().is_empty() && !uses_full_inline_viewport(state) {
-        let size = terminal.size().map_err(|error| error.to_string())?;
-        let viewport_height =
-            desired_inline_viewport_height_for_transcript(state, size.width, size.height, 0);
-        set_inline_viewport_height(terminal, viewport_height).map_err(|error| error.to_string())?;
-        commit_stable_transcript(state, terminal)?;
-        transcript_cache.invalidate();
-    }
-
-    let size = terminal.size().map_err(|error| error.to_string())?;
-    let viewport_height = if uses_full_inline_viewport(state) {
-        size.height
-    } else {
-        transcript_cache.prepare(state, Rect::new(0, 0, size.width, size.height));
-        desired_inline_viewport_height_for_transcript(
-            state,
-            size.width,
-            size.height,
-            transcript_cache.lines.len(),
-        )
-    };
-    set_inline_viewport_height(terminal, viewport_height).map_err(|error| error.to_string())?;
-    Ok(())
-}
-
 fn prepare_fullscreen_frame<B>(
-    state: &TuiState,
+    state: &mut TuiState,
     terminal: &mut Terminal<B>,
     transcript_cache: &mut TranscriptRenderCache,
 ) -> Result<(), String>
@@ -1675,221 +2143,19 @@ where
     B: Backend,
 {
     terminal.autoresize().map_err(|error| error.to_string())?;
+    if matches!(
+        state.overlay(),
+        Overlay::Onboarding
+            | Overlay::Agents
+            | Overlay::Todos
+            | Overlay::AgentInspect
+            | Overlay::AgentMessage
+            | Overlay::ConfirmAgentCancel
+    ) {
+        return Ok(());
+    }
     transcript_cache.prepare(state, terminal.get_frame().area());
     Ok(())
-}
-
-#[cfg(test)]
-fn desired_inline_viewport_height(state: &TuiState, width: u16, height: u16) -> u16 {
-    if height == 0 {
-        return 0;
-    }
-    if uses_full_inline_viewport(state) {
-        return height;
-    }
-
-    let area = main_area(Rect::new(0, 0, width, height));
-    let transcript_height = transcript_lines(
-        state.live_transcript(),
-        area.width as usize,
-        TranscriptDetail::Compact,
-    )
-    .len();
-    desired_inline_viewport_height_for_transcript(state, width, height, transcript_height)
-}
-
-fn uses_full_inline_viewport(state: &TuiState) -> bool {
-    state.transcript_view_expanded()
-        || matches!(
-            state.overlay(),
-            Overlay::Onboarding
-                | Overlay::Agents
-                | Overlay::Todos
-                | Overlay::AgentInspect
-                | Overlay::AgentMessage
-                | Overlay::ConfirmAgentCancel
-        )
-}
-
-fn desired_inline_viewport_height_for_transcript(
-    state: &TuiState,
-    width: u16,
-    height: u16,
-    transcript_height: usize,
-) -> u16 {
-    if height == 0 {
-        return 0;
-    }
-
-    let area = main_area(Rect::new(0, 0, width, height));
-    let approval_visible = matches!(state.overlay(), Overlay::Approval | Overlay::ApprovalEdit);
-    let shortcuts_visible = state.overlay() == Overlay::Shortcuts;
-    let input_height = if approval_visible {
-        approval_height(state, area.width)
-    } else if shortcuts_visible {
-        10.min(height).max(5)
-    } else {
-        composer_height(state, area.width)
-    }
-    .max(1)
-    .min(height);
-    let queue = if approval_visible {
-        0
-    } else {
-        queue_height(state, area.width)
-    };
-    let activity_height = u16::from(
-        state.overlay() == Overlay::None
-            && (state.activity().is_animated() || state.last_turn_elapsed().is_some())
-            && input_height < height,
-    );
-    let footer_height = u16::from(input_height.saturating_add(activity_height) < height);
-    let chrome_height = input_height
-        .saturating_add(activity_height)
-        .saturating_add(queue)
-        .saturating_add(footer_height);
-    let palette_height = if approval_visible || shortcuts_visible {
-        0
-    } else {
-        command_palette_height(state, height.saturating_sub(chrome_height))
-    };
-    let chrome_height = chrome_height.saturating_add(palette_height);
-    let transcript_capacity = height.saturating_sub(chrome_height);
-    let transcript_height = transcript_height.min(transcript_capacity as usize) as u16;
-
-    input_height
-        .saturating_add(activity_height)
-        .saturating_add(queue)
-        .saturating_add(footer_height)
-        .saturating_add(palette_height)
-        .saturating_add(transcript_height)
-        .min(height)
-}
-
-fn sync_alt_overlay<B>(
-    want: bool,
-    alt: &mut AltOverlay,
-    terminal: &mut Terminal<B>,
-) -> Result<(), String>
-where
-    B: Backend + Clone,
-{
-    if want == alt.active {
-        return Ok(());
-    }
-    if want {
-        alt.saved = Some(terminal.get_frame().area());
-        terminal
-            .backend_mut()
-            .flush()
-            .map_err(|error| error.to_string())?;
-        execute!(io::stdout(), EnterAlternateScreen).map_err(|error| error.to_string())?;
-        alt.active = true;
-        let size = terminal.size().map_err(|error| error.to_string())?;
-        replace_inline_terminal(
-            terminal,
-            Rect::new(0, 0, size.width, size.height),
-            0,
-            size.height,
-        )
-        .map_err(|error| error.to_string())?;
-    } else {
-        terminal
-            .backend_mut()
-            .flush()
-            .map_err(|error| error.to_string())?;
-        execute!(io::stdout(), LeaveAlternateScreen).map_err(|error| error.to_string())?;
-        alt.active = false;
-        let size = terminal.size().map_err(|error| error.to_string())?;
-        let saved = alt.saved.take().unwrap_or_else(|| {
-            let height = 8.min(size.height).max(1);
-            Rect::new(0, size.height.saturating_sub(height), size.width, height)
-        });
-        replace_inline_terminal(
-            terminal,
-            Rect::new(0, 0, size.width, size.height),
-            saved.y.min(size.height.saturating_sub(1)),
-            saved.height.max(1).min(size.height),
-        )
-        .map_err(|error| error.to_string())?;
-    }
-    Ok(())
-}
-
-fn set_inline_viewport_height<B>(
-    terminal: &mut Terminal<B>,
-    viewport_height: u16,
-) -> Result<(), B::Error>
-where
-    B: Backend + Clone,
-{
-    let mut current_area = terminal.get_frame().area();
-    if current_area.height == viewport_height {
-        return Ok(());
-    }
-
-    let size = terminal.size()?;
-    let viewport_height = viewport_height.min(size.height);
-    let growth = viewport_height.saturating_sub(current_area.height);
-    if growth > 0 {
-        terminal.insert_before(growth, |_| {})?;
-        current_area = terminal.get_frame().area();
-    }
-    let viewport_top = size.height.saturating_sub(viewport_height);
-    let clear_top = current_area.top().min(viewport_top);
-    terminal
-        .backend_mut()
-        .set_cursor_position(Position::new(0, clear_top))?;
-    terminal
-        .backend_mut()
-        .clear_region(ClearType::AfterCursor)?;
-    terminal.backend_mut().flush()?;
-    replace_inline_terminal(
-        terminal,
-        Rect::new(0, 0, size.width, size.height),
-        viewport_top,
-        viewport_height,
-    )
-}
-
-fn replace_inline_terminal<B>(
-    terminal: &mut Terminal<B>,
-    terminal_area: Rect,
-    viewport_top: u16,
-    viewport_height: u16,
-) -> Result<(), B::Error>
-where
-    B: Backend + Clone,
-{
-    let mut backend = terminal.backend().clone();
-    backend.set_cursor_position(Position::new(
-        0,
-        viewport_top.min(terminal_area.height.saturating_sub(1)),
-    ))?;
-    let replacement = Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(viewport_height),
-        },
-    )?;
-    *terminal = replacement;
-    Ok(())
-}
-
-fn clear_inline_terminal<B>(terminal: &mut Terminal<B>) -> Result<(), B::Error>
-where
-    B: Backend,
-{
-    let viewport_top = terminal.get_frame().area().as_position();
-    terminal.clear()?;
-    terminal.set_cursor_position(viewport_top)?;
-    terminal.backend_mut().flush()
-}
-
-fn purge_terminal_history() -> io::Result<()> {
-    let mut stdout = io::stdout().lock();
-    stdout.write_all(b"\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H")?;
-    stdout.flush()
 }
 
 pub async fn run(args: Args) -> Result<Option<ExitSummary>, String> {
@@ -1941,18 +2207,9 @@ pub async fn run_with<B>(
     runtime_events: mpsc::Receiver<RuntimeEvent>,
 ) -> Result<App, String>
 where
-    B: Backend + Clone,
+    B: Backend,
 {
-    run_loop(
-        &mut app,
-        terminal,
-        &mut input,
-        Some(runtime_events),
-        None,
-        false,
-        ResizeMode::PRESERVE,
-    )
-    .await?;
+    run_loop(&mut app, terminal, &mut input, Some(runtime_events), None).await?;
     Ok(app)
 }
 
@@ -1969,7 +2226,9 @@ fn apply_runtime_event_in_order(
             | RuntimeEvent::Error { .. }
             | RuntimeEvent::Shutdown
     ) {
-        loop {
+        // The completing operation has already emitted its deltas. Drain the
+        // queued snapshot, not an endlessly refilled stream from another tool.
+        for _ in 0..tool_receiver.len() {
             match tool_receiver.try_recv() {
                 Ok(event) => state.apply_runtime_event(event),
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -1993,6 +2252,10 @@ fn requires_immediate_redraw(event: &RuntimeEvent) -> bool {
             | RuntimeEvent::GoalUpdated { .. }
             | RuntimeEvent::GoalCleared
             | RuntimeEvent::Usage { .. }
+            | RuntimeEvent::ContextInspected { .. }
+            | RuntimeEvent::SteeringQueued { .. }
+            | RuntimeEvent::SteeringApplied { .. }
+            | RuntimeEvent::SteeringRejected { .. }
             | RuntimeEvent::Error { .. }
             | RuntimeEvent::Shutdown
     )
@@ -2036,7 +2299,7 @@ fn drain_ready_events(
     runtime_open: &mut bool,
     tool_receiver: &mut mpsc::Receiver<RuntimeEvent>,
     tool_open: &mut bool,
-) -> (bool, bool) {
+) -> (bool, bool, bool) {
     let mut processed = 0;
     let mut immediate_redraw = false;
     let mut exit = false;
@@ -2076,7 +2339,379 @@ fn drain_ready_events(
             break;
         }
     }
-    (immediate_redraw, exit)
+    (immediate_redraw, exit, processed > 0)
+}
+
+fn handle_input_with_current_geometry(
+    app: &mut App,
+    cache: &mut TranscriptRenderCache,
+    area: Rect,
+    event: Event,
+) -> Result<bool, String> {
+    if let Event::Mouse(mouse) = event {
+        cache.prepare(&mut app.state, area);
+        if let Some(action) = update_transcript_pointer(&mut app.state, cache, area, mouse) {
+            apply_pointer_action(app, action);
+        }
+        return Ok(false);
+    }
+    if let Event::Key(key) = &event {
+        if key.kind != KeyEventKind::Release && app.state.overlay() == Overlay::None {
+            if app.state.transcript_view_expanded()
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && matches!(
+                    key.code,
+                    KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter | KeyCode::Char('y')
+                )
+            {
+                cache.prepare(&mut app.state, area);
+                if let Some(action) = update_transcript_link_focus(&mut app.state, cache, key.code)
+                {
+                    apply_pointer_action(app, action);
+                }
+                return Ok(false);
+            }
+            if key.code == KeyCode::Esc
+                && (app.state.transcript_selection.is_some()
+                    || app.state.composer_selection.is_some()
+                    || app.state.copied_characters.is_some())
+            {
+                app.state.transcript_selection = None;
+                app.state.composer_selection = None;
+                app.state.copied_characters = None;
+                return Ok(false);
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.code == KeyCode::Char('c')
+                && let Some(range) = app
+                    .state
+                    .composer_selection
+                    .as_ref()
+                    .and_then(|selection| selection.range(&app.state.composer))
+            {
+                let text = app.state.composer[range].to_owned();
+                if let Some(selection) = app.state.composer_selection.as_mut() {
+                    selection.dragging = false;
+                }
+                apply_pointer_action(app, PointerAction::Copy(text));
+                return Ok(false);
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.code == KeyCode::Char('c')
+                && let Some(selection) = app
+                    .state
+                    .transcript_selection
+                    .as_ref()
+                    .filter(|selection| selection.dragged)
+            {
+                let text = selection.text(&cache.lines);
+                if let Some(selection) = app.state.transcript_selection.as_mut() {
+                    selection.dragging = false;
+                }
+                apply_pointer_action(app, PointerAction::Copy(text));
+                return Ok(false);
+            }
+        }
+        if key.kind != KeyEventKind::Release {
+            let editing = if key.modifiers.contains(KeyModifiers::CONTROL) {
+                matches!(key.code, KeyCode::Char('j' | 'k' | 'u' | 'w' | 'd'))
+            } else {
+                matches!(
+                    key.code,
+                    KeyCode::Char(_)
+                        | KeyCode::Backspace
+                        | KeyCode::Delete
+                        | KeyCode::Left
+                        | KeyCode::Right
+                ) || (key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT))
+            };
+            if !editing {
+                app.state.composer_selection = None;
+            }
+            app.state.transcript_selection = None;
+            app.state.copied_characters = None;
+        }
+    } else if matches!(&event, Event::Paste(_)) {
+        app.state.transcript_selection = None;
+        app.state.copied_characters = None;
+    }
+    if app.state.transcript_view_expanded()
+        && matches!(
+            &event,
+            Event::Key(KeyEvent {
+                code: KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::Char('{')
+                    | KeyCode::Char('}'),
+                ..
+            })
+        )
+    {
+        cache.prepare(&mut app.state, area);
+    }
+    app.handle_event(event)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PointerAction {
+    Open(Arc<str>),
+    Copy(String),
+}
+
+fn update_transcript_link_focus(
+    state: &mut TuiState,
+    cache: &TranscriptRenderCache,
+    key: KeyCode,
+) -> Option<PointerAction> {
+    let height = cache.viewport_height as usize;
+    let start = cache
+        .lines
+        .len()
+        .saturating_sub(height.saturating_add(state.scroll));
+    let mut targets = Vec::new();
+    for target in cache
+        .lines
+        .iter()
+        .skip(start)
+        .take(height)
+        .flat_map(TranscriptLine::link_targets)
+    {
+        // A wrapped destination is one keyboard stop, not one stop per fragment.
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    let focus = state.focused_link.get_mut();
+    let current = focus
+        .as_ref()
+        .and_then(|target| targets.iter().position(|candidate| *candidate == target));
+    if targets.is_empty() {
+        *focus = None;
+        return None;
+    }
+    match key {
+        KeyCode::Tab | KeyCode::BackTab => {
+            let next = if key == KeyCode::BackTab {
+                current.map_or(targets.len() - 1, |index| {
+                    (index + targets.len() - 1) % targets.len()
+                })
+            } else {
+                current.map_or(0, |index| (index + 1) % targets.len())
+            };
+            *focus = Some(Arc::clone(targets[next]));
+            state.transcript_selection = None;
+            state.copied_characters = None;
+            None
+        }
+        KeyCode::Enter => current.map(|index| PointerAction::Open(Arc::clone(targets[index]))),
+        KeyCode::Char('y') => current.map(|index| PointerAction::Copy(targets[index].to_string())),
+        _ => None,
+    }
+}
+
+fn update_transcript_pointer(
+    state: &mut TuiState,
+    cache: &TranscriptRenderCache,
+    area: Rect,
+    mouse: MouseEvent,
+) -> Option<PointerAction> {
+    if state.overlay() != Overlay::None {
+        return None;
+    }
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            state.copied_characters = None;
+            if !state.transcript_view_expanded()
+                && let Some(cursor) = composer_cursor_at(
+                    state,
+                    main_layout(area, state).input,
+                    ratatui::layout::Position::new(mouse.column, mouse.row),
+                    false,
+                )
+            {
+                state.transcript_selection = None;
+                state.cursor = cursor;
+                state.composer_selection = Some(ComposerSelection::new(cursor));
+                return None;
+            }
+            state.composer_selection = None;
+            state.transcript_selection = cache.point_at(state, area, mouse, false).map(|point| {
+                TranscriptSelection::new(point, cache.lines[point.row].link_at(point.column))
+            });
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if state
+                .composer_selection
+                .as_ref()
+                .is_some_and(|selection| selection.dragging)
+            {
+                let cursor = composer_cursor_at(
+                    state,
+                    main_layout(area, state).input,
+                    ratatui::layout::Position::new(mouse.column, mouse.row),
+                    true,
+                );
+                if let Some(cursor) = cursor
+                    && let Some(selection) = state.composer_selection.as_mut()
+                {
+                    selection.update(cursor);
+                    if let Some(range) = selection.range(&state.composer) {
+                        state.cursor = if selection.focus >= selection.anchor {
+                            range.end
+                        } else {
+                            range.start
+                        };
+                    }
+                }
+                return None;
+            }
+            let point = cache.point_at(state, area, mouse, true);
+            if let Some(selection) = state
+                .transcript_selection
+                .as_mut()
+                .filter(|selection| selection.dragging)
+                && let Some(point) = point
+            {
+                selection.update(point);
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let input_cursor = state
+                .composer_selection
+                .as_ref()
+                .filter(|selection| selection.dragging)
+                .and_then(|_| {
+                    composer_cursor_at(
+                        state,
+                        main_layout(area, state).input,
+                        ratatui::layout::Position::new(mouse.column, mouse.row),
+                        true,
+                    )
+                });
+            if let Some(mut selection) = state.composer_selection.take() {
+                if !selection.dragging {
+                    state.composer_selection = Some(selection);
+                    return None;
+                }
+                let cursor = input_cursor?;
+                if cursor != selection.anchor {
+                    selection.update(cursor);
+                }
+                selection.dragging = false;
+                if let Some(range) = selection.range(&state.composer) {
+                    let text = state.composer[range.clone()].to_owned();
+                    state.cursor = if selection.focus >= selection.anchor {
+                        range.end
+                    } else {
+                        range.start
+                    };
+                    state.composer_selection = Some(selection);
+                    return Some(PointerAction::Copy(text));
+                }
+                return None;
+            }
+            let mut selection = state.transcript_selection.take()?;
+            if !selection.dragging {
+                state.transcript_selection = Some(selection);
+                return None;
+            }
+            let released = cache.point_at(state, area, mouse, false);
+            let point = cache.point_at(state, area, mouse, true)?;
+            if point != selection.anchor {
+                selection.update(point);
+            }
+            selection.finish(point);
+            if selection.dragged {
+                let text = selection.text(&cache.lines);
+                if !text.is_empty() {
+                    state.transcript_selection = Some(selection);
+                    return Some(PointerAction::Copy(text));
+                }
+            } else if released == Some(selection.anchor)
+                && let Some(target) = selection.pressed_link
+                && cache.lines[point.row].link_at(point.column).as_deref() == Some(target.as_ref())
+            {
+                return Some(PointerAction::Open(target));
+            }
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            state.scroll_transcript(if mouse.kind == MouseEventKind::ScrollUp {
+                3
+            } else {
+                -3
+            });
+            let point = cache.point_at(state, area, mouse, true);
+            if let Some(selection) = state
+                .transcript_selection
+                .as_mut()
+                .filter(|selection| selection.dragging)
+                && let Some(point) = point
+            {
+                selection.update(point);
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+fn apply_pointer_action(app: &mut App, action: PointerAction) {
+    let result = match action {
+        PointerAction::Open(target) => {
+            app.link_tasks
+                .spawn(async move { open_link(&target).await });
+            Ok(())
+        }
+        PointerAction::Copy(text) => copy_to_clipboard(&text).inspect(|()| {
+            app.state.copied_characters = Some(text.chars().count());
+        }),
+    };
+    if let Err(error) = result {
+        app.state.push_error(error);
+    }
+}
+
+fn handle_preapproval_input(
+    app: &mut App,
+    cache: &mut TranscriptRenderCache,
+    area: Rect,
+    origin: &mut Overlay,
+    event: Event,
+) -> Result<(bool, bool), String> {
+    if matches!(&event, Event::Mouse(_)) {
+        return Ok((false, false));
+    }
+    let interrupt = matches!(&event, Event::Key(key)
+        if key.code == KeyCode::Esc
+            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c')));
+    if interrupt {
+        return Ok((
+            true,
+            handle_input_with_current_geometry(app, cache, area, event)?,
+        ));
+    }
+    if matches!(*origin, Overlay::Approval | Overlay::ApprovalEdit) {
+        // Responses queued for a replaced prompt cannot authorize its successor.
+        return Ok((false, false));
+    }
+    let visible_overlay = std::mem::replace(&mut app.state.overlay, *origin);
+    let accepted = app.accepts_event(&event);
+    let result = if accepted {
+        handle_input_with_current_geometry(app, cache, area, event)
+    } else {
+        Ok(false)
+    };
+    *origin = app.state.overlay;
+    if app.state.approval.is_some() {
+        app.state.overlay = visible_overlay;
+    }
+    Ok((accepted, result?))
 }
 
 async fn run_loop<B>(
@@ -2085,11 +2720,9 @@ async fn run_loop<B>(
     input: &mut mpsc::Receiver<Event>,
     runtime_events: Option<mpsc::Receiver<RuntimeEvent>>,
     tool_events: Option<mpsc::Receiver<RuntimeEvent>>,
-    commit_to_scrollback: bool,
-    resize_mode: ResizeMode,
 ) -> Result<(), String>
 where
-    B: Backend + Clone,
+    B: Backend,
 {
     let (runtime_tx, mut runtime_receiver) = mpsc::channel(1);
     let mut runtime_open = if let Some(events) = runtime_events {
@@ -2108,18 +2741,25 @@ where
         false
     };
     let mut input_open = true;
-    let mut transcript_cache = TranscriptRenderCache::default();
-    let mut alt_overlay = AltOverlay::default();
-    if commit_to_scrollback {
-        sync_alt_overlay(
-            uses_full_inline_viewport(&app.state),
-            &mut alt_overlay,
-            terminal,
-        )?;
-        prepare_inline_frame(&mut app.state, terminal, &mut transcript_cache)?;
+    let mut pending_input = None;
+    let mut approval_generation = app.state.approval_generation();
+    let mut preapproval_input = if app.state.approval.is_some() {
+        input.len()
     } else {
-        prepare_fullscreen_frame(&app.state, terminal, &mut transcript_cache)?;
-    }
+        0
+    };
+    let mut preapproval_overlay = Overlay::None;
+    let mut transcript_cache = TranscriptRenderCache::default();
+    let root = PathBuf::from(&app.state.project);
+    let mut file_index_load = Some(FileIndexLoad::start(root));
+    let mut mention_open = app.state.file_mention().is_some();
+    app.state.file_index_dirty = false;
+    // Establish a clean canvas once per run/restart. Ratatui's frame diff clears
+    // cells removed by subsequent redraws without erasing the screen each tick.
+    // resize resets the back buffer without clear's blocking cursor-position query.
+    let area = terminal.size().map_err(|error| error.to_string())?.into();
+    terminal.resize(area).map_err(|error| error.to_string())?;
+    prepare_fullscreen_frame(&mut app.state, terminal, &mut transcript_cache)?;
     terminal
         .draw(|frame| render_with_transcript(frame, &app.state, transcript_cache.lines()))
         .map_err(|error| error.to_string())?;
@@ -2127,13 +2767,16 @@ where
     let mut next_activity_frame = last_draw + ACTIVITY_FRAME_INTERVAL;
     let mut redraw_pending = false;
 
-    while input_open || runtime_open || tool_open {
+    while input_open
+        || runtime_open
+        || tool_open
+        || app.diff_load.is_some()
+        || file_index_load.is_some()
+    {
         let mut exit = false;
-        let mut animation_tick = false;
         let mut force_redraw = false;
         let mut state_changed = false;
-        let mut transcript_changed = false;
-        let transcript_len_before = app.state.transcript.len();
+        let mut input_origin = app.state.overlay;
         let terminal_area = terminal.get_frame().area();
         let animate_activity = !visible_activity_rect(terminal_area, &app.state).is_empty();
         let activity_deadline =
@@ -2157,35 +2800,62 @@ where
         tokio::pin!(stream_redraw);
         tokio::select! {
             biased;
-            event = input.recv(), if input_open => {
+            event = async { if pending_input.is_some() { pending_input.take() } else { input.recv().await } }, if input_open => {
+                let predates_approval = preapproval_input > 0;
+                if event.is_some() {
+                    preapproval_input = preapproval_input.saturating_sub(1);
+                }
                 match event {
-                    Some(Event::Resize(width, height)) if commit_to_scrollback => {
-                        if resize_mode.purge_history {
-                            purge_terminal_history().map_err(|error| error.to_string())?;
+                    Some(Event::Resize(..)) => {
+                        for _ in 0..READY_EVENT_BATCH_LIMIT {
+                            match input.try_recv() {
+                                Ok(Event::Resize(..)) => {
+                                    preapproval_input = preapproval_input.saturating_sub(1);
+                                }
+                                Ok(event) => { pending_input = Some(event); break; }
+                                Err(_) => break,
+                            }
                         }
-                        if resize_mode.replay {
-                            app.state.reset_transcript_commit();
-                        }
-                        resize_inline_terminal(terminal, width, height, resize_mode.replay)
-                            .map_err(|error| error.to_string())?;
                         state_changed = true;
-                        transcript_changed = true;
                         force_redraw = true;
                     }
-                    Some(event) => {
-                        exit = app.handle_event(event)?;
+                    Some(event) if predates_approval && app.state.approval.is_some() => {
+                        let outcome = handle_preapproval_input(
+                            app, &mut transcript_cache, terminal_area, &mut preapproval_overlay, event,
+                        )?;
+                        state_changed |= outcome.0;
+                        force_redraw |= outcome.0;
+                        exit |= outcome.1;
+                    }
+                    Some(event) if app.accepts_event(&event) => {
+                        exit = handle_input_with_current_geometry(app, &mut transcript_cache, terminal_area, event)?;
                         state_changed = true;
-                        transcript_changed = app.state.transcript.len() != transcript_len_before;
                         force_redraw = true;
                     }
+                    Some(_) => {}
                     None => input_open = false,
+                }
+                input_origin = if predates_approval { preapproval_overlay } else { app.state.overlay };
+                // Input keeps first refusal for interrupts, but every input event
+                // also gives ready runtime/tool events a bounded turn. Even ignored
+                // input must not postpone approval, completion, or shutdown.
+                if !exit {
+                    let batch = drain_ready_events(
+                        &mut app.state,
+                        &mut runtime_receiver,
+                        &mut runtime_open,
+                        &mut tool_receiver,
+                        &mut tool_open,
+                    );
+                    force_redraw |= batch.0;
+                    exit |= batch.1;
+                    state_changed |= batch.2;
                 }
             }
             event = runtime_receiver.recv(), if runtime_open => {
                 match event {
                     Some(event) => {
                         state_changed = true;
-                        transcript_changed = true;
                         let mut outcome = apply_runtime_channel_event(
                             &mut app.state,
                             event,
@@ -2213,7 +2883,6 @@ where
                 match event {
                     Some(event) => {
                         state_changed = true;
-                        transcript_changed = true;
                         let mut outcome = apply_tool_channel_event(&mut app.state, event);
                         if !outcome.0 {
                             let batch = drain_ready_events(
@@ -2232,34 +2901,87 @@ where
                     None => tool_open = false,
                 }
             }
+            result = async {
+                match app.diff_load.as_mut() {
+                    Some(load) => load.events.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if app.diff_load.is_some() => {
+                app.diff_load = None;
+                app.state.diff_loading = false;
+                match result {
+                    Some(Ok(review)) => app.state.diff_review = Some(review),
+                    Some(Err(error)) => app.state.diff_error = Some(error),
+                    None => app.state.diff_error = Some("diff loader stopped unexpectedly".into()),
+                }
+                state_changed = true;
+                force_redraw = true;
+            }
+            result = async {
+                match file_index_load.as_mut() {
+                    Some(load) => (&mut load.task).await,
+                    None => std::future::pending().await,
+                }
+            }, if file_index_load.is_some() => {
+                file_index_load = None;
+                match result {
+                    Ok(files) => app.state.set_file_index(files),
+                    Err(error) => {
+                        app.state.push_error(format!("file index failed: {error}"));
+                        state_changed = true;
+                    }
+                }
+                state_changed |= app.state.file_mention().is_some();
+                force_redraw = state_changed;
+            }
+            result = app.link_tasks.join_next(), if !app.link_tasks.is_empty() => {
+                let error = match result {
+                    Some(Ok(Err(error))) => Some(error),
+                    Some(Err(error)) => Some(format!("link opener failed: {error}")),
+                    _ => None,
+                };
+                if let Some(error) = error {
+                    app.state.push_error(error);
+                    state_changed = true;
+                    force_redraw = true;
+                }
+            }
             _ = &mut stream_redraw => force_redraw = true,
             _ = &mut animation => {
-                animation_tick = true;
                 force_redraw = true;
             }
         }
+        let now_open = app.state.file_mention().is_some();
+        app.state.file_index_dirty |= now_open && !mention_open;
+        mention_open = now_open;
+        if app.state.file_index_dirty && file_index_load.is_none() {
+            app.state.file_index_dirty = false;
+            let root = PathBuf::from(&app.state.project);
+            file_index_load = Some(FileIndexLoad::start(root));
+        }
+        if app.state.overlay() != Overlay::Diff {
+            app.diff_load = None;
+            app.state.diff_loading = false;
+            app.state.diff_review = None;
+        }
+        if approval_generation != app.state.approval_generation() {
+            approval_generation = app.state.approval_generation();
+            // Keep input already queued before this prompt in its original UI
+            // context, including a key held by resize coalescing. Runtime work
+            // still progresses; a fresh response is required for the new prompt.
+            preapproval_input = input
+                .len()
+                .saturating_add(usize::from(pending_input.is_some()));
+            preapproval_overlay = input_origin;
+        }
         if !app.state.sent_commands().is_empty() {
             app.flush_commands().await?;
-        }
-        if transcript_changed {
-            transcript_cache.invalidate();
         }
         redraw_pending |= state_changed;
         let now = tokio::time::Instant::now();
         let channels_closed = !input_open && !runtime_open && !tool_open;
         if force_redraw || stream_redraw_due(last_draw, now, redraw_pending, channels_closed) {
-            if commit_to_scrollback && !animation_tick {
-                sync_alt_overlay(
-                    uses_full_inline_viewport(&app.state),
-                    &mut alt_overlay,
-                    terminal,
-                )?;
-                prepare_inline_frame(&mut app.state, terminal, &mut transcript_cache)?;
-            } else if !commit_to_scrollback {
-                prepare_fullscreen_frame(&app.state, terminal, &mut transcript_cache)?;
-            } else {
-                transcript_cache.prepare(&app.state, terminal.get_frame().area());
-            }
+            prepare_fullscreen_frame(&mut app.state, terminal, &mut transcript_cache)?;
             terminal
                 .draw(|frame| render_with_transcript(frame, &app.state, transcript_cache.lines()))
                 .map_err(|error| error.to_string())?;
@@ -2271,63 +2993,6 @@ where
             break;
         }
     }
-    if commit_to_scrollback {
-        sync_alt_overlay(false, &mut alt_overlay, terminal)?;
-    }
-    Ok(())
-}
-
-fn commit_stable_transcript<B>(
-    state: &mut TuiState,
-    terminal: &mut Terminal<B>,
-) -> Result<(), String>
-where
-    B: Backend,
-{
-    terminal.autoresize().map_err(|error| error.to_string())?;
-    let committed_end = state.stable_transcript_end();
-    if state.stable_transcript().is_empty() {
-        return Ok(());
-    }
-
-    let terminal_width = terminal.get_frame().area().width as usize;
-    if terminal_width <= TRANSCRIPT_HORIZONTAL_PADDING * 2 {
-        return Ok(());
-    }
-    let content_width = terminal_width
-        .saturating_sub(TRANSCRIPT_HORIZONTAL_PADDING * 2)
-        .max(1);
-    let mut lines = transcript_lines(
-        state.stable_transcript(),
-        content_width,
-        TranscriptDetail::Compact,
-    );
-    if state.transcript.len() > state.live_transcript().len()
-        && matches!(
-            state.stable_transcript().first(),
-            Some(crate::tui::TranscriptEntry::UserTurn { .. })
-        )
-    {
-        lines.insert(0, ratatui::text::Line::from(""));
-    }
-
-    for chunk in lines.chunks(MAX_TRANSCRIPT_INSERT_HEIGHT) {
-        terminal
-            .insert_before(chunk.len() as u16, |buffer| {
-                buffer.set_style(*buffer.area(), Style::default().bg(SURFACE));
-                Paragraph::new(chunk.to_vec())
-                    .block(Block::default().padding(Padding::new(
-                        TRANSCRIPT_HORIZONTAL_PADDING as u16,
-                        TRANSCRIPT_HORIZONTAL_PADDING as u16,
-                        0,
-                        0,
-                    )))
-                    .render(*buffer.area(), buffer);
-            })
-            .map_err(|error| error.to_string())?;
-    }
-
-    state.mark_transcript_committed(committed_end);
     Ok(())
 }
 
@@ -2357,7 +3022,6 @@ fn search_backend(
     http: HttpClient,
 ) -> Result<Option<Arc<dyn SearchBackend>>, String> {
     match config.search.as_ref() {
-        None => Ok(None),
         Some(SearchConfig::Json { endpoint, auth }) => {
             let secret = credentials
                 .resolve_optional("search", auth.as_ref(), session_secrets)
@@ -2368,7 +3032,7 @@ fn search_backend(
                 secret,
             ))))
         }
-        Some(SearchConfig::Provider) if active.kind == ProfileKind::OpenAi => {
+        None | Some(SearchConfig::Provider) if active.kind == ProfileKind::OpenAi => {
             let auth = active
                 .auth
                 .as_ref()
@@ -2386,7 +3050,22 @@ fn search_backend(
                 active.model.clone(),
             ))))
         }
-        Some(SearchConfig::Provider) => Ok(None),
+        None | Some(SearchConfig::Provider) if active.kind == ProfileKind::CodexCli => {
+            Ok(Some(Arc::new(CodexNativeSearch::new(
+                active.command.as_deref().unwrap_or("codex"),
+                active.model.clone(),
+            ))))
+        }
+        None | Some(SearchConfig::Provider) if active.kind == ProfileKind::ClaudeCli => {
+            Ok(Some(Arc::new(ClaudeNativeSearch::new(
+                active.command.as_deref().unwrap_or("claude"),
+                active.model.clone(),
+            ))))
+        }
+        Some(SearchConfig::Provider) => Err(format!(
+            "profile {active_profile} does not support native web search; configure [search] kind = \"json\" with a search endpoint"
+        )),
+        None => Ok(None),
     }
 }
 
@@ -2444,6 +3123,32 @@ fn now_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+async fn open_link(target: &str) -> Result<(), String> {
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        "rundll32.exe"
+    } else {
+        "xdg-open"
+    };
+    let mut command = tokio::process::Command::new(program);
+    #[cfg(target_os = "windows")]
+    command.arg("url.dll,FileProtocolHandler");
+    let status = command
+        .arg(target)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map_err(|error| format!("could not open link: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("system link opener failed: {status}"))
+    }
+}
+
 #[cfg(test)]
 fn copy_to_clipboard(_text: &str) -> Result<(), String> {
     Ok(())
@@ -2451,9 +3156,12 @@ fn copy_to_clipboard(_text: &str) -> Result<(), String> {
 
 #[cfg(not(test))]
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
-    let mut copied = false;
-    for command in ["pbcopy", "wl-copy", "xclip"] {
-        let mut child = match std::process::Command::new(command)
+    for program in ["pbcopy", "wl-copy", "xclip"] {
+        let mut command = std::process::Command::new(program);
+        if program == "xclip" {
+            command.args(["-selection", "clipboard"]);
+        }
+        let mut child = match command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -2462,24 +3170,24 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
             Ok(child) => child,
             Err(_) => continue,
         };
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
+        let written = child
+            .stdin
+            .take()
+            .is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
+        if !written {
+            let _ = child.kill();
         }
-        if child.wait().map(|status| status.success()).unwrap_or(false) {
-            copied = true;
-            break;
+        if child.wait().is_ok_and(|status| status.success()) && written {
+            return Ok(());
         }
     }
     if io::IsTerminal::is_terminal(&io::stdout()) {
         let mut encoded = String::new();
         base64_encode(text.as_bytes(), &mut encoded);
         let mut stdout = io::stdout();
-        let _ = write!(stdout, "\x1b]52;c;{encoded}\x07");
-        let _ = stdout.flush();
-        copied = true;
-    }
-    if copied {
-        Ok(())
+        write!(stdout, "\x1b]52;c;{encoded}\x07")
+            .and_then(|()| stdout.flush())
+            .map_err(|error| format!("could not send text to the clipboard: {error}"))
     } else {
         Err("no clipboard command available".into())
     }
@@ -2519,46 +3227,6 @@ fn save_pasted_image(project: &str, bytes: &[u8], ext: &str) -> Result<String, S
     Ok(relative)
 }
 
-fn git_diff_stat(project: &str) -> Result<String, String> {
-    let output = std::process::Command::new("git")
-        .args(["-C", project, "diff", "--stat"])
-        .output()
-        .map_err(|error| format!("git diff failed: {error}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let first = stderr
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .unwrap_or("git diff failed");
-        if first.contains("not a git repository") || first.contains("Not a git repository") {
-            return Err("not a git repository".into());
-        }
-        let mut message = first.to_owned();
-        if message.chars().count() > 200 {
-            let end = message
-                .char_indices()
-                .nth(200)
-                .map(|(index, _)| index)
-                .unwrap_or(message.len());
-            message.truncate(end);
-            message.push('…');
-        }
-        return Err(message);
-    }
-    let mut diff = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if diff.chars().count() > 800 {
-        let end = diff
-            .char_indices()
-            .nth(800)
-            .map(|(index, _)| index)
-            .unwrap_or(diff.len());
-        diff.truncate(end);
-        diff.push('…');
-    }
-    Ok(diff)
-}
-
 fn execution_mode_label(mode: ExecutionMode) -> &'static str {
     match mode {
         ExecutionMode::Supervised => "supervised",
@@ -2596,15 +3264,13 @@ mod tests {
         tool::{CommandClass, Operation, ToolResult},
     };
     use ratatui::{
-        TerminalOptions, Viewport,
-        backend::{Backend, TestBackend, WindowSize},
+        backend::{Backend, ClearType, TestBackend, WindowSize},
         buffer::Cell as BufferCell,
         layout::{Position, Rect, Size},
-        style::Color,
     };
 
     use super::*;
-    use crate::tui::{ActivityState, TranscriptEntry, visible_activity_rect};
+    use crate::tui::{ActivityState, TranscriptEntry, transcript_lines, visible_activity_rect};
 
     #[derive(Clone)]
     struct DrawBudgetBackend {
@@ -2686,7 +3352,731 @@ mod tests {
             restart_args: None,
             exit_requested: false,
             control: None,
+            link_tasks: tokio::task::JoinSet::new(),
+            diff_load: None,
         }
+    }
+
+    fn rendered_app(app: &App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| crate::tui::render(frame, &app.state))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn shortcuts_reach_last_entry_and_clamp_after_resize() {
+        let mut app = test_app();
+        for (width, height) in [(80, 8), (24, 10)] {
+            app.state.open_shortcuts();
+            let first = rendered_app(&app, width, height);
+            assert!(first.contains("ctrl+c"), "{first}");
+            let end = Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+            assert!(app.accepts_event(&end));
+            app.handle_event(end).unwrap();
+            let last = rendered_app(&app, width, height);
+            assert!(last.contains("shift+tab"), "{last}");
+            let wide = rendered_app(&app, 100, 30);
+            assert!(
+                wide.contains("ctrl+c") && wide.contains("shift+tab"),
+                "{wide}"
+            );
+            app.handle_event(Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)))
+                .unwrap();
+            assert!(rendered_app(&app, width, height).contains("ctrl+c"));
+        }
+    }
+
+    #[test]
+    fn agent_list_pages_and_inspection_reaches_old_wrapped_rows() {
+        let mut app = test_app();
+        app.state.agents = (0..30)
+            .map(|index| crate::tui::AgentRow {
+                id: format!("a_{index:02}").into(),
+                role: "reviewer".into(),
+                profile: "fixture".into(),
+                task: "inspect".into(),
+                state: kurama_protocol::agent::AgentState::Running,
+                activity: "reading".into(),
+                transcript: (0..30)
+                    .map(|row| format!("row-{row:02} {}", "wrapped content ".repeat(4)))
+                    .collect(),
+            })
+            .collect();
+        app.state.open_agents();
+        rendered_app(&app, 40, 8);
+        for code in [KeyCode::PageDown, KeyCode::End] {
+            let event = Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+            assert!(app.accepts_event(&event));
+            app.handle_event(event).unwrap();
+        }
+        assert!(rendered_app(&app, 40, 8).contains("a_29"));
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        let tail = rendered_app(&app, 40, 8);
+        assert!(!tail.contains("row-00"), "{tail}");
+        for code in [KeyCode::PageUp, KeyCode::Home] {
+            let event = Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+            assert!(app.accepts_event(&event));
+            app.handle_event(event).unwrap();
+        }
+        assert!(rendered_app(&app, 40, 8).contains("row-00"));
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(rendered_app(&app, 40, 8), tail);
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)))
+            .unwrap();
+        assert!(rendered_app(&app, 40, 8).contains("a_00"));
+    }
+
+    #[test]
+    fn expanded_keyboard_links_use_sanitized_pointer_actions_across_wraps() {
+        let mut app = test_app();
+        app.state.push_assistant("[a long first label](https://one.test/a) [second](https://two.test/b) [unsafe](javascript:alert(1))");
+        app.state.toggle_transcript_view();
+        let mut cache = TranscriptRenderCache::default();
+        let area = Rect::new(0, 0, 24, 16);
+        handle_input_with_current_geometry(
+            &mut app,
+            &mut cache,
+            area,
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+        )
+        .unwrap();
+        assert_eq!(
+            update_transcript_link_focus(&mut app.state, &cache, KeyCode::Enter),
+            Some(PointerAction::Open(Arc::from("https://one.test/a")))
+        );
+        update_transcript_link_focus(&mut app.state, &cache, KeyCode::Tab);
+        assert_eq!(
+            update_transcript_link_focus(&mut app.state, &cache, KeyCode::Char('y')),
+            Some(PointerAction::Copy("https://two.test/b".into()))
+        );
+        update_transcript_link_focus(&mut app.state, &cache, KeyCode::Tab);
+        assert_eq!(
+            update_transcript_link_focus(&mut app.state, &cache, KeyCode::Enter),
+            Some(PointerAction::Open(Arc::from("https://one.test/a")))
+        );
+        update_transcript_link_focus(&mut app.state, &cache, KeyCode::BackTab);
+        cache.prepare(&mut app.state, Rect::new(0, 0, 100, 24));
+        assert_eq!(
+            update_transcript_link_focus(&mut app.state, &cache, KeyCode::Enter),
+            Some(PointerAction::Open(Arc::from("https://two.test/b")))
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|frame| render_with_transcript(frame, &app.state, cache.lines()))
+            .unwrap();
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.modifier.contains(ratatui::style::Modifier::REVERSED))
+        );
+        app.state.toggle_transcript_view();
+        app.state.composer = "ordinary draft".into();
+        app.state.cursor = app.state.composer.len();
+        handle_input_with_current_geometry(
+            &mut app,
+            &mut cache,
+            area,
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+        )
+        .unwrap();
+        assert_eq!(app.state.composer, "ordinary draft");
+    }
+
+    #[test]
+    fn composer_line_boundaries_keep_shell_buffer_and_history_keys() {
+        let mut app = test_app();
+        app.state.remember_prompt("previous prompt");
+        app.state.composer = "first\nAe\u{301}界Z\nlast".into();
+        app.state.cursor = "first\nAe\u{301}".len();
+        for (code, modifiers, cursor) in [
+            (KeyCode::Home, KeyModifiers::NONE, "first\n".len()),
+            (
+                KeyCode::End,
+                KeyModifiers::NONE,
+                "first\nAe\u{301}界Z".len(),
+            ),
+            (KeyCode::Char('a'), KeyModifiers::CONTROL, 0),
+            (
+                KeyCode::Char('e'),
+                KeyModifiers::CONTROL,
+                app.state.composer.len(),
+            ),
+        ] {
+            app.handle_event(Event::Key(KeyEvent::new(code, modifiers)))
+                .unwrap();
+            assert_eq!(app.state.cursor, cursor);
+        }
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.state.composer, "previous prompt");
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.state.composer, "first\nAe\u{301}界Z\nlast");
+    }
+
+    #[test]
+    fn onboarding_dispatch_edits_secret_middle_without_exposing_it() {
+        let mut app = test_app();
+        app.state.overlay = Overlay::Onboarding;
+        app.state.onboarding = OnboardingState::credential("fixture");
+        app.handle_event(Event::Paste("Ae\u{301}👩‍👩‍👧‍👦Z".into()))
+            .unwrap();
+        for code in [
+            KeyCode::Home,
+            KeyCode::Right,
+            KeyCode::Delete,
+            KeyCode::Char('X'),
+            KeyCode::End,
+            KeyCode::Left,
+            KeyCode::Backspace,
+        ] {
+            let event = Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+            assert!(app.accepts_event(&event));
+            app.handle_event(event).unwrap();
+        }
+        assert!(!rendered_app(&app, 24, 8).contains("AXZ"));
+        match app.state.onboarding.submit().unwrap() {
+            Some(OnboardingSubmission::Credential { secret, .. }) => assert_eq!(secret, "AXZ"),
+            _ => panic!("expected corrected credential"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_file_index_load_stops_an_already_started_blocking_scan() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("visible.rs"), b"").unwrap();
+        let path = root.path().to_path_buf();
+        let cancel = CancelToken::new();
+        let worker_cancel = cancel.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (finished, result) = tokio::sync::oneshot::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(2)).unwrap();
+            let files = crate::tui::collect_files(&path, &worker_cancel);
+            let _ = finished.send(files);
+            Vec::new()
+        });
+        let load = FileIndexLoad { cancel, task };
+        tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .expect("blocking task starts")
+            .unwrap();
+        drop(load);
+        release.send(()).unwrap();
+        let files = tokio::time::timeout(Duration::from_secs(2), result)
+            .await
+            .expect("cancelled blocking task exits")
+            .unwrap();
+        assert!(
+            files.is_empty(),
+            "cancelled scan must not publish file suggestions"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_index_publishes_dot_directory_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
+        std::fs::write(dir.path().join(".github/workflows/ci.yml"), "name: CI").unwrap();
+        let mut app = test_app();
+        app.state.project = dir.path().display().to_string();
+        app.state.composer = "@ci".into();
+        app.state.cursor = 3;
+        assert!(app.state.file_suggestions().is_empty());
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let (sender, mut receiver) = mpsc::channel(1);
+        drop(sender);
+        run_loop(&mut app, &mut terminal, &mut receiver, None, None)
+            .await
+            .unwrap();
+        assert_eq!(app.state.file_suggestions(), [".github/workflows/ci.yml"]);
+        app.state.complete_selected_file();
+        assert_eq!(app.state.composer, "@.github/workflows/ci.yml ");
+    }
+
+    #[test]
+    fn oversized_image_paste_reports_error_without_changing_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.png");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(8 * 1024 * 1024 + 1).unwrap();
+        let mut app = test_app();
+        app.state.composer = "keep draft".into();
+        app.state.cursor = app.state.composer.len();
+        app.handle_event(Event::Paste(path.display().to_string()))
+            .unwrap();
+        assert_eq!(app.state.composer, "keep draft");
+        assert!(matches!(
+            app.state.transcript.last(),
+            Some(TranscriptEntry::Error { .. })
+        ));
+    }
+    #[test]
+    fn late_steering_blocks_followups_until_its_turn_completes() {
+        let mut app = test_app();
+        app.state.set_thinking();
+        app.state.submit_turn("queued next", false);
+        app.state.steer_or_submit("late correction".into(), false);
+        assert!(matches!(
+            app.state.take_commands().as_slice(),
+            [EngineCommand::Steer { .. }]
+        ));
+        app.state.apply_runtime_event(RuntimeEvent::TurnCompleted);
+        assert!(app.state.sent_commands().is_empty());
+        assert_eq!(app.state.pending_turn_count(), 1);
+        app.state
+            .apply_runtime_event(RuntimeEvent::SteeringApplied {
+                text: "late correction".into(),
+            });
+        assert!(app.state.activity().is_animated());
+        app.state.apply_runtime_event(RuntimeEvent::TurnCompleted);
+        assert!(
+            matches!(app.state.sent_commands(), [EngineCommand::SubmitTurn { text, .. }] if text == "queued next")
+        );
+    }
+
+    #[test]
+    fn approval_interrupt_preempts_queue_edit_restoration() {
+        let mut app = test_app();
+        app.state.set_thinking();
+        app.state.submit_turn("later", false);
+        app.state.composer = "unrelated draft".into();
+        app.state.cursor = app.state.composer.len();
+        app.state.open_queue();
+        app.state.edit_selected_follow_up();
+        app.state.begin_approval(ApprovalRequest {
+            operation_id: OperationId::from("pending-edit"),
+            operation: Operation::Bash {
+                command: "cargo test".into(),
+                cwd: ".".into(),
+                class: CommandClass::ReadOnly,
+                timeout_ms: 30_000,
+            },
+            summary: "Run tests".into(),
+            arguments: serde_json::json!({"command": "cargo test"}),
+        });
+        assert!(!app.handle_ctrl_c());
+        assert!(app.state.approval.is_none());
+        assert_eq!(app.state.overlay(), Overlay::None);
+        assert!(matches!(
+            app.state.sent_commands(),
+            [EngineCommand::CancelTurn]
+        ));
+        assert!(!app.handle_ctrl_c());
+        assert_eq!(app.state.composer, "unrelated draft");
+        assert_eq!(app.state.pending_prompts().collect::<Vec<_>>(), ["later"]);
+    }
+
+    #[test]
+    fn queue_edit_holds_dispatch_and_cancel_preserves_original_and_draft() {
+        let mut app = test_app();
+        app.state.set_thinking();
+        app.state.submit_turn("first queued", false);
+        app.state.submit_turn("second queued", false);
+        app.state.composer = "unrelated draft".into();
+        app.state.cursor = 4;
+        app.state.open_queue();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        app.state.apply_runtime_event(RuntimeEvent::TurnCompleted);
+        assert_eq!(app.state.composer, "first queued");
+        assert!(app.state.sent_commands().is_empty());
+        assert_eq!(
+            app.state.pending_prompts().collect::<Vec<_>>(),
+            ["first queued", "second queued"]
+        );
+
+        app.state.composer = "edited follow-up".into();
+        app.state.cursor = app.state.composer.len();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        assert_eq!(app.state.overlay(), Overlay::Queue);
+        assert_eq!(app.state.composer, "unrelated draft");
+        assert_eq!(app.state.cursor, 4);
+        assert!(app.state.sent_commands().is_empty());
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
+            .unwrap();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        app.state.composer = "discard this edit".into();
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(
+            app.state.pending_prompts().collect::<Vec<_>>(),
+            ["edited follow-up", "second queued"]
+        );
+        assert_eq!(app.state.composer, "unrelated draft");
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Delete,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        assert!(
+            matches!(app.state.sent_commands(), [EngineCommand::SubmitTurn { text, .. }] if text == "edited follow-up")
+        );
+        assert_eq!(app.state.pending_turn_count(), 0);
+    }
+
+    #[test]
+    fn interrupted_queue_waits_for_explicit_resume_and_rejection_stays_in_draft() {
+        let mut app = test_app();
+        app.state.set_thinking();
+        app.state.submit_turn("later", false);
+        app.state.composer = "unrelated draft".into();
+        app.state.cursor = app.state.composer.len();
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        app.state.take_commands();
+        app.state
+            .apply_runtime_event(RuntimeEvent::SteeringRejected {
+                text: "returned steering".into(),
+                message: "turn cancelled".into(),
+            });
+        assert_eq!(app.state.activity(), &ActivityState::Interrupted);
+        app.state.apply_runtime_event(RuntimeEvent::TurnCompleted);
+        assert_eq!(app.state.pending_prompts().collect::<Vec<_>>(), ["later"]);
+        assert!(app.state.sent_commands().is_empty());
+        assert_eq!(app.state.composer, "unrelated draft\n\nreturned steering");
+        app.state.open_queue();
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        assert!(app.state.sent_commands().is_empty());
+        app.state.open_queue();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('s'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        assert!(
+            matches!(app.state.sent_commands(), [EngineCommand::SubmitTurn { text, .. }] if text == "later")
+        );
+        assert_eq!(app.state.composer, "unrelated draft\n\nreturned steering");
+    }
+
+    #[test]
+    fn cancelling_hunk_feedback_restores_draft_and_never_sends_patch() {
+        let mut app = test_app();
+        app.state.set_thinking();
+        app.state.composer = "unrelated draft".into();
+        app.state.cursor = 3;
+        let feedback = "Review src/lib.rs @@ -1 +1 @@\n-old\n+new\nFeedback: ";
+        app.state.begin_diff_feedback(feedback.into());
+        assert_eq!(app.state.composer, feedback);
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::SHIFT,
+        )))
+        .unwrap();
+        assert!(app.state.composer.ends_with('\n'));
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.state.composer, "unrelated draft");
+        assert_eq!(app.state.cursor, 3);
+        assert!(app.state.sent_commands().is_empty());
+        assert!(matches!(
+            app.state.activity(),
+            ActivityState::Thinking { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn pending_desktop_link_does_not_block_exit() {
+        let mut app = test_app();
+        app.link_tasks.spawn(std::future::pending());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let (sender, mut input) = mpsc::channel(1);
+        sender
+            .send(Event::Key(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+            )))
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            run_loop(&mut app, &mut terminal, &mut input, None, None),
+        )
+        .await
+        .expect("desktop handler must not block input")
+        .unwrap();
+        assert!(app.exit_requested);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_profile_searches_without_a_separate_search_configuration() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join("codex");
+        std::fs::write(&program, r#"#!/bin/sh
+input=$(cat)
+case "$*" in
+  *'web_search="live"'*)
+    printf '%s\n' '{"type":"item.completed","item":{"type":"web_search","query":"Rust async book","action":{"type":"search"}}}'
+    printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"results\":[{\"title\":\"Async Book\",\"url\":\"https://rust-lang.github.io/async-book/\",\"snippet\":\"Official Rust async guide.\"}]}"}}'
+    ;;
+  *)
+    printf '%s\n' '{"type":"thread.started","thread_id":"search-session"}'
+    case "$input" in
+    *'https://rust-lang.github.io/async-book/'*)
+      printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"kind\":\"final\",\"text\":\"Found the guide.\"}"}}'
+      ;;
+    *)
+      printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"kind\":\"tool_calls\",\"text\":\"\",\"calls\":[{\"call_id\":\"search\",\"name\":\"web-search\",\"arguments\":\"{\\\"operation\\\":\\\"search\\\",\\\"query\\\":\\\"Rust async book\\\",\\\"limit\\\":2}\"}],\"agents\":[]}"}}'
+      ;;
+    esac
+    ;;
+esac
+printf '%s\n' '{"type":"turn.completed"}'
+"#).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = AppPaths::from_root(root.path().join("state"));
+        let mut config = empty_config();
+        config.default_profile = Some("codex".into());
+        config.profiles.insert(
+            "codex".into(),
+            ProfileConfig {
+                kind: ProfileKind::CodexCli,
+                model: "fixture".into(),
+                command: Some(program.display().to_string()),
+                endpoint: None,
+                auth: None,
+                max_input_tokens: 32_000,
+                max_output_tokens: 4_000,
+                escalation_profiles: Vec::new(),
+            },
+        );
+        ConfigRepository::open(paths.clone())
+            .unwrap()
+            .write_config(&config)
+            .unwrap();
+        let mut app = App::bootstrap_with_paths(
+            &Args::default(),
+            root.path().to_path_buf(),
+            paths,
+            SessionSecrets::default(),
+        )
+        .unwrap();
+        app.engine
+            .as_ref()
+            .unwrap()
+            .submit("Find the official Rust async book.", false)
+            .await
+            .unwrap();
+        let results = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut results = Vec::new();
+            while let Some(event) = app.runtime_events.as_mut().unwrap().recv().await {
+                match event {
+                    RuntimeEvent::ToolCompleted { result, .. } => results.push(result),
+                    RuntimeEvent::TurnCompleted => break,
+                    RuntimeEvent::Error { message } => panic!("{message}"),
+                    _ => {}
+                }
+            }
+            results
+        })
+        .await
+        .expect("search turn completes");
+        app.engine.as_ref().unwrap().shutdown().await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].is_error, "{}", results[0].output);
+        assert_eq!(
+            results[0].metadata["results"][0]["url"],
+            "https://rust-lang.github.io/async-book/"
+        );
+    }
+
+    fn display_app() -> (tempfile::TempDir, Arc<FsSessionStore>, App) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(FsSessionStore::open(temp.path().to_path_buf()).unwrap());
+        let mut app = test_app();
+        app.state.set_display_store(Arc::clone(&store));
+        (temp, store, app)
+    }
+
+    fn displayed_tool_output(app: &App, index: usize) -> &str {
+        match &app.state.transcript[index] {
+            TranscriptEntry::ToolCall(tool) => &tool.output,
+            _ => panic!("expected tool output"),
+        }
+    }
+
+    fn toggle_transcript(app: &mut App) {
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+    }
+
+    #[test]
+    fn completed_display_previews_keep_mixed_streams_and_reused_call_ids() {
+        let (_temp, store, mut app) = display_app();
+        let stdout = format!("stdout head\n{}stdout tail\n", "界🙂a\n".repeat(32_768));
+        let stderr = format!("stderr head\n{}stderr tail\n", "warning\n".repeat(32_768));
+        let mut result = ToolResult::success(CallId::from("reused"), "model summary");
+        result.truncated = true;
+        result.metadata = serde_json::json!({
+            "tool_name": "bash",
+            "display_blobs": {
+                "stdout": store.put_blob(stdout.as_bytes()).unwrap(),
+                "stderr": store.put_blob(stderr.as_bytes()).unwrap(),
+            },
+        });
+        app.state.apply_runtime_event(RuntimeEvent::ToolCompleted {
+            operation_id: OperationId::from("first"),
+            result,
+        });
+        let preview = displayed_tool_output(&app, 0).to_owned();
+        assert!(preview.len() <= 128 * 1_024);
+        assert!(preview.contains("stdout tail\n\n[stderr]\n"));
+        assert!(preview.ends_with("stderr tail\n"));
+        assert!(!preview.contains('\u{fffd}'));
+        toggle_transcript(&mut app);
+        let full = format!("{stdout}\n[stderr]\n{stderr}");
+        assert_eq!(displayed_tool_output(&app, 0), full);
+        let mut cache = TranscriptRenderCache::default();
+        cache.prepare(&mut app.state, Rect::new(0, 0, 80, 24));
+
+        // A later operation can reuse the provider's call id. Completing it while
+        // expanded must hydrate the new entry without replacing the first source.
+        let second = format!("second head\n{}second tail\n", "line\n".repeat(32_768));
+        let mut result = ToolResult::success(CallId::from("reused"), "second summary");
+        result.truncated = true;
+        result.metadata = serde_json::json!({
+            "tool_name": "read",
+            "display_output": second,
+            "display_blobs": { "output": store.put_blob(second.as_bytes()).unwrap() },
+        });
+        app.state
+            .apply_runtime_event(RuntimeEvent::ToolOutputDelta {
+                call_id: CallId::from("reused"),
+                stream: "stdout".into(),
+                chunk: "partial".into(),
+            });
+        app.state.apply_runtime_event(RuntimeEvent::ToolCompleted {
+            operation_id: OperationId::from("second"),
+            result,
+        });
+        cache.prepare(&mut app.state, Rect::new(0, 0, 80, 24));
+        assert_eq!(displayed_tool_output(&app, 0), full);
+        assert_eq!(displayed_tool_output(&app, 1), second);
+        assert!(
+            cache
+                .lines()
+                .unwrap()
+                .iter()
+                .any(|line| line.text.to_string().contains("second head"))
+        );
+        toggle_transcript(&mut app);
+        cache.prepare(&mut app.state, Rect::new(0, 0, 80, 24));
+        assert_eq!(displayed_tool_output(&app, 0), preview);
+        assert!(displayed_tool_output(&app, 1).len() <= 128 * 1_024);
+        assert!(
+            !cache
+                .lines()
+                .unwrap()
+                .iter()
+                .any(|line| line.text.to_string().contains("second head"))
+        );
+        toggle_transcript(&mut app);
+        assert_eq!(displayed_tool_output(&app, 0), full);
+        assert_eq!(displayed_tool_output(&app, 1), second);
+        app.state.hydrate_replay(&[]);
+        toggle_transcript(&mut app);
+        assert!(app.state.transcript.is_empty());
+    }
+
+    #[test]
+    fn display_blob_corruption_is_visible_on_resume_and_expansion() {
+        let (_temp, store, mut app) = display_app();
+        let full = format!("head\n{}tail\n", "x".repeat(256 * 1_024));
+        let reference = store.put_blob(full.as_bytes()).unwrap();
+        let mut result = ToolResult::success(CallId::from("call"), "fallback summary");
+        result.truncated = true;
+        result.metadata = serde_json::json!({"display_blobs": {"output": reference}});
+        let replay = [EventEnvelope::new(
+            0,
+            1,
+            "session".into(),
+            None,
+            SessionEvent::ToolCompleted {
+                operation_id: OperationId::from("operation"),
+                result,
+            },
+        )];
+        app.state.hydrate_replay(&replay);
+        assert!(displayed_tool_output(&app, 0).ends_with("tail\n"));
+        let path = store.root().join("blobs").join(&reference.sha256);
+        let mut corrupt = full.as_bytes().to_vec();
+        corrupt[0] = b'!';
+        std::fs::write(&path, &corrupt).unwrap();
+        toggle_transcript(&mut app);
+        assert!(displayed_tool_output(&app, 0).contains("unavailable"));
+        assert!(displayed_tool_output(&app, 0).contains("mismatch"));
+        toggle_transcript(&mut app);
+        app.state.hydrate_replay(&replay);
+        assert!(displayed_tool_output(&app, 0).contains("fallback summary"));
+        assert!(displayed_tool_output(&app, 0).contains("unavailable"));
+        std::fs::write(&path, full.as_bytes()).unwrap();
+        toggle_transcript(&mut app);
+        assert_eq!(displayed_tool_output(&app, 0), full);
+    }
+
+    #[test]
+    fn completed_output_without_store_remains_available_after_collapse() {
+        let mut app = test_app();
+        let full = format!("head\n{}tail\n", "x".repeat(256 * 1_024));
+        let mut result = ToolResult::success(CallId::from("call"), "model summary");
+        result.truncated = true;
+        result.metadata = serde_json::json!({
+            "display_output": full,
+            // No filesystem control exists in an embedded App. The supplied
+            // output is the only retrievable copy, regardless of this reference.
+            "display_blobs": {"output": {"sha256": "0".repeat(64), "bytes": full.len()}},
+        });
+        app.state.apply_runtime_event(RuntimeEvent::ToolCompleted {
+            operation_id: OperationId::from("operation"),
+            result,
+        });
+        assert_eq!(displayed_tool_output(&app, 0), full);
+        toggle_transcript(&mut app);
+        assert_eq!(displayed_tool_output(&app, 0), full);
+        toggle_transcript(&mut app);
+        assert_eq!(displayed_tool_output(&app, 0), full);
     }
 
     #[test]
@@ -2836,26 +4226,31 @@ Session ID: ses_cafebabe"
     }
 
     #[test]
-    fn expanded_transcript_view_uses_arrow_and_page_scrolling() {
+    fn expanded_transcript_scrolling_clamps_and_closing_returns_to_live_tail() {
         let mut app = test_app();
+        app.state.push_assistant("line\n\n".repeat(100));
+        app.state.viewport_height.set(10);
         app.state.toggle_transcript_view();
-
         app.handle_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)))
-            .expect("scroll transcript up");
+            .unwrap();
         app.handle_event(Event::Key(KeyEvent::new(
             KeyCode::PageUp,
             KeyModifiers::NONE,
         )))
-        .expect("page transcript up");
-        assert_eq!(app.state.scroll, 6);
-
-        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
-            .expect("scroll transcript down");
+        .unwrap();
+        assert_eq!(app.state.scroll, 10);
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)))
+            .unwrap();
+        let first = app.state.scroll;
         app.handle_event(Event::Key(KeyEvent::new(
-            KeyCode::PageDown,
+            KeyCode::PageUp,
             KeyModifiers::NONE,
         )))
-        .expect("page transcript down");
+        .unwrap();
+        assert_eq!(app.state.scroll, first);
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        assert!(!app.state.transcript_view_expanded());
         assert_eq!(app.state.scroll, 0);
     }
 
@@ -2957,22 +4352,38 @@ Session ID: ses_cafebabe"
     }
 
     #[test]
-    fn up_recalls_previous_prompts() {
+    fn arrow_history_restores_replayed_multiline_prompts_and_the_draft_cursor() {
         let mut app = test_app();
-        app.state.remember_prompt("first turn");
-        app.state.remember_prompt("second turn");
-
-        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)))
-            .expect("newer history");
-        assert_eq!(app.state.composer, "second turn");
-
-        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)))
-            .expect("older history");
-        assert_eq!(app.state.composer, "first turn");
-
-        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
-            .expect("forward history");
-        assert_eq!(app.state.composer, "second turn");
+        let replay = ["first\nturn", "second turn"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| {
+                EventEnvelope::new(
+                    index as u64,
+                    0,
+                    "history".into(),
+                    None,
+                    SessionEvent::UserMessage {
+                        text: text.into(),
+                        explicit_delegation: false,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        app.state.hydrate_replay(&replay);
+        app.state.composer = "unfinished draft".into();
+        app.state.cursor = 5;
+        for (key, expected) in [
+            (KeyCode::Up, "second turn"),
+            (KeyCode::Up, "first\nturn"),
+            (KeyCode::Down, "second turn"),
+            (KeyCode::Down, "unfinished draft"),
+        ] {
+            app.handle_event(Event::Key(KeyEvent::new(key, KeyModifiers::NONE)))
+                .unwrap();
+            assert_eq!(app.state.composer, expected);
+        }
+        assert_eq!(app.state.cursor, 5);
     }
 
     #[test]
@@ -3055,7 +4466,7 @@ Session ID: ses_cafebabe"
                 request: ApprovalRequest {
                     operation_id: OperationId::from("operation_approval"),
                     operation: Operation::Read {
-                        path: "README.md".into(),
+                        paths: vec!["README.md".into()],
                         external: false,
                     },
                     summary: "Read README".into(),
@@ -3077,6 +4488,134 @@ Session ID: ses_cafebabe"
         assert!(!requires_immediate_redraw(&RuntimeEvent::AssistantDelta {
             text: "x".into()
         }));
+    }
+
+    #[tokio::test]
+    async fn sustained_input_cannot_starve_tool_completion_approval_or_shutdown() {
+        let mut app = test_app();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let (input_sender, mut input) = mpsc::channel(513);
+        for _ in 0..512 {
+            input_sender.try_send(Event::FocusGained).unwrap();
+        }
+        input_sender
+            .try_send(Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
+        let (runtime_sender, runtime_events) = mpsc::channel(4);
+        let (tool_sender, tool_events) = mpsc::channel(1);
+        tool_sender
+            .try_send(RuntimeEvent::ToolOutputDelta {
+                call_id: CallId::from("call"),
+                stream: "stdout".into(),
+                chunk: "partial".into(),
+            })
+            .unwrap();
+        for event in [
+            RuntimeEvent::ToolCompleted {
+                operation_id: OperationId::from("tool"),
+                result: ToolResult::success(CallId::from("call"), "canonical completion"),
+            },
+            RuntimeEvent::ApprovalRequired {
+                request: ApprovalRequest {
+                    operation_id: OperationId::from("approval"),
+                    operation: Operation::Read {
+                        paths: vec!["file".into()],
+                        external: false,
+                    },
+                    summary: "Read file".into(),
+                    arguments: serde_json::json!({"path": "file"}),
+                },
+            },
+            RuntimeEvent::Shutdown,
+        ] {
+            runtime_sender.try_send(event).unwrap();
+        }
+        run_loop(
+            &mut app,
+            &mut terminal,
+            &mut input,
+            Some(runtime_events),
+            Some(tool_events),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(&app.state.transcript[..], [TranscriptEntry::ToolCall(tool)]
+            if tool.output == "canonical completion" && tool.lifecycle == crate::tui::ToolLifecycle::Completed)
+        );
+        assert!(app.state.approval.is_some());
+        assert_eq!(app.state.activity(), &ActivityState::Idle);
+        // Check progress while input is continuously ready, not elapsed time.
+        assert!(input.len() >= 510);
+        assert!(!app.exit_requested);
+    }
+
+    #[tokio::test]
+    async fn queued_composer_input_cannot_answer_a_new_approval() {
+        for first in [
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            Event::Resize(80, 24),
+        ] {
+            let resized = matches!(first, Event::Resize(..));
+            let mut app = test_app();
+            app.state.set_thinking();
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let (input_sender, mut input) = mpsc::channel(3);
+            for event in [
+                first,
+                Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE)),
+            ] {
+                input_sender.try_send(event).unwrap();
+            }
+            let (runtime_sender, runtime_events) = mpsc::channel(2);
+            runtime_sender
+                .try_send(RuntimeEvent::ApprovalRequired {
+                    request: ApprovalRequest {
+                        operation_id: OperationId::from("new-approval"),
+                        operation: Operation::Read {
+                            paths: vec!["file".into()],
+                            external: false,
+                        },
+                        summary: "Read file".into(),
+                        arguments: serde_json::json!({"path":"file"}),
+                    },
+                })
+                .unwrap();
+            runtime_sender.try_send(RuntimeEvent::Shutdown).unwrap();
+            run_loop(
+                &mut app,
+                &mut terminal,
+                &mut input,
+                Some(runtime_events),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(
+                app.state.approval.is_some(),
+                "typeahead answered the prompt"
+            );
+            assert_eq!(app.state.composer, if resized { "a" } else { "ca" });
+            assert!(app.state.sent_commands().is_empty());
+
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+            assert!(matches!(
+                app.state.sent_commands(),
+                [EngineCommand::ResolveApproval {
+                    response: ApprovalResponse::ApproveOnce,
+                    ..
+                }]
+            ));
+        }
     }
 
     #[tokio::test]
@@ -3105,8 +4644,6 @@ Session ID: ses_cafebabe"
             &mut input,
             Some(runtime_events),
             None,
-            false,
-            ResizeMode::PRESERVE,
         )
         .await
         .expect("run loop");
@@ -3168,8 +4705,6 @@ Session ID: ses_cafebabe"
             &mut input,
             Some(runtime_events),
             Some(tool_events),
-            false,
-            ResizeMode::PRESERVE,
         )
         .await
         .expect("run loop");
@@ -3263,498 +4798,318 @@ Session ID: ses_cafebabe"
             [TranscriptEntry::ToolCall(tool), TranscriptEntry::Error { body }]
                 if tool.output == "partial output" && body == "cancelled"
         ));
-        assert_eq!(state.stable_transcript_end(), 2);
     }
 
     #[test]
-    fn normal_view_leaves_page_keys_to_native_scrollback() {
-        let mut app = App {
-            state: TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised),
-            engine: None,
-            runtime_events: None,
-            tool_events: None,
-            orchestrator: None,
-            session_id: None,
-            restart_args: None,
-            exit_requested: false,
-            control: None,
-        };
-        app.state.scroll = usize::from(u16::MAX);
-
-        app.handle_event(Event::Key(KeyEvent::new(
-            KeyCode::PageUp,
-            KeyModifiers::NONE,
-        )))
-        .expect("page up");
-
-        assert_eq!(app.state.scroll, usize::from(u16::MAX));
-    }
-
-    #[test]
-    fn mouse_events_preserve_native_terminal_selection() {
-        let mut app = App {
-            state: TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised),
-            engine: None,
-            runtime_events: None,
-            tool_events: None,
-            orchestrator: None,
-            session_id: None,
-            restart_args: None,
-            exit_requested: false,
-            control: None,
-        };
-
-        app.handle_event(Event::Mouse(MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        }))
-        .expect("scroll up");
-        assert_eq!(app.state.scroll, 0);
-
-        app.handle_event(Event::Mouse(MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        }))
-        .expect("scroll down");
-        assert_eq!(app.state.scroll, 0);
-    }
-
-    #[test]
-    fn inline_terminal_initialization_clears_output_and_anchors_at_the_bottom() {
-        let mut lines = vec![" ".repeat(80); 40];
-        lines[0] = "stale shell prompt".into();
-        lines[4] = "stale viewport content".into();
-        lines[30] = "stale lower content".into();
-        let mut backend = TestBackend::with_lines(lines);
-        backend
-            .set_cursor_position(Position::new(0, 4))
-            .expect("position inline viewport");
-
-        let mut terminal = initialize_inline_terminal(backend).expect("initialize terminal");
-        let visible = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert_eq!(terminal.get_frame().area(), Rect::new(0, 28, 80, 12));
-        assert!(!visible.contains("stale shell prompt"));
-        assert!(!visible.contains("stale viewport content"));
-        assert!(!visible.contains("stale lower content"));
-    }
-
-    #[test]
-    fn active_and_expanded_views_use_the_available_terminal_height() {
-        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        state.push_assistant(
-            (0..40)
-                .map(|line| format!("- line {line}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
+    fn wheel_scroll_moves_output_without_mutating_the_draft() {
+        let mut app = test_app();
+        app.state.push_assistant(
+            (0..100)
+                .map(|row| format!("output {row}\n\n"))
+                .collect::<String>(),
         );
-        state.set_thinking();
-
-        assert_eq!(desired_inline_viewport_height(&state, 80, 24), 24);
-
-        state.toggle_transcript_view();
-        assert_eq!(desired_inline_viewport_height(&state, 80, 24), 24);
-
-        state.toggle_transcript_view();
-        state.overlay = Overlay::Agents;
-        assert_eq!(desired_inline_viewport_height(&state, 80, 24), 24);
-
-        state.overlay = Overlay::Shortcuts;
-        assert_eq!(desired_inline_viewport_height(&state, 80, 24), 24);
-        assert!(!uses_full_inline_viewport(&state));
-
-        state.overlay = Overlay::Todos;
-        assert_eq!(desired_inline_viewport_height(&state, 80, 24), 24);
-        assert!(uses_full_inline_viewport(&state));
-    }
-
-    #[test]
-    fn filtering_the_slash_palette_keeps_the_inline_viewport_stable() {
-        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        state.composer = "/".into();
-        state.cursor = state.composer.len();
-        let open_height = desired_inline_viewport_height(&state, 80, 24);
-
-        state.composer = "/res".into();
-        state.cursor = state.composer.len();
-        let filtered_height = desired_inline_viewport_height(&state, 80, 24);
-
-        assert!(open_height >= filtered_height);
-        assert!(filtered_height >= 4);
-    }
-
-    #[test]
-    fn committed_history_leaves_completion_and_composer_at_the_bottom() {
-        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        state.submit_turn("hi", false);
-        state.push_assistant("hello from kurama");
-        state.apply_runtime_event(RuntimeEvent::TurnCompleted);
-        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24))
-            .expect("initialize inline terminal");
-
-        let mut transcript_cache = TranscriptRenderCache::default();
-        prepare_inline_frame(&mut state, &mut terminal, &mut transcript_cache)
-            .expect("prepare inline frame");
-        terminal
-            .draw(|frame| render_with_transcript(frame, &state, transcript_cache.lines()))
-            .expect("draw idle frame");
-
-        assert_eq!(terminal.get_frame().area().bottom(), 24);
-        let rows = terminal
-            .backend()
-            .buffer()
-            .content()
-            .chunks(80)
-            .map(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>())
-            .collect::<Vec<_>>();
-        let answer_row = rows
-            .iter()
-            .position(|row| row.contains("hello from kurama"))
-            .expect("committed answer row");
-        let composer_row = rows
-            .iter()
-            .position(|row| row.contains("Ask Kurama"))
-            .expect("composer row");
-        let worked_row = rows
-            .iter()
-            .position(|row| row.contains("Worked for"))
-            .expect("duration divider row");
-
-        assert!(
-            worked_row > answer_row,
-            "answer={answer_row} worked={worked_row} composer={composer_row} {rows:#?}"
-        );
-        assert!(
-            composer_row > worked_row,
-            "answer={answer_row} worked={worked_row} composer={composer_row} {rows:#?}"
-        );
-        assert!(composer_row < 23, "{rows:#?}");
-    }
-
-    #[test]
-    fn growing_inline_viewport_preserves_committed_startup_history() {
-        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        state.prepend_startup("0.1.0", "~/project");
-        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24))
-            .expect("initialize inline terminal");
-        let mut transcript_cache = TranscriptRenderCache::default();
-
-        prepare_inline_frame(&mut state, &mut terminal, &mut transcript_cache)
-            .expect("commit startup");
-        terminal
-            .draw(|frame| render_with_transcript(frame, &state, transcript_cache.lines()))
-            .expect("draw startup frame");
-
-        state.submit_turn("inspect the repository", false);
-        prepare_inline_frame(&mut state, &mut terminal, &mut transcript_cache)
-            .expect("commit user turn");
-        terminal
-            .draw(|frame| render_with_transcript(frame, &state, transcript_cache.lines()))
-            .expect("draw active frame");
-
-        let text = terminal
-            .backend()
-            .scrollback()
-            .content()
-            .iter()
-            .chain(terminal.backend().buffer().content().iter())
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert_eq!(text.matches("◢ kurama").count(), 1, "{text}");
-        assert_eq!(text.matches("~/project").count(), 1, "{text}");
-        assert_eq!(
-            text.matches("› inspect the repository").count(),
-            1,
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn growing_viewport_does_not_leave_blank_rows_between_committed_tools() {
-        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        state.prepend_startup("0.1.9", "~/project");
-        state.push_user("inspect");
-        state.push_tool(
-            "bash",
-            (0..80)
-                .map(|index| format!("path-{index}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
-        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24))
-            .expect("initialize inline terminal");
-        let mut transcript_cache = TranscriptRenderCache::default();
-        prepare_inline_frame(&mut state, &mut terminal, &mut transcript_cache)
-            .expect("commit first tool");
-        terminal
-            .draw(|frame| render_with_transcript(frame, &state, transcript_cache.lines()))
-            .expect("draw first tool");
-
-        state.push_tool("read", "line\n".repeat(40));
-        state.set_thinking();
-        prepare_inline_frame(&mut state, &mut terminal, &mut transcript_cache)
-            .expect("grow for live tool");
-        terminal
-            .draw(|frame| render_with_transcript(frame, &state, transcript_cache.lines()))
-            .expect("draw live tool");
-
-        let text = terminal
-            .backend()
-            .scrollback()
-            .content()
-            .iter()
-            .chain(terminal.backend().buffer().content().iter())
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        let rows = text
-            .as_bytes()
-            .chunks(80)
-            .map(|row| std::str::from_utf8(row).unwrap_or("").trim().is_empty())
-            .collect::<Vec<_>>();
-        let start = rows.iter().position(|blank| !blank).unwrap_or(0);
-        let end = rows.iter().rposition(|blank| !blank).unwrap_or(rows.len());
-        let blank_run = rows[start..=end]
-            .windows(5)
-            .any(|window| window.iter().all(|blank| *blank));
-        assert!(!blank_run, "{text}");
-        assert!(text.contains("Ran bash"), "{text}");
-        assert!(text.contains("Ran read"), "{text}");
-    }
-
-    #[test]
-    fn inline_resize_does_not_commit_live_viewport_to_scrollback() {
-        let state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24))
-            .expect("initialize inline terminal");
-        terminal
-            .draw(|frame| render(frame, &state))
-            .expect("draw initial viewport");
-
-        terminal.backend_mut().resize(52, 12);
-        resize_inline_terminal(&mut terminal, 52, 12, false).expect("shrink inline terminal");
-        assert_eq!(terminal.get_frame().area(), Rect::new(0, 0, 52, 12));
-        terminal
-            .draw(|frame| render(frame, &state))
-            .expect("draw narrow viewport");
-
-        terminal.backend_mut().resize(100, 30);
-        resize_inline_terminal(&mut terminal, 100, 30, false).expect("grow inline terminal");
-        assert_eq!(terminal.get_frame().area(), Rect::new(0, 18, 100, 12));
-        terminal
-            .draw(|frame| render(frame, &state))
-            .expect("draw wide viewport");
-
-        let text = terminal
-            .backend()
-            .scrollback()
-            .content()
-            .iter()
-            .chain(terminal.backend().buffer().content().iter())
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert_eq!(text.matches("Ask Kurama").count(), 1, "{text}");
-        assert!(
-            text.contains("work/model")
-                || text.contains("enter send")
-                || text.contains("shortcuts"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn expanding_inline_viewport_clears_rows_above_the_old_viewport() {
-        let mut backend = TestBackend::with_lines(["stale terminal content"; 16]);
-        backend
-            .set_cursor_position(Position::new(0, 8))
-            .expect("position inline viewport");
-        let mut terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(8),
-            },
-        )
-        .expect("inline terminal");
-        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        state.toggle_transcript_view();
-
-        set_inline_viewport_height(&mut terminal, 16).expect("expand inline viewport");
-        terminal
-            .draw(|frame| render(frame, &state))
-            .expect("draw expanded transcript");
-
-        let visible = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(!visible.contains("stale terminal content"), "{visible}");
-    }
-
-    #[test]
-    fn clearing_inline_terminal_removes_the_live_ui_before_exit_output() {
-        let state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24))
-            .expect("initialize inline terminal");
-        terminal
-            .draw(|frame| render(frame, &state))
-            .expect("draw live viewport");
-        let viewport_top = terminal.get_frame().area().as_position();
-
-        clear_inline_terminal(&mut terminal).expect("clear live viewport");
-
-        let text = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(!text.contains("Ask Kurama"), "{text}");
-        assert_eq!(
-            terminal
-                .backend_mut()
-                .get_cursor_position()
-                .expect("exit cursor"),
-            viewport_top
-        );
-    }
-
-    #[tokio::test]
-    async fn completed_transcript_is_inserted_above_the_inline_viewport() {
-        let mut app = App {
-            state: TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised),
-            engine: None,
-            runtime_events: None,
-            tool_events: None,
-            orchestrator: None,
-            session_id: None,
-            restart_args: None,
-            exit_requested: false,
-            control: None,
-        };
-        app.state.push_user("committed question");
-
-        let mut backend = TestBackend::new(80, 16);
-        backend
-            .set_cursor_position(Position::new(0, 4))
-            .expect("position inline viewport");
-        let mut terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(8),
-            },
-        )
-        .expect("inline terminal");
-        let (input_sender, mut input) = mpsc::channel(1);
-        let (runtime_sender, runtime_events) = mpsc::channel(1);
-        drop(input_sender);
-        drop(runtime_sender);
-
-        run_loop(
-            &mut app,
-            &mut terminal,
-            &mut input,
-            Some(runtime_events),
-            None,
-            true,
-            ResizeMode::PRESERVE,
-        )
-        .await
-        .expect("run inline terminal");
-        let inserted_row = (0..16)
-            .find(|y| {
-                (0..80)
-                    .map(|x| {
-                        terminal
-                            .backend()
-                            .buffer()
-                            .cell((x, *y))
-                            .expect("inserted cell")
-                            .symbol()
-                    })
-                    .collect::<String>()
-                    .contains("› committed question")
+        app.state.remember_prompt("previous prompt");
+        app.state.composer = "current draft".into();
+        app.state.cursor = 3;
+        let area = Rect::new(0, 0, 48, 12);
+        let mut cache = TranscriptRenderCache::default();
+        cache.prepare(&mut app.state, area);
+        let wheel = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 4,
+                row: 9,
+                modifiers: KeyModifiers::NONE,
             })
-            .expect("committed transcript row");
+        };
+        let up = wheel(MouseEventKind::ScrollUp);
+        assert!(app.accepts_event(&up));
+        handle_input_with_current_geometry(&mut app, &mut cache, area, up).unwrap();
+        assert!(app.state.scroll > 0);
+        assert_eq!(app.state.composer, "current draft");
+        assert_eq!(app.state.cursor, 3);
+        handle_input_with_current_geometry(
+            &mut app,
+            &mut cache,
+            area,
+            wheel(MouseEventKind::ScrollDown),
+        )
+        .unwrap();
+        assert_eq!(app.state.scroll, 0);
+        assert_eq!(app.state.composer, "current draft");
+        assert_eq!(app.state.cursor, 3);
+        assert!(!app.accepts_event(&wheel(MouseEventKind::Moved)));
+    }
 
-        assert!((0..80).all(|x| {
-            let bg = terminal
+    fn pointer(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn mouse_selects_wrapped_input_and_typing_replaces_the_selection() {
+        let mut app = test_app();
+        app.state.composer = "abcdEFGHijkl".into();
+        app.state.cursor = app.state.composer.len();
+        let area = Rect::new(0, 0, 10, 14);
+        let mut cache = TranscriptRenderCache::default();
+        cache.prepare(&mut app.state, area);
+        let mut terminal = Terminal::new(TestBackend::new(10, 14)).unwrap();
+        terminal
+            .draw(|frame| render_with_transcript(frame, &app.state, cache.lines()))
+            .unwrap();
+        let input = main_layout(area, &app.state).input;
+        let first_row = input.y + 1;
+        let x = input.x + 2;
+        update_transcript_pointer(
+            &mut app.state,
+            &cache,
+            area,
+            pointer(MouseEventKind::Down(MouseButton::Left), x + 1, first_row),
+        );
+        update_transcript_pointer(
+            &mut app.state,
+            &cache,
+            area,
+            pointer(
+                MouseEventKind::Drag(MouseButton::Left),
+                x + 2,
+                first_row + 1,
+            ),
+        );
+        assert_eq!(
+            update_transcript_pointer(
+                &mut app.state,
+                &cache,
+                area,
+                pointer(MouseEventKind::Up(MouseButton::Left), x + 2, first_row + 1)
+            ),
+            Some(PointerAction::Copy("bcdEFG".into()))
+        );
+        handle_input_with_current_geometry(
+            &mut app,
+            &mut cache,
+            area,
+            Event::Key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE)),
+        )
+        .unwrap();
+        assert_eq!(app.state.composer, "aXHijkl");
+        assert_eq!(app.state.cursor, 2);
+    }
+
+    #[test]
+    fn clicking_multiline_input_places_the_caret_without_changing_text() {
+        let mut app = test_app();
+        app.state.composer = "first line\nsecond line".into();
+        app.state.cursor = app.state.composer.len();
+        let area = Rect::new(0, 0, 80, 16);
+        let mut cache = TranscriptRenderCache::default();
+        cache.prepare(&mut app.state, area);
+        let input = main_layout(area, &app.state).input;
+        let click = pointer(
+            MouseEventKind::Down(MouseButton::Left),
+            input.x + 2 + 6,
+            input.y + 1,
+        );
+        update_transcript_pointer(&mut app.state, &cache, area, click);
+        update_transcript_pointer(
+            &mut app.state,
+            &cache,
+            area,
+            pointer(
+                MouseEventKind::Up(MouseButton::Left),
+                click.column,
+                click.row,
+            ),
+        );
+        assert_eq!(app.state.cursor, 6);
+        app.handle_event(Event::Paste("X".into())).unwrap();
+        assert_eq!(app.state.composer, "first Xline\nsecond line");
+    }
+
+    #[test]
+    fn plain_link_click_opens_but_link_drag_selects_without_changing_the_draft() {
+        let mut app = test_app();
+        app.state
+            .push_assistant("Select [reference](https://example.test/one).");
+        app.state.composer = "keep draft".into();
+        app.state.cursor = 4;
+        let area = Rect::new(0, 0, 80, 24);
+        let mut cache = TranscriptRenderCache::default();
+        cache.prepare(&mut app.state, area);
+        assert_eq!(
+            update_transcript_pointer(
+                &mut app.state,
+                &cache,
+                area,
+                pointer(MouseEventKind::Down(MouseButton::Left), 9, 0)
+            ),
+            None
+        );
+        assert_eq!(
+            update_transcript_pointer(
+                &mut app.state,
+                &cache,
+                area,
+                pointer(MouseEventKind::Up(MouseButton::Left), 9, 0)
+            ),
+            Some(PointerAction::Open(Arc::from("https://example.test/one")))
+        );
+        update_transcript_pointer(
+            &mut app.state,
+            &cache,
+            area,
+            pointer(MouseEventKind::Down(MouseButton::Left), 9, 0),
+        );
+        update_transcript_pointer(
+            &mut app.state,
+            &cache,
+            area,
+            pointer(MouseEventKind::Drag(MouseButton::Left), 13, 0),
+        );
+        assert_eq!(
+            update_transcript_pointer(
+                &mut app.state,
+                &cache,
+                area,
+                pointer(MouseEventKind::Up(MouseButton::Left), 13, 0)
+            ),
+            Some(PointerAction::Copy("refer".into()))
+        );
+        assert_eq!(app.state.composer, "keep draft");
+        assert_eq!(app.state.cursor, 4);
+    }
+
+    #[test]
+    fn dragging_copies_the_visible_snapshot_while_streaming_markdown_reflows() {
+        let mut app = test_app();
+        app.state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+            text: "[reference](https://example.test".into(),
+        });
+        let area = Rect::new(0, 0, 80, 24);
+        let mut cache = TranscriptRenderCache::default();
+        cache.prepare(&mut app.state, area);
+        update_transcript_pointer(
+            &mut app.state,
+            &cache,
+            area,
+            pointer(MouseEventKind::Down(MouseButton::Left), 3, 0),
+        );
+        app.state
+            .apply_runtime_event(RuntimeEvent::AssistantDelta { text: ")".into() });
+        cache.prepare(&mut app.state, area);
+        update_transcript_pointer(
+            &mut app.state,
+            &cache,
+            area,
+            pointer(MouseEventKind::Drag(MouseButton::Left), 11, 0),
+        );
+        assert_eq!(
+            update_transcript_pointer(
+                &mut app.state,
+                &cache,
+                area,
+                pointer(MouseEventKind::Up(MouseButton::Left), 11, 0)
+            ),
+            Some(PointerAction::Copy("reference".into()))
+        );
+        cache.prepare(&mut app.state, area);
+        assert!(app.state.transcript_selection.is_none());
+        assert!(cache.lines[0].text.to_string().starts_with("reference"));
+    }
+
+    #[test]
+    fn resize_cancels_pointer_coordinates_before_a_link_can_open() {
+        let mut app = test_app();
+        app.state
+            .push_assistant("[reference](https://example.test)");
+        let mut cache = TranscriptRenderCache::default();
+        let wide = Rect::new(0, 0, 80, 24);
+        let narrow = Rect::new(0, 0, 40, 12);
+        cache.prepare(&mut app.state, wide);
+        update_transcript_pointer(
+            &mut app.state,
+            &cache,
+            wide,
+            pointer(MouseEventKind::Down(MouseButton::Left), 2, 0),
+        );
+        cache.prepare(&mut app.state, narrow);
+        assert_eq!(
+            update_transcript_pointer(
+                &mut app.state,
+                &cache,
+                narrow,
+                pointer(MouseEventKind::Up(MouseButton::Left), 2, 0)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn escape_dismisses_copied_feedback_without_cancelling_the_active_turn() {
+        let mut app = test_app();
+        app.state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+            text: "still working".into(),
+        });
+        app.state.copied_characters = Some(12);
+        let mut cache = TranscriptRenderCache::default();
+        handle_input_with_current_geometry(
+            &mut app,
+            &mut cache,
+            Rect::new(0, 0, 80, 24),
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        )
+        .unwrap();
+        assert_eq!(app.state.copied_characters, None);
+        assert!(app.state.activity().is_animated());
+        assert!(app.state.sent_commands().is_empty());
+    }
+
+    #[test]
+    fn copied_character_count_is_visible_in_normal_and_expanded_views() {
+        let mut app = test_app();
+        apply_pointer_action(&mut app, PointerAction::Copy("é界\n".into()));
+        for expanded in [false, true] {
+            if expanded {
+                app.state.toggle_transcript_view();
+            }
+            let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+            terminal
+                .draw(|frame| render_with_transcript(frame, &app.state, None))
+                .unwrap();
+            let visible = terminal
                 .backend()
                 .buffer()
-                .cell((x, inserted_row))
-                .expect("inserted background")
-                .bg;
-            bg == Color::Reset || bg == Color::Rgb(36, 40, 48)
-        }));
-        assert!(app.state.live_transcript().is_empty());
-    }
-
-    #[tokio::test]
-    async fn inline_resize_replays_committed_history_without_duplicates() {
-        let mut app = test_app();
-        app.state.push_user("committed question");
-        app.state.push_assistant("committed answer");
-        let mut terminal = initialize_inline_terminal(TestBackend::new(80, 24))
-            .expect("initialize inline terminal");
-        let (input_sender, mut input) = mpsc::channel(2);
-        input_sender
-            .send(Event::Resize(60, 18))
-            .await
-            .expect("queue resize");
-        drop(input_sender);
-
-        run_loop(
-            &mut app,
-            &mut terminal,
-            &mut input,
-            None,
-            None,
-            true,
-            ResizeMode::REPLAY,
-        )
-        .await
-        .expect("run resized inline terminal");
-
-        let text = terminal
-            .backend()
-            .scrollback()
-            .content()
-            .iter()
-            .chain(terminal.backend().buffer().content().iter())
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert_eq!(text.matches("committed question").count(), 1, "{text}");
-        assert_eq!(text.matches("committed answer").count(), 1, "{text}");
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(visible.contains("Copied 3 chars"), "{visible}");
+        }
+        app.state.push_assistant("ab界");
+        app.copy_last_assistant();
+        assert_eq!(app.state.copied_characters, Some(3));
     }
 
     #[test]
-    fn inline_prepare_reuses_markdown_render_for_draw() {
+    fn fullscreen_prepare_reuses_markdown_render_for_draw() {
         let mut state = TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised);
         state.apply_runtime_event(RuntimeEvent::AssistantDelta {
             text: "## Heading\n\n- one\n- two\n\n```rust\nfn main() {}\n```".into(),
         });
-        let mut terminal =
-            initialize_inline_terminal(TestBackend::new(80, 24)).expect("inline terminal");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("fullscreen terminal");
 
         crate::tui::reset_transcript_render_calls();
         let mut transcript_cache = TranscriptRenderCache::default();
-        prepare_inline_frame(&mut state, &mut terminal, &mut transcript_cache)
-            .expect("prepare inline frame");
+        prepare_fullscreen_frame(&mut state, &mut terminal, &mut transcript_cache)
+            .expect("prepare fullscreen frame");
         terminal
             .draw(|frame| render_with_transcript(frame, &state, transcript_cache.lines()))
-            .expect("render inline frame");
+            .expect("render fullscreen frame");
 
         assert_eq!(crate::tui::transcript_render_calls(), 1);
     }
@@ -3765,8 +5120,7 @@ Session ID: ses_cafebabe"
         app.state.apply_runtime_event(RuntimeEvent::AssistantDelta {
             text: "## Heading\n\n- one\n- two\n\n```rust\nfn main() {}\n```".into(),
         });
-        let mut terminal =
-            initialize_inline_terminal(TestBackend::new(80, 24)).expect("inline terminal");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("fullscreen terminal");
         let (input_sender, mut input) = mpsc::channel(1);
         let closer = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(150)).await;
@@ -3774,17 +5128,9 @@ Session ID: ses_cafebabe"
         });
 
         crate::tui::reset_transcript_render_calls();
-        run_loop(
-            &mut app,
-            &mut terminal,
-            &mut input,
-            None,
-            None,
-            true,
-            ResizeMode::PRESERVE,
-        )
-        .await
-        .expect("run animated inline frame");
+        run_loop(&mut app, &mut terminal, &mut input, None, None)
+            .await
+            .expect("run animated fullscreen frame");
         closer.await.expect("close input channel");
 
         assert_eq!(crate::tui::transcript_render_calls(), 1);
@@ -3796,8 +5142,7 @@ Session ID: ses_cafebabe"
         app.state.apply_runtime_event(RuntimeEvent::AssistantDelta {
             text: "## Heading\n\n- one\n- two\n\n```rust\nfn main() {}\n```".into(),
         });
-        let mut terminal =
-            initialize_inline_terminal(TestBackend::new(80, 24)).expect("inline terminal");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("fullscreen terminal");
         let (input_sender, mut input) = mpsc::channel(1);
         input_sender
             .send(Event::Key(KeyEvent::new(
@@ -3809,24 +5154,16 @@ Session ID: ses_cafebabe"
         drop(input_sender);
 
         crate::tui::reset_transcript_render_calls();
-        run_loop(
-            &mut app,
-            &mut terminal,
-            &mut input,
-            None,
-            None,
-            true,
-            ResizeMode::PRESERVE,
-        )
-        .await
-        .expect("run composer redraw");
+        run_loop(&mut app, &mut terminal, &mut input, None, None)
+            .await
+            .expect("run composer redraw");
 
         assert_eq!(app.state.composer, "x");
         assert_eq!(crate::tui::transcript_render_calls(), 1);
     }
 
     #[tokio::test]
-    async fn fullscreen_run_with_keeps_transcript_in_the_live_view() {
+    async fn fullscreen_run_clears_old_cells_and_anchors_the_composer() {
         let mut app = App {
             state: TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised),
             engine: None,
@@ -3837,9 +5174,16 @@ Session ID: ses_cafebabe"
             restart_args: None,
             exit_requested: false,
             control: None,
+            link_tasks: tokio::task::JoinSet::new(),
+            diff_load: None,
         };
         app.state.push_user("visible fullscreen question");
-        let mut terminal = Terminal::new(TestBackend::new(80, 16)).expect("fullscreen terminal");
+        let mut rows = vec![" ".repeat(80); 16];
+        rows[0] = "stale shell header".into();
+        rows[8] = "stale screen content".into();
+        let mut backend = TestBackend::with_lines(rows);
+        backend.set_cursor_position(Position::new(22, 8)).unwrap();
+        let mut terminal = Terminal::new(backend).expect("fullscreen terminal");
         let (input_sender, input) = mpsc::channel(1);
         let (runtime_sender, runtime_events) = mpsc::channel(1);
         drop(input_sender);
@@ -3857,7 +5201,11 @@ Session ID: ses_cafebabe"
             .collect::<String>();
 
         assert!(visible.contains("visible fullscreen question"));
-        assert_eq!(app.state.live_transcript().len(), 1);
+        assert_eq!(app.state.transcript.len(), 1);
+        assert!(!visible.contains("stale shell header"));
+        assert!(!visible.contains("stale screen content"));
+        assert_eq!(terminal.get_frame().area(), Rect::new(0, 0, 80, 16));
+        assert_eq!(terminal.backend_mut().get_cursor_position().unwrap().y, 12);
     }
 
     #[tokio::test]
@@ -3887,27 +5235,379 @@ Session ID: ses_cafebabe"
         assert_eq!(terminal.get_frame().area().width, 28);
         assert!(visible.contains("lambda"), "{visible}");
         assert_eq!(crate::tui::transcript_render_calls(), 1);
-        assert_eq!(app.state.live_transcript().len(), 1);
+        assert_eq!(app.state.transcript.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ignored_input_does_not_redraw_or_execute_global_shortcuts() {
+        let mut app = test_app();
+        let draws = Rc::new(Cell::new(1));
+        let backend = DrawBudgetBackend::new(TestBackend::new(80, 24), draws.clone());
+        let mut terminal = Terminal::new(backend).unwrap();
+        let (sender, mut input) = mpsc::channel(8);
+        for event in [
+            Event::FocusGained,
+            Event::FocusLost,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Event::Key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Release,
+            )),
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('o'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Release,
+            )),
+        ] {
+            sender.send(event).await.unwrap();
+        }
+        drop(sender);
+        run_loop(&mut app, &mut terminal, &mut input, None, None)
+            .await
+            .unwrap();
+        assert_eq!(draws.get(), 0);
+        assert!(!app.exit_requested);
+        assert!(!app.state.transcript_view_expanded());
     }
 
     #[test]
-    fn transcript_commit_uses_current_terminal_width_after_resize() {
-        let mut backend = TestBackend::new(30, 16);
-        backend
-            .set_cursor_position(Position::new(0, 4))
-            .expect("position inline viewport");
-        let mut terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(8),
+    fn expanded_cache_uses_actual_width_and_true_prompt_anchors() {
+        let mut app = test_app();
+        for prompt in ["first prompt", "second prompt", "third prompt"] {
+            app.state.push_user(prompt);
+            app.state
+                .push_tool("bash", "> not a user prompt\n".repeat(30));
+        }
+        app.state.toggle_transcript_view();
+        app.state.composer_inner_width.set(90);
+        let mut terminal = Terminal::new(TestBackend::new(32, 8)).unwrap();
+        let mut cache = TranscriptRenderCache::default();
+        prepare_fullscreen_frame(&mut app.state, &mut terminal, &mut cache).unwrap();
+        terminal
+            .draw(|frame| render_with_transcript(frame, &app.state, cache.lines()))
+            .unwrap();
+        crate::tui::reset_transcript_render_calls();
+        for (key, prompt) in [
+            (KeyCode::Home, "first prompt"),
+            (KeyCode::Char('}'), "second prompt"),
+            (KeyCode::Char('}'), "third prompt"),
+            (KeyCode::Char('{'), "second prompt"),
+        ] {
+            app.handle_event(Event::Key(KeyEvent::new(key, KeyModifiers::NONE)))
+                .unwrap();
+            prepare_fullscreen_frame(&mut app.state, &mut terminal, &mut cache).unwrap();
+            terminal
+                .draw(|frame| render_with_transcript(frame, &app.state, cache.lines()))
+                .unwrap();
+            let first_row: String = terminal.backend().buffer().content()[..32]
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(first_row.contains(prompt), "{first_row}");
+        }
+        app.state.apply_runtime_event(RuntimeEvent::Usage {
+            usage: Usage {
+                input_tokens: 100,
+                ..Usage::default()
             },
-        )
-        .expect("inline terminal");
-        terminal.backend_mut().resize(60, 16);
-        let mut state = TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised);
-        state.push_user("123456789012345678901234567890");
+        });
+        prepare_fullscreen_frame(&mut app.state, &mut terminal, &mut cache).unwrap();
+        assert_eq!(crate::tui::transcript_render_calls(), 0);
+    }
 
-        commit_stable_transcript(&mut state, &mut terminal).expect("commit transcript");
+    #[test]
+    fn read_position_survives_new_output_and_height_changes() {
+        for expanded in [false, true] {
+            let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+            state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+                text: (0..80).map(|i| format!("row {i}\n\n")).collect(),
+            });
+            if expanded {
+                state.toggle_transcript_view();
+            }
+            let mut cache = TranscriptRenderCache::default();
+            cache.prepare(&mut state, Rect::new(0, 0, 40, 10));
+            state.scroll = 40;
+            let top = cache.lines.len() - cache.viewport_height as usize - state.scroll;
+            let before = cache.lines[top].text.clone();
+            state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+                text: "new output\n\n".into(),
+            });
+            cache.prepare(&mut state, Rect::new(0, 0, 40, 7));
+            let top = cache.lines.len() - cache.viewport_height as usize - state.scroll;
+            assert_eq!(cache.lines[top].text, before);
+            state.scroll = usize::MAX;
+            cache.prepare(&mut state, Rect::new(0, 0, 40, 7));
+            assert_eq!(
+                state.scroll,
+                cache.lines.len() - cache.viewport_height as usize
+            );
+        }
+    }
+
+    #[test]
+    fn composer_deletes_whole_graphemes_and_normalizes_invalid_byte_cursors() {
+        let mut app = test_app();
+        app.state.composer = "e\u{301}👨‍👩‍👧‍👦界".into();
+        app.state.cursor = app.state.composer.len();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        assert_eq!(app.state.composer, "e\u{301}👨‍👩‍👧‍👦");
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)))
+            .unwrap();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Delete,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        assert_eq!(app.state.composer, "e\u{301}");
+        app.state.cursor = 2;
+        app.handle_event(Event::Paste("x".into())).unwrap();
+        assert_eq!(app.state.composer, "xe\u{301}");
+        assert!(app.state.composer.is_char_boundary(app.state.cursor));
+    }
+
+    #[test]
+    fn expanded_width_reflow_keeps_the_same_entry_at_the_reading_position() {
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        state.push_assistant("earlier wrapping text ".repeat(80));
+        state.push_user("ANCHOR");
+        state.push_assistant(
+            (0..30)
+                .map(|i| format!("short {i}\n\n"))
+                .collect::<String>(),
+        );
+        state.toggle_transcript_view();
+        let mut cache = TranscriptRenderCache::default();
+        cache.prepare(&mut state, Rect::new(0, 0, 80, 10));
+        let anchor = cache
+            .lines
+            .iter()
+            .position(|line| {
+                line.text
+                    .spans
+                    .iter()
+                    .any(|span| span.content.contains("ANCHOR"))
+            })
+            .unwrap();
+        state.scroll = cache.lines.len() - 9 - anchor;
+        for width in [32, 100, 18] {
+            cache.prepare(&mut state, Rect::new(0, 0, width, 10));
+            let first = &cache.lines[cache.lines.len() - 9 - state.scroll];
+            assert!(
+                first
+                    .text
+                    .spans
+                    .iter()
+                    .any(|span| span.content.contains("ANCHOR")),
+                "lost reading position at width {width}: {first:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_placeholder_is_stable_and_never_submitted_as_input() {
+        let mut app = test_app();
+        let session = SessionId::from("placeholder-session");
+        app.state.set_composer_session(&session);
+        let placeholder = app.state.composer_placeholder();
+        for (width, height) in [(80, 24), (32, 8), (100, 30)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| crate::tui::render(frame, &app.state))
+                .unwrap();
+            let visible = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            if width >= 80 {
+                assert!(visible.contains(placeholder));
+            }
+            assert_eq!(app.state.composer_placeholder(), placeholder);
+            assert!(app.state.composer.is_empty());
+        }
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        assert!(app.state.sent_commands().is_empty());
+        assert!(app.state.transcript.is_empty());
+        app.state.composer = "actual draft".into();
+        app.state.cursor = app.state.composer.len();
+        app.state.clear_composer();
+        app.state.set_thinking();
+        app.state.apply_runtime_event(RuntimeEvent::TurnCompleted);
+        assert_eq!(app.state.composer_placeholder(), placeholder);
+        let mut resumed = TuiState::new(
+            "other-profile",
+            "other-model",
+            ".",
+            ExecutionMode::Supervised,
+        );
+        resumed.set_composer_session(&session);
+        assert_eq!(resumed.composer_placeholder(), placeholder);
+    }
+
+    #[test]
+    fn distinct_sessions_can_display_different_composer_prompts() {
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        let prompts = (0..32)
+            .map(|index| {
+                state.set_composer_session(&SessionId::from(format!("session-{index}")));
+                state.composer_placeholder()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            prompts.len() > 1,
+            "session selection always returned the same prompt"
+        );
+    }
+
+    #[test]
+    fn prompt_navigation_uses_unpainted_stream_geometry_once() {
+        let mut app = test_app();
+        for prompt in ["first prompt", "second prompt", "third prompt"] {
+            app.state.push_user(prompt);
+            app.state.push_tool("bash", "tool output row\n".repeat(30));
+        }
+        app.state.toggle_transcript_view();
+        let area = Rect::new(0, 0, 32, 8);
+        let mut cache = TranscriptRenderCache::default();
+        cache.prepare(&mut app.state, area);
+        handle_input_with_current_geometry(
+            &mut app,
+            &mut cache,
+            area,
+            Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+        )
+        .unwrap();
+        app.state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+            text: "unpainted content ".repeat(20),
+        });
+        handle_input_with_current_geometry(
+            &mut app,
+            &mut cache,
+            area,
+            Event::Key(KeyEvent::new(KeyCode::Char('}'), KeyModifiers::NONE)),
+        )
+        .unwrap();
+        cache.prepare(&mut app.state, area);
+        let row = &cache.lines[cache.lines.len() - 7 - app.state.scroll];
+        assert!(
+            row.text
+                .spans
+                .iter()
+                .any(|span| span.content.contains("second prompt")),
+            "{row:?}"
+        );
+    }
+
+    #[test]
+    fn pasted_joiner_backspace_preserves_neighboring_composer_text() {
+        let mut app = test_app();
+        app.state.composer = "A\u{1f469}\u{1f467}Z".into();
+        app.state.cursor = "A\u{1f469}".len();
+        app.handle_event(Event::Paste("\u{200d}".into())).unwrap();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        assert_eq!(app.state.composer, "AZ");
+    }
+
+    #[test]
+    fn incremental_stream_and_todo_updates_match_fresh_rendering() {
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        for index in 0..20 {
+            state.push_user(format!("earlier prompt {index}"));
+            state.push_assistant(format!("**earlier answer {index}**"));
+        }
+        state.toggle_transcript_view();
+        let mut cache = TranscriptRenderCache::default();
+        let area = Rect::new(0, 0, 48, 10);
+        cache.prepare(&mut state, area);
+        let todo = |items: serde_json::Value| {
+            let mut result =
+                kurama_protocol::tool::ToolResult::success("todo-call".into(), "updated");
+            result.metadata = serde_json::json!({"tool_name":"todo", "items":items});
+            RuntimeEvent::ToolCompleted {
+                operation_id: "todo-operation".into(),
+                result,
+            }
+        };
+        let mut completed =
+            kurama_protocol::tool::ToolResult::success("bash-call".into(), "complete output");
+        completed.metadata = serde_json::json!({"tool_name":"bash"});
+        for event in [
+            RuntimeEvent::AssistantDelta {
+                text: "streaming **answer".into(),
+            },
+            RuntimeEvent::AssistantDelta {
+                text: "**\n\nsecond paragraph".into(),
+            },
+            RuntimeEvent::ToolOutputDelta {
+                call_id: "bash-call".into(),
+                stream: "stdout".into(),
+                chunk: "first output".into(),
+            },
+            todo(serde_json::json!([{"id":"one","content":"in-flight item","status":"pending"}])),
+            RuntimeEvent::ToolOutputDelta {
+                call_id: "bash-call".into(),
+                stream: "stdout".into(),
+                chunk: "\nupdated output".into(),
+            },
+            todo(serde_json::json!([])),
+            RuntimeEvent::ToolCompleted {
+                operation_id: "bash-operation".into(),
+                result: completed,
+            },
+            RuntimeEvent::AssistantDelta {
+                text: "final answer".into(),
+            },
+        ] {
+            state.apply_runtime_event(event);
+            cache.prepare(&mut state, area);
+            assert_eq!(
+                cache
+                    .lines
+                    .iter()
+                    .map(|line| &line.text)
+                    .collect::<Vec<_>>(),
+                transcript_lines(&state.transcript, 44, TranscriptDetail::Expanded)
+                    .iter()
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    #[test]
+    fn zero_height_terminal_preserves_content_until_rows_return() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 0)).unwrap();
+        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+        state.push_assistant("deferred output");
+        let mut cache = TranscriptRenderCache::default();
+        prepare_fullscreen_frame(&mut state, &mut terminal, &mut cache).unwrap();
+        terminal.backend_mut().resize(80, 12);
+        prepare_fullscreen_frame(&mut state, &mut terminal, &mut cache).unwrap();
+        terminal
+            .draw(|frame| render_with_transcript(frame, &state, cache.lines()))
+            .unwrap();
         let visible = terminal
             .backend()
             .buffer()
@@ -3915,28 +5615,8 @@ Session ID: ses_cafebabe"
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-
-        assert!(visible.contains("› 123456789012345678901234567890"));
-    }
-
-    #[test]
-    fn tiny_inline_terminal_defers_invisible_transcript_commit() {
-        let mut backend = TestBackend::new(4, 8);
-        backend
-            .set_cursor_position(Position::new(0, 2))
-            .expect("position inline viewport");
-        let mut terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(4),
-            },
-        )
-        .expect("inline terminal");
-        let mut state = TuiState::new("fixture", "frontier", ".", ExecutionMode::Supervised);
-        state.push_user("defer me");
-
-        commit_stable_transcript(&mut state, &mut terminal).expect("defer transcript");
-
-        assert_eq!(state.live_transcript().len(), 1);
+        assert_eq!(visible.matches("deferred output").count(), 1);
+        assert_eq!(state.transcript.len(), 1);
+        assert_eq!(terminal.backend_mut().get_cursor_position().unwrap().y, 8);
     }
 }

@@ -1,15 +1,28 @@
-use kurama_core::context::{ContextManager, ContextPolicy};
+use kurama_core::context::{CompactionRequest, ContextManager, ContextPolicy, estimate_text};
 use kurama_protocol::{
     id::{CallId, OperationId, SessionId},
-    model::{ModelItem, ModelProfile},
+    model::{ModelItem, ModelProfile, ModelRequest},
     policy::ExecutionMode,
-    session::{EventEnvelope, GoalStatus, SessionEvent, SessionGoal, SessionMetadata},
-    tool::ToolResult,
+    session::{
+        EventEnvelope, GoalStatus, SessionEvent, SessionGoal, SessionMetadata, TodoItem, TodoStatus,
+    },
+    tool::{ToolDescriptor, ToolResult},
 };
 use serde_json::json;
 
 fn event(sequence: u64, event: SessionEvent) -> EventEnvelope {
     EventEnvelope::new(sequence, sequence, SessionId::from("session"), None, event)
+}
+
+fn compaction_events(request: &CompactionRequest) -> Vec<EventEnvelope> {
+    request
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ModelItem::User { text } => Some(serde_json::from_str(text).expect("durable events")),
+            _ => None,
+        })
+        .expect("new compaction events")
 }
 
 fn long_session() -> Vec<EventEnvelope> {
@@ -27,6 +40,7 @@ fn long_session() -> Vec<EventEnvelope> {
             events.len() as u64,
             SessionEvent::UserMessage {
                 text: format!("question {turn} {}", "x".repeat(150)),
+                explicit_delegation: false,
             },
         ));
         events.push(event(
@@ -66,7 +80,7 @@ fn keeps_recent_turns_and_summary_within_budget() {
 }
 
 #[test]
-fn current_turn_keeps_complete_tool_output_when_it_fits() {
+fn steering_retains_the_complete_current_turn_and_tool_output() {
     let output = (0..300)
         .map(|line| format!("tracked-file-{line}.rs"))
         .collect::<Vec<_>>()
@@ -87,6 +101,7 @@ fn current_turn_keeps_complete_tool_output_when_it_fits() {
             1,
             SessionEvent::UserMessage {
                 text: "Summarize the repository.".into(),
+                explicit_delegation: false,
             },
         ),
         event(
@@ -94,6 +109,13 @@ fn current_turn_keeps_complete_tool_output_when_it_fits() {
             SessionEvent::ToolCompleted {
                 operation_id: OperationId::from("operation"),
                 result,
+            },
+        ),
+        event(
+            3,
+            SessionEvent::UserSteered {
+                text: "Focus on the public API.".into(),
+                explicit_delegation: false,
             },
         ),
     ];
@@ -114,16 +136,28 @@ fn current_turn_keeps_complete_tool_output_when_it_fits() {
         )
         .expect("assemble context");
 
-    assert!(assembled.request.items.iter().any(|item| {
-        matches!(
-            item,
-            ModelItem::ToolResult { content, .. } if content == &output
-        )
-    }));
+    assert_eq!(
+        assembled.request.items,
+        vec![
+            ModelItem::User {
+                text: "Summarize the repository.".into(),
+            },
+            ModelItem::ToolResult {
+                call_id: CallId::from("call"),
+                name: "bash".into(),
+                content: output,
+                is_error: false,
+                blob_refs: Vec::new(),
+            },
+            ModelItem::User {
+                text: "Focus on the public API.".into(),
+            },
+        ]
+    );
 }
 
 #[test]
-fn current_turn_reports_context_overflow_instead_of_dropping_tool_output() {
+fn steering_cannot_hide_current_turn_context_overflow() {
     let metadata = SessionMetadata {
         id: SessionId::from("session"),
         created_at_ms: 0,
@@ -146,6 +180,7 @@ fn current_turn_reports_context_overflow_instead_of_dropping_tool_output() {
             1,
             SessionEvent::UserMessage {
                 text: "Inspect everything.".into(),
+                explicit_delegation: false,
             },
         ),
         event(
@@ -153,6 +188,13 @@ fn current_turn_reports_context_overflow_instead_of_dropping_tool_output() {
             SessionEvent::ToolCompleted {
                 operation_id: OperationId::from("operation"),
                 result,
+            },
+        ),
+        event(
+            3,
+            SessionEvent::UserSteered {
+                text: "Do not discard the output.".into(),
+                explicit_delegation: false,
             },
         ),
     ]);
@@ -166,7 +208,7 @@ fn current_turn_reports_context_overflow_instead_of_dropping_tool_output() {
         )
         .expect_err("oversized current turn must fail explicitly");
 
-    assert!(error.to_string().contains("current turn exceeds"));
+    assert!(matches!(error, kurama_protocol::KuramaError::Session(_)));
 }
 
 #[test]
@@ -188,6 +230,7 @@ fn assembled_items_keep_completed_history_before_the_current_turn() {
             1,
             SessionEvent::UserMessage {
                 text: "older question".into(),
+                explicit_delegation: false,
             },
         ),
         event(
@@ -201,6 +244,7 @@ fn assembled_items_keep_completed_history_before_the_current_turn() {
             4,
             SessionEvent::UserMessage {
                 text: "current question".into(),
+                explicit_delegation: false,
             },
         ),
         event(
@@ -240,6 +284,156 @@ fn compaction_preserves_canonical_events() {
     manager.apply_compaction(request.covered_through_sequence, "facts".into(), 2);
     assert_eq!(manager.canonical_event_count(), events.len());
     assert_eq!(manager.report().summary_tokens, 2);
+}
+
+#[test]
+fn repeated_compaction_carries_summary_outside_the_new_prefix() {
+    let mut manager = ContextManager::new(ContextPolicy::default());
+    for (turn, name) in ["A", "B", "C", "D", "E"].into_iter().enumerate() {
+        let sequence = turn as u64 * 3;
+        manager.record(event(
+            sequence,
+            SessionEvent::UserMessage {
+                text: name.into(),
+                explicit_delegation: false,
+            },
+        ));
+        manager.record(event(
+            sequence + 1,
+            SessionEvent::AssistantMessage {
+                text: format!("decision {name}"),
+            },
+        ));
+        manager.record(event(sequence + 2, SessionEvent::TurnCompleted));
+    }
+    let first = manager.compaction_request().expect("compact A");
+    assert_eq!(first.covered_through_sequence, 2);
+    let summary = format!("decision A: {}", "durable detail ".repeat(80));
+    manager.record(event(
+        15,
+        SessionEvent::ContextCompacted {
+            covered_through_sequence: first.covered_through_sequence,
+            summary: summary.clone(),
+            // Estimates must measure the actual input, not trust stored counts.
+            tokens: 1,
+        },
+    ));
+    assert!(manager.compaction_request().is_none());
+    manager.record(event(
+        16,
+        SessionEvent::UserMessage {
+            text: "F".into(),
+            explicit_delegation: false,
+        },
+    ));
+    manager.record(event(
+        17,
+        SessionEvent::AssistantMessage {
+            text: "decision F".into(),
+        },
+    ));
+    manager.record(event(18, SessionEvent::TurnCompleted));
+
+    let second = manager
+        .compaction_request()
+        .expect("compact B with A summary");
+    assert_eq!(second.covered_through_sequence, 5);
+    assert_eq!(
+        compaction_events(&second)
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5]
+    );
+    assert!(matches!(
+        &second.items[0],
+        ModelItem::Summary { text, covered_through_sequence: 2, .. } if text == &summary
+    ));
+    let input = serde_json::to_string(&second.items).expect("serialize model data");
+    assert_eq!(input.matches("decision A").count(), 1);
+    assert!(!second.prompt.contains("decision A"));
+    assert!(second.estimated_tokens >= estimate_text(&summary));
+
+    let assembled = manager
+        .assemble(
+            &ModelProfile::new("test", "frontier", 128_000, 8_000),
+            Vec::new(),
+            false,
+            ".",
+        )
+        .expect("assemble retained turns");
+    let users: Vec<_> = assembled
+        .request
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ModelItem::User { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(users, vec!["C", "D", "E", "F"]);
+}
+
+#[test]
+fn compaction_excludes_superseded_summary_events_from_new_data() {
+    let mut manager = ContextManager::new(ContextPolicy {
+        recent_turns: 0,
+        ..ContextPolicy::default()
+    });
+    manager.replay(vec![
+        event(
+            0,
+            SessionEvent::UserMessage {
+                text: "A".into(),
+                explicit_delegation: false,
+            },
+        ),
+        event(1, SessionEvent::TurnCompleted),
+        event(
+            2,
+            SessionEvent::ContextCompacted {
+                covered_through_sequence: 1,
+                summary: "stale decision".into(),
+                tokens: 5,
+            },
+        ),
+        event(
+            3,
+            SessionEvent::UserMessage {
+                text: "B replaces A".into(),
+                explicit_delegation: false,
+            },
+        ),
+        event(4, SessionEvent::TurnCompleted),
+        event(
+            5,
+            SessionEvent::ContextCompacted {
+                covered_through_sequence: 4,
+                summary: "current decision".into(),
+                tokens: 5,
+            },
+        ),
+        event(
+            6,
+            SessionEvent::UserMessage {
+                text: "C".into(),
+                explicit_delegation: false,
+            },
+        ),
+        event(7, SessionEvent::TurnCompleted),
+    ]);
+    let request = manager.compaction_request().expect("compact C");
+    assert_eq!(request.covered_through_sequence, 7);
+    assert_eq!(
+        compaction_events(&request)
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![6, 7]
+    );
+    let input = serde_json::to_string(&request.items).expect("serialize model data");
+    assert_eq!(input.matches("current decision").count(), 1);
+    assert!(!input.contains("stale decision"));
 }
 
 #[test]
@@ -444,6 +638,7 @@ fn goal_continuation_turns_stay_in_recent_history() {
             2,
             SessionEvent::UserMessage {
                 text: objective.into(),
+                explicit_delegation: false,
             },
         ),
         event(
@@ -470,6 +665,13 @@ fn goal_continuation_turns_stay_in_recent_history() {
         recent_turns: 3,
     });
     manager.replay(events);
+    assert_eq!(
+        manager
+            .compaction_request()
+            .expect("compact older continuation turns")
+            .covered_through_sequence,
+        8
+    );
     let items = manager
         .assemble(
             &ModelProfile::new("test", "frontier", 4_000, 200),
@@ -518,6 +720,7 @@ fn tight_budget_still_keeps_the_active_goal() {
             events.len() as u64,
             SessionEvent::UserMessage {
                 text: format!("turn {turn} {padding}"),
+                explicit_delegation: false,
             },
         ));
         events.push(event(
@@ -560,6 +763,636 @@ fn tight_budget_still_keeps_the_active_goal() {
         items.iter().any(
             |item| matches!(item, ModelItem::Goal { goal, .. } if goal.objective == objective)
         )
+    );
+}
+
+#[test]
+fn oversized_recent_turn_is_omitted_whole_without_blocking_later_turns() {
+    let mut manager = ContextManager::new(ContextPolicy {
+        max_input_tokens: 2_000,
+        reserve_output_tokens: 0,
+        recent_turns: 2,
+        ..ContextPolicy::default()
+    });
+    manager.replay(vec![
+        event(
+            0,
+            SessionEvent::UserMessage {
+                text: "orphaned question".into(),
+                explicit_delegation: false,
+            },
+        ),
+        event(
+            1,
+            SessionEvent::AssistantMessage {
+                text: "orphaned answer".into(),
+            },
+        ),
+        event(
+            2,
+            SessionEvent::ToolCompleted {
+                operation_id: OperationId::from("large-operation"),
+                result: ToolResult::success(CallId::from("large-call"), "x".repeat(9_000)),
+            },
+        ),
+        event(3, SessionEvent::TurnCompleted),
+        event(
+            4,
+            SessionEvent::UserMessage {
+                text: "small question".into(),
+                explicit_delegation: false,
+            },
+        ),
+        event(
+            5,
+            SessionEvent::AssistantMessage {
+                text: "small answer".into(),
+            },
+        ),
+        event(
+            6,
+            SessionEvent::UserSteered {
+                text: "Use both small messages.".into(),
+                explicit_delegation: false,
+            },
+        ),
+        event(7, SessionEvent::TurnCompleted),
+        event(
+            8,
+            SessionEvent::UserMessage {
+                text: "current question".into(),
+                explicit_delegation: false,
+            },
+        ),
+    ]);
+
+    let assembled = manager
+        .assemble(
+            &ModelProfile::new("test", "frontier", 2_000, 0),
+            Vec::new(),
+            false,
+            ".",
+        )
+        .expect("assemble with an oversized historical turn");
+    assert_eq!(
+        assembled.request.items,
+        vec![
+            ModelItem::User {
+                text: "small question".into()
+            },
+            ModelItem::Assistant {
+                text: "small answer".into()
+            },
+            ModelItem::User {
+                text: "Use both small messages.".into()
+            },
+            ModelItem::User {
+                text: "current question".into()
+            },
+        ]
+    );
+    let inspection = manager.inspect(
+        &ModelProfile::new("test", "frontier", 2_000, 0),
+        Vec::new(),
+        false,
+        ".",
+    );
+    assert_eq!(inspection.total_completed_turns, 2);
+    assert_eq!(inspection.included_recent_turns, 1);
+    assert_eq!(inspection.omitted_turns, 1);
+    assert_eq!(inspection.estimated_tokens, assembled.estimated_tokens);
+}
+
+#[test]
+fn malformed_boundaries_preserve_latest_incomplete_and_failed_turns() {
+    let mut manager = ContextManager::new(ContextPolicy {
+        recent_turns: 1,
+        ..ContextPolicy::default()
+    });
+    let profile = ModelProfile::new("test", "frontier", 128_000, 8_000);
+    let mut events = vec![
+        event(0, SessionEvent::TurnCompleted),
+        event(
+            1,
+            SessionEvent::UserMessage {
+                text: "interrupted".into(),
+                explicit_delegation: false,
+            },
+        ),
+        event(
+            2,
+            SessionEvent::AssistantMessage {
+                text: "partial answer".into(),
+            },
+        ),
+        event(
+            3,
+            SessionEvent::UserMessage {
+                text: "failed question".into(),
+                explicit_delegation: false,
+            },
+        ),
+        event(
+            4,
+            SessionEvent::AssistantMessage {
+                text: "failed answer".into(),
+            },
+        ),
+        event(
+            5,
+            SessionEvent::TurnFailed {
+                error: "provider disconnected".into(),
+            },
+        ),
+        event(6, SessionEvent::TurnCompleted),
+    ];
+    for entry in &events {
+        manager.record(entry.clone());
+    }
+    assert_eq!(
+        manager
+            .assemble(&profile, Vec::new(), false, ".")
+            .expect("assemble failed turn")
+            .request
+            .items,
+        vec![
+            ModelItem::User {
+                text: "failed question".into()
+            },
+            ModelItem::Assistant {
+                text: "failed answer".into()
+            },
+            ModelItem::User {
+                text: "interrupted".into()
+            },
+            ModelItem::Assistant {
+                text: "partial answer".into()
+            },
+        ]
+    );
+
+    let continuation = event(
+        7,
+        SessionEvent::AssistantMessage {
+            text: "continuation".into(),
+        },
+    );
+    manager.record(continuation.clone());
+    events.push(continuation);
+    assert_eq!(
+        manager
+            .assemble(&profile, Vec::new(), false, ".")
+            .expect("assemble open continuation")
+            .request
+            .items,
+        vec![
+            ModelItem::User {
+                text: "failed question".into()
+            },
+            ModelItem::Assistant {
+                text: "failed answer".into()
+            },
+            ModelItem::Assistant {
+                text: "continuation".into()
+            },
+        ]
+    );
+
+    let completed = event(8, SessionEvent::TurnCompleted);
+    manager.record(completed.clone());
+    events.push(completed);
+    let expected = vec![
+        ModelItem::Assistant {
+            text: "continuation".into(),
+        },
+        ModelItem::User {
+            text: "interrupted".into(),
+        },
+        ModelItem::Assistant {
+            text: "partial answer".into(),
+        },
+    ];
+    assert_eq!(
+        manager
+            .assemble(&profile, Vec::new(), false, ".")
+            .expect("assemble completed continuation")
+            .request
+            .items,
+        expected
+    );
+    manager.replay(events);
+    assert_eq!(
+        manager
+            .assemble(&profile, Vec::new(), false, ".")
+            .expect("assemble replayed boundaries")
+            .request
+            .items,
+        expected
+    );
+}
+
+#[test]
+fn clearing_and_replay_remove_stale_goal_todo_evidence_and_turns() {
+    let mut manager = ContextManager::new(ContextPolicy::default());
+    let profile = ModelProfile::new("test", "frontier", 128_000, 8_000);
+    let todo = TodoItem {
+        id: "todo".into(),
+        content: "latest task".into(),
+        status: TodoStatus::InProgress,
+    };
+    let goal = SessionGoal::new("latest goal").expect("valid goal");
+    let mut result = ToolResult::success(CallId::from("evidence-call"), "tool output");
+    result.metadata = json!({"evidence": [{"path": "src/lib.rs", "content": "fact"}]});
+    manager.replay(vec![
+        event(
+            0,
+            SessionEvent::GoalUpdated {
+                goal: SessionGoal::new("old goal").expect("valid goal"),
+            },
+        ),
+        event(
+            1,
+            SessionEvent::TodoUpdated {
+                items: vec![TodoItem {
+                    content: "old task".into(),
+                    ..todo.clone()
+                }],
+            },
+        ),
+        event(
+            2,
+            SessionEvent::ToolCompleted {
+                operation_id: OperationId::from("evidence-operation"),
+                result,
+            },
+        ),
+        event(3, SessionEvent::TurnCompleted),
+        event(
+            4,
+            SessionEvent::UserMessage {
+                text: "interrupted".into(),
+                explicit_delegation: false,
+            },
+        ),
+        event(
+            5,
+            SessionEvent::UserMessage {
+                text: "open".into(),
+                explicit_delegation: false,
+            },
+        ),
+        event(
+            6,
+            SessionEvent::ContextCompacted {
+                covered_through_sequence: 3,
+                summary: "old summary".into(),
+                tokens: 4,
+            },
+        ),
+        event(7, SessionEvent::GoalUpdated { goal: goal.clone() }),
+        event(
+            8,
+            SessionEvent::TodoUpdated {
+                items: vec![todo.clone()],
+            },
+        ),
+    ]);
+    let items = manager
+        .assemble(&profile, Vec::new(), false, ".")
+        .expect("assemble latest state")
+        .request
+        .items;
+    assert_eq!(
+        items
+            .iter()
+            .filter_map(|item| match item {
+                ModelItem::Goal { goal, .. } => Some(goal),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![&goal]
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter_map(|item| match item {
+                ModelItem::TodoList { items } => Some(items),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![&vec![todo]]
+    );
+    assert!(items.iter().any(|item| matches!(item, ModelItem::Evidence { path, content, .. } if path == "src/lib.rs" && content == "fact")));
+
+    manager.record(event(9, SessionEvent::GoalCleared));
+    manager.record(event(10, SessionEvent::TodoUpdated { items: Vec::new() }));
+    let cleared = manager
+        .assemble(&profile, Vec::new(), false, ".")
+        .expect("assemble cleared state");
+    assert!(
+        !cleared
+            .request
+            .items
+            .iter()
+            .any(|item| matches!(item, ModelItem::Goal { .. } | ModelItem::TodoList { .. }))
+    );
+
+    manager.replay(vec![event(
+        0,
+        SessionEvent::UserMessage {
+            text: "replacement".into(),
+            explicit_delegation: false,
+        },
+    )]);
+    assert_eq!(
+        manager
+            .assemble(&profile, Vec::new(), false, ".")
+            .expect("assemble replacement history")
+            .request
+            .items,
+        vec![ModelItem::User {
+            text: "replacement".into()
+        }]
+    );
+    assert!(manager.compaction_request().is_none());
+    manager.replay(Vec::new());
+    assert!(matches!(
+        manager.assemble(&profile, Vec::new(), false, "."),
+        Err(kurama_protocol::KuramaError::Session(_))
+    ));
+}
+
+#[test]
+fn evidence_skips_malformed_entries_and_stops_at_the_budget_boundary() {
+    let mut result = ToolResult::success(CallId::from("call"), "output");
+    result.metadata = json!({"evidence": [
+        {"path": "missing-content"},
+        {"path": 7, "content": "invalid path"},
+        {"path": "first", "content": "small fact"},
+        {"path": "oversized", "content": "x".repeat(9_000)},
+        {"path": "after-boundary", "content": "must not be included"}
+    ]});
+    let mut manager = ContextManager::new(ContextPolicy {
+        max_input_tokens: 2_000,
+        reserve_output_tokens: 0,
+        recent_turns: 0,
+        ..ContextPolicy::default()
+    });
+    manager.replay(vec![
+        event(
+            0,
+            SessionEvent::ToolCompleted {
+                operation_id: OperationId::from("operation"),
+                result,
+            },
+        ),
+        event(1, SessionEvent::TurnCompleted),
+    ]);
+    let items = manager
+        .assemble(
+            &ModelProfile::new("test", "frontier", 2_000, 0),
+            Vec::new(),
+            false,
+            ".",
+        )
+        .expect("assemble bounded evidence")
+        .request
+        .items;
+    assert_eq!(
+        items,
+        vec![ModelItem::Evidence {
+            path: "first".into(),
+            content: "small fact".into(),
+            blob: None
+        }]
+    );
+}
+
+#[test]
+fn zero_recent_turns_compacts_completed_history_but_not_the_current_turn() {
+    let mut manager = ContextManager::new(ContextPolicy {
+        recent_turns: 0,
+        ..ContextPolicy::default()
+    });
+    manager.replay(vec![
+        event(
+            0,
+            SessionEvent::UserMessage {
+                text: "completed question".into(),
+                explicit_delegation: false,
+            },
+        ),
+        event(
+            1,
+            SessionEvent::AssistantMessage {
+                text: "completed answer".into(),
+            },
+        ),
+        event(2, SessionEvent::TurnCompleted),
+    ]);
+    let completed = manager
+        .compaction_request()
+        .expect("compact all completed turns");
+    assert_eq!(completed.covered_through_sequence, 2);
+    assert_eq!(
+        compaction_events(&completed)
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+
+    manager.record(event(
+        3,
+        SessionEvent::UserMessage {
+            text: "current question".into(),
+            explicit_delegation: false,
+        },
+    ));
+    assert_eq!(
+        manager
+            .compaction_request()
+            .expect("retain current turn")
+            .covered_through_sequence,
+        2
+    );
+    manager.apply_compaction(2, "completed facts".into(), 4);
+    assert!(manager.compaction_request().is_none());
+
+    manager.record(event(
+        4,
+        SessionEvent::TurnFailed {
+            error: "failed".into(),
+        },
+    ));
+    let next = manager
+        .compaction_request()
+        .expect("compact newly completed turn");
+    assert_eq!(next.covered_through_sequence, 4);
+    assert_eq!(
+        compaction_events(&next)
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![3, 4]
+    );
+    manager.record(event(
+        5,
+        SessionEvent::ContextCompacted {
+            covered_through_sequence: 4,
+            summary: "all completed facts".into(),
+            tokens: 4,
+        },
+    ));
+    assert!(manager.compaction_request().is_none());
+}
+
+#[test]
+fn inspector_partitions_the_selected_request_without_mutating_history() {
+    let mut manager = ContextManager::new(ContextPolicy {
+        recent_turns: 2,
+        ..ContextPolicy::default()
+    });
+    manager.replay(long_session());
+    manager.apply_compaction(18, "durable facts".into(), 4);
+    manager.record(event(
+        31,
+        SessionEvent::GoalUpdated {
+            goal: SessionGoal::new("Keep the active goal").expect("valid goal"),
+        },
+    ));
+    manager.record(event(
+        32,
+        SessionEvent::TodoUpdated {
+            items: vec![TodoItem {
+                id: "todo".into(),
+                content: "Keep the task list".into(),
+                status: TodoStatus::InProgress,
+            }],
+        },
+    ));
+    manager.record(event(
+        33,
+        SessionEvent::UserMessage {
+            text: "Inspect the latest evidence".into(),
+            explicit_delegation: false,
+        },
+    ));
+    let mut result = ToolResult::success(CallId::from("call"), "source excerpt");
+    result.metadata = json!({"evidence": [{"path": "src/lib.rs", "content": "verified fact"}]});
+    manager.record(event(
+        34,
+        SessionEvent::ToolCompleted {
+            operation_id: OperationId::from("operation"),
+            result,
+        },
+    ));
+    let profile = ModelProfile::new("test", "frontier", 64_000, 500);
+    let tools = vec![ToolDescriptor {
+        name: "read".into(),
+        description: "Read a file".into(),
+        parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+    }];
+    let before = manager
+        .assemble(&profile, tools.clone(), true, ".")
+        .expect("assemble before inspection");
+    let inspection = manager.inspect(&profile, tools.clone(), true, ".");
+    assert!(inspection.assembly_error.is_none());
+    assert_eq!(inspection.max_input_tokens, 64_000);
+    assert_eq!(inspection.reserved_output_tokens, 500);
+    assert_eq!(inspection.usable_tokens, 63_500);
+    assert_eq!(inspection.estimated_tokens, before.estimated_tokens);
+    assert_eq!(
+        inspection
+            .categories
+            .iter()
+            .map(|category| category.tokens)
+            .sum::<u64>(),
+        inspection.estimated_tokens
+    );
+    assert_eq!(inspection.total_completed_turns, 10);
+    assert_eq!(inspection.included_recent_turns, 2);
+    assert_eq!(inspection.omitted_turns, 8);
+    assert_eq!(inspection.summary_covered_through_sequence, Some(18));
+    assert_eq!(
+        manager
+            .assemble(&profile, tools, true, ".")
+            .expect("assemble after inspection")
+            .request,
+        before.request
+    );
+}
+
+#[test]
+fn overflow_inspection_still_previews_the_complete_compaction_request() {
+    let mut manager = ContextManager::new(ContextPolicy {
+        reserve_output_tokens: 100,
+        recent_turns: 3,
+        ..ContextPolicy::default()
+    });
+    manager.replay(long_session());
+    manager.apply_compaction(6, "earlier facts with \"quoted\" details".into(), 10);
+    manager.record(event(
+        31,
+        SessionEvent::UserMessage {
+            text: "x".repeat(12_000),
+            explicit_delegation: false,
+        },
+    ));
+    let profile = ModelProfile::new("test", "frontier", 1_000, 100);
+    let inspection = manager.inspect(&profile, Vec::new(), false, ".");
+    assert!(inspection.assembly_error.is_some());
+    assert!(inspection.estimated_tokens > inspection.usable_tokens);
+    assert_eq!(
+        inspection
+            .categories
+            .iter()
+            .map(|category| category.tokens)
+            .sum::<u64>(),
+        inspection.estimated_tokens
+    );
+    assert_eq!(inspection.total_completed_turns, 10);
+    assert_eq!(inspection.included_recent_turns, 0);
+    assert_eq!(inspection.omitted_turns, 10);
+    assert_eq!(inspection.summary_covered_through_sequence, Some(6));
+    let preview = inspection
+        .compaction
+        .expect("pending compaction despite overflow");
+    assert_eq!(preview.covered_through_sequence, 21);
+    assert_eq!(preview.event_count, 15);
+    let compaction = manager.compaction_request().expect("pending compaction");
+    let request = ModelRequest {
+        session_id: SessionId::from("session"),
+        agent_id: None,
+        workspace_root: ".".into(),
+        profile,
+        system: compaction.prompt,
+        items: compaction.items,
+        tools: Vec::new(),
+        delegation: None,
+        continuation: None,
+    };
+    assert_eq!(
+        preview.estimated_tokens,
+        (serde_json::to_vec(&request)
+            .expect("serialized compaction request")
+            .len() as u64)
+            .div_ceil(3)
+            + 512
+    );
+    assert!(!preview.fits_budget);
+    let roomy = manager.inspect(
+        &ModelProfile::new("test", "frontier", 64_000, 100),
+        Vec::new(),
+        false,
+        ".",
+    );
+    assert!(roomy.assembly_error.is_none());
+    assert!(
+        roomy
+            .compaction
+            .expect("same pending compaction")
+            .fits_budget
     );
 }
 

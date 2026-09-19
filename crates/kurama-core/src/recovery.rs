@@ -333,9 +333,16 @@ impl RecoveryPlanner {
                     turn_terminal = true;
                 }
                 SessionEvent::UserMessage { .. } => turn_terminal = false,
+                SessionEvent::UserSteered { .. } => {
+                    turn_terminal = false;
+                    // The previous provider cursor does not include this input.
+                    cursor = None;
+                }
                 SessionEvent::AgentQueued { snapshot }
                 | SessionEvent::AgentStarted { snapshot }
-                | SessionEvent::AgentProgress { snapshot } => {
+                | SessionEvent::AgentProgress { snapshot }
+                    if envelope.agent_id.as_ref() != Some(&snapshot.id) =>
+                {
                     agents.insert(snapshot.id.clone(), snapshot.clone());
                 }
                 SessionEvent::AgentCompleted { snapshot, .. }
@@ -462,10 +469,12 @@ impl RecoveryPlanner {
             } else {
                 StreamRecovery::RestartFromBoundary
             }
-        } else if events
-            .iter()
-            .any(|event| matches!(event.event, SessionEvent::UserMessage { .. }))
-        {
+        } else if events.iter().any(|event| {
+            matches!(
+                event.event,
+                SessionEvent::UserMessage { .. } | SessionEvent::UserSteered { .. }
+            )
+        }) {
             StreamRecovery::RestartFromBoundary
         } else {
             StreamRecovery::None

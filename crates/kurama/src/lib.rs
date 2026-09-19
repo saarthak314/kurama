@@ -41,6 +41,7 @@ pub struct Kurama {
 
 impl Kurama {
     pub fn openai(api_key: impl Into<String>) -> Result<Self, KuramaError> {
+        let api_key: String = api_key.into();
         let backend = OpenAiBackend::from_endpoint(
             HttpClient::try_new()?,
             "https://api.openai.com/v1",
@@ -50,6 +51,7 @@ impl Kurama {
     }
 
     pub fn anthropic(api_key: impl Into<String>) -> Result<Self, KuramaError> {
+        let api_key: String = api_key.into();
         let backend = AnthropicBackend::from_endpoint(
             HttpClient::try_new()?,
             "https://api.anthropic.com/v1",
@@ -66,8 +68,11 @@ impl Kurama {
         endpoint: impl AsRef<str>,
         api_key: Option<String>,
     ) -> Result<Self, KuramaError> {
-        let backend =
-            OpenAiCompatBackend::from_endpoint(HttpClient::try_new()?, endpoint.as_ref(), api_key)?;
+        let backend = OpenAiCompatBackend::from_endpoint(
+            HttpClient::try_new()?,
+            endpoint.as_ref(),
+            api_key.map(Into::into),
+        )?;
         Ok(Self::provider(
             "openai-compatible",
             "default",
@@ -192,23 +197,22 @@ impl Kurama {
     pub fn build(self) -> Result<Agent, KuramaError> {
         let mut setup = self.setup;
         if let Some(cli) = self.cli {
-            let root = match &self.persist_root {
-                Some(root) => root.clone(),
-                None => default_root()?,
-            };
-            let cache = root.join("cache/bridge");
             setup = match cli {
-                CliBackend::Codex => setup.backend_as(
-                    "codex",
-                    Arc::new(CodexBridge::new(
-                        cache.join("sessions/codex"),
-                        cache.join("control-v1.json"),
-                    )),
-                ),
-                CliBackend::Claude => setup.backend_as(
-                    "claude",
-                    Arc::new(ClaudeBridge::new(cache.join("control-v1.json"))),
-                ),
+                CliBackend::Codex => {
+                    let root = match &self.persist_root {
+                        Some(root) => root.clone(),
+                        None => default_root()?,
+                    };
+                    let cache = root.join("cache/bridge");
+                    setup.backend_as(
+                        "codex",
+                        Arc::new(CodexBridge::new(
+                            cache.join("sessions/codex"),
+                            cache.join("control-v1.json"),
+                        )),
+                    )
+                }
+                CliBackend::Claude => setup.backend_as("claude", Arc::new(ClaudeBridge::new())),
             };
         }
         if !self.no_tools {

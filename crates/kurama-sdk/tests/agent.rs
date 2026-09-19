@@ -119,6 +119,52 @@ async fn turn_next_returns_none_after_done() {
 }
 
 #[tokio::test]
+async fn cancelling_and_draining_a_partial_turn_keeps_the_next_prompt_clean() {
+    let mut agent = Agent::new()
+        .backend(ScriptedBackend::new(vec![
+            vec![
+                text("abandoned text"),
+                Ok(ModelEvent::ToolCall {
+                    call_id: "pending".into(),
+                    name: "echo".into(),
+                    arguments: Default::default(),
+                }),
+                completed(),
+            ],
+            vec![text("second response"), completed()],
+        ]))
+        .tool(EchoTool)
+        .policy(Arc::new(AskPolicy))
+        .build()
+        .expect("agent");
+    let mut turn = agent.turn("first request").await.expect("turn");
+    let mut first_text = String::new();
+    loop {
+        match turn.next().await.expect("event").expect("live turn") {
+            Event::Text(text) => first_text.push_str(&text),
+            Event::Approval(_) => break,
+            Event::Done(_) | Event::Error(_) => panic!("turn ended before approval"),
+            _ => {}
+        }
+    }
+    assert_eq!(first_text, "abandoned text");
+    turn.cancel().await.expect("cancel");
+    tokio::time::timeout(std::time::Duration::from_secs(1), turn.drain())
+        .await
+        .expect("drain stops");
+    assert!(turn.next().await.expect("after drain").is_none());
+    drop(turn);
+    assert_eq!(
+        agent
+            .prompt("second request")
+            .await
+            .expect("next prompt")
+            .text,
+        "second response"
+    );
+}
+
+#[tokio::test]
 async fn session_id_tracks_the_live_session() {
     let mut agent = Agent::new()
         .profile(

@@ -26,7 +26,6 @@ async fn from_backend_prompt_returns_text() {
 fn openai_constructor_keeps_the_named_profile() {
     let agent = Kurama::openai("sk-test")
         .expect("openai")
-        .model("gpt-5.6")
         .no_tools()
         .ephemeral()
         .build()

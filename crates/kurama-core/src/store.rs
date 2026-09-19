@@ -67,11 +67,17 @@ impl MemoryStore {
 
 impl SessionStore for MemoryStore {
     fn create(&self, metadata: &SessionMetadata) -> Result<(), KuramaError> {
-        self.metadata
-            .lock()
-            .expect("memory metadata lock")
-            .insert(metadata.id.clone(), metadata.clone());
-        Ok(())
+        let mut sessions = self.metadata.lock().expect("memory metadata lock");
+        match sessions.entry(metadata.id.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(metadata.clone());
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(_) => Err(KuramaError::Storage(format!(
+                "session {} already exists",
+                metadata.id
+            ))),
+        }
     }
 
     fn append(&self, event: &EventEnvelope) -> Result<(), KuramaError> {
@@ -81,6 +87,25 @@ impl SessionStore for MemoryStore {
             .entry((event.session_id.clone(), event.agent_id.clone()))
             .or_default()
             .push(event.clone());
+        Ok(())
+    }
+
+    fn append_next(&self, event: &mut EventEnvelope) -> Result<(), KuramaError> {
+        let mut events = self
+            .events
+            .lock()
+            .map_err(|_| KuramaError::Storage("memory events lock poisoned".into()))?;
+        let log = events
+            .entry((event.session_id.clone(), event.agent_id.clone()))
+            .or_default();
+        event.sequence = match log.last() {
+            Some(prior) => prior
+                .sequence
+                .checked_add(1)
+                .ok_or_else(|| KuramaError::Storage("event sequence exceeds u64".into()))?,
+            None => 0,
+        };
+        log.push(event.clone());
         Ok(())
     }
 
@@ -110,12 +135,19 @@ impl SessionStore for MemoryStore {
 
     fn list(&self) -> Result<Vec<SessionSummary>, KuramaError> {
         let metadata = self.metadata.lock().expect("memory metadata lock");
+        let events = self.events.lock().expect("memory events lock");
         Ok(metadata
             .values()
             .map(|metadata| SessionSummary {
                 id: metadata.id.clone(),
                 created_at_ms: metadata.created_at_ms,
-                updated_at_ms: metadata.created_at_ms,
+                updated_at_ms: events
+                    .range((metadata.id.clone(), None)..)
+                    .take_while(|((session_id, _), _)| session_id == &metadata.id)
+                    .flat_map(|(_, log)| log.iter().map(|event| event.timestamp_ms))
+                    .max()
+                    .unwrap_or(metadata.created_at_ms)
+                    .max(metadata.created_at_ms),
                 project_root: metadata.project_root.clone(),
                 profile: metadata.profile.clone(),
                 mode: metadata.mode,
@@ -162,8 +194,174 @@ fn lowercase_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn duplicate_create_preserves_metadata_and_history() {
+        let store = MemoryStore::default();
+        let original = SessionMetadata {
+            id: "session".into(),
+            created_at_ms: 10,
+            project_root: "/original".into(),
+            profile: "first".into(),
+            mode: kurama_protocol::policy::ExecutionMode::Supervised,
+            redaction_best_effort: false,
+        };
+        store.create(&original).expect("create session");
+        let first_summary = store.list().expect("list");
+        assert_eq!(first_summary[0].updated_at_ms, 10);
+        let mut parent = event(0, None);
+        parent.timestamp_ms = 20;
+        store.append(&parent).expect("append parent");
+        let replacement = SessionMetadata {
+            profile: "replacement".into(),
+            project_root: "/other".into(),
+            ..original.clone()
+        };
+        assert!(matches!(
+            store.create(&replacement),
+            Err(KuramaError::Storage(_))
+        ));
+        assert_eq!(store.replay(&original.id).expect("replay"), vec![parent]);
+        let listed = store.list().expect("list");
+        assert_eq!(listed[0].profile, original.profile);
+        assert_eq!(listed[0].project_root, original.project_root);
+        assert_eq!(listed[0].updated_at_ms, 20);
+        let mut child = event(0, Some("child".into()));
+        child.timestamp_ms = 30;
+        store.append(&child).expect("append child");
+        // A later append with an older timestamp must not move updated_at backwards.
+        store
+            .append(&event(1, Some("child".into())))
+            .expect("older event");
+        assert_eq!(store.list().expect("list")[0].updated_at_ms, 30);
+    }
+
     use super::MemoryStore;
     use kurama_protocol::traits::SessionStore;
+    use kurama_protocol::{
+        KuramaError,
+        id::{AgentId, SessionId},
+        session::{BlobRef, EventEnvelope, SessionEvent, SessionMetadata, SessionSummary},
+    };
+
+    struct CompatibilityStore(MemoryStore);
+
+    impl SessionStore for CompatibilityStore {
+        fn create(&self, metadata: &SessionMetadata) -> Result<(), KuramaError> {
+            self.0.create(metadata)
+        }
+
+        fn append(&self, event: &EventEnvelope) -> Result<(), KuramaError> {
+            self.0.append(event)
+        }
+
+        fn replay(&self, session_id: &SessionId) -> Result<Vec<EventEnvelope>, KuramaError> {
+            self.0.replay(session_id)
+        }
+
+        fn replay_agent(
+            &self,
+            session_id: &SessionId,
+            agent_id: &AgentId,
+        ) -> Result<Vec<EventEnvelope>, KuramaError> {
+            self.0.replay_agent(session_id, agent_id)
+        }
+
+        fn list(&self) -> Result<Vec<SessionSummary>, KuramaError> {
+            self.0.list()
+        }
+
+        fn put_blob(&self, bytes: &[u8]) -> Result<BlobRef, KuramaError> {
+            self.0.put_blob(bytes)
+        }
+
+        fn get_blob(&self, reference: &BlobRef) -> Result<Vec<u8>, KuramaError> {
+            self.0.get_blob(reference)
+        }
+    }
+
+    fn event(sequence: u64, agent_id: Option<AgentId>) -> EventEnvelope {
+        EventEnvelope::new(
+            sequence,
+            1,
+            SessionId::from("session"),
+            agent_id,
+            SessionEvent::UserMessage {
+                text: sequence.to_string(),
+                explicit_delegation: false,
+            },
+        )
+    }
+
+    #[test]
+    fn memory_and_compatible_append_next_allocate_contiguous_sequences_concurrently() {
+        let memory = MemoryStore::default();
+        let compatibility = CompatibilityStore(MemoryStore::default());
+        for store in [&memory as &dyn SessionStore, &compatibility] {
+            let mut parent = event(99, None);
+            store.append_next(&mut parent).expect("parent event");
+            let barrier = std::sync::Barrier::new(4);
+            std::thread::scope(|scope| {
+                for writer in 0..4 {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for index in 0..16 {
+                            let mut next = event(writer * 16 + index, Some(AgentId::from("child")));
+                            store.append_next(&mut next).expect("child event");
+                        }
+                    });
+                }
+            });
+            let replayed = store
+                .replay_agent(&SessionId::from("session"), &AgentId::from("child"))
+                .expect("replay child");
+            assert_eq!(
+                replayed
+                    .iter()
+                    .map(|event| event.sequence)
+                    .collect::<Vec<_>>(),
+                (0..64).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                store.replay(&SessionId::from("session")).expect("parent"),
+                vec![parent]
+            );
+        }
+    }
+
+    #[test]
+    fn memory_and_compatible_append_next_reject_sequence_overflow() {
+        let memory = MemoryStore::default();
+        let compatibility = CompatibilityStore(MemoryStore::default());
+        for store in [&memory as &dyn SessionStore, &compatibility] {
+            let last = event(u64::MAX, None);
+            store.append(&last).expect("exhausted log");
+            let mut next = event(0, None);
+            assert!(matches!(
+                store.append_next(&mut next),
+                Err(KuramaError::Storage(_))
+            ));
+            assert_eq!(
+                store
+                    .replay(&SessionId::from("session"))
+                    .expect("unchanged log"),
+                vec![last]
+            );
+        }
+    }
+
+    #[test]
+    fn memory_append_next_returns_an_error_for_a_poisoned_log() {
+        let store = MemoryStore::default();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = store.events.lock().expect("events lock");
+            panic!("poison log");
+        });
+        assert!(matches!(
+            store.append_next(&mut event(0, None)),
+            Err(KuramaError::Storage(_))
+        ));
+    }
 
     #[test]
     fn same_length_blobs_stay_distinct() {

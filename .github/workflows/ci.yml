@@ -29,6 +29,8 @@ jobs:
           python3 scripts/check-release-version.py
       - name: Install Rust 1.98.0
         run: |
+          export RUSTUP_HOME="$RUNNER_TEMP/kurama-rustup"
+          printf 'RUSTUP_HOME=%s\n' "$RUSTUP_HOME" >> "$GITHUB_ENV"
           rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
           rustup default 1.98.0
       - name: Cache Cargo
@@ -44,15 +46,55 @@ jobs:
         run: cargo fmt --all --check
       - name: Lint
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-      - name: Test libraries
-        run: cargo test --locked --workspace --lib
-      - name: Test core
-        run: cargo test --locked -p kurama-core --tests
-      - name: Test adapters
-        run: cargo test --locked -p kurama-adapters --all-features --tests
-      - name: Test SDK
-        run: cargo test --locked -p kurama-sdk --tests
-      - name: Test kurama
-        run: cargo test --locked -p kurama --tests
-      - name: Test CLI
-        run: cargo test --locked -p kurama-cli --tests
+      - name: Test workspace with all features
+        run: cargo test --locked --workspace --all-features
+      - name: Test verification runners
+        run: python3 scripts/test-verification.py
+
+  tui-pty:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust 1.98.0
+        run: |
+          export RUSTUP_HOME="$RUNNER_TEMP/kurama-rustup"
+          printf 'RUSTUP_HOME=%s\n' "$RUSTUP_HOME" >> "$GITHUB_ENV"
+          rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.98.0
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-ci-pty-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-ci-pty-${{ runner.os }}-
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install pinned PTY emulator
+        id: pty-python
+        run: |
+          python -m venv .venv-tui
+          .venv-tui/bin/python -m pip install pyte==0.8.2
+      - name: Build CLI for actual PTY checks
+        id: pty-build
+        run: cargo build --locked -p kurama-cli
+      - name: Check actual PTY with cursor reports
+        timeout-minutes: 5
+        run: .venv-tui/bin/python scripts/check-tui.py target/debug/kurama tui-artifacts/normal --no-images --check-controls
+      - name: Check actual PTY without cursor reports and with resumed todos
+        if: ${{ !cancelled() && steps.pty-build.outcome == 'success' && steps.pty-python.outcome == 'success' }}
+        timeout-minutes: 5
+        run: .venv-tui/bin/python scripts/check-tui.py target/debug/kurama tui-artifacts/no-cpr-todos --no-images --no-cpr --seed-todos
+      - name: Upload PTY transcripts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kurama-pty-pr-${{ runner.os }}-${{ github.run_id }}
+          path: tui-artifacts/
+          if-no-files-found: error
