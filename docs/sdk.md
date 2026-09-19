@@ -1,6 +1,6 @@
-# Rust SDK
+# SDKs
 
-Kurama's public `0.x` SDK is a compile-time composition boundary. `Agent` is the product API. `AgentBuilder` remains the explicit wiring harness used by tests and by embedders who want every seam. It is not a dynamic plugin system or stable binary ABI.
+Kurama provides a native Rust API and [TypeScript/Python clients](#typescript-and-python) over its headless process. Rust owns execution, approvals, tools, persistence, recovery, and orchestration. The native `0.x` SDK is a compile-time composition boundary: `Agent` is the product API, while `AgentBuilder` exposes explicit wiring for embedders. Neither interface is a dynamic plugin system or stable binary ABI.
 
 ```text
 kurama          ──────▶ kurama-sdk ─────▶ kurama-core ─────▶ kurama-protocol
@@ -125,6 +125,8 @@ Provider streams retain an owned cancellation future after establishment. `SseDe
 
 `BoundedOutput::with_staging` records staging intent; it creates a file only when output really truncates. Deferred filesystem errors appear in `finish().staging_error`. Below-limit output has no staging path or blob reference. Byte and LF-delimited line limits include omission markers and, for Bash, stream labels and timeout notes. Complete raw streams remain retrievable when truncated; execution-error suffixes are separate metadata, not part of raw stream hashes.
 
+Once Bash execution has started, cancellation waits for process-group teardown and returns an error `ToolResult` with `metadata.cancelled = true` and bounded partial output. Cancellation before execution still returns `KuramaError::Cancelled`. Direct tool consumers must inspect `is_error` and metadata rather than treating every returned result as success.
+
 ## Compatibility
 
 Kurama follows semantic versioning with `0.x` expectations. Breaking public API changes require a minor-version bump and migration notes. Patch releases preserve the public contracts, while trait additions are driven by working first-party implementations rather than speculative extension points.
@@ -136,3 +138,92 @@ Every registered profile must provide non-zero input and output token limits, in
 Implement `CancelSignal::cancelled` as `BoxFuture<'static, ()>` by cloning owned cancellation state before constructing the future. `DefaultPolicy` is a unit struct: use `DefaultPolicy` rather than the removed constructor/accessor with stale mode state. Provider `parse_fixture` helpers were removed; tests and embedders use the production stream API.
 
 OpenAI/Anthropic key constructors accept values convertible to `Zeroizing<String>`; compatible providers accept `Option<Zeroizing<String>>`. `SecretValue::into_zeroizing` transfers an existing protected allocation. `ClaudeBridge::new()` and `command_for(request, cursor)` no longer take an unused schema path. Codex uses immutable mode-specific schema files; the public schema writer rejects replacement with different content. Unsafe/long profile cache names use a reserved `~` plus SHA-256 component; existing safe cache paths remain stable.
+
+Raw runtime consumers must also handle `Ready`, `VerificationUpdated`, and `VerificationsInspected`. `Ready` marks completion of startup recovery; the high-level Rust `Turn` interface consumes it internally. Verification records extend the durable event schema; older binaries cannot read these new records.
+
+## TypeScript and Python
+
+The process clients require Node 22+ or Python 3.11+ and have no runtime package dependencies. Configure Kurama once through its CLI, then omit `profile` to use the configured default. They locate the binary through an explicit `binary` option, then `KURAMA_BIN`, then `kurama` on `PATH`. Startup checks the protocol automatically. Credentials stay in existing configuration references or the child environment; no credential fields cross the protocol.
+
+These clients require a binary supporting `--stdio` protocol version 1. The original `v0.2.0` release predates that interface. During development, build this checkout and pass `binary: "./target/release/kurama"` (TypeScript) or `binary="./target/release/kurama"` (Python). SDK packages do not automatically download or upgrade binaries.
+
+Build distributable packages from the checkout:
+
+```sh
+cargo build --locked --release -p kurama-cli
+npm --prefix sdk/typescript ci
+mkdir -p target/sdk-packages
+npm pack ./sdk/typescript --pack-destination target/sdk-packages
+python3 -m pip wheel --no-deps --wheel-dir target/sdk-packages ./sdk/python
+```
+
+Install the resulting npm archive or Python wheel in the consuming application. Package sources are also installable from `sdk/typescript` and `sdk/python`; TypeScript's `prepack` script builds its declarations and JavaScript. Package publication is separate from building these artifacts.
+
+### TypeScript
+
+```typescript
+import { Agent } from "@kurama/sdk";
+
+await using agent = await Agent.open({ workspace: "." });
+const reply = await agent.prompt("Explain the main entry point without editing files.");
+console.log(reply.text);
+```
+
+`await using` uses TypeScript's async-disposal support. Ordinary `try/finally` with `await agent.close()` works too. `agent.stream(text)` is a native async iterable:
+
+```typescript
+for await (const event of agent.stream("Review the current changes.")) {
+  if (event.type === "text") process.stdout.write(event.text);
+  if (event.type === "approval") await agent.approve(event.request.operation_id, "deny");
+}
+```
+
+The example explicitly denies operations rather than silently approving them. Interactive approval and cancellation examples are in `sdk/typescript/examples/`. Save `reply.sessionId` and reopen with `Agent.open({ sessionId })` to resume the same workspace/profile.
+
+### Python
+
+```python
+import asyncio
+from kurama import Agent
+
+async def main():
+    async with Agent(workspace=".") as agent:
+        reply = await agent.prompt("Explain the main entry point without editing files.")
+        print(reply.text)
+
+asyncio.run(main())
+```
+
+Streaming exposes typed events with `event.type`, `event.text`, and `event.request`. Use the stream context manager when a loop might exit early:
+
+```python
+async with agent.stream("Review the current changes.") as events:
+    async for event in events:
+        if event.type == "text":
+            print(event.text, end="", flush=True)
+        elif event.type == "approval":
+            await agent.approve(event.request.operation_id, "deny")
+```
+
+Python's bare `async for` does not close an iterator on `break`; `async with`, `await events.aclose()`, or closing the agent cancels/drains the active operation. Save `reply.session_id` and reopen with `Agent(session_id=...)` to resume. Runnable examples are in `sdk/python/examples/`.
+
+### Approvals, errors, and checks
+
+- Both clients default to supervised mode. `onApproval` / `on_approval` optionally accepts a synchronous or asynchronous callback returning `approve_once`, `approve_session`, `deny`, or an edited-arguments response. Without a callback, `prompt` and `verify` raise `ApprovalRequired` at an approval boundary, cancel/drain the operation, and leave the client reusable. Streaming instead exposes approval events for the application to handle explicitly.
+- `cancel()` requests cancellation; it does not undo side effects. A stream emits a terminal `done` event with `completed`, `cancelled`, or `failed`. Convenience prompts raise `TurnFailed` for failed terminals and retain a partial reply. Server/protocol/process failures are typed errors, not empty successful replies.
+- Only one execution is active per agent. `close()` owns bounded process cleanup; a blocked or broken peer cannot leave callers waiting indefinitely. Event buffers are bounded and fail explicitly on overflow instead of silently dropping authoritative events. `events()` exposes recovery and unsolicited session events separately from prompt streams.
+- `verificationStatus()` / `verification_status()` lists named project recipes and their last results. `verify("quick")` runs one through the same Rust policy and returns a `VerificationReport`. A nonzero check exit yields `status="failed"`, not a protocol failure. See [verification configuration](configuration.md#verification-recipes).
+- Existing auto boundaries still apply. Selecting `mode="yolo"` is explicit launch-only consent; clients pass the launch flag and cannot later escalate an existing process through the protocol.
+
+### Transport and reproducible checks
+
+`kurama --stdio` keeps stdout exclusively for versioned JSONL frames. The shared schema and cross-language fixtures are `protocol/sdk.schema.json` and `protocol/sdk.fixtures.json`. Applications use the client APIs rather than constructing those frames. Requests are correlated, recovery completes before initialization succeeds, and cancellation drains before another execution can start. Handshake deadlines do not limit time spent obtaining a recovery approval.
+
+```sh
+cargo build --locked -p kurama-cli --bin kurama --example sdk_contract
+npm --prefix sdk/typescript test
+PYTHONPATH=sdk/python/src python3 -m unittest discover -s sdk/python/tests -v
+python3 scripts/check-sdk.py target/debug/kurama target/verification/sdk-contracts
+```
+
+The last command uses a local scripted provider and real Rust/TypeScript/Python clients. It exercises streaming, manual and missing-handler approvals, cancellation/reuse, delegation, resume, model-free verification, and matching conversational histories. CI also installs the built npm archive and wheel before running this scenario on Linux/macOS. Release jobs check the packaged binary's stdio handshake and publish `kurama-<version>-platforms.json` with protocol version, platform archives, and hashes.

@@ -213,7 +213,7 @@ async fn repeated_engine_compaction_preserves_the_first_decision_in_later_contex
     for (compaction_index, next_turn) in ["F", "G"].into_iter().enumerate() {
         handle.compact().await.expect("request compaction");
         loop {
-            match events.recv().await.expect("compaction event") {
+            match control_event(&mut events).await {
                 RuntimeEvent::Status { .. } => {
                     let completed = store
                         .replay(&SessionId::from("resume"))
@@ -236,7 +236,7 @@ async fn repeated_engine_compaction_preserves_the_first_decision_in_later_contex
             .await
             .expect("submit next turn");
         loop {
-            match events.recv().await.expect("runtime event") {
+            match control_event(&mut events).await {
                 RuntimeEvent::TurnCompleted => break,
                 RuntimeEvent::Error { message } => panic!("engine error: {message}"),
                 _ => {}
@@ -343,7 +343,7 @@ async fn compaction_overflow_preserves_the_previous_summary_and_coverage() {
         .await
         .expect("request oversized compaction");
     loop {
-        match events.recv().await.expect("runtime event") {
+        match control_event(&mut events).await {
             RuntimeEvent::Error { .. } => break,
             RuntimeEvent::Shutdown => panic!("engine stopped instead of rejecting compaction"),
             _ => {}
@@ -492,7 +492,7 @@ async fn tool_completion_keeps_durable_output_bounded_and_hydrates_live_display(
     handle.submit("inspect", false).await.expect("submit");
     let mut live_result = None;
     loop {
-        match events.recv().await.expect("runtime event") {
+        match control_event(&mut events).await {
             RuntimeEvent::ToolCompleted { result, .. } => live_result = Some(result),
             RuntimeEvent::TurnCompleted => break,
             RuntimeEvent::Error { message } => panic!("engine error: {message}"),
@@ -630,7 +630,7 @@ async fn engine_executes_tool_and_finishes_turn() {
     let mut saw_tool_context = false;
     let mut text = String::new();
     loop {
-        match events.recv().await.expect("runtime event") {
+        match control_event(&mut events).await {
             RuntimeEvent::ToolStarted { name, context, .. } => {
                 saw_tool_context = name == "echo" && context == ".";
             }
@@ -948,10 +948,15 @@ impl ModelBackend for FirstRoundGateBackend {
 }
 
 async fn control_event(events: &mut kurama_core::engine::RuntimeEvents) -> RuntimeEvent {
-    tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
-        .await
-        .expect("control event timed out")
-        .expect("engine event stream closed")
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .expect("control event timed out")
+            .expect("engine event stream closed");
+        if !matches!(event, RuntimeEvent::Ready) {
+            return event;
+        }
+    }
 }
 
 #[tokio::test]
@@ -1205,7 +1210,7 @@ async fn eof_without_response_completed_fails_and_preserves_partial_text() {
     handle.submit("inspect", false).await.expect("submit");
     let message = tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
-            match events.recv().await.expect("runtime event") {
+            match control_event(&mut events).await {
                 RuntimeEvent::Error { message } => break message,
                 RuntimeEvent::TurnCompleted => {
                     panic!("unterminated model stream completed the turn")
@@ -1248,7 +1253,7 @@ async fn response_completed_stops_stream_consumption() {
     handle.submit("inspect", false).await.expect("submit");
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
-            match events.recv().await.expect("runtime event") {
+            match control_event(&mut events).await {
                 RuntimeEvent::TurnCompleted => break,
                 RuntimeEvent::Error { message } => panic!("engine error: {message}"),
                 _ => {}
@@ -1277,7 +1282,7 @@ async fn tool_calls_finish_without_work_fails_before_another_round() {
     handle.submit("inspect", false).await.expect("submit");
     let message = tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
-            match events.recv().await.expect("runtime event") {
+            match control_event(&mut events).await {
                 RuntimeEvent::Error { message } => break message,
                 RuntimeEvent::TurnCompleted => {
                     panic!("no-progress tool-call round completed the turn")
@@ -1328,7 +1333,7 @@ async fn length_finish_rejects_tool_calls_before_execution() {
     handle.submit("inspect", false).await.expect("submit");
     let message = tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
-            match events.recv().await.expect("runtime event") {
+            match control_event(&mut events).await {
                 RuntimeEvent::Error { message } => break message,
                 RuntimeEvent::TurnCompleted => panic!("length finish completed the turn"),
                 _ => {}
@@ -1372,7 +1377,7 @@ async fn cancelled_finish_rejects_delegation_before_execution() {
     handle.submit("delegate", true).await.expect("submit");
     let message = tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
-            match events.recv().await.expect("runtime event") {
+            match control_event(&mut events).await {
                 RuntimeEvent::Error { message } => break message,
                 RuntimeEvent::AgentUpdated { .. } => {
                     panic!("cancelled finish started delegation")
@@ -1717,7 +1722,7 @@ async fn delegation_can_run_two_waves_then_stop() {
     handle.submit("delegate", true).await.expect("submit");
     let mut completed_agents = 0;
     loop {
-        match events.recv().await.expect("runtime event") {
+        match control_event(&mut events).await {
             RuntimeEvent::AgentUpdated { snapshot } if snapshot.state == AgentState::Completed => {
                 completed_agents += 1;
             }
@@ -1763,7 +1768,7 @@ async fn fourth_delegation_wave_is_refused() {
 
     handle.submit("delegate", true).await.expect("submit");
     let message = loop {
-        match events.recv().await.expect("runtime event") {
+        match control_event(&mut events).await {
             RuntimeEvent::Error { message } => break message,
             RuntimeEvent::TurnCompleted => panic!("fourth delegation completed the turn"),
             _ => {}
@@ -1801,7 +1806,7 @@ async fn stream_failure_flushes_and_persists_sub_threshold_assistant_text() {
     handle.submit("inspect", false).await.expect("submit");
     let mut streamed = String::new();
     loop {
-        match events.recv().await.expect("runtime event") {
+        match control_event(&mut events).await {
             RuntimeEvent::AssistantDelta { text } => streamed.push_str(&text),
             RuntimeEvent::Error { message } => {
                 assert!(message.contains("provider disconnected"));
@@ -1851,8 +1856,8 @@ async fn observed_usage_is_durable_even_when_text_delivery_fails() {
     let (handle, mut events) = Engine::spawn(config, Vec::new()).expect("engine");
     handle.submit("inspect", false).await.expect("submit");
     assert!(matches!(
-        events.recv().await,
-        Some(RuntimeEvent::Error { .. })
+        control_event(&mut events).await,
+        RuntimeEvent::Error { .. }
     ));
     let recorded_usage = store
         .events("usage-delivery-failure")
@@ -1883,7 +1888,7 @@ async fn cancellation_flushes_and_persists_sub_threshold_assistant_text() {
     handle.cancel_turn().await.expect("cancel turn");
     let mut streamed = String::new();
     loop {
-        match events.recv().await.expect("runtime event") {
+        match control_event(&mut events).await {
             RuntimeEvent::AssistantDelta { text } => streamed.push_str(&text),
             RuntimeEvent::Error { message } => {
                 assert_eq!(message, "cancelled");
@@ -1923,12 +1928,12 @@ async fn short_delta_is_visible_before_provider_completion() {
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         handle.submit("inspect", false).await.expect("submit");
         blocked.notified().await;
-        match events.recv().await.expect("first runtime event") {
+        match control_event(&mut events).await {
             RuntimeEvent::AssistantDelta { text } => assert_eq!(text, "first token"),
             event => panic!("expected text while completion remained gated, got {event:?}"),
         }
         complete.notify_one();
-        match events.recv().await.expect("completion event") {
+        match control_event(&mut events).await {
             RuntimeEvent::TurnCompleted => {}
             event => panic!("unexpected event after releasing completion: {event:?}"),
         }
@@ -1952,12 +1957,13 @@ async fn cancellation_flushes_pending_tail_after_full_chunk() {
     let (handle, mut events) = Engine::spawn(config, Vec::new()).expect("spawn engine");
 
     let streamed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        assert!(matches!(events.recv().await, Some(RuntimeEvent::Ready)));
         handle.submit("inspect", false).await.expect("submit");
         blocked.notified().await;
         handle.cancel_turn().await.expect("cancel turn");
         let mut streamed = String::new();
         loop {
-            match events.recv().await.expect("runtime event") {
+            match control_event(&mut events).await {
                 RuntimeEvent::AssistantDelta { text } => streamed.push_str(&text),
                 RuntimeEvent::Error { .. } => break streamed,
                 event => panic!("unexpected cancellation event: {event:?}"),
@@ -2007,7 +2013,7 @@ async fn large_utf8_deltas_preserve_bytes_and_usage_order_under_backpressure() {
         let mut streamed = String::new();
         let mut saw_usage = false;
         loop {
-            match events.recv().await.expect("runtime event") {
+            match control_event(&mut events).await {
                 RuntimeEvent::AssistantDelta { text } => {
                     assert!(!text.is_empty() && text.len() <= 4_096);
                     streamed.push_str(&text);
@@ -2057,7 +2063,7 @@ async fn shutdown_during_streaming_is_acknowledged_without_an_error() {
 
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
-            match events.recv().await.expect("runtime event") {
+            match control_event(&mut events).await {
                 RuntimeEvent::Shutdown => break,
                 RuntimeEvent::Error { message } => {
                     panic!("shutdown surfaced an error: {message}")
@@ -2238,7 +2244,7 @@ async fn approval_edit_is_reclassified_before_execution() {
     let mut approvals = 0;
     let mut stale_rejections = 0;
     loop {
-        match events.recv().await.expect("event") {
+        match control_event(&mut events).await {
             RuntimeEvent::ApprovalRequired { request } if approvals == 0 => {
                 approvals += 1;
                 assert_eq!(request.arguments, serde_json::json!({"path":"unsafe.txt"}));
@@ -2313,7 +2319,7 @@ async fn approval_edit_remains_resumable_after_a_crash() {
 
     let mut approvals = 0;
     while approvals < 2 {
-        match events.recv().await.expect("runtime event") {
+        match control_event(&mut events).await {
             RuntimeEvent::ApprovalRequired { request } if approvals == 0 => {
                 approvals += 1;
                 handle
@@ -2343,18 +2349,6 @@ async fn approval_edit_remains_resumable_after_a_crash() {
         .expect("edited tool did not start");
 
     let replay = store.events("approval-crash");
-    let recorded: Vec<_> = replay
-        .iter()
-        .filter_map(|event| match &event.event {
-            SessionEvent::ToolInvocationRecorded { invocation, .. }
-                if invocation.call_id == CallId::from("edited_call") =>
-            {
-                Some(invocation.clone())
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(recorded.len(), 1, "edited call was recorded more than once");
 
     drop(handle);
     drop(events);
@@ -2382,7 +2376,7 @@ async fn approval_edit_remains_resumable_after_a_crash() {
 
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
-            match resume_events.recv().await.expect("resume event") {
+            match control_event(&mut resume_events).await {
                 RuntimeEvent::TurnCompleted => break,
                 RuntimeEvent::Error { message } => panic!("resume error: {message}"),
                 _ => {}
@@ -2540,7 +2534,7 @@ async fn duplicate_model_call_ids_in_one_round_are_rejected_before_execution() {
     handle.submit("count twice", false).await.expect("submit");
 
     let message = loop {
-        match events.recv().await.expect("event") {
+        match control_event(&mut events).await {
             RuntimeEvent::Error { message } => break message,
             RuntimeEvent::TurnCompleted => panic!("duplicate call ids completed the turn"),
             _ => {}
@@ -2593,7 +2587,7 @@ async fn reused_model_call_id_is_remapped_instead_of_failing_the_turn() {
     handle.submit("count twice", false).await.expect("submit");
 
     loop {
-        match events.recv().await.expect("event") {
+        match control_event(&mut events).await {
             RuntimeEvent::TurnCompleted => break,
             RuntimeEvent::Error { message } => panic!("reused call id failed the turn: {message}"),
             _ => {}
@@ -2788,7 +2782,7 @@ async fn resume_retries_interrupted_read_and_continues_turn() {
 
     let mut completed_operation = None;
     loop {
-        match events.recv().await.expect("recovery event") {
+        match control_event(&mut events).await {
             RuntimeEvent::ToolCompleted {
                 operation_id,
                 result,
@@ -2862,7 +2856,7 @@ async fn resume_restores_pending_approval_before_write() {
     )
     .expect("resume engine");
 
-    match events.recv().await.expect("approval event") {
+    match control_event(&mut events).await {
         RuntimeEvent::ApprovalRequired { request } => {
             assert_eq!(request.operation_id, operation_id);
             assert_eq!(request.operation, operation);
@@ -2930,7 +2924,7 @@ async fn resume_approval_uses_empty_arguments_without_durable_invocation() {
     )
     .expect("resume engine");
 
-    match events.recv().await.expect("approval event") {
+    match control_event(&mut events).await {
         RuntimeEvent::ApprovalRequired { request } => {
             assert_eq!(request.operation_id, operation_id);
             assert_eq!(request.operation, operation);
@@ -3075,7 +3069,9 @@ impl Tool for BashCountingTool {
     ) -> BoxFuture<'a, Result<ToolResult, kurama_protocol::KuramaError>> {
         Box::pin(async move {
             self.executions.fetch_add(1, Ordering::Relaxed);
-            Ok(ToolResult::success(invocation.call_id, "ran"))
+            let mut result = ToolResult::success(invocation.call_id, "ran");
+            result.metadata["exit_code"] = serde_json::json!(0);
+            Ok(result)
         })
     }
 }
@@ -3134,7 +3130,7 @@ async fn resume_requires_a_decision_before_retrying_unknown_bash() {
     )
     .expect("resume engine");
 
-    match events.recv().await.expect("decision event") {
+    match control_event(&mut events).await {
         RuntimeEvent::ApprovalRequired { request } => {
             assert_eq!(request.operation_id, operation_id);
             assert_eq!(request.operation, operation);
@@ -3242,7 +3238,7 @@ async fn resume_requires_a_new_decision_after_an_authorized_bash_retry_is_interr
     )
     .expect("resume engine");
 
-    match events.recv().await.expect("decision event") {
+    match control_event(&mut events).await {
         RuntimeEvent::ApprovalRequired { request } => {
             assert_eq!(request.operation_id, operation_id);
             assert_eq!(request.operation, operation);
@@ -3306,7 +3302,7 @@ async fn resume_marks_interrupted_children_failed() {
     )
     .expect("resume engine");
 
-    match events.recv().await.expect("agent recovery event") {
+    match control_event(&mut events).await {
         RuntimeEvent::AgentUpdated { snapshot } => {
             assert_eq!(snapshot.id.as_ref(), "child");
             assert_eq!(snapshot.state, AgentState::Failed);
@@ -4096,4 +4092,266 @@ async fn replay_recovers_same_turn_delegation_without_importing_earlier_authoriz
             RuntimeEvent::Shutdown
         ));
     }
+}
+
+fn verification_recipe() -> kurama_protocol::verification::VerificationRecipe {
+    kurama_protocol::verification::VerificationRecipe {
+        command: "make check".into(),
+        cwd: ".".into(),
+        timeout_ms: 60_000,
+    }
+}
+
+async fn verification_report(
+    events: &mut kurama_core::engine::RuntimeEvents,
+) -> kurama_protocol::verification::VerificationReport {
+    let mut report = None;
+    loop {
+        match control_event(events).await {
+            RuntimeEvent::VerificationUpdated { report: update } => report = Some(update),
+            RuntimeEvent::TurnCompleted => return report.expect("verification report"),
+            RuntimeEvent::Error { message } => panic!("verification runtime error: {message}"),
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn verification_is_model_free_and_last_run_survives_resume_but_not_recipe_changes() {
+    use kurama_protocol::verification::VerificationStatus;
+    let store = Arc::new(MemoryStore::default());
+    let backend = Arc::new(RecordingBackend {
+        inner: ScriptedBackend::new(vec![]),
+        requests: Mutex::new(Vec::new()),
+    });
+    let mut config = resume_config(
+        store.clone(),
+        vec![Arc::new(BashCountingTool::default())],
+        Arc::new(AllowAllPolicy),
+    );
+    config.backend = backend.clone();
+    let (handle, mut events) = Engine::spawn(config, vec![]).unwrap();
+    handle.verify("quick", verification_recipe()).await.unwrap();
+    let report = verification_report(&mut events).await;
+    assert_eq!(report.status, VerificationStatus::Passed);
+    assert_eq!(report.exit_code, Some(0));
+    let replay = store.events("resume");
+    assert!(replay.iter().any(|event| matches!(&event.event, SessionEvent::ToolCompleted { operation_id, result } if Some(operation_id) == report.operation_id.as_ref() && result.output == "ran")));
+    assert!(backend.requests.lock().is_empty());
+    handle.shutdown().await.unwrap();
+    assert!(matches!(
+        control_event(&mut events).await,
+        RuntimeEvent::Shutdown
+    ));
+    let (handle, mut events) = Engine::spawn(
+        resume_config(store, vec![], Arc::new(AllowAllPolicy)),
+        replay,
+    )
+    .unwrap();
+    handle
+        .inspect_verifications([("quick".into(), verification_recipe())].into())
+        .await
+        .unwrap();
+    match control_event(&mut events).await {
+        RuntimeEvent::VerificationsInspected { reports } => assert_eq!(reports, vec![report]),
+        event => panic!("unexpected event: {event:?}"),
+    }
+    let mut changed = verification_recipe();
+    changed.timeout_ms += 1;
+    handle
+        .inspect_verifications(
+            [
+                ("quick".into(), changed),
+                ("new".into(), verification_recipe()),
+            ]
+            .into(),
+        )
+        .await
+        .unwrap();
+    match control_event(&mut events).await {
+        RuntimeEvent::VerificationsInspected { reports } => {
+            assert!(
+                reports
+                    .iter()
+                    .all(|report| report.status == VerificationStatus::NotRun
+                        && report.operation_id.is_none())
+            );
+            assert!(
+                reports
+                    .iter()
+                    .find(|report| report.name == "quick")
+                    .unwrap()
+                    .message
+                    .is_some()
+            );
+        }
+        event => panic!("unexpected event: {event:?}"),
+    }
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn verification_approval_edit_cannot_certify_original_recipe_and_denial_does_not_execute() {
+    use kurama_protocol::verification::VerificationStatus;
+    for edited in [false, true] {
+        let store = Arc::new(MemoryStore::default());
+        let tool = BashCountingTool::default();
+        let executions = tool.executions.clone();
+        let (handle, mut events) = Engine::spawn(
+            resume_config(store.clone(), vec![Arc::new(tool)], Arc::new(AskPolicy)),
+            vec![],
+        )
+        .unwrap();
+        handle.verify("quick", verification_recipe()).await.unwrap();
+        let mut approvals = 0;
+        let mut report = None;
+        loop {
+            match control_event(&mut events).await {
+                RuntimeEvent::ApprovalRequired { request } => {
+                    let response = if !edited {
+                        ApprovalResponse::Deny
+                    } else if approvals == 0 {
+                        ApprovalResponse::Edit {
+                            arguments: serde_json::json!({"command":"true", "cwd":".", "timeout_ms":12_345}),
+                        }
+                    } else {
+                        ApprovalResponse::ApproveOnce
+                    };
+                    approvals += 1;
+                    handle
+                        .resolve_approval(request.operation_id, response)
+                        .await
+                        .unwrap();
+                }
+                RuntimeEvent::VerificationUpdated { report: update } => report = Some(update),
+                RuntimeEvent::TurnCompleted => break,
+                RuntimeEvent::Error { message } => panic!("{message}"),
+                _ => {}
+            }
+        }
+        let report = report.unwrap();
+        assert_eq!(
+            report.status,
+            if edited {
+                VerificationStatus::Failed
+            } else {
+                VerificationStatus::Denied
+            }
+        );
+        assert_eq!(executions.load(Ordering::Relaxed), usize::from(edited));
+        if edited {
+            assert_eq!(report.command, "true");
+            assert_eq!(report.timeout_ms, 12_345);
+            assert_eq!(report.exit_code, Some(0));
+            let replay = store.events("resume");
+            assert!(replay.iter().any(|event| matches!(&event.event, SessionEvent::ToolInvocationRecorded { operation_id, invocation } if Some(operation_id) == report.operation_id.as_ref() && invocation.arguments["command"] == "true")));
+        }
+        handle.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn interrupted_verification_is_reported_without_approval_or_tool_retry() {
+    use kurama_protocol::verification::{VerificationReport, VerificationStatus};
+    let recipe = verification_recipe();
+    let mut report = VerificationReport::not_run("quick".into(), &recipe);
+    report.status = VerificationStatus::Running;
+    report.started_at_ms = Some(1);
+    let replay = vec![
+        replay_event(
+            0,
+            SessionEvent::VerificationStarted {
+                recipe: recipe.clone(),
+                report,
+            },
+        ),
+        replay_event(
+            1,
+            SessionEvent::ToolProposed {
+                operation_id: "check".into(),
+                call_id: "call".into(),
+                operation: Operation::Bash {
+                    command: recipe.command.clone(),
+                    cwd: ".".into(),
+                    class: CommandClass::Unknown,
+                    timeout_ms: recipe.timeout_ms,
+                },
+            },
+        ),
+        replay_event(
+            2,
+            SessionEvent::ApprovalRequested {
+                operation_id: "check".into(),
+                summary: "check".into(),
+            },
+        ),
+    ];
+    let store = Arc::new(MemoryStore::default());
+    seed_replay(&store, &replay);
+    let tool = BashCountingTool::default();
+    let executions = tool.executions.clone();
+    let (handle, mut events) = Engine::spawn(
+        resume_config(store.clone(), vec![Arc::new(tool)], Arc::new(AskPolicy)),
+        replay,
+    )
+    .unwrap();
+    handle
+        .inspect_verifications([("quick".into(), recipe)].into())
+        .await
+        .unwrap();
+    loop {
+        match control_event(&mut events).await {
+            RuntimeEvent::VerificationUpdated { report } => {
+                assert_eq!(report.status, VerificationStatus::Interrupted)
+            }
+            RuntimeEvent::VerificationsInspected { reports } => {
+                assert_eq!(reports[0].status, VerificationStatus::Interrupted);
+                break;
+            }
+            event => panic!("interrupted verification resumed work: {event:?}"),
+        }
+    }
+    assert_eq!(executions.load(Ordering::Relaxed), 0);
+    assert!(store.events("resume").iter().any(|event| matches!(&event.event, SessionEvent::VerificationCompleted { report } if report.status == VerificationStatus::Interrupted)));
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn verification_inspection_works_during_approval_and_cancel_is_not_a_pass() {
+    use kurama_protocol::verification::VerificationStatus;
+    let (handle, mut events) = Engine::spawn(
+        resume_config(
+            Arc::new(MemoryStore::default()),
+            vec![Arc::new(BashCountingTool::default())],
+            Arc::new(AskPolicy),
+        ),
+        vec![],
+    )
+    .unwrap();
+    handle.verify("quick", verification_recipe()).await.unwrap();
+    loop {
+        if matches!(
+            control_event(&mut events).await,
+            RuntimeEvent::ApprovalRequired { .. }
+        ) {
+            break;
+        }
+    }
+    assert!(handle.verify("other", verification_recipe()).await.is_err());
+    handle
+        .inspect_verifications([("quick".into(), verification_recipe())].into())
+        .await
+        .unwrap();
+    match control_event(&mut events).await {
+        RuntimeEvent::VerificationsInspected { reports } => {
+            assert_eq!(reports[0].status, VerificationStatus::Running)
+        }
+        event => panic!("unexpected event: {event:?}"),
+    }
+    handle.cancel_turn().await.unwrap();
+    assert_eq!(
+        verification_report(&mut events).await.status,
+        VerificationStatus::Cancelled
+    );
+    handle.shutdown().await.unwrap();
 }

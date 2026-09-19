@@ -13,25 +13,23 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use kurama_adapters::{
-    AppPaths, BashTool, ClaudeNativeSearch, CodexNativeSearch, ConfigRepository,
-    CredentialResolver, FsSessionStore, HttpClient, JsonSearchBackend, OpenAiNativeSearch,
-    ProviderFactory, ReadTool, SearchBackend, SecretValue, SessionSecrets, WebSearchTool,
-    WriteTool,
+    AppPaths, ConfigRepository, CredentialResolver, FsSessionStore, HttpClient, ProviderFactory,
+    SecretValue, SessionSecrets, read_verification_recipes,
 };
 use kurama_core::cancel::CancelToken;
+#[cfg(test)]
+use kurama_protocol::config::{ProfileConfig, ProfileKind};
 use kurama_protocol::{
     KuramaError,
-    config::{
-        AuthRef, KuramaConfig, OrchestrationConfig, ProfileConfig, ProfileKind, SearchConfig,
-    },
+    config::{KuramaConfig, OrchestrationConfig},
     id::SessionId,
-    model::{ModelProfile, Usage},
+    model::Usage,
     policy::{ApprovalResponse, AutoBoundaries, ExecutionMode},
     runtime::{EngineCommand, RuntimeEvent},
-    session::{EventEnvelope, SessionEvent, SessionMetadata},
-    traits::{EventSink, Orchestrator, SessionStore, Tool},
+    session::SessionEvent,
+    traits::{EventSink, Orchestrator, SessionStore},
 };
-use kurama_sdk::{Agent, Events, Handle};
+use kurama_sdk::{Events, Handle};
 use ratatui::{
     Terminal,
     backend::{Backend, CrosstermBackend},
@@ -41,6 +39,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     args::{Args, ResumeChoice},
+    bootstrap::{self, BootstrapState, standard_tools},
     commands::{Command, GoalAction, command_missing_required_arguments, parse_command},
     tui::{
         ComposerSelection, DiffAction, DiffReview, OnboardingState, OnboardingSubmission, Overlay,
@@ -384,247 +383,63 @@ impl App {
         paths: AppPaths,
         session_secrets: Arc<Mutex<SessionSecrets>>,
     ) -> Result<Self, String> {
-        let project = cwd
-            .canonicalize()
-            .map_err(|error| format!("canonicalize project: {error}"))?;
+        let (tool_tx, tool_rx) = mpsc::channel(TOOL_EVENT_CAPACITY);
+        let prepared = bootstrap::prepare(
+            args,
+            cwd,
+            paths,
+            session_secrets,
+            None,
+            Arc::new(ToolEventSink { sender: tool_tx }),
+        )?;
         let home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
             .map(PathBuf::from);
-        let startup_project = project_display_path(&project, home.as_deref());
-        let repository =
-            ConfigRepository::open(paths.clone()).map_err(|error| error.to_string())?;
-        let store = Arc::new(
-            FsSessionStore::open(paths.root().to_path_buf()).map_err(|error| error.to_string())?,
-        );
-        let Some(config) = repository
-            .read_config()
-            .map_err(|error| error.to_string())?
-        else {
-            if args.profile.is_some() || args.resume.is_some() {
-                return Err("Kurama is not configured; create ~/.kurama/config.toml first".into());
-            }
-            let mut state = TuiState::onboarding(project.display().to_string());
-            state.prepend_startup(env!("CARGO_PKG_VERSION"), startup_project.clone());
-            return Ok(Self::disconnected(
-                state,
-                AppControl {
-                    project,
-                    paths,
-                    session_secrets,
-                    repository,
-                    store,
-                    profiles: Vec::new(),
-                    max_input_tokens: 0,
-                    launch_args: args.clone(),
-                },
-            ));
+        let startup_project = project_display_path(&prepared.project, home.as_deref());
+        let control = AppControl {
+            project: prepared.project,
+            paths: prepared.paths,
+            session_secrets: prepared.session_secrets,
+            repository: prepared.repository,
+            store: prepared.store,
+            profiles: prepared.profiles,
+            max_input_tokens: prepared.max_input_tokens,
+            launch_args: args.clone(),
         };
-        if config.profiles.is_empty() {
-            let mut state = TuiState::onboarding(project.display().to_string());
-            state.prepend_startup(env!("CARGO_PKG_VERSION"), startup_project.clone());
-            return Ok(Self::disconnected(
-                state,
-                AppControl {
-                    project,
-                    paths,
-                    session_secrets,
-                    repository,
-                    store,
-                    profiles: Vec::new(),
-                    max_input_tokens: 0,
-                    launch_args: args.clone(),
-                },
-            ));
-        }
-
-        let resume_id = resolve_resume(args, &repository, store.as_ref(), &project)?;
-        let mut replay = resume_id
-            .as_ref()
-            .map(|session_id| store.replay(session_id))
-            .transpose()
-            .map_err(|error| error.to_string())?
-            .unwrap_or_default();
-        let previous_metadata = replay.iter().find_map(|event| {
-            if let SessionEvent::SessionStarted { metadata } = &event.event {
-                Some(metadata.clone())
-            } else {
-                None
+        let connection = match prepared.state {
+            BootstrapState::Onboarding => {
+                let mut state = TuiState::onboarding(control.project.display().to_string());
+                state.prepend_startup(env!("CARGO_PKG_VERSION"), startup_project);
+                return Ok(Self::disconnected(state, control));
             }
-        });
-        if resume_id.is_some() && previous_metadata.is_none() {
-            return Err("resumed session has no durable session metadata".into());
-        }
-        if let Some(metadata) = &previous_metadata {
-            let recorded = PathBuf::from(&metadata.project_root);
-            if recorded.canonicalize().ok().as_ref() != Some(&project) {
-                return Err(format!(
-                    "session {} belongs to another project",
-                    metadata.id
-                ));
+            BootstrapState::Credential { profile, mode } => {
+                let mut state =
+                    TuiState::credential(control.project.display().to_string(), profile);
+                state.mode = mode;
+                state.prepend_startup(env!("CARGO_PKG_VERSION"), startup_project);
+                return Ok(Self::disconnected(state, control));
             }
-            if args
-                .profile
-                .as_deref()
-                .is_some_and(|profile| profile != metadata.profile)
-            {
-                return Err(format!(
-                    "session {} is pinned to profile {}; start a new session to switch profiles",
-                    metadata.id, metadata.profile
-                ));
-            }
-        }
-        let active_profile = if let Some(metadata) = &previous_metadata {
-            metadata.profile.clone()
-        } else {
-            repository
-                .resolve_profile(&project, args.profile.as_deref())
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "no active profile is configured".to_owned())?
+            BootstrapState::Connected(connection) => connection,
         };
-        let active = config
-            .profiles
-            .get(&active_profile)
-            .ok_or_else(|| format!("unknown active profile: {active_profile}"))?;
-        let mutable_state = repository.read_state().map_err(|error| error.to_string())?;
-        let mode = if args.yolo {
-            ExecutionMode::Yolo
-        } else if let Some(metadata) = &previous_metadata {
-            if metadata.mode == ExecutionMode::Yolo {
-                mutable_state.last_mode.unwrap_or(ExecutionMode::Supervised)
-            } else {
-                metadata.mode
-            }
-        } else {
-            mutable_state.last_mode.unwrap_or(config.default_mode)
-        };
-        let profile_names: Vec<_> = config.profiles.keys().cloned().collect();
-        let active_session_missing = {
-            let secrets = session_secrets
-                .lock()
-                .map_err(|_| "session credential store is unavailable".to_owned())?;
-            matches!(active.auth, Some(AuthRef::Session)) && !secrets.contains(&active_profile)
-        };
-        if active_session_missing {
-            let mut state =
-                TuiState::credential(project.display().to_string(), active_profile.clone());
-            state.mode = mode;
-            state.prepend_startup(env!("CARGO_PKG_VERSION"), startup_project.clone());
-            return Ok(Self::disconnected(
-                state,
-                AppControl {
-                    project,
-                    paths,
-                    session_secrets,
-                    repository,
-                    store,
-                    profiles: profile_names,
-                    max_input_tokens: active.max_input_tokens,
-                    launch_args: args.clone(),
-                },
-            ));
-        }
-
-        let http = HttpClient::try_new().map_err(|error| error.to_string())?;
-        let credentials = CredentialResolver;
-        let provider_factory = ProviderFactory::new(http.clone(), paths.clone(), credentials);
-        let mut agent = Agent::new()
-            .workspace(project.clone())
-            .mode(mode)
-            .active_profile(active_profile.clone())
-            .store(store.clone())
-            .config(&config)
-            .orchestrate();
-        let secrets = session_secrets
-            .lock()
-            .map_err(|_| "session credential store is unavailable".to_owned())?;
-        for (name, profile) in &config.profiles {
-            if matches!(profile.auth, Some(AuthRef::Session)) && !secrets.contains(name) {
-                continue;
-            }
-            let model_profile = ModelProfile::new(
-                name.clone(),
-                profile.model.clone(),
-                profile.max_input_tokens,
-                profile.max_output_tokens,
-            );
-            let backend = provider_factory
-                .build(name, profile, &secrets)
-                .map_err(|error| error.to_string())?;
-            agent = agent.profile(model_profile, backend);
-        }
-        let search_backend = search_backend(
-            &config,
-            active_profile.as_str(),
-            active,
-            &secrets,
-            credentials,
-            http.clone(),
-        )?;
-        drop(secrets);
-        let (tool_tx, tool_rx) = mpsc::channel(TOOL_EVENT_CAPACITY);
-        let tool_sink: Arc<dyn EventSink> = Arc::new(ToolEventSink { sender: tool_tx });
-        let agent = agent
-            .tools(standard_tools(http, search_backend, Some(tool_sink)))
-            .build()
-            .map_err(|error| error.to_string())?;
-        let orchestrator = agent.orchestrator();
-
-        let session_id = resume_id.unwrap_or_else(|| agent.allocate_session_id());
-        let created_at_ms = previous_metadata
-            .as_ref()
-            .map_or_else(now_ms, |metadata| metadata.created_at_ms);
-        let resumed_yolo = previous_metadata
-            .as_ref()
-            .is_some_and(|metadata| metadata.mode == ExecutionMode::Yolo)
-            && mode != ExecutionMode::Yolo;
-        if previous_metadata
-            .as_ref()
-            .is_some_and(|metadata| metadata.mode != mode)
-        {
-            let event = EventEnvelope::new(
-                replay.last().map_or(0, |event| event.sequence + 1),
-                now_ms(),
-                session_id.clone(),
-                None,
-                SessionEvent::ModeSelected { mode },
-            );
-            store.append(&event).map_err(|error| error.to_string())?;
-            replay.push(event);
-        }
-        let metadata = SessionMetadata {
-            id: session_id.clone(),
-            created_at_ms,
-            project_root: project.display().to_string(),
-            profile: active_profile.clone(),
-            mode,
-            redaction_best_effort: mode == ExecutionMode::Yolo,
-        };
-
-        repository
-            .remember_session(
-                &project,
-                &active_profile,
-                &session_id,
-                (mode != ExecutionMode::Yolo).then_some(mode),
-            )
-            .map_err(|error| error.to_string())?;
-
         let mut state = TuiState::new(
-            active_profile,
-            active.model.clone(),
-            project.display().to_string(),
-            mode,
+            connection.metadata.profile.clone(),
+            connection.model,
+            control.project.display().to_string(),
+            connection.metadata.mode,
         );
-        state.set_composer_session(&session_id);
-        state.max_input_tokens = active.max_input_tokens;
-        state.set_display_store(Arc::clone(&store));
-        state.hydrate_replay(&replay);
-        let (engine, runtime_events) = agent
-            .launch(metadata, replay)
+        state.set_composer_session(&connection.metadata.id);
+        state.max_input_tokens = control.max_input_tokens;
+        state.set_display_store(Arc::clone(&control.store));
+        state.hydrate_replay(&connection.replay);
+        let session_id = connection.metadata.id.clone();
+        let orchestrator = connection.agent.orchestrator();
+        let (engine, runtime_events) = connection
+            .agent
+            .launch(connection.metadata, connection.replay)
             .map_err(|error| error.to_string())?;
         state.refresh_git_branch();
         state.prepend_startup(env!("CARGO_PKG_VERSION"), startup_project);
-        if resumed_yolo {
+        if connection.resumed_yolo {
             state.push_notice(
                 Some("MODE".into()),
                 "Previous run used YOLO; resumed in supervised mode",
@@ -641,16 +456,7 @@ impl App {
             exit_requested: false,
             link_tasks: tokio::task::JoinSet::new(),
             diff_load: None,
-            control: Some(AppControl {
-                project,
-                paths,
-                session_secrets,
-                repository,
-                store,
-                profiles: profile_names,
-                max_input_tokens: active.max_input_tokens,
-                launch_args: args.clone(),
-            }),
+            control: Some(control),
         })
     }
 
@@ -1394,6 +1200,14 @@ impl App {
                 Command::Todo => self.state.open_todos(),
                 Command::Queue => self.state.open_queue(),
                 Command::Goal(action) => self.handle_goal_command(action)?,
+                Command::Verify(name) => {
+                    if let Err(error) = self.handle_verify_command(name) {
+                        self.state.push_error(error);
+                        self.state.composer = text;
+                        self.state.cursor = self.state.composer.len();
+                        self.state.composer_edited();
+                    }
+                }
                 Command::Model(profile) => {
                     if let Some(profile) = profile {
                         let known = self
@@ -1505,6 +1319,32 @@ impl App {
             }
             if editing_feedback {
                 self.state.restore_composer_draft();
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_verify_command(&mut self, name: Option<String>) -> Result<(), String> {
+        if self.engine.is_none() {
+            return Err("not connected; configure ~/.kurama/config.toml".into());
+        }
+        let project = self
+            .control
+            .as_ref()
+            .map(|control| control.project.as_path())
+            .ok_or_else(|| "project verification is unavailable".to_owned())?;
+        let mut recipes = read_verification_recipes(project).map_err(|error| error.to_string())?;
+        match name {
+            None => self
+                .state
+                .queue_command(EngineCommand::InspectVerifications { recipes }),
+            Some(name) => {
+                let recipe = recipes.remove(&name).ok_or_else(|| {
+                    format!("unknown verification recipe: {name}; /verify lists configured checks")
+                })?;
+                if !self.state.submit_verification(name, recipe) {
+                    return Err("cannot run verification while another turn is active; input returned to draft".into());
+                }
             }
         }
         Ok(())
@@ -2113,6 +1953,15 @@ impl App {
                     explicit_delegation,
                 } => engine.steer(text, explicit_delegation).await,
                 EngineCommand::InspectContext => engine.inspect_context().await,
+                EngineCommand::Verify { name, recipe } => {
+                    if let Err(error) = engine.verify(name, recipe).await {
+                        self.state.reject_verification(error.to_string());
+                    }
+                    Ok(())
+                }
+                EngineCommand::InspectVerifications { recipes } => {
+                    engine.inspect_verifications(recipes).await
+                }
                 EngineCommand::ResolveApproval {
                     operation_id,
                     response,
@@ -2253,6 +2102,8 @@ fn requires_immediate_redraw(event: &RuntimeEvent) -> bool {
             | RuntimeEvent::GoalCleared
             | RuntimeEvent::Usage { .. }
             | RuntimeEvent::ContextInspected { .. }
+            | RuntimeEvent::VerificationUpdated { .. }
+            | RuntimeEvent::VerificationsInspected { .. }
             | RuntimeEvent::SteeringQueued { .. }
             | RuntimeEvent::SteeringApplied { .. }
             | RuntimeEvent::SteeringRejected { .. }
@@ -2996,79 +2847,6 @@ where
     Ok(())
 }
 
-fn standard_tools(
-    http: HttpClient,
-    search_backend: Option<Arc<dyn SearchBackend>>,
-    bash_sink: Option<Arc<dyn EventSink>>,
-) -> Vec<Arc<dyn Tool>> {
-    let bash: Arc<dyn Tool> = match bash_sink {
-        Some(sink) => Arc::new(BashTool::with_event_sink("/bin/bash", sink)),
-        None => Arc::new(BashTool::default()),
-    };
-    vec![
-        bash,
-        Arc::new(ReadTool::default()),
-        Arc::new(WebSearchTool::new(http, search_backend)),
-        Arc::new(WriteTool::default()),
-    ]
-}
-
-fn search_backend(
-    config: &KuramaConfig,
-    active_profile: &str,
-    active: &ProfileConfig,
-    session_secrets: &SessionSecrets,
-    credentials: CredentialResolver,
-    http: HttpClient,
-) -> Result<Option<Arc<dyn SearchBackend>>, String> {
-    match config.search.as_ref() {
-        Some(SearchConfig::Json { endpoint, auth }) => {
-            let secret = credentials
-                .resolve_optional("search", auth.as_ref(), session_secrets)
-                .map_err(|error| error.to_string())?;
-            Ok(Some(Arc::new(JsonSearchBackend::with_client(
-                http,
-                endpoint.clone(),
-                secret,
-            ))))
-        }
-        None | Some(SearchConfig::Provider) if active.kind == ProfileKind::OpenAi => {
-            let auth = active
-                .auth
-                .as_ref()
-                .ok_or_else(|| "OpenAI native search requires profile auth".to_owned())?;
-            let secret = credentials
-                .resolve(active_profile, auth, session_secrets)
-                .map_err(|error| error.to_string())?;
-            Ok(Some(Arc::new(OpenAiNativeSearch::new(
-                http,
-                active
-                    .endpoint
-                    .clone()
-                    .unwrap_or_else(|| "https://api.openai.com/v1".into()),
-                secret,
-                active.model.clone(),
-            ))))
-        }
-        None | Some(SearchConfig::Provider) if active.kind == ProfileKind::CodexCli => {
-            Ok(Some(Arc::new(CodexNativeSearch::new(
-                active.command.as_deref().unwrap_or("codex"),
-                active.model.clone(),
-            ))))
-        }
-        None | Some(SearchConfig::Provider) if active.kind == ProfileKind::ClaudeCli => {
-            Ok(Some(Arc::new(ClaudeNativeSearch::new(
-                active.command.as_deref().unwrap_or("claude"),
-                active.model.clone(),
-            ))))
-        }
-        Some(SearchConfig::Provider) => Err(format!(
-            "profile {active_profile} does not support native web search; configure [search] kind = \"json\" with a search endpoint"
-        )),
-        None => Ok(None),
-    }
-}
-
 fn empty_config() -> KuramaConfig {
     KuramaConfig {
         version: 1,
@@ -3080,47 +2858,6 @@ fn empty_config() -> KuramaConfig {
         auto: AutoBoundaries::default(),
         search: None,
     }
-}
-
-fn resolve_resume(
-    args: &Args,
-    repository: &ConfigRepository,
-    store: &dyn SessionStore,
-    project: &Path,
-) -> Result<Option<SessionId>, String> {
-    match &args.resume {
-        None => Ok(None),
-        Some(ResumeChoice::Id(session_id)) => Ok(Some(SessionId::from(session_id.clone()))),
-        Some(ResumeChoice::Continue) => {
-            let state = repository.read_state().map_err(|error| error.to_string())?;
-            if let Some(session_id) = state.latest_sessions.get(project) {
-                return Ok(Some(session_id.clone()));
-            }
-            let session = store
-                .list()
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .find(|summary| {
-                    PathBuf::from(&summary.project_root)
-                        .canonicalize()
-                        .ok()
-                        .as_ref()
-                        == Some(&project.to_path_buf())
-                })
-                .map(|summary| summary.id)
-                .ok_or_else(|| "no resumable session exists for this project".to_owned())?;
-            Ok(Some(session))
-        }
-    }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 async fn open_link(target: &str) -> Result<(), String> {
@@ -3261,6 +2998,7 @@ mod tests {
     use kurama_protocol::{
         id::{CallId, OperationId},
         policy::ApprovalRequest,
+        session::EventEnvelope,
         tool::{CommandClass, Operation, ToolResult},
     };
     use ratatui::{
