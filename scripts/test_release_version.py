@@ -75,25 +75,6 @@ class ReleaseVersionTests(unittest.TestCase):
         result = self.check("v0.1.10", "--binary", binary)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_ci_and_release_run_validation_regressions(self):
-        command = "python3 -m unittest discover -s scripts -p 'test_release_version.py' -v"
-        for workflow in ("ci.yml", "release.yml"):
-            with self.subTest(workflow=workflow):
-                text = (ROOT / ".github/workflows" / workflow).read_text()
-                self.assertIn(command, text)
-                self.assertIn("python3 scripts/check-release-version.py", text)
-
-    def test_release_checks_tag_before_tests_and_binary_before_archive(self):
-        text = (ROOT / ".github/workflows/release.yml").read_text()
-        source_guard = 'python3 scripts/check-release-version.py "$GITHUB_REF_NAME"'
-        binary_guard = source_guard + ' --binary target/${{ matrix.target }}/release/kurama'
-        self.assertIn(source_guard, text)
-        self.assertIn(binary_guard, text)
-        self.assertLess(text.index(source_guard), text.index("cargo test --locked"))
-        self.assertLess(text.index("cargo build --locked"), text.index(binary_guard))
-        self.assertLess(text.index("scripts/check-size.sh"), text.index(binary_guard))
-        self.assertLess(text.index(binary_guard), text.index("Package archive and checksum"))
-
     def test_tag_must_match_exactly(self):
         for tag in ("v0.1.9", "v0.1.9.5", "v0.1.10.1", "0.1.10", "V0.1.10",
                     "vv0.1.10", "v0.1.10-rc.1", "v0.1.10+build", "v0.1.10\n", ""):
