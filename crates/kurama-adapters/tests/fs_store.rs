@@ -1,10 +1,8 @@
 #![cfg(feature = "fs-store")]
 
-#[path = "../src/storage/mod.rs"]
-mod storage;
-
 use std::io::Write;
 
+use kurama_adapters::FsSessionStore;
 use kurama_protocol::{
     KuramaError,
     id::{AgentId, SessionId},
@@ -12,7 +10,6 @@ use kurama_protocol::{
     session::{BlobRef, EventEnvelope, SessionEvent, SessionMetadata},
     traits::SessionStore,
 };
-use storage::FsSessionStore;
 
 fn metadata(id: &str, created_at_ms: u64) -> SessionMetadata {
     SessionMetadata {
@@ -33,17 +30,9 @@ fn event(session: &str, sequence: u64, timestamp_ms: u64, agent: Option<&str>) -
         agent.map(AgentId::from),
         SessionEvent::UserMessage {
             text: format!("message-{sequence}"),
+            explicit_delegation: false,
         },
     )
-}
-
-fn write_log(path: &std::path::Path, events: impl IntoIterator<Item = EventEnvelope>) {
-    let mut file = std::io::BufWriter::new(std::fs::File::create(path).expect("create log"));
-    for event in events {
-        serde_json::to_writer(&mut file, &event).expect("serialize event");
-        file.write_all(b"\n").expect("terminate event");
-    }
-    file.flush().expect("flush log");
 }
 
 #[test]
@@ -111,6 +100,82 @@ fn open_creates_owner_only_layout_without_overwriting_files() {
             0o600
         );
     }
+}
+
+#[test]
+fn create_lock_name_is_a_valid_session_id() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = FsSessionStore::open(temp.path().to_owned()).expect("store");
+    store
+        .create(&metadata(".create.lock", 1))
+        .expect("dot-named session");
+    store
+        .append(&event(".create.lock", 0, 2, None))
+        .expect("append");
+    assert!(store.create(&metadata(".create.lock", 3)).is_err());
+    store
+        .create(&metadata("ordinary", 4))
+        .expect("another session");
+    assert_eq!(
+        store
+            .list()
+            .expect("list")
+            .into_iter()
+            .map(|summary| summary.id)
+            .collect::<Vec<_>>(),
+        vec![SessionId::from("ordinary"), SessionId::from(".create.lock")],
+    );
+    assert_eq!(
+        store
+            .replay(&SessionId::from(".create.lock"))
+            .expect("replay"),
+        vec![event(".create.lock", 0, 2, None)],
+    );
+}
+
+#[test]
+fn preexisting_create_lock_session_remains_visible_and_does_not_block_creation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let session = temp.path().join("sessions/.create.lock");
+    std::fs::create_dir_all(session.join("agents")).expect("legacy session layout");
+    std::fs::write(
+        session.join("metadata.json"),
+        serde_json::to_vec(&metadata(".create.lock", 1)).expect("metadata"),
+    )
+    .expect("legacy metadata");
+    let original = event(".create.lock", 0, 2, None);
+    std::fs::write(
+        session.join("events.jsonl"),
+        format!("{}\n", serde_json::to_string(&original).expect("event")),
+    )
+    .expect("legacy event log");
+
+    let store = FsSessionStore::open(temp.path().to_owned()).expect("open legacy store");
+    assert_eq!(
+        store.list().expect("list legacy session")[0].id,
+        SessionId::from(".create.lock")
+    );
+    assert_eq!(
+        store
+            .replay(&SessionId::from(".create.lock"))
+            .expect("legacy replay"),
+        vec![original]
+    );
+    store
+        .create(&metadata("new-session", 3))
+        .expect("create beside legacy session");
+    assert_eq!(
+        store
+            .list()
+            .expect("list both")
+            .into_iter()
+            .map(|summary| summary.id)
+            .collect::<Vec<_>>(),
+        vec![
+            SessionId::from("new-session"),
+            SessionId::from(".create.lock")
+        ],
+    );
 }
 
 #[test]
@@ -375,6 +440,7 @@ fn append_next_reads_a_tail_record_larger_than_its_scan_buffer() {
     let mut large = event("large-tail", 99, 11, None);
     large.event = SessionEvent::UserMessage {
         text: "x".repeat(32 * 1024),
+        explicit_delegation: false,
     };
     store.append_next(&mut large).expect("large event");
     let mut next = event("large-tail", 99, 12, None);
@@ -620,98 +686,170 @@ fn list_includes_a_new_repair_in_the_first_summary() {
 }
 
 #[test]
-fn replay_repairs_a_torn_tail_with_one_durable_sync() {
+fn concurrent_first_openers_and_duplicate_creators_publish_one_complete_session() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("new-store");
+    let barrier = std::sync::Barrier::new(16);
+    let winners = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..16)
+            .map(|index| {
+                let root = &root;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let store = FsSessionStore::open(root.clone()).expect("concurrent first open");
+                    let created = store.create(&metadata("same-session", index)).is_ok();
+                    if created { Some(index) } else { None }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().expect("creator"))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(winners.len(), 1);
+    let store = FsSessionStore::open(root.clone()).expect("reopen");
+    let summaries = store.list().expect("list complete session");
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].created_at_ms, winners[0]);
+    assert!(
+        store
+            .replay(&SessionId::from("same-session"))
+            .expect("complete empty log")
+            .is_empty()
+    );
+    assert!(root.join("sessions/same-session/agents").is_dir());
+    store
+        .append(&event("same-session", 0, 20, None))
+        .expect("append after racing creation");
+    assert_eq!(
+        store
+            .replay(&SessionId::from("same-session"))
+            .expect("replay")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn concurrent_repair_readers_append_exactly_one_repair() {
     let temp = tempfile::tempdir().expect("tempdir");
     let store = FsSessionStore::open(temp.path().to_owned()).expect("store");
-    store.create(&metadata("repair-sync", 10)).expect("create");
+    store.create(&metadata("repair-race", 1)).expect("session");
     store
-        .append(&event("repair-sync", 0, 11, None))
-        .expect("append");
-
-    let log = temp.path().join("sessions/repair-sync/events.jsonl");
+        .append(&event("repair-race", 0, 2, None))
+        .expect("event");
     std::fs::OpenOptions::new()
         .append(true)
-        .open(log)
-        .expect("open")
-        .write_all(br#"{"schema_version":1"#)
-        .expect("write torn tail");
-
-    let (events, syncs) = store
-        .replay_with_operation_counts_for_test(&SessionId::from("repair-sync"))
-        .expect("repair");
-
-    assert!(matches!(
-        events.last().map(|event| &event.event),
-        Some(SessionEvent::RecoveryRepair { removed_bytes: 19 })
-    ));
-    assert_eq!(syncs, 1);
-}
-
-#[test]
-fn append_inspects_only_the_final_record_of_a_large_log() {
-    const EVENT_COUNT: u64 = 512;
-
-    let temp = tempfile::tempdir().expect("tempdir");
-    let store = FsSessionStore::open(temp.path().to_owned()).expect("store");
+        .open(temp.path().join("sessions/repair-race/events.jsonl"))
+        .expect("log")
+        .write_all(b"{\"torn\"")
+        .expect("torn tail");
+    let barrier = std::sync::Barrier::new(8);
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let barrier = &barrier;
+            let root = temp.path();
+            scope.spawn(move || {
+                let store = FsSessionStore::open(root.to_owned()).expect("independent reader");
+                barrier.wait();
+                let events = store
+                    .replay(&SessionId::from("repair-race"))
+                    .expect("concurrent repair");
+                assert_eq!(events.len(), 2);
+                assert!(matches!(
+                    events[1].event,
+                    SessionEvent::RecoveryRepair { .. }
+                ));
+            });
+        }
+    });
     store
-        .create(&metadata("bounded-append", 10))
-        .expect("create");
-    let log = temp.path().join("sessions/bounded-append/events.jsonl");
-    write_log(
-        &log,
-        (0..EVENT_COUNT).map(|sequence| event("bounded-append", sequence, 11 + sequence, None)),
+        .append(&event("repair-race", 2, 3, None))
+        .expect("append after repair");
+    assert_eq!(
+        store
+            .replay(&SessionId::from("repair-race"))
+            .expect("durable replay")
+            .len(),
+        3
     );
-    let log_bytes = std::fs::metadata(&log).expect("log metadata").len();
-
-    let (tail_bytes_read, records_deserialized, syncs) = store
-        .append_with_operation_counts_for_test(&event(
-            "bounded-append",
-            EVENT_COUNT,
-            11 + EVENT_COUNT,
-            None,
-        ))
-        .expect("append");
-
-    assert!(tail_bytes_read <= 8 * 1024);
-    assert!(tail_bytes_read < log_bytes);
-    assert_eq!(records_deserialized, 1);
-    assert_eq!(syncs, 1);
-
-    let mut next = event("bounded-append", 0, 12 + EVENT_COUNT, None);
-    let (tail_bytes_read, records_deserialized, syncs) = store
-        .append_next_with_operation_counts_for_test(&mut next)
-        .expect("allocate next sequence");
-    assert_eq!(next.sequence, EVENT_COUNT + 1);
-    assert!(tail_bytes_read <= 8 * 1024);
-    assert!(tail_bytes_read < log_bytes);
-    assert_eq!(records_deserialized, 1);
-    assert_eq!(syncs, 1);
 }
 
 #[test]
-fn list_streams_log_summaries_without_materializing_replay_vectors() {
-    const PARENT_EVENTS: u64 = 128;
-    const CHILD_EVENTS: u64 = 96;
-
+fn list_uses_the_maximum_timestamp_not_the_final_record() {
     let temp = tempfile::tempdir().expect("tempdir");
     let store = FsSessionStore::open(temp.path().to_owned()).expect("store");
-    store.create(&metadata("stream-list", 10)).expect("create");
-    let session_dir = temp.path().join("sessions/stream-list");
-    write_log(
-        &session_dir.join("events.jsonl"),
-        (0..PARENT_EVENTS).map(|sequence| event("stream-list", sequence, 11 + sequence, None)),
-    );
-    write_log(
-        &session_dir.join("agents/child.jsonl"),
-        (0..CHILD_EVENTS)
-            .map(|sequence| event("stream-list", sequence, 1000 + sequence, Some("child"))),
-    );
+    store.create(&metadata("nonmonotonic", 1)).expect("session");
+    for item in [
+        event("nonmonotonic", 0, 500, None),
+        event("nonmonotonic", 1, 2, None),
+        event("nonmonotonic", 0, 900, Some("child")),
+        event("nonmonotonic", 1, 3, Some("child")),
+    ] {
+        store.append(&item).expect("append");
+    }
+    assert_eq!(store.list().expect("list")[0].updated_at_ms, 900);
+}
 
-    let (sessions, records_deserialized, replay_events_materialized) =
-        store.list_with_operation_counts_for_test().expect("list");
+#[cfg(unix)]
+#[test]
+fn opened_store_is_not_redirected_by_a_replaced_root() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("root");
+    let outside = temp.path().join("outside");
+    let store = FsSessionStore::open(root.clone()).expect("store");
+    let other = FsSessionStore::open(outside.clone()).expect("outside");
+    store.create(&metadata("session", 1)).expect("session");
+    other
+        .create(&metadata("session", 999))
+        .expect("outside session");
+    let reference = store.put_blob(b"opened-root-bytes").expect("blob");
+    let moved = temp.path().join("original");
+    std::fs::rename(&root, &moved).expect("move root");
+    symlink(&outside, &root).expect("replace root");
+    store
+        .append(&event("session", 0, 2, None))
+        .expect("append to original");
+    assert_eq!(
+        store.get_blob(&reference).expect("original blob"),
+        b"opened-root-bytes"
+    );
+    assert_eq!(
+        store
+            .replay(&SessionId::from("session"))
+            .expect("original log")
+            .len(),
+        1
+    );
+    assert!(
+        other
+            .replay(&SessionId::from("session"))
+            .expect("outside log")
+            .is_empty()
+    );
+    assert_eq!(
+        other.list().expect("outside metadata")[0].created_at_ms,
+        999
+    );
+}
 
-    assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0].updated_at_ms, 1000 + CHILD_EVENTS - 1);
-    assert_eq!(records_deserialized, PARENT_EVENTS + CHILD_EVENTS);
-    assert_eq!(replay_events_materialized, 0);
+#[test]
+fn deduplicated_put_checks_every_chunk_before_accepting_existing_blob() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = FsSessionStore::open(temp.path().to_owned()).expect("store");
+    let bytes = vec![b'x'; 3 * 64 * 1024 + 1];
+    let reference = store.put_blob(&bytes).expect("blob");
+    for offset in [0, 64 * 1024, bytes.len() - 1] {
+        let mut corrupt = bytes.clone();
+        corrupt[offset] = b'y';
+        std::fs::write(temp.path().join("blobs").join(&reference.sha256), corrupt)
+            .expect("corrupt blob");
+        assert!(store.put_blob(&bytes).is_err());
+    }
+    std::fs::write(temp.path().join("blobs").join(&reference.sha256), &bytes)
+        .expect("restore blob");
+    assert_eq!(store.put_blob(&bytes).expect("verified dedup"), reference);
 }

@@ -6,13 +6,16 @@ it gives models four environment tools: bounded file reads, atomic writes, timed
 
 ## install
 
-requires rust 1.98.0.
+requires rust 1.98.0. released targets are macOS and Linux.
 
 ```bash
 cargo build --locked --release -p kurama-cli
-install target/release/kurama ~/.local/bin/kurama
+install -d "$HOME/.local/bin"
+install -m 755 target/release/kurama "$HOME/.local/bin/kurama"
 kurama
 ```
+
+ensure `$HOME/.local/bin` is on your `PATH`.
 
 binaries: [releases](https://github.com/saarthak314/kurama/releases).
 
@@ -56,6 +59,8 @@ let reply = Kurama::openai(std::env::var("OPENAI_API_KEY")?)
 
 ```bash
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-features
 ```
+
+credential-free [terminal checks and benchmarks](docs/design.md#reproducing-terminal-checks) exercise the real binary in isolated PTYs and close their processes afterward.

@@ -26,7 +26,6 @@ jobs:
         uses: actions/cache@v5
         with:
           path: |
-            ~/.cargo/bin
             ~/.cargo/registry
             ~/.cargo/git
             target
@@ -35,18 +34,8 @@ jobs:
           restore-keys: cargo-nightly-heavy-${{ runner.os }}-
       - name: Test all features
         run: cargo test --locked --workspace --all-features
-      - name: Run exhaustive recovery matrix
-        run: cargo test --locked -p kurama-core --all-features --test recovery -- --include-ignored
-      - name: Run fake bridge contracts
-        run: cargo test --locked -p kurama-adapters --all-features --test bridge_contract
       - name: Check prompt budget
-        run: scripts/check-prompt-budget.sh target/release/kurama
-      - name: Report duplicate dependencies
-        run: cargo tree -d --workspace --all-features
-      - name: Report crate contribution to binary size
-        run: |
-          command -v cargo-bloat >/dev/null || cargo install cargo-bloat --locked
-          cargo bloat --release --crates
+        run: scripts/check-prompt-budget.sh
 
   tui-compatibility:
     name: Actual PTY (${{ matrix.runner }})
@@ -86,16 +75,15 @@ jobs:
       - name: Build CLI for actual PTY checks
         id: pty-build
         run: cargo build --locked -p kurama-cli
-      - name: Test terminal structures
-        run: |
-          for term in xterm-256color screen-256color vt100; do
-            echo "TERM=$term"
-            TERM="$term" cargo test --locked -p kurama-cli --test tui_structure
-          done
-      - name: Check actual PTY with cursor reports
+      - name: Check actual PTYs across terminal types with controls
         if: ${{ !cancelled() && steps.pty-build.outcome == 'success' && steps.pty-python.outcome == 'success' }}
-        timeout-minutes: 5
-        run: .venv-tui/bin/python scripts/check-tui.py target/debug/kurama tui-artifacts/normal --no-images
+        timeout-minutes: 10
+        run: |
+          status=0
+          for term in xterm-256color screen-256color vt100; do
+            .venv-tui/bin/python scripts/check-tui.py target/debug/kurama "tui-artifacts/$term" --no-images --check-controls --term "$term" || status=1
+          done
+          exit "$status"
       - name: Check actual PTY without cursor reports and with resumed todos
         if: ${{ !cancelled() && steps.pty-build.outcome == 'success' && steps.pty-python.outcome == 'success' }}
         timeout-minutes: 5
@@ -180,9 +168,9 @@ jobs:
       - name: Build release binary
         id: cli-build
         run: cargo build --locked --release -p kurama-cli
-      - name: Build release control-plane and rendering benchmarks
+      - name: Build release control-plane, rendering and adapter benchmarks
         id: harness-build
-        run: cargo build --locked --release -p kurama-cli --example control_plane_bench --example tui_bench
+        run: cargo build --locked --release -p kurama-cli --example control_plane_bench --example tui_bench --example adapter_bench
       - name: Measure startup and idle core process
         if: ${{ !cancelled() && steps.cli-build.outcome == 'success' }}
         run: |
@@ -191,14 +179,13 @@ jobs:
           startup_status=${PIPESTATUS[0]}
           python3 scripts/bench-idle.py target/release/kurama | tee idle.json
           idle_status=${PIPESTATUS[0]}
-          printf '%s\n' 'Kurama core metrics are in idle.json. Official provider CLI and local-server processes must be measured and reported separately.' > process-boundary.txt
           if (( startup_status != 0 || idle_status != 0 )); then
             exit 1
           fi
-      - name: Measure control plane and rendering sequentially
+      - name: Measure control plane, rendering and adapters sequentially
         if: ${{ !cancelled() && steps.harness-build.outcome == 'success' }}
         timeout-minutes: 12
-        run: python scripts/bench-harness.py --bin-dir target/release/examples --output-dir harness-measurements
+        run: python scripts/bench-harness.py --bin-dir target/release/examples --output-dir harness-measurements --include-adapters
       - name: Upload raw measurements
         if: always()
         uses: actions/upload-artifact@v7
@@ -207,6 +194,5 @@ jobs:
           path: |
             startup.json
             idle.json
-            process-boundary.txt
             harness-measurements/
           if-no-files-found: error

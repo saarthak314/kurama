@@ -11,10 +11,7 @@ use zeroize::Zeroizing;
 
 use crate::http::{HttpClient, SseNormalizer, sse_model_stream};
 
-use super::{
-    normalize_delegation_events, provider_instructions, responses_input, responses_tools,
-    sse::SseDecoder,
-};
+use super::{normalize_delegation_events, provider_instructions, responses_input, responses_tools};
 
 use super::endpoint_url;
 
@@ -30,18 +27,18 @@ pub struct OpenAiBackend {
 }
 
 impl OpenAiBackend {
-    pub fn new(http: HttpClient, endpoint: Url, api_key: impl Into<String>) -> Self {
+    pub fn new(http: HttpClient, endpoint: Url, api_key: impl Into<Zeroizing<String>>) -> Self {
         Self {
             http,
             endpoint,
-            api_key: Zeroizing::new(api_key.into()),
+            api_key: api_key.into(),
         }
     }
 
     pub fn from_endpoint(
         http: HttpClient,
         endpoint: &str,
-        api_key: impl Into<String>,
+        api_key: impl Into<Zeroizing<String>>,
     ) -> Result<Self, KuramaError> {
         let endpoint = Url::parse(endpoint)
             .map_err(|error| KuramaError::Configuration(format!("OpenAI endpoint: {error}")))?;
@@ -67,22 +64,6 @@ impl OpenAiBackend {
             body["previous_response_id"] = Value::String(cursor.value.clone());
         }
         body
-    }
-
-    pub fn parse_fixture(fixture: &str) -> Result<Vec<ModelEvent>, KuramaError> {
-        let mut decoder = SseDecoder::default();
-        let mut normalizer = OpenAiNormalizer::default();
-        let mut events = Vec::new();
-        for byte in fixture.as_bytes() {
-            for event in decoder.push(&[*byte])? {
-                events.extend(normalizer.push(&event.data)?);
-            }
-        }
-        for event in decoder.finish()? {
-            events.extend(normalizer.push(&event.data)?);
-        }
-        events.extend(normalizer.finish()?);
-        Ok(events)
     }
 }
 
@@ -190,6 +171,7 @@ impl OpenAiNormalizer {
                     let item_id = value
                         .pointer("/item/id")
                         .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
                         .ok_or_else(|| {
                             KuramaError::Protocol("OpenAI function call omitted item.id".into())
                         })?;
@@ -210,7 +192,7 @@ impl OpenAiNormalizer {
                             call_id: value
                                 .pointer("/item/call_id")
                                 .and_then(Value::as_str)
-                                .unwrap_or(item_id)
+                                .unwrap_or_default()
                                 .to_owned(),
                             name: value
                                 .pointer("/item/name")
@@ -261,6 +243,11 @@ impl OpenAiNormalizer {
                         call.arguments = arguments.to_owned();
                     }
                 }
+                if call.call_id.is_empty() || call.name.is_empty() {
+                    return Err(KuramaError::Protocol(
+                        "OpenAI tool call omitted id or name".into(),
+                    ));
+                }
                 let arguments = parse_arguments(&call.arguments, "OpenAI")?;
                 self.emitted_call = true;
                 events.push(ModelEvent::ToolCall {
@@ -270,6 +257,11 @@ impl OpenAiNormalizer {
                 });
             }
             "response.completed" => {
+                if !self.calls.is_empty() {
+                    return Err(KuramaError::Protocol(
+                        "OpenAI completed with unfinished tool calls".into(),
+                    ));
+                }
                 let response = value.get("response").unwrap_or(&Value::Null);
                 if let Some(usage) = response.get("usage") {
                     events.push(ModelEvent::Usage {

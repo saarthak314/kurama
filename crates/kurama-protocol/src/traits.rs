@@ -15,7 +15,7 @@ pub type ModelStream =
 
 pub trait CancelSignal: Send + Sync {
     fn is_cancelled(&self) -> bool;
-    fn cancelled(&self) -> BoxFuture<'_, ()>;
+    fn cancelled(&self) -> BoxFuture<'static, ()>;
 }
 
 pub trait ModelBackend: Send + Sync {

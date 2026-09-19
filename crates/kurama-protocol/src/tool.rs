@@ -131,7 +131,8 @@ pub enum CommandClass {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Operation {
     Read {
-        path: PathBuf,
+        #[serde(alias = "path", deserialize_with = "deserialize_read_paths")]
+        paths: Vec<PathBuf>,
         external: bool,
     },
     Write {
@@ -153,6 +154,24 @@ pub enum Operation {
         url: String,
         private_target: bool,
     },
+}
+
+fn deserialize_read_paths<'de, D>(deserializer: D) -> Result<Vec<PathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum ReadPaths {
+        Many(Vec<PathBuf>),
+        Legacy(PathBuf),
+    }
+    Ok(
+        match <ReadPaths as serde::Deserialize>::deserialize(deserializer)? {
+            ReadPaths::Many(paths) => paths,
+            ReadPaths::Legacy(path) => vec![path],
+        },
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

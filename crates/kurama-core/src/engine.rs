@@ -953,7 +953,10 @@ impl EngineActor {
     ) -> Result<(), KuramaError> {
         self.completed_tool_calls.clear();
         self.seen_tool_calls.clear();
-        self.append(SessionEvent::UserMessage { text })?;
+        self.append(SessionEvent::UserMessage {
+            text,
+            explicit_delegation,
+        })?;
         self.continue_turn(explicit_delegation).await
     }
 
@@ -1005,7 +1008,10 @@ impl EngineActor {
     ) -> Result<(), KuramaError> {
         self.completed_tool_calls.clear();
         self.seen_tool_calls.clear();
-        self.append(SessionEvent::UserMessage { text: text.clone() })?;
+        self.append(SessionEvent::UserMessage {
+            text: text.clone(),
+            explicit_delegation,
+        })?;
         self.emit(RuntimeEvent::SteeringApplied { text }).await?;
         self.continue_turn(explicit_delegation).await
     }
@@ -1648,6 +1654,10 @@ impl EngineActor {
                 combined_tool_output(
                     stdout.as_deref().unwrap_or_default(),
                     stderr.as_deref().unwrap_or_default(),
+                    result
+                        .metadata
+                        .get("execution_error_suffix")
+                        .and_then(serde_json::Value::as_str),
                 )
             })
         }))
@@ -1672,6 +1682,10 @@ impl EngineActor {
                 Some(combined_tool_output(
                     stdout.as_deref().unwrap_or_default(),
                     stderr.as_deref().unwrap_or_default(),
+                    result
+                        .metadata
+                        .get("execution_error_suffix")
+                        .and_then(serde_json::Value::as_str),
                 ))
             } else {
                 None
@@ -1687,7 +1701,7 @@ impl EngineActor {
 
     async fn execute_delegation(
         &mut self,
-        request: kurama_protocol::agent::DelegationRequest,
+        mut request: kurama_protocol::agent::DelegationRequest,
         capability_enabled: bool,
         cancel: &CancelToken,
     ) -> Result<bool, KuramaError> {
@@ -1696,7 +1710,7 @@ impl EngineActor {
                 "model emitted delegation without an enabled parent capability".into(),
             ));
         }
-        let (orchestration_context, child_runner) = self
+        let (mut orchestration_context, child_runner) = self
             .orchestration
             .as_ref()
             .map(|orchestration| (orchestration.context.clone(), orchestration.runner.clone()))
@@ -1707,6 +1721,27 @@ impl EngineActor {
             self.agent_manager.as_ref().cloned().ok_or_else(|| {
                 KuramaError::Configuration("agent manager is not configured".into())
             })?;
+        // Parent and model paths share the explicit workspace base, including paths
+        // that do not exist yet. Only the cloned context is normalized.
+        for (owner, scope) in
+            std::iter::once(("parent", &mut orchestration_context.parent_write_scope)).chain(
+                request
+                    .agents
+                    .iter_mut()
+                    .map(|spec| ("child", &mut spec.write_scope)),
+            )
+        {
+            for path in scope.roots.iter_mut().chain(&mut scope.files) {
+                *path = crate::policy::canonical_candidate(path, &self.workspace_root).ok_or_else(
+                    || {
+                        KuramaError::Policy(format!(
+                            "cannot resolve {owner} write scope path {}",
+                            path.display()
+                        ))
+                    },
+                )?;
+            }
+        }
         let plan = self.orchestrator.resolve(request, &orchestration_context)?;
         let scheduled = !plan.ready.is_empty() || !plan.queued.is_empty();
         for spec in plan.ready.iter().chain(&plan.queued).chain(&plan.blocked) {
@@ -2295,13 +2330,20 @@ fn display_text(bytes: Vec<u8>) -> String {
     }
 }
 
-fn combined_tool_output(stdout: &str, stderr: &str) -> String {
-    match (stdout.is_empty(), stderr.is_empty()) {
+fn combined_tool_output(stdout: &str, stderr: &str, error_suffix: Option<&str>) -> String {
+    let mut output = match (stdout.is_empty(), stderr.is_empty()) {
         (false, true) => stdout.to_owned(),
         (true, false) => stderr.to_owned(),
         (true, true) => String::new(),
         (false, false) => format!("{stdout}\n[stderr]\n{stderr}"),
+    };
+    if let Some(suffix) = error_suffix {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(suffix);
     }
+    output
 }
 
 fn completed_tool_calls_for_active_turn(
@@ -2476,7 +2518,7 @@ fn attach_tool_name(result: &mut ToolResult, tool_name: &str) {
 
 fn operation_summary(operation: &Operation) -> String {
     match operation {
-        Operation::Read { path, .. } => format!("read {}", path.display()),
+        Operation::Read { .. } => format!("read {}", operation_context(operation)),
         Operation::Write { paths, .. } => format!("write {} path(s)", paths.len()),
         Operation::Bash { command, .. } => format!("run {command}"),
         Operation::WebSearch { query, .. } => format!("search for {query}"),
@@ -2486,8 +2528,7 @@ fn operation_summary(operation: &Operation) -> String {
 
 fn operation_context(operation: &Operation) -> String {
     match operation {
-        Operation::Read { path, .. } => path.display().to_string(),
-        Operation::Write { paths, .. } => paths
+        Operation::Read { paths, .. } | Operation::Write { paths, .. } => paths
             .iter()
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>()
@@ -2509,6 +2550,9 @@ fn operation_tool_name(operation: &Operation) -> &'static str {
 }
 
 fn is_transient(error: &KuramaError) -> bool {
+    if let KuramaError::Provider { retryable, .. } = error {
+        return *retryable;
+    }
     let KuramaError::Model(message) = error else {
         return false;
     };

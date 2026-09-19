@@ -584,9 +584,11 @@ impl Fixture {
             metadata: self.session.clone(),
         })?;
         for turn in 0..turns {
-            append(SessionEvent::UserMessage {
-                text: format!("seed-{turn}: deterministic context for completed work"),
-            })?;
+            append(serde_json::from_value(json!({
+                "type": "user_message",
+                "text": format!("seed-{turn}: deterministic context for completed work"),
+                "explicit_delegation": false,
+            }))?)?;
             append(SessionEvent::AssistantMessage {
                 text: format!("seed-answer-{turn}: completed deterministic work"),
             })?;

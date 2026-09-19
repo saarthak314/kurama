@@ -56,7 +56,7 @@ impl Tool for GatedRead {
         _invocation: &ToolInvocation,
     ) -> Result<Operation, KuramaError> {
         Ok(Operation::Read {
-            path: context.cwd.join("input.txt"),
+            paths: vec![context.cwd.join("input.txt")],
             external: false,
         })
     }

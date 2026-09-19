@@ -5,29 +5,19 @@ use std::{
 
 use kurama_protocol::{
     agent::WriteScope,
-    policy::{AutoBoundaries, ExecutionMode, PolicyContext, PolicyDecision},
+    policy::{ExecutionMode, PolicyContext, PolicyDecision},
     tool::{CommandClass, Operation, split_shell_commands},
     traits::ApprovalPolicy,
 };
 
-#[derive(Debug, Clone)]
-pub struct DefaultPolicy {
-    mode: ExecutionMode,
-}
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DefaultPolicy;
 
 impl DefaultPolicy {
-    pub fn new(mode: ExecutionMode, _boundaries: AutoBoundaries) -> Self {
-        Self { mode }
-    }
-
-    pub fn mode(&self) -> ExecutionMode {
-        self.mode
-    }
-
     fn supervised(&self, context: &PolicyContext, operation: &Operation) -> PolicyDecision {
         match operation {
-            Operation::Read { path, external } => {
-                if !external && within_workspace(path, context) {
+            Operation::Read { paths, external } => {
+                if !external && paths.iter().all(|path| within_workspace(path, context)) {
                     PolicyDecision::Allow
                 } else {
                     ask("read is outside the workspace boundary")
@@ -86,8 +76,8 @@ impl DefaultPolicy {
 
     fn automatic(&self, context: &PolicyContext, operation: &Operation) -> PolicyDecision {
         match operation {
-            Operation::Read { path, external } => {
-                if !external && within_workspace(path, context) {
+            Operation::Read { paths, external } => {
+                if !external && paths.iter().all(|path| within_workspace(path, context)) {
                     PolicyDecision::Allow
                 } else {
                     deny("read exceeds the automatic workspace boundary")
@@ -243,7 +233,7 @@ fn contained(path: &Path, root: &Path, workspace: &Path) -> bool {
         .is_some_and(|(path, root)| path.starts_with(root))
 }
 
-fn canonical_candidate(path: &Path, base: &Path) -> Option<PathBuf> {
+pub(crate) fn canonical_candidate(path: &Path, base: &Path) -> Option<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_owned()
     } else {
@@ -514,7 +504,7 @@ fn host_matches(host: &str, allowed: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kurama_protocol::agent::WriteScope;
+    use kurama_protocol::policy::AutoBoundaries;
 
     #[test]
     fn decision_matrix_has_no_prompts_in_auto_or_yolo() {
@@ -524,7 +514,7 @@ mod tests {
             allowed_commands: vec!["cargo".into()],
             allowed_hosts: vec!["docs.rs".into()],
         };
-        let context = PolicyContext {
+        let mut context = PolicyContext {
             mode: ExecutionMode::Auto,
             workspace_root: workspace.clone(),
             write_scope: WriteScope {
@@ -535,7 +525,7 @@ mod tests {
         };
         let operations = [
             Operation::Read {
-                path: workspace.join("Cargo.toml"),
+                paths: vec![workspace.join("Cargo.toml")],
                 external: false,
             },
             Operation::Write {
@@ -549,7 +539,8 @@ mod tests {
             },
         ];
         for mode in [ExecutionMode::Auto, ExecutionMode::Yolo] {
-            let policy = DefaultPolicy::new(mode, auto.clone());
+            context.mode = mode;
+            let policy = DefaultPolicy;
             assert!(operations.iter().all(|operation| {
                 !matches!(
                     policy.decide(&context, operation),

@@ -125,15 +125,15 @@ impl CancelSignal for NeverCancel {
         false
     }
 
-    fn cancelled(&self) -> BoxFuture<'_, ()> {
+    fn cancelled(&self) -> BoxFuture<'static, ()> {
         Box::pin(pending())
     }
 }
 
 #[derive(Default)]
 struct ManualCancel {
-    cancelled: AtomicBool,
-    notify: Notify,
+    cancelled: Arc<AtomicBool>,
+    notify: Arc<Notify>,
 }
 
 #[derive(Default)]
@@ -162,10 +162,18 @@ impl CancelSignal for ManualCancel {
         self.cancelled.load(Ordering::Acquire)
     }
 
-    fn cancelled(&self) -> BoxFuture<'_, ()> {
+    fn cancelled(&self) -> BoxFuture<'static, ()> {
+        let cancelled = Arc::clone(&self.cancelled);
+        let notify = Arc::clone(&self.notify);
         Box::pin(async move {
-            while !self.is_cancelled() {
-                self.notify.notified().await;
+            loop {
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
             }
         })
     }
@@ -232,12 +240,8 @@ async fn bash_bounds_stdout_and_stderr_with_head_and_tail() {
             .unwrap()
             .starts_with("head1")
     );
-    assert!(
-        result.metadata["stdout"]
-            .as_str()
-            .unwrap()
-            .contains("omitted 19 bytes / 3 lines")
-    );
+    assert_eq!(result.metadata["stdout_omitted_bytes"], 19);
+    assert_eq!(result.metadata["stdout_omitted_lines"], 3);
     assert!(
         result.metadata["stdout"]
             .as_str()
@@ -250,18 +254,21 @@ async fn bash_bounds_stdout_and_stderr_with_head_and_tail() {
             .unwrap()
             .starts_with("errhead")
     );
-    assert!(
-        result.metadata["stderr"]
-            .as_str()
-            .unwrap()
-            .contains("omitted 10 bytes / 1 lines")
-    );
+    assert_eq!(result.metadata["stderr_omitted_bytes"], 10);
+    assert_eq!(result.metadata["stderr_omitted_lines"], 1);
     assert!(
         result.metadata["stderr"]
             .as_str()
             .unwrap()
             .ends_with("errtail\n")
     );
+    for stream in ["stdout", "stderr"] {
+        let text = result.metadata[stream].as_str().expect("captured text");
+        assert!(text.len() <= small.max_bytes);
+        assert!(text.lines().count() <= small.max_lines);
+    }
+    assert!(result.output.len() <= small.max_bytes);
+    assert!(result.output.lines().count() <= small.max_lines);
     assert!(result.metadata.get("display_output").is_none());
     let staging = result.metadata["_display_staging"]
         .as_object()
@@ -281,6 +288,123 @@ async fn bash_bounds_stdout_and_stderr_with_head_and_tail() {
 }
 
 #[tokio::test]
+async fn bash_zero_line_limit_keeps_complete_staging_without_visible_output() {
+    let fixture = Fixture::empty();
+    let sink = Arc::new(RecordingSink::default());
+    let result = BashTool::with_event_sink("/bin/bash", sink)
+        .execute(
+            fixture.context(ToolLimits {
+                max_bytes: 1,
+                max_lines: 0,
+            }),
+            invocation(serde_json::json!({
+                "command": "printf 'a\\377\\n'; printf 'b\\n' >&2"
+            })),
+            &NeverCancel,
+        )
+        .await
+        .expect("bounded command");
+    assert!(result.truncated);
+    assert!(result.output.is_empty());
+    for (stream, expected) in [("stdout", b"a\xff\n".as_slice()), ("stderr", b"b\n")] {
+        assert_eq!(result.metadata[stream], "");
+        let path = PathBuf::from(
+            result.metadata["_display_staging"][stream]
+                .as_str()
+                .expect("staging"),
+        );
+        assert_eq!(fs::read(&path).expect("original output"), expected);
+        fs::remove_file(path).expect("remove staging");
+    }
+    assert_eq!(result.metadata["stdout_omitted_bytes"], 3);
+    assert_eq!(result.metadata["stderr_omitted_bytes"], 2);
+}
+
+#[tokio::test]
+async fn bash_stages_both_original_streams_when_only_the_aggregate_overflows() {
+    let fixture = Fixture::empty();
+    for limits in [
+        ToolLimits {
+            max_bytes: 32,
+            max_lines: 10,
+        },
+        ToolLimits {
+            max_bytes: 128,
+            max_lines: 2,
+        },
+    ] {
+        let result = BashTool::default()
+            .execute(
+                fixture.context(limits),
+                invocation(serde_json::json!({
+                    "command": "printf 'HEAD\\377aaaaaaaaaaaaaaaa'; printf 'TAILbbbbbbbbbbbbbbbb' >&2"
+                })),
+                &NeverCancel,
+            )
+            .await
+            .expect("aggregate bounded output");
+        assert!(result.truncated);
+        assert!(result.output.len() <= limits.max_bytes);
+        assert!(result.output.lines().count() <= limits.max_lines);
+        assert_eq!(result.metadata["stdout_truncated"], false);
+        assert_eq!(result.metadata["stderr_truncated"], false);
+        assert_eq!(result.metadata["stdout_total_bytes"], 21);
+        assert_eq!(result.metadata["stderr_total_bytes"], 20);
+        for (stream, expected) in [
+            ("stdout", b"HEAD\xffaaaaaaaaaaaaaaaa".as_slice()),
+            ("stderr", b"TAILbbbbbbbbbbbbbbbb"),
+        ] {
+            assert_eq!(
+                result.metadata[stream],
+                String::from_utf8_lossy(expected).as_ref()
+            );
+            let path = PathBuf::from(
+                result.metadata["_display_staging"][stream]
+                    .as_str()
+                    .expect("staging"),
+            );
+            assert_eq!(fs::read(&path).expect("original stream"), expected);
+            fs::remove_file(path).expect("remove staging");
+        }
+    }
+}
+
+#[tokio::test]
+async fn bash_timeout_notes_share_the_output_budget() {
+    let fixture = Fixture::empty();
+    let result = BashTool::default()
+        .execute(
+            fixture.context(ToolLimits {
+                max_bytes: 32,
+                max_lines: 2,
+            }),
+            invocation(serde_json::json!({
+                "command": "printf before; printf warn >&2; sleep 5",
+                "timeout_ms": 100
+            })),
+            &NeverCancel,
+        )
+        .await
+        .expect("bounded timeout result");
+    assert!(result.is_error);
+    assert!(result.truncated);
+    assert_eq!(result.metadata["timed_out"], true);
+    assert!(result.output.len() <= 32);
+    assert!(result.output.lines().count() <= 2);
+    assert_eq!(result.metadata["stdout_truncated"], false);
+    assert_eq!(result.metadata["stderr_truncated"], false);
+    for (stream, expected) in [("stdout", b"before".as_slice()), ("stderr", b"warn")] {
+        let path = PathBuf::from(
+            result.metadata["_display_staging"][stream]
+                .as_str()
+                .expect("staging"),
+        );
+        assert_eq!(fs::read(&path).expect("original stream"), expected);
+        fs::remove_file(path).expect("remove staging");
+    }
+}
+
+#[tokio::test]
 async fn bash_stream_events_decode_split_utf8_and_remain_bounded() {
     let fixture = Fixture::empty();
     let sink = Arc::new(RecordingSink::default());
@@ -291,12 +415,18 @@ async fn bash_stream_events_decode_split_utf8_and_remain_bounded() {
         "timeout_ms": 1000
     }));
 
-    tool.execute(fixture.context(limits()), call, &NeverCancel)
+    let result = tool
+        .execute(fixture.context(limits()), call, &NeverCancel)
         .await
         .expect("binary output");
 
     let chunks = sink.chunks.lock().unwrap();
-    assert!(!chunks.is_empty());
+    assert!(!result.truncated);
+    assert!(result.metadata.get("_display_staging").is_none());
+    assert_eq!(
+        result.metadata["stdout"].as_str().expect("stdout"),
+        chunks.concat()
+    );
     assert!(chunks.concat().starts_with('€'));
     assert!(chunks.iter().all(|chunk| chunk.len() <= 4 * 1024));
 }

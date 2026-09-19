@@ -166,6 +166,166 @@ impl ChildRunner for ReportingRunner {
 }
 
 #[tokio::test]
+async fn schedule_order_wins_over_random_ids_for_capacity_and_overlapping_writers() {
+    for max_concurrency in [1, 2] {
+        let mut first = resolved_agent("z-ready", "first", "first task", &[]);
+        let mut second = resolved_agent("a-queued", "second", "second task", &[]);
+        if max_concurrency == 2 {
+            first.write_scope.files.push(PathBuf::from("same-file"));
+            second.write_scope = first.write_scope.clone();
+        }
+        let manager = AgentManager::new(
+            "ordered".into(),
+            None,
+            max_concurrency,
+            Arc::new(MemoryStore::default()),
+            Arc::new(CollectingSink::default()),
+        );
+        let results = manager
+            .execute(
+                SchedulePlan {
+                    ready: vec![first],
+                    queued: vec![second],
+                    blocked: Vec::new(),
+                },
+                "project".into(),
+                Arc::new(ReportingRunner),
+            )
+            .await
+            .expect("execute ordered plan");
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.agent_id.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["z-ready", "a-queued"]
+        );
+    }
+}
+
+struct ClosedMessageRunner {
+    closed: mpsc::UnboundedSender<AgentId>,
+}
+
+impl ChildRunner for ClosedMessageRunner {
+    fn run(
+        &self,
+        context: ChildRunContext,
+    ) -> BoxFuture<'static, Result<AgentResult, KuramaError>> {
+        let closed = self.closed.clone();
+        Box::pin(async move {
+            drop(context.messages);
+            closed
+                .send(context.agent_id)
+                .expect("closed channel signal");
+            context.cancel.cancelled().await;
+            Err(KuramaError::Cancelled)
+        })
+    }
+}
+
+#[tokio::test]
+async fn closed_child_channel_rejects_message_without_a_false_receipt() {
+    let store = Arc::new(MemoryStore::default());
+    let manager = AgentManager::new(
+        "closed-message".into(),
+        None,
+        1,
+        store.clone(),
+        Arc::new(CollectingSink::default()),
+    );
+    let (closed, mut closed_rx) = mpsc::unbounded_channel();
+    let execution = manager.execute(
+        SchedulePlan {
+            ready: vec![resolved_agent("child", "worker", "work", &[])],
+            queued: Vec::new(),
+            blocked: Vec::new(),
+        },
+        "project".into(),
+        Arc::new(ClosedMessageRunner { closed }),
+    );
+    tokio::pin!(execution);
+    let child = tokio::select! {
+        result = &mut execution => panic!("child stopped early: {result:?}"),
+        child = closed_rx.recv() => child.expect("closed child"),
+    };
+    assert!(matches!(
+        manager.message(&child, "not delivered".into()).await,
+        Err(KuramaError::Cancelled)
+    ));
+    assert!(
+        !store
+            .replay_agent(&"closed-message".into(), &child)
+            .expect("log")
+            .iter()
+            .any(|event| matches!(event.event, SessionEvent::AgentMessage { .. }))
+    );
+    assert!(
+        !manager
+            .inspect(&child)
+            .await
+            .expect("inspect")
+            .transcript
+            .iter()
+            .any(|line| line.contains("not delivered"))
+    );
+    manager.cancel_all().await;
+    execution.await.expect("cancelled execution");
+}
+
+#[tokio::test]
+async fn queued_child_message_is_durable_before_launch_and_reaches_the_child() {
+    let store = Arc::new(MemoryStore::default());
+    let manager = AgentManager::new(
+        "queued-message".into(),
+        None,
+        1,
+        store.clone(),
+        Arc::new(CollectingSink::default()),
+    );
+    let (started, mut started_rx) = mpsc::unbounded_channel();
+    let execution = manager.execute(
+        SchedulePlan {
+            ready: vec![resolved_agent("first", "first", "first", &[])],
+            queued: vec![resolved_agent("second", "second", "second", &[])],
+            blocked: Vec::new(),
+        },
+        "project".into(),
+        Arc::new(ControlledRunner { started }),
+    );
+    tokio::pin!(execution);
+    tokio::select! {
+        result = &mut execution => panic!("child stopped early: {result:?}"),
+        first = started_rx.recv() => assert_eq!(first.expect("started").as_ref(), "first"),
+    }
+    manager
+        .message(&"second".into(), "queued instructions".into())
+        .await
+        .expect("queue");
+    let before_launch = store
+        .replay_agent(&"queued-message".into(), &"second".into())
+        .expect("log");
+    assert!(before_launch.iter().any(|event| matches!(&event.event, SessionEvent::AgentMessage { text, .. } if text == "queued instructions")));
+    assert!(
+        !before_launch
+            .iter()
+            .any(|event| matches!(event.event, SessionEvent::AgentStarted { .. }))
+    );
+    manager
+        .message(&"first".into(), "finish first".into())
+        .await
+        .expect("deliver");
+    let results = execution.await.expect("execute");
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.summary.as_str())
+            .collect::<Vec<_>>(),
+        vec!["finish first", "queued instructions"]
+    );
+}
+
+#[tokio::test]
 async fn manager_canonicalizes_unique_objective_dependencies() {
     let mut implementation = agent("ignored", None, &[]);
     implementation.objective = "implement api".into();

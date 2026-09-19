@@ -249,6 +249,7 @@ async fn resume_previews_large_display_blob_and_expands_on_demand() {
         SessionEvent::SessionStarted { metadata },
         SessionEvent::UserMessage {
             text: "inspect the parser".into(),
+            explicit_delegation: false,
         },
         SessionEvent::AssistantMessage {
             text: "checking it".into(),
@@ -257,7 +258,7 @@ async fn resume_previews_large_display_blob_and_expands_on_demand() {
             operation_id: OperationId::from("operation"),
             call_id: CallId::from("call"),
             operation: Operation::Read {
-                path: "parser.rs".into(),
+                paths: vec!["parser.rs".into()],
                 external: false,
             },
         },
@@ -796,6 +797,7 @@ async fn at_sign_tab_completes_a_project_file() {
     let mut app =
         App::bootstrap_with_paths(&Args::default(), project, paths, SessionSecrets::default())
             .expect("bootstrap");
+    app.state.set_file_index(vec!["src/lib.rs".into()]);
 
     type_command(&mut app, "@lib");
     app.handle_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
@@ -867,6 +869,7 @@ async fn escape_dismisses_file_mentions_without_clearing_composer() {
     let mut app =
         App::bootstrap_with_paths(&Args::default(), project, paths, SessionSecrets::default())
             .expect("bootstrap");
+    app.state.set_file_index(vec!["src/lib.rs".into()]);
 
     type_command(&mut app, "@lib");
     assert!(

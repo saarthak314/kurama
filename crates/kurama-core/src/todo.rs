@@ -46,7 +46,7 @@ impl Tool for TodoTool {
         _invocation: &ToolInvocation,
     ) -> Result<Operation, KuramaError> {
         Ok(Operation::Read {
-            path: context.workspace_root.clone(),
+            paths: vec![context.workspace_root.clone()],
             external: false,
         })
     }

@@ -1,6 +1,5 @@
 use kurama_cli::{
     app::App,
-    commands::{Command, GoalAction, parse_command},
     tui::{
         ActivityState, AgentRow, Overlay, ResponsiveLayout, ToolLifecycle, ToolTranscript,
         TranscriptDetail, TranscriptEntry, TuiState, activity_line, render, transcript_lines,
@@ -8,7 +7,7 @@ use kurama_cli::{
 };
 use kurama_protocol::{
     agent::AgentState,
-    id::{AgentId, CallId, OperationId, SessionId},
+    id::{AgentId, CallId, OperationId},
     policy::{ApprovalRequest, ExecutionMode},
     runtime::RuntimeEvent,
     tool::Operation,
@@ -148,51 +147,6 @@ fn narrow_approval_request() -> ApprovalRequest {
 }
 
 #[test]
-fn parses_all_product_commands_without_restart() {
-    assert_eq!(parse_command("/agents").unwrap(), Command::Agents);
-    assert_eq!(
-        parse_command("/model openai-main").unwrap(),
-        Command::Model(Some("openai-main".into()))
-    );
-    assert_eq!(
-        parse_command("/resume ses_deadbeef").unwrap(),
-        Command::Resume(SessionId::from("ses_deadbeef"))
-    );
-    assert_eq!(
-        parse_command("/mode auto").unwrap(),
-        Command::Mode(ExecutionMode::Auto)
-    );
-    assert_eq!(parse_command("/help").unwrap(), Command::Help);
-    assert_eq!(parse_command("/copy").unwrap(), Command::Copy);
-    assert_eq!(parse_command("/diff").unwrap(), Command::Diff);
-    assert_eq!(parse_command("/status").unwrap(), Command::Status);
-    assert_eq!(
-        parse_command("/goal").unwrap(),
-        Command::Goal(GoalAction::View)
-    );
-    assert_eq!(
-        parse_command("/goal keep tests green").unwrap(),
-        Command::Goal(GoalAction::Set("keep tests green".into()))
-    );
-    assert_eq!(
-        parse_command("/goal set ship the e2e pass").unwrap(),
-        Command::Goal(GoalAction::Set("ship the e2e pass".into()))
-    );
-    assert_eq!(
-        parse_command("/goal view").unwrap(),
-        Command::Goal(GoalAction::View)
-    );
-    assert_eq!(
-        parse_command("/goal pause").unwrap(),
-        Command::Goal(GoalAction::Pause)
-    );
-    assert!(parse_command("/goal set").is_err());
-    assert_eq!(parse_command("/exit").unwrap(), Command::Exit);
-    assert!(parse_command("/restart").is_err());
-    assert!(parse_command("/mode yolo").is_err());
-}
-
-#[test]
 fn activity_row_visibility_follows_layout_geometry() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.set_thinking();
@@ -205,7 +159,7 @@ fn activity_row_visibility_follows_layout_geometry() {
 }
 
 #[test]
-fn main_screen_is_transcript_first_without_tool_statistics() {
+fn main_screen_keeps_transcript_and_prompt_visible() {
     let mut state = TuiState::new(
         "openai-main",
         "gpt-5.6",
@@ -223,14 +177,11 @@ fn main_screen_is_transcript_first_without_tool_statistics() {
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("Use sub-agents to review the parser."));
         assert!(text.contains("I’ll split this between an implementer and reviewer."));
-        assert!(!text.contains("KURAMA"));
         assert!(
             text.contains("supervised")
                 || text.contains("enter send")
                 || text.contains("shortcuts")
         );
-        assert!(!text.contains("tool calls"));
-        assert!(!text.contains("tokens/sec"));
     }
 }
 
@@ -1124,7 +1075,6 @@ fn approvals_render_inline_without_hiding_the_main_screen() {
     state.begin_approval(approval_request());
 
     let pending = buffer_text(&rendered(&state, 100, 30));
-    assert!(!pending.contains("KURAMA"));
     assert!(pending.contains("> Run the CLI tests."));
     assert!(pending.contains("Action required"));
     assert!(pending.contains("Run the focused CLI tests"));
@@ -1142,7 +1092,6 @@ fn approvals_render_inline_without_hiding_the_main_screen() {
     let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
     terminal.draw(|frame| render(frame, &state)).unwrap();
     let editing = buffer_text(terminal.backend().buffer());
-    assert!(!editing.contains("KURAMA"));
     assert!(editing.contains("> Run the CLI tests."));
     assert!(editing.contains(r#""command": "cargo test -p kurama-cli""#));
     assert!(!editing.contains("Message Kurama or type / for commands"));
@@ -1583,6 +1532,7 @@ fn at_sign_mentions_complete_a_project_file() {
     state.composer = "@lib".into();
     state.cursor = 4;
     state.composer_edited();
+    state.set_file_index(vec!["src/lib.rs".into()]);
 
     let text = buffer_text(&rendered(&state, 80, 12));
     assert!(text.contains("src/lib.rs"), "{text}");

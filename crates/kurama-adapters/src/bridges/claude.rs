@@ -1,5 +1,3 @@
-use std::path::{Path, PathBuf};
-
 use kurama_protocol::{
     KuramaError,
     model::{BackendCapabilities, BackendCursor, FinishReason, ModelEvent, ModelRequest, Usage},
@@ -18,15 +16,13 @@ const CORE_TOOL_INSTRUCTION: &str = "Operate only through the supplied tools.";
 #[derive(Clone)]
 pub struct ClaudeBridge {
     program: String,
-    schema_path: PathBuf,
     secrets: Vec<String>,
 }
 
 impl ClaudeBridge {
-    pub fn new(schema_path: impl Into<PathBuf>) -> Self {
+    pub fn new() -> Self {
         Self {
             program: "claude".into(),
-            schema_path: schema_path.into(),
             secrets: Vec::new(),
         }
     }
@@ -41,19 +37,14 @@ impl ClaudeBridge {
         self
     }
 
-    pub fn command_for(
-        request: &ModelRequest,
-        cursor: Option<&BackendCursor>,
-        schema_path: &Path,
-    ) -> BridgeCommand {
-        Self::command_for_program("claude", request, cursor, schema_path)
+    pub fn command_for(request: &ModelRequest, cursor: Option<&BackendCursor>) -> BridgeCommand {
+        Self::command_for_program("claude", request, cursor)
     }
 
     fn command_for_program(
         program: &str,
         request: &ModelRequest,
         cursor: Option<&BackendCursor>,
-        _schema_path: &Path,
     ) -> BridgeCommand {
         let mut args = vec![
             "-p".into(),
@@ -90,6 +81,12 @@ impl ClaudeBridge {
     }
 }
 
+impl Default for ClaudeBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn claude_system_prompt(request: &ModelRequest) -> String {
     let mut prompt = bridge_system_prompt(request).replace(
         CORE_TOOL_INSTRUCTION,
@@ -121,13 +118,8 @@ impl ModelBackend for ClaudeBridge {
         cancel: &'a dyn CancelSignal,
     ) -> BoxFuture<'a, Result<ModelStream, KuramaError>> {
         Box::pin(async move {
-            super::control::write_control_schema(&self.schema_path, request.delegation.is_some())?;
-            let command = Self::command_for_program(
-                &self.program,
-                &request,
-                request.continuation.as_ref(),
-                &self.schema_path,
-            );
+            let command =
+                Self::command_for_program(&self.program, &request, request.continuation.as_ref());
             super::event_stream(
                 command,
                 ClaudeDecoder::new(request.delegation.is_some()),
@@ -157,7 +149,7 @@ struct ClaudeDecoder {
     session_id: Option<String>,
     control: Option<String>,
     structured_control: Option<String>,
-    protocol_calls: Vec<ModelEvent>,
+    protocol_calls: Vec<(Option<String>, ModelEvent)>,
     recovered_native_calls: bool,
     partial: String,
     completed: bool,
@@ -269,13 +261,39 @@ impl BridgeDecoder for ClaudeDecoder {
                             "agents": []
                         })
                         .to_string();
+                        let mut calls = parse_control(&encoded, self.delegation_enabled)?;
+                        let call = calls.remove(0);
+                        let native_id = block.get("id").and_then(Value::as_str);
+                        if native_id == Some("") {
+                            return Err(KuramaError::Protocol(
+                                "Claude emitted an empty native call ID".into(),
+                            ));
+                        }
+                        let mut repeated = false;
+                        for (previous_id, previous_call) in &self.protocol_calls {
+                            let same_call_id = matches!(previous_call, ModelEvent::ToolCall { call_id: previous, .. } if previous.as_ref() == call_id);
+                            if (native_id.is_some() && previous_id.as_deref() == native_id)
+                                || same_call_id
+                            {
+                                if previous_call != &call || previous_id.as_deref() != native_id {
+                                    return Err(KuramaError::Protocol(
+                                        "Claude reused a tool call ID with conflicting content"
+                                            .into(),
+                                    ));
+                                }
+                                repeated = true;
+                            }
+                        }
+                        if repeated {
+                            continue;
+                        }
                         if self.protocol_calls.len() >= 8 {
                             return Err(KuramaError::Protocol(
                                 "Claude emitted too many protocol tool calls".into(),
                             ));
                         }
                         self.protocol_calls
-                            .extend(parse_control(&encoded, self.delegation_enabled)?);
+                            .push((native_id.map(str::to_owned), call));
                         self.recovered_native_calls = true;
                     }
                 }
@@ -330,6 +348,9 @@ impl BridgeDecoder for ClaudeDecoder {
                     parse_control(&control_value, self.delegation_enabled)?
                 } else {
                     std::mem::take(&mut self.protocol_calls)
+                        .into_iter()
+                        .map(|(_, call)| call)
+                        .collect()
                 };
                 let tool_calls = normalized.iter().any(|event| {
                     matches!(

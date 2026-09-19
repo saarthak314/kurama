@@ -1,7 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -53,6 +52,7 @@ enum DisplaySource {
     Streams {
         stdout: Option<BlobRef>,
         stderr: Option<BlobRef>,
+        error_suffix: Option<String>,
     },
 }
 
@@ -87,15 +87,33 @@ impl DisplaySource {
         if stdout.is_none() && stderr.is_none() {
             return Ok(None);
         }
-        Ok(Some(Self::Streams { stdout, stderr }))
+        let error_suffix = result
+            .metadata
+            .get("execution_error_suffix")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        Ok(Some(Self::Streams {
+            stdout,
+            stderr,
+            error_suffix,
+        }))
     }
 
     fn load(&self, store: &FsSessionStore, max_bytes: Option<usize>) -> Result<String, String> {
         match self {
             Self::Output(reference) => display_blob_text(store, reference, max_bytes),
-            Self::Streams { stdout, stderr } => {
+            Self::Streams {
+                stdout,
+                stderr,
+                error_suffix,
+            } => {
                 const SEPARATOR: &str = "\n[stderr]\n";
                 let budget = max_bytes.map(|limit| {
+                    let limit = limit.saturating_sub(
+                        error_suffix
+                            .as_ref()
+                            .map_or(0, |suffix| suffix.len().saturating_add(1)),
+                    );
                     if stdout.is_some() && stderr.is_some() {
                         limit.saturating_sub(SEPARATOR.len()) / 2
                     } else {
@@ -115,6 +133,17 @@ impl DisplaySource {
                     output.push_str(SEPARATOR);
                 }
                 output.push_str(&stderr);
+                if let Some(suffix) = error_suffix {
+                    if !output.is_empty() && !output.ends_with('\n') {
+                        output.push('\n');
+                    }
+                    output.push_str(suffix);
+                }
+                if let Some(limit) = max_bytes
+                    && output.len() > limit
+                {
+                    output = bounded_output(&output, limit, false);
+                }
                 Ok(output)
             }
         }
@@ -308,6 +337,7 @@ pub struct TuiState {
     pub scroll: usize,
     pub(crate) transcript_selection: Option<TranscriptSelection>,
     pub(crate) copied_characters: Option<usize>,
+    pub(crate) focused_link: RefCell<Option<Arc<str>>>,
     pub running_agents: usize,
     pub queued_agents: usize,
     pub overlay: Overlay,
@@ -320,12 +350,20 @@ pub struct TuiState {
     pub git_branch: Option<String>,
     pub viewport_height: Cell<u16>,
     pub selected_agent: usize,
+    pub(crate) agents_page_height: Cell<usize>,
+    pub(crate) agent_inspect_scroll: Cell<usize>,
+    pub(crate) agent_inspect_max_scroll: Cell<usize>,
+    pub(crate) agent_inspect_page_height: Cell<usize>,
+    pub(crate) shortcuts_scroll: Cell<usize>,
+    pub(crate) shortcuts_max_scroll: Cell<usize>,
+    pub(crate) shortcuts_page_height: Cell<usize>,
     pub agent_message: String,
     pub agent_message_cursor: usize,
     command_selection: usize,
     command_palette_dismissed: bool,
     file_selection: usize,
-    file_index: RefCell<Option<Vec<String>>>,
+    file_index: Vec<String>,
+    pub(crate) file_index_dirty: bool,
     history_search: Option<HistorySearch>,
     pending_turns: VecDeque<PendingTurn>,
     pub(crate) selected_follow_up: usize,
@@ -391,6 +429,7 @@ impl TuiState {
             scroll: 0,
             transcript_selection: None,
             copied_characters: None,
+            focused_link: RefCell::new(None),
             running_agents: 0,
             queued_agents: 0,
             overlay: Overlay::None,
@@ -403,12 +442,20 @@ impl TuiState {
             git_branch: None,
             viewport_height: Cell::new(12),
             selected_agent: 0,
+            agents_page_height: Cell::new(1),
+            agent_inspect_scroll: Cell::new(0),
+            agent_inspect_max_scroll: Cell::new(0),
+            agent_inspect_page_height: Cell::new(1),
+            shortcuts_scroll: Cell::new(0),
+            shortcuts_max_scroll: Cell::new(0),
+            shortcuts_page_height: Cell::new(1),
             agent_message: String::new(),
             agent_message_cursor: 0,
             command_selection: 0,
             command_palette_dismissed: false,
             file_selection: 0,
-            file_index: RefCell::new(None),
+            file_index: Vec::new(),
+            file_index_dirty: false,
             history_search: None,
             pending_turns: VecDeque::new(),
             selected_follow_up: 0,
@@ -511,6 +558,22 @@ impl TuiState {
     pub fn cursor_end(&mut self) {
         self.composer_selection = None;
         self.cursor = self.composer.len();
+    }
+
+    pub fn cursor_line_home(&mut self) {
+        self.normalize_composer_cursor();
+        self.composer_selection = None;
+        self.cursor = self.composer[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+    }
+
+    pub fn cursor_line_end(&mut self) {
+        self.normalize_composer_cursor();
+        self.composer_selection = None;
+        self.cursor += self.composer[self.cursor..]
+            .find('\n')
+            .unwrap_or(self.composer.len() - self.cursor);
     }
 
     pub fn kill_to_end(&mut self) {
@@ -687,8 +750,7 @@ impl TuiState {
         if self.command_palette_dismissed || self.history_search.is_some() {
             return false;
         }
-        let showing_files = super::mention_at_cursor(&self.composer, self.cursor).is_some()
-            && !self.file_suggestions().is_empty();
+        let showing_files = self.file_mention().is_some();
         let showing_commands = !command_suggestions(&self.composer).is_empty()
             && self.overlay == Overlay::None
             && !self.transcript_view_expanded;
@@ -750,7 +812,7 @@ impl TuiState {
         Some(selected)
     }
 
-    pub fn file_mention(&self) -> Option<(usize, String)> {
+    pub fn file_mention(&self) -> Option<(usize, &str)> {
         if self.history_search.is_some()
             || self.overlay != Overlay::None
             || self.command_palette_dismissed
@@ -760,25 +822,25 @@ impl TuiState {
         super::mention_at_cursor(&self.composer, self.cursor)
     }
 
-    pub fn file_suggestions(&self) -> Vec<String> {
+    pub fn file_suggestions(&self) -> Vec<&str> {
         let Some((_, query)) = self.file_mention() else {
             return Vec::new();
         };
-        if self.file_index.borrow().is_none() {
-            *self.file_index.borrow_mut() = Some(super::collect_files(Path::new(&self.project)));
-        }
-        let files = self.file_index.borrow();
-        super::filter_files(files.as_deref().unwrap_or(&[]), &query)
-            .into_iter()
-            .map(str::to_owned)
-            .collect()
+        super::filter_files(&self.file_index, query)
+    }
+
+    pub fn set_file_index(&mut self, files: Vec<String>) {
+        self.file_index = files;
+        self.file_selection = self
+            .file_selection
+            .min(self.file_suggestions().len().saturating_sub(1));
     }
 
     pub fn selected_file(&self) -> Option<String> {
         let suggestions = self.file_suggestions();
         suggestions
             .get(self.file_selection.min(suggestions.len().saturating_sub(1)))
-            .cloned()
+            .map(|path| (*path).to_owned())
     }
 
     pub fn select_previous_file(&mut self) -> bool {
@@ -830,11 +892,21 @@ impl TuiState {
         let Some(search) = &self.history_search else {
             return Vec::new();
         };
-        let query = search.query.to_ascii_lowercase();
+        let query = search.query.to_lowercase();
         self.composer_history
             .iter()
             .rev()
-            .filter(|prompt| query.is_empty() || prompt.to_ascii_lowercase().contains(&query))
+            .filter(|prompt| {
+                query.is_empty()
+                    || if prompt.is_ascii() {
+                        prompt
+                            .as_bytes()
+                            .windows(query.len())
+                            .any(|part| part.eq_ignore_ascii_case(query.as_bytes()))
+                    } else {
+                        prompt.to_lowercase().contains(&query)
+                    }
+            })
             .map(String::as_str)
             .take(8)
             .collect()
@@ -1198,12 +1270,14 @@ impl TuiState {
 
     pub fn open_shortcuts(&mut self) {
         self.overlay = Overlay::Shortcuts;
+        self.shortcuts_scroll.set(0);
     }
 
     pub fn toggle_transcript_view(&mut self) {
         self.transcript_view_expanded = !self.transcript_view_expanded;
         *self.transcript_geometry.get_mut() = None;
         self.scroll = 0;
+        *self.focused_link.get_mut() = None;
         if let Some(store) = &self.display_store {
             let mut dirty_from = self.transcript.len();
             for (&index, deferred) in &mut self.deferred_tool_outputs {
@@ -1324,7 +1398,7 @@ impl TuiState {
         let mut replayed_tool_contexts = HashMap::new();
         for envelope in replay {
             match &envelope.event {
-                SessionEvent::UserMessage { text } => {
+                SessionEvent::UserMessage { text, .. } => {
                     self.remember_prompt(text);
                     self.push_user(text.clone());
                 }
@@ -1557,6 +1631,7 @@ impl TuiState {
                     .push(EngineCommand::Agent(AgentCommand::Inspect { agent_id }));
             }
             self.overlay = Overlay::AgentInspect;
+            self.agent_inspect_scroll.set(0);
         }
     }
 
@@ -1675,7 +1750,6 @@ impl TuiState {
             approval.set_editor(
                 serde_json::to_string_pretty(&arguments).unwrap_or_else(|_| "{}".into()),
             );
-            approval.arguments = arguments;
         }
     }
 
@@ -1712,7 +1786,6 @@ impl TuiState {
             }
         };
         if let Some(approval) = &mut self.approval {
-            approval.arguments = arguments.clone();
             approval.validation_error = None;
         }
         self.resolve_approval(ApprovalResponse::Edit { arguments });
@@ -1819,6 +1892,9 @@ impl TuiState {
                 operation_id,
                 result,
             } => {
+                if matches!(tool_name(&result), "bash" | "write") {
+                    self.file_index_dirty = true;
+                }
                 let todo_items = todo_items(&result);
                 self.complete_tool(operation_id, result);
                 if let Some(items) = todo_items {
@@ -2009,7 +2085,12 @@ impl TuiState {
                 && !tool.output.is_empty()
                 && !has_display_blobs
             {
-                append_error_boundary(&mut tool.output, &display_output);
+                let error = result
+                    .metadata
+                    .get("execution_error_suffix")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&display_output);
+                append_error_boundary(&mut tool.output, error);
             } else if !result.truncated
                 || persisted_display_output.is_some()
                 || has_display_blobs
@@ -2263,7 +2344,7 @@ fn append_error_boundary(body: &mut String, error: &str) {
         body.push('\n');
     }
     body.push_str("\n[error]\n");
-    body.push_str(error);
+    append_live_tool_output(body, error);
 }
 
 fn tool_display_output(result: &ToolResult) -> &str {
@@ -2312,7 +2393,11 @@ fn tool_lifecycle(result: &ToolResult) -> ToolLifecycle {
 
 fn operation_context(operation: &kurama_protocol::tool::Operation) -> String {
     match operation {
-        kurama_protocol::tool::Operation::Read { path, .. } => path.display().to_string(),
+        kurama_protocol::tool::Operation::Read { paths, .. } => paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
         kurama_protocol::tool::Operation::Write { paths, .. } => paths
             .iter()
             .map(|path| path.display().to_string())
@@ -2340,6 +2425,167 @@ fn mode_label(mode: ExecutionMode) -> &'static str {
 mod tests {
     use super::{Overlay, TuiState};
     use kurama_protocol::policy::ExecutionMode;
+
+    #[tokio::test]
+    async fn aggregate_timeout_diagnostic_survives_engine_completion_and_replay() {
+        use kurama_adapters::{BashTool, FsSessionStore};
+        use kurama_core::{
+            context::ContextPolicy,
+            engine::{Engine, EngineConfig},
+            testing::{AllowAllPolicy, CollectingSink, NoDelegation, ScriptedBackend, SequenceIds},
+        };
+        use kurama_protocol::{
+            agent::WriteScope,
+            model::{FinishReason, ModelEvent, ModelProfile},
+            policy::AutoBoundaries,
+            runtime::RuntimeEvent,
+            session::{BlobRef, SessionEvent, SessionMetadata},
+            traits::SessionStore,
+        };
+        use std::{sync::Arc, time::Duration};
+
+        let temp = tempfile::tempdir().expect("workspace");
+        let workspace = temp.path().canonicalize().expect("absolute workspace");
+        let store = Arc::new(FsSessionStore::open(workspace.join("store")).expect("store"));
+        let sink = Arc::new(CollectingSink::default());
+        let session_id = kurama_protocol::id::SessionId::from("timeout-display");
+        let config = EngineConfig {
+            session: SessionMetadata {
+                id: session_id.clone(),
+                created_at_ms: 0,
+                project_root: workspace.display().to_string(),
+                profile: "test".into(),
+                mode: ExecutionMode::Supervised,
+                redaction_best_effort: false,
+            },
+            profile: ModelProfile::new("test", "frontier", 60_000, 10_000),
+            backend: Arc::new(ScriptedBackend::new(vec![vec![
+                Ok(ModelEvent::ToolCall {
+                    call_id: "bash-timeout".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({
+                        "command": "printf '%074990d' 7; printf '%074990d' 8 >&2; sleep 5",
+                        "timeout_ms": 250,
+                    }),
+                }),
+                Ok(ModelEvent::ResponseCompleted {
+                    cursor: None,
+                    finish_reason: FinishReason::ToolCalls,
+                }),
+            ]])),
+            tools: vec![Arc::new(BashTool::with_event_sink(
+                "/bin/bash",
+                sink.clone(),
+            ))],
+            policy: Arc::new(AllowAllPolicy),
+            store: store.clone(),
+            sink: sink.clone(),
+            orchestrator: Arc::new(NoDelegation),
+            ids: Arc::new(SequenceIds::new(1)),
+            context_policy: ContextPolicy {
+                max_input_tokens: 60_000,
+                reserve_output_tokens: 10_000,
+                ..ContextPolicy::default()
+            },
+            workspace_root: workspace.clone(),
+            write_scope: WriteScope {
+                roots: vec![workspace],
+                files: Vec::new(),
+            },
+            auto: AutoBoundaries::default(),
+            agent_id: None,
+            orchestration: None,
+            provider_retry_delays_ms: Vec::new(),
+            command_capacity: 32,
+            event_capacity: 128,
+        };
+        let (handle, mut events) = Engine::spawn(config, Vec::new()).expect("engine");
+        handle
+            .submit("run the command", false)
+            .await
+            .expect("submit");
+        let live_result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.expect("runtime event") {
+                    RuntimeEvent::ToolCompleted { result, .. } => break result,
+                    RuntimeEvent::Error { message } => panic!("before tool completion: {message}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("tool completion");
+        handle.shutdown().await.expect("shutdown");
+
+        // Each stream and their separator fit 150,000 bytes; only the timeout
+        // diagnostic forces staging. The visible TUI preview has a smaller bound.
+        assert!(live_result.is_error && live_result.truncated);
+        assert!(live_result.output.len() <= 150_000);
+        assert_eq!(live_result.metadata["stdout_truncated"], false);
+        assert_eq!(live_result.metadata["stderr_truncated"], false);
+        let suffix = live_result.metadata["execution_error_suffix"]
+            .as_str()
+            .expect("diagnostic");
+        assert!(suffix.contains("timed out"));
+        let full = live_result.metadata["display_output"]
+            .as_str()
+            .expect("full runtime output");
+        assert!(full.ends_with(suffix));
+        assert_eq!(full.matches(suffix).count(), 1);
+        for (stream, digit) in [("stdout", '7'), ("stderr", '8')] {
+            let reference: BlobRef =
+                serde_json::from_value(live_result.metadata["display_blobs"][stream].clone())
+                    .expect("stream blob");
+            let expected = format!("{}{}", "0".repeat(74_989), digit);
+            assert_eq!(
+                store.get_blob(&reference).expect("raw stream"),
+                expected.as_bytes()
+            );
+        }
+
+        let tool_output = |state: &TuiState| {
+            state
+                .transcript
+                .iter()
+                .find_map(|entry| match entry {
+                    super::TranscriptEntry::ToolCall(tool) => {
+                        assert_eq!(tool.lifecycle, super::ToolLifecycle::Failed);
+                        Some(tool.output.clone())
+                    }
+                    _ => None,
+                })
+                .expect("displayed Bash output")
+        };
+        let mut live = TuiState::new("test", "frontier", ".", ExecutionMode::Supervised);
+        live.set_display_store(store.clone());
+        let mut streaming_only = TuiState::new("test", "frontier", ".", ExecutionMode::Supervised);
+        for event in sink.take() {
+            streaming_only.apply_runtime_event(event.clone());
+            live.apply_runtime_event(event);
+        }
+        let streamed = tool_output(&streaming_only);
+        assert!(streamed.len() <= super::MAX_LIVE_TOOL_OUTPUT_BYTES);
+        assert!(streamed.ends_with(suffix));
+        assert_eq!(streamed.matches(suffix).count(), 1);
+
+        let replay = store.replay(&session_id).expect("durable replay");
+        assert!(replay.iter().any(|event| matches!(&event.event, SessionEvent::ToolCompleted { result, .. } if result.is_error)));
+        let mut restored = TuiState::new("test", "frontier", ".", ExecutionMode::Supervised);
+        restored.set_display_store(store);
+        restored.hydrate_replay(&replay);
+        for state in [&mut live, &mut restored] {
+            let preview = tool_output(state);
+            assert!(preview.len() <= super::MAX_LIVE_TOOL_OUTPUT_BYTES);
+            assert!(preview.ends_with(suffix));
+            assert_eq!(preview.matches(suffix).count(), 1);
+            state.toggle_transcript_view();
+            assert_eq!(tool_output(state), full);
+            state.toggle_transcript_view();
+            assert_eq!(tool_output(state), preview);
+            state.toggle_transcript_view();
+            assert_eq!(tool_output(state), full);
+        }
+    }
 
     fn scrollable_state() -> TuiState {
         let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);

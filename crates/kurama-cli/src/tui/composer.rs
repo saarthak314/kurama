@@ -340,16 +340,24 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect,
         match state.overlay {
             Overlay::Approval => ["↑↓ choose · Enter confirm", "Enter confirm", "↵"],
             Overlay::ApprovalEdit => ["Enter submit · Esc back", "Enter/Esc", "↵"],
-            Overlay::Shortcuts => ["Esc close shortcuts", "Esc close", "Esc"],
+            Overlay::Shortcuts => [
+                "↑↓ scroll · PgUp/PgDn page · Home/End · Esc close",
+                "↑↓ Pg End Esc",
+                "Esc ↑↓",
+            ],
             Overlay::Onboarding if state.onboarding.is_selecting_connection() => [
                 "↑↓ choose · Enter confirm · Esc close",
                 "↑↓ Enter Esc",
                 "↵/Esc",
             ],
-            Overlay::Onboarding => ["Enter confirm · Esc back", "Enter/Esc", "↵"],
+            Overlay::Onboarding => [
+                "←→ Home/End edit · Enter confirm · Esc back",
+                "←→ Enter Esc",
+                "↵",
+            ],
             Overlay::Agents => [
-                "Enter inspect · m message · x cancel · ↑↓ select · Esc close",
-                "↵ m x ↑↓ Esc",
+                "Enter inspect · m message · x cancel · ↑↓ Pg Home/End · Esc close",
+                "↵ m x ↑↓ Pg Esc",
                 "↵/Esc",
             ],
             Overlay::Todos => ["↑↓ scroll · Esc close", "↑↓ Esc", "Esc"],
@@ -364,7 +372,11 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect,
                 "Esc",
             ],
             Overlay::Diff => ["n/p hunk · Enter feedback · Esc close", "n/p ↵ Esc", "Esc"],
-            Overlay::AgentInspect => ["m message · x cancel · Esc agents", "m x Esc", "Esc"],
+            Overlay::AgentInspect => [
+                "↑↓ Pg Home/End scroll · m message · x cancel · Esc agents",
+                "↑↓ Pg m x Esc",
+                "Esc ↑↓",
+            ],
             Overlay::AgentMessage => ["Enter send · Esc back", "Enter/Esc", "↵"],
             Overlay::ConfirmAgentCancel => [
                 cancel_prompt.as_deref().unwrap_or_default(),
@@ -996,7 +1008,14 @@ fn approval_validation_line(error: &str, width: usize) -> Line<'static> {
 
 fn approval_detail(operation: &Operation) -> String {
     match operation {
-        Operation::Read { path, .. } => format!("read  {}", path.display()),
+        Operation::Read { paths, .. } => format!(
+            "read  {}",
+            paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Operation::Write { paths, .. } => format!(
             "write  {}",
             paths

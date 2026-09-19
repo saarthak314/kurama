@@ -36,12 +36,11 @@ impl Redactor {
         let mut offset = 0;
         while offset < text.len() {
             let remaining = &text[offset..];
-            let matched = self.patterns.iter().find_map(|pattern| {
-                std::str::from_utf8(pattern)
-                    .ok()
-                    .filter(|pattern| remaining.starts_with(pattern))
-                    .map(str::len)
-            });
+            let matched = self
+                .patterns
+                .iter()
+                .find(|pattern| remaining.as_bytes().starts_with(pattern.as_slice()))
+                .map(|pattern| pattern.len());
             if let Some(length) = matched {
                 output.push_str("[REDACTED]");
                 offset += length;
@@ -83,9 +82,25 @@ impl Redactor {
             }
             serde_json::Value::Object(values) => {
                 let original = std::mem::take(values);
+                let mut renamed = Vec::new();
                 for (key, mut value) in original {
                     self.redact_json(&mut value);
-                    values.insert(self.redact(&key), value);
+                    let redacted = self.redact(&key);
+                    if redacted == key {
+                        values.insert(key, value);
+                    } else {
+                        renamed.push((redacted, value));
+                    }
+                }
+                // Reserve unchanged keys first, including literal redaction markers.
+                for (key, value) in renamed {
+                    let mut unique = key.clone();
+                    let mut suffix = 2;
+                    while values.contains_key(&unique) {
+                        unique = format!("{key}#{suffix}");
+                        suffix += 1;
+                    }
+                    values.insert(unique, value);
                 }
             }
             serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
@@ -97,5 +112,53 @@ impl Redactor {
         RedactionMetadata {
             registered_patterns: self.patterns.len(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn colliding_secret_keys_retain_every_value_and_literal_marker_key() {
+        let mut redactor = Redactor::default();
+        redactor.register(SecretValue::new("secret-alpha".into()));
+        redactor.register(SecretValue::new("secret-bravo".into()));
+        let mut value = json!({
+            "secret-alpha": {"nested": "secret-bravo"},
+            "secret-bravo": 2,
+            "[REDACTED]": 3,
+            "[REDACTED]#2": null,
+            "nested": [{"secret-alpha": 4, "secret-bravo": 5}],
+        });
+        redactor.redact_json(&mut value);
+        assert_eq!(
+            value,
+            json!({
+                "[REDACTED]": 3,
+                "[REDACTED]#2": null,
+                "[REDACTED]#3": {"nested": "[REDACTED]"},
+                "[REDACTED]#4": 2,
+                "nested": [{"[REDACTED]": 4, "[REDACTED]#2": 5}],
+            })
+        );
+        let serialized = value.to_string();
+        assert!(!serialized.contains("secret-alpha"));
+        assert!(!serialized.contains("secret-bravo"));
+        let once = value.clone();
+        redactor.redact_json(&mut value);
+        assert_eq!(value, once);
+    }
+
+    #[test]
+    fn overlapping_unicode_patterns_match_longest_in_text_and_bytes() {
+        let mut redactor = Redactor::default();
+        redactor.register(SecretValue::new("秘密-token".into()));
+        redactor.register(SecretValue::new("秘密-token-long".into()));
+        let text = "é秘密-token-long/秘密-token終";
+        let expected = "é[REDACTED]/[REDACTED]終";
+        assert_eq!(redactor.redact(text), expected);
+        assert_eq!(redactor.redact_bytes(text.as_bytes()), expected.as_bytes());
     }
 }

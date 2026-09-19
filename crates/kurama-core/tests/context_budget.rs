@@ -40,6 +40,7 @@ fn long_session() -> Vec<EventEnvelope> {
             events.len() as u64,
             SessionEvent::UserMessage {
                 text: format!("question {turn} {}", "x".repeat(150)),
+                explicit_delegation: false,
             },
         ));
         events.push(event(
@@ -100,6 +101,7 @@ fn steering_retains_the_complete_current_turn_and_tool_output() {
             1,
             SessionEvent::UserMessage {
                 text: "Summarize the repository.".into(),
+                explicit_delegation: false,
             },
         ),
         event(
@@ -178,6 +180,7 @@ fn steering_cannot_hide_current_turn_context_overflow() {
             1,
             SessionEvent::UserMessage {
                 text: "Inspect everything.".into(),
+                explicit_delegation: false,
             },
         ),
         event(
@@ -227,6 +230,7 @@ fn assembled_items_keep_completed_history_before_the_current_turn() {
             1,
             SessionEvent::UserMessage {
                 text: "older question".into(),
+                explicit_delegation: false,
             },
         ),
         event(
@@ -240,6 +244,7 @@ fn assembled_items_keep_completed_history_before_the_current_turn() {
             4,
             SessionEvent::UserMessage {
                 text: "current question".into(),
+                explicit_delegation: false,
             },
         ),
         event(
@@ -288,7 +293,10 @@ fn repeated_compaction_carries_summary_outside_the_new_prefix() {
         let sequence = turn as u64 * 3;
         manager.record(event(
             sequence,
-            SessionEvent::UserMessage { text: name.into() },
+            SessionEvent::UserMessage {
+                text: name.into(),
+                explicit_delegation: false,
+            },
         ));
         manager.record(event(
             sequence + 1,
@@ -311,7 +319,13 @@ fn repeated_compaction_carries_summary_outside_the_new_prefix() {
         },
     ));
     assert!(manager.compaction_request().is_none());
-    manager.record(event(16, SessionEvent::UserMessage { text: "F".into() }));
+    manager.record(event(
+        16,
+        SessionEvent::UserMessage {
+            text: "F".into(),
+            explicit_delegation: false,
+        },
+    ));
     manager.record(event(
         17,
         SessionEvent::AssistantMessage {
@@ -367,7 +381,13 @@ fn compaction_excludes_superseded_summary_events_from_new_data() {
         ..ContextPolicy::default()
     });
     manager.replay(vec![
-        event(0, SessionEvent::UserMessage { text: "A".into() }),
+        event(
+            0,
+            SessionEvent::UserMessage {
+                text: "A".into(),
+                explicit_delegation: false,
+            },
+        ),
         event(1, SessionEvent::TurnCompleted),
         event(
             2,
@@ -381,6 +401,7 @@ fn compaction_excludes_superseded_summary_events_from_new_data() {
             3,
             SessionEvent::UserMessage {
                 text: "B replaces A".into(),
+                explicit_delegation: false,
             },
         ),
         event(4, SessionEvent::TurnCompleted),
@@ -392,7 +413,13 @@ fn compaction_excludes_superseded_summary_events_from_new_data() {
                 tokens: 5,
             },
         ),
-        event(6, SessionEvent::UserMessage { text: "C".into() }),
+        event(
+            6,
+            SessionEvent::UserMessage {
+                text: "C".into(),
+                explicit_delegation: false,
+            },
+        ),
         event(7, SessionEvent::TurnCompleted),
     ]);
     let request = manager.compaction_request().expect("compact C");
@@ -611,6 +638,7 @@ fn goal_continuation_turns_stay_in_recent_history() {
             2,
             SessionEvent::UserMessage {
                 text: objective.into(),
+                explicit_delegation: false,
             },
         ),
         event(
@@ -692,6 +720,7 @@ fn tight_budget_still_keeps_the_active_goal() {
             events.len() as u64,
             SessionEvent::UserMessage {
                 text: format!("turn {turn} {padding}"),
+                explicit_delegation: false,
             },
         ));
         events.push(event(
@@ -750,6 +779,7 @@ fn oversized_recent_turn_is_omitted_whole_without_blocking_later_turns() {
             0,
             SessionEvent::UserMessage {
                 text: "orphaned question".into(),
+                explicit_delegation: false,
             },
         ),
         event(
@@ -770,6 +800,7 @@ fn oversized_recent_turn_is_omitted_whole_without_blocking_later_turns() {
             4,
             SessionEvent::UserMessage {
                 text: "small question".into(),
+                explicit_delegation: false,
             },
         ),
         event(
@@ -790,6 +821,7 @@ fn oversized_recent_turn_is_omitted_whole_without_blocking_later_turns() {
             8,
             SessionEvent::UserMessage {
                 text: "current question".into(),
+                explicit_delegation: false,
             },
         ),
     ]);
@@ -844,6 +876,7 @@ fn malformed_boundaries_preserve_latest_incomplete_and_failed_turns() {
             1,
             SessionEvent::UserMessage {
                 text: "interrupted".into(),
+                explicit_delegation: false,
             },
         ),
         event(
@@ -856,6 +889,7 @@ fn malformed_boundaries_preserve_latest_incomplete_and_failed_turns() {
             3,
             SessionEvent::UserMessage {
                 text: "failed question".into(),
+                explicit_delegation: false,
             },
         ),
         event(
@@ -997,12 +1031,14 @@ fn clearing_and_replay_remove_stale_goal_todo_evidence_and_turns() {
             4,
             SessionEvent::UserMessage {
                 text: "interrupted".into(),
+                explicit_delegation: false,
             },
         ),
         event(
             5,
             SessionEvent::UserMessage {
                 text: "open".into(),
+                explicit_delegation: false,
             },
         ),
         event(
@@ -1065,6 +1101,7 @@ fn clearing_and_replay_remove_stale_goal_todo_evidence_and_turns() {
         0,
         SessionEvent::UserMessage {
             text: "replacement".into(),
+            explicit_delegation: false,
         },
     )]);
     assert_eq!(
@@ -1142,6 +1179,7 @@ fn zero_recent_turns_compacts_completed_history_but_not_the_current_turn() {
             0,
             SessionEvent::UserMessage {
                 text: "completed question".into(),
+                explicit_delegation: false,
             },
         ),
         event(
@@ -1168,6 +1206,7 @@ fn zero_recent_turns_compacts_completed_history_but_not_the_current_turn() {
         3,
         SessionEvent::UserMessage {
             text: "current question".into(),
+            explicit_delegation: false,
         },
     ));
     assert_eq!(
@@ -1236,6 +1275,7 @@ fn inspector_partitions_the_selected_request_without_mutating_history() {
         33,
         SessionEvent::UserMessage {
             text: "Inspect the latest evidence".into(),
+            explicit_delegation: false,
         },
     ));
     let mut result = ToolResult::success(CallId::from("call"), "source excerpt");
@@ -1296,6 +1336,7 @@ fn overflow_inspection_still_previews_the_complete_compaction_request() {
         31,
         SessionEvent::UserMessage {
             text: "x".repeat(12_000),
+            explicit_delegation: false,
         },
     ));
     let profile = ModelProfile::new("test", "frontier", 1_000, 100);

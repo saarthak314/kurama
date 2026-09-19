@@ -39,18 +39,10 @@ jobs:
         run: cargo fmt --all --check
       - name: Lint
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-      - name: Test libraries
-        run: cargo test --locked --workspace --lib
-      - name: Test core
-        run: cargo test --locked -p kurama-core --tests
-      - name: Test adapters
-        run: cargo test --locked -p kurama-adapters --all-features --tests
-      - name: Test SDK
-        run: cargo test --locked -p kurama-sdk --tests
-      - name: Test kurama
-        run: cargo test --locked -p kurama --tests
-      - name: Test CLI
-        run: cargo test --locked -p kurama-cli --tests
+      - name: Test workspace with all features
+        run: cargo test --locked --workspace --all-features
+      - name: Test verification runners
+        run: python3 scripts/test-verification.py
 
   tui-pty:
     runs-on: ubuntu-24.04
@@ -87,7 +79,7 @@ jobs:
         run: cargo build --locked -p kurama-cli
       - name: Check actual PTY with cursor reports
         timeout-minutes: 5
-        run: .venv-tui/bin/python scripts/check-tui.py target/debug/kurama tui-artifacts/normal --no-images
+        run: .venv-tui/bin/python scripts/check-tui.py target/debug/kurama tui-artifacts/normal --no-images --check-controls
       - name: Check actual PTY without cursor reports and with resumed todos
         if: ${{ !cancelled() && steps.pty-build.outcome == 'success' && steps.pty-python.outcome == 'success' }}
         timeout-minutes: 5

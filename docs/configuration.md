@@ -19,6 +19,8 @@ max_output_tokens = 12000
 kind = "claude_cli"
 model = "sonnet"
 command = "claude"
+max_input_tokens = 128000
+max_output_tokens = 16000
 
 [roles.reviewer]
 profile = "claude-sub"
@@ -49,6 +51,8 @@ Authentication accepts only:
 - `session` — prompt once and keep the value only in memory.
 
 Plaintext keys are invalid. Kurama never reads Codex or Claude credential stores; BYOS bridges communicate only through the installed official CLI.
+
+Native credential access requires the `native-credentials` feature. macOS uses Security.framework rather than passing secrets in process arguments; OS authorization is synchronous and has no cancellation deadline. Linux uses bounded nonblocking `secret-tool` pipes with a ten-second deadline and a 64 KiB read ceiling. Controlled exits clean their process groups; forcibly killing the parent or deliberately detached descendants is outside that guarantee.
 
 ## Routing and Search
 
@@ -83,4 +87,4 @@ All user-owned state is under `~/.kurama`:
 └── cache/
 ```
 
-`state.json` contains mutable UI preferences, project/profile mappings, latest-session pointers, and supervised/auto mode history. API keys never enter configuration, state, transcripts, logs, or shell history. The directory is owner-only; `cache/` is disposable.
+`state.json` contains mutable UI preferences, project/profile mappings, latest-session pointers, and supervised/auto mode history. Configuration stores authentication references, not plaintext keys. Application-owned credential buffers are zeroizing and known provider-error secrets are redacted; transcripts and arbitrary tool output are not a general secret boundary. Do not paste credentials into prompts or commands. The state directory is owner-only; `cache/` is disposable.

@@ -16,39 +16,64 @@ use super::{
 
 pub(crate) const MAX_COMMAND_PALETTE_ROWS: usize = 8;
 
+pub(crate) enum Palette<'a> {
+    History(Vec<&'a str>),
+    Files(Vec<&'a str>),
+    Commands(Vec<crate::commands::CommandSpec>),
+}
+
+impl<'a> Palette<'a> {
+    pub(crate) fn prepare(state: &'a TuiState) -> Self {
+        if state.history_search_active() {
+            return Self::History(state.history_matches());
+        }
+        let files = state.file_suggestions();
+        if files.is_empty() {
+            Self::Commands(state.command_suggestions())
+        } else {
+            Self::Files(files)
+        }
+    }
+
+    pub(crate) fn height(&self, available: u16) -> u16 {
+        let count = match self {
+            Self::History(rows) => rows.len() + 1,
+            Self::Files(rows) => rows.len(),
+            Self::Commands(rows) => rows.len(),
+        };
+        count
+            .min(MAX_COMMAND_PALETTE_ROWS + 1)
+            .min(available as usize) as u16
+    }
+}
+
 pub(crate) fn command_palette_height(state: &TuiState, available: u16) -> u16 {
     if available == 0 {
         return 0;
     }
-    let count = if state.history_search_active() {
-        state.history_matches().len().saturating_add(1)
-    } else {
-        let files = state.file_suggestions();
-        if files.is_empty() {
-            state.command_suggestions().len()
-        } else {
-            files.len()
-        }
-    };
-    count
-        .min(MAX_COMMAND_PALETTE_ROWS + 1)
-        .min(available as usize) as u16
+    Palette::prepare(state).height(available)
 }
 
-pub(crate) fn render_command_palette(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
+pub(crate) fn render_command_palette(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    palette: &Palette<'_>,
+    area: Rect,
+) {
     if area.is_empty() {
         return;
     }
-    if state.history_search_active() {
-        render_history_palette(frame, state, area);
-        return;
-    }
-    let files = state.file_suggestions();
-    if !files.is_empty() {
-        render_named_rows(frame, area, &files, state.file_selection());
-        return;
-    }
-    let suggestions = state.command_suggestions();
+    let suggestions = match palette {
+        Palette::History(matches) => {
+            render_history_palette(frame, state, matches, area);
+            return;
+        }
+        Palette::Files(files) => {
+            render_named_rows(frame, area, files, state.file_selection());
+            return;
+        }
+        Palette::Commands(suggestions) => suggestions,
+    };
     if suggestions.is_empty() {
         return;
     }
@@ -95,10 +120,9 @@ pub(crate) fn render_command_palette(frame: &mut Frame<'_>, state: &TuiState, ar
     render_rows(frame, area, lines);
 }
 
-fn render_history_palette(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
-    let matches = state.history_matches();
+fn render_history_palette(frame: &mut Frame<'_>, state: &TuiState, matches: &[&str], area: Rect) {
     if area.height == 1 && !matches.is_empty() {
-        render_named_rows(frame, area, &matches, state.history_search_selection());
+        render_named_rows(frame, area, matches, state.history_search_selection());
         return;
     }
     let title = if matches.is_empty() {
@@ -124,7 +148,7 @@ fn render_history_palette(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
         render_named_rows(
             frame,
             Rect::new(area.x, area.y + 1, area.width, area.height - 1),
-            &matches,
+            matches,
             state.history_search_selection(),
         );
     }

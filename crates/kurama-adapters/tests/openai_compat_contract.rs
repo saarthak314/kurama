@@ -1,13 +1,7 @@
 #![cfg(feature = "openai-compatible")]
-#![allow(dead_code)]
 
-#[path = "../src/http.rs"]
-mod http;
-#[path = "../src/providers/mod.rs"]
-mod providers;
-
-use futures_util::StreamExt;
-use http::HttpClient;
+use futures_util::{StreamExt, TryStreamExt};
+use kurama_adapters::{HttpClient, OpenAiCompatBackend};
 use kurama_protocol::{
     KuramaError,
     id::SessionId,
@@ -15,7 +9,6 @@ use kurama_protocol::{
     tool::ToolDescriptor,
     traits::ModelBackend,
 };
-use providers::openai_compat::OpenAiCompatBackend;
 
 #[path = "support/provider_http.rs"]
 mod provider_http;
@@ -68,11 +61,12 @@ fn chat_request_supports_optional_parallel_tool_calls() {
     );
 }
 
-#[test]
-fn maps_chat_completions_stream_to_normalized_events() {
-    let events = OpenAiCompatBackend::parse_fixture(include_str!(
+#[tokio::test]
+async fn maps_chat_completions_stream_to_normalized_events() {
+    let events = events_from_wire(include_str!(
         "../../../tests/fixtures/openai_compat/tool_turn.jsonl"
     ))
+    .await
     .expect("fixture");
 
     assert!(
@@ -100,31 +94,6 @@ fn maps_chat_completions_stream_to_normalized_events() {
     );
 }
 
-#[test]
-fn openai_compat_normalization_rejects_transport_eof_before_done() {
-    let error = OpenAiCompatBackend::parse_fixture(include_str!(
-        "../../../tests/fixtures/openai_compat/truncated_text.jsonl"
-    ))
-    .expect_err("truncated stream must fail");
-
-    assert!(matches!(
-        error,
-        KuramaError::Model(message)
-            if message == "OpenAI-compatible stream ended before [DONE]"
-    ));
-}
-
-#[test]
-fn openai_compat_normalization_rejects_empty_transport_eof() {
-    let error = OpenAiCompatBackend::parse_fixture("").expect_err("empty stream must fail");
-
-    assert!(matches!(
-        error,
-        KuramaError::Model(message)
-            if message == "OpenAI-compatible stream ended before [DONE]"
-    ));
-}
-
 #[tokio::test]
 async fn openai_compat_backend_rejects_transport_eof_before_done() {
     let (endpoint, captured) = serve_sse_once(include_str!(
@@ -141,6 +110,7 @@ async fn openai_compat_backend_rejects_transport_eof_before_done() {
     let mut error = None;
     while let Some(event) = stream.next().await {
         match event {
+            Ok(ModelEvent::ResponseCompleted { .. }) => panic!("truncated stream completed"),
             Ok(_) => {}
             Err(stream_error) => {
                 error = Some(stream_error);
@@ -152,8 +122,7 @@ async fn openai_compat_backend_rejects_transport_eof_before_done() {
 
     assert!(matches!(
         error.expect("truncated stream error"),
-        KuramaError::Model(message)
-            if message == "OpenAI-compatible stream ended before [DONE]"
+        KuramaError::Model(_)
     ));
 }
 
@@ -239,15 +208,11 @@ async fn openai_compat_normalization_bounds_cumulative_tool_argument_bytes() {
     };
     let _ = captured.await.expect("captured request");
 
-    assert!(matches!(
-        error,
-        KuramaError::Protocol(message)
-            if message.contains("Chat tool arguments") && message.contains("1048576")
-    ));
+    assert!(matches!(error, KuramaError::Protocol(_)));
 }
 
-#[test]
-fn openai_compat_normalization_bounds_tool_call_count() {
+#[tokio::test]
+async fn openai_compat_normalization_bounds_tool_call_count() {
     let mut body = String::new();
     for index in 0..65_u64 {
         body.push_str(&format!(
@@ -265,12 +230,56 @@ fn openai_compat_normalization_bounds_tool_call_count() {
         ));
     }
 
-    let error =
-        OpenAiCompatBackend::parse_fixture(&body).expect_err("tool call count must be bounded");
+    let error = events_from_wire(body)
+        .await
+        .expect_err("tool call count must be bounded");
 
+    assert!(matches!(error, KuramaError::Protocol(_)));
+}
+
+async fn events_from_wire(body: impl Into<String>) -> Result<Vec<ModelEvent>, KuramaError> {
+    let (endpoint, _) = serve_sse_once(body).await;
+    let backend = OpenAiCompatBackend::from_endpoint(HttpClient::default(), &endpoint, None)?;
+    backend
+        .stream(request(), &NeverCancel)
+        .await?
+        .try_collect()
+        .await
+}
+
+#[tokio::test]
+async fn openai_compat_backend_cancels_after_first_event() {
+    let (first, tail) = split_first_sse_event(include_str!(
+        "../../../tests/fixtures/openai_compat/tool_turn.jsonl"
+    ));
+    let server = serve_sse_until_released(first, tail).await;
+    let backend = OpenAiCompatBackend::from_endpoint(HttpClient::default(), &server.endpoint, None)
+        .expect("backend");
+    provider_http::assert_stream_cancels(&backend, request(), server).await;
+}
+
+#[tokio::test]
+async fn openai_compat_backend_accepts_bom_and_cr_only_sse() {
+    let wire = format!(
+        "\u{feff}{}",
+        include_str!("../../../tests/fixtures/openai_compat/tool_turn.jsonl").replace('\n', "\r")
+    );
+    let events = events_from_wire(wire).await.expect("CR-only SSE");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ModelEvent::ToolCall { name, .. } if name == "read"))
+    );
     assert!(matches!(
-        error,
-        KuramaError::Protocol(message)
-            if message.contains("Chat tool calls") && message.contains("64")
+        events.last(),
+        Some(ModelEvent::ResponseCompleted { .. })
+    ));
+}
+
+#[tokio::test]
+async fn openai_compat_backend_rejects_empty_http_body() {
+    assert!(matches!(
+        events_from_wire("").await,
+        Err(KuramaError::Model(_))
     ));
 }

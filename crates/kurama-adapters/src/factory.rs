@@ -22,7 +22,7 @@ pub struct ProviderFactory {
         feature = "openai-compatible"
     ))]
     http: HttpClient,
-    #[cfg(any(feature = "codex-bridge", feature = "claude-bridge"))]
+    #[cfg(feature = "codex-bridge")]
     paths: AppPaths,
     #[cfg(any(
         feature = "openai",
@@ -40,7 +40,7 @@ impl ProviderFactory {
             feature = "openai-compatible"
         )))]
         let _ = (&http, credentials);
-        #[cfg(not(any(feature = "codex-bridge", feature = "claude-bridge")))]
+        #[cfg(not(feature = "codex-bridge"))]
         let _ = &paths;
         Self {
             #[cfg(any(
@@ -49,7 +49,7 @@ impl ProviderFactory {
                 feature = "openai-compatible"
             ))]
             http,
-            #[cfg(any(feature = "codex-bridge", feature = "claude-bridge"))]
+            #[cfg(feature = "codex-bridge")]
             paths,
             #[cfg(any(
                 feature = "openai",
@@ -66,7 +66,11 @@ impl ProviderFactory {
         profile: &ProfileConfig,
         session_secrets: &SessionSecrets,
     ) -> Result<Arc<dyn ModelBackend>, KuramaError> {
-        validate_profile_name(profile_name)?;
+        if profile_name.trim().is_empty() {
+            return Err(KuramaError::Configuration(
+                "profile name cannot be empty".into(),
+            ));
+        }
         match profile.kind {
             ProfileKind::OpenAi => self.openai(profile_name, profile, session_secrets),
             ProfileKind::Anthropic => self.anthropic(profile_name, profile, session_secrets),
@@ -88,10 +92,10 @@ impl ProviderFactory {
         profile_name: &str,
         profile: &ProfileConfig,
         session_secrets: &SessionSecrets,
-    ) -> Result<Option<String>, KuramaError> {
+    ) -> Result<Option<zeroize::Zeroizing<String>>, KuramaError> {
         self.credentials
             .resolve_optional(profile_name, profile.auth.as_ref(), session_secrets)
-            .map(|secret| secret.map(|secret| secret.expose().to_owned()))
+            .map(|secret| secret.map(|secret| secret.into_zeroizing()))
     }
 
     #[cfg(feature = "openai")]
@@ -199,7 +203,7 @@ impl ProviderFactory {
         reject_cli_auth(profile)?;
         let (bridge_dir, schema_path) = self.bridge_paths(profile_name);
         let bridge = crate::bridges::codex::CodexBridge::new(bridge_dir, schema_path)
-            .with_program(profile.command.as_deref().unwrap_or("codex"));
+            .with_program(cli_command(profile)?);
         Ok(Arc::new(bridge))
     }
 
@@ -215,9 +219,8 @@ impl ProviderFactory {
     #[cfg(feature = "claude-bridge")]
     fn claude(&self, profile: &ProfileConfig) -> Result<Arc<dyn ModelBackend>, KuramaError> {
         reject_cli_auth(profile)?;
-        let schema_path = self.paths.cache().join("bridge/control-v1.json");
-        let bridge = crate::bridges::claude::ClaudeBridge::new(schema_path)
-            .with_program(profile.command.as_deref().unwrap_or("claude"));
+        let bridge =
+            crate::bridges::claude::ClaudeBridge::new().with_program(cli_command(profile)?);
         Ok(Arc::new(bridge))
     }
 
@@ -230,23 +233,30 @@ impl ProviderFactory {
     fn bridge_paths(&self, profile_name: &str) -> (PathBuf, PathBuf) {
         let root = self.paths.cache().join("bridge");
         (
-            root.join("sessions").join(profile_name),
+            root.join("sessions")
+                .join(profile_cache_key(profile_name).as_ref()),
             root.join("control-v1.json"),
         )
     }
 }
 
-fn validate_profile_name(profile_name: &str) -> Result<(), KuramaError> {
-    if profile_name.is_empty()
-        || !profile_name
+#[cfg(feature = "codex-bridge")]
+fn profile_cache_key(profile_name: &str) -> std::borrow::Cow<'_, str> {
+    if !matches!(profile_name, "." | "..")
+        && profile_name.len() <= 255
+        && profile_name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
-        return Err(KuramaError::Configuration(
-            "profile name is unsafe for adapter cache paths".into(),
-        ));
+        return std::borrow::Cow::Borrowed(profile_name);
     }
-    Ok(())
+    use sha2::{Digest, Sha256};
+    // Preserve existing safe directories so persisted CLI cursors keep their
+    // workspace; reserve a prefix outside the old alphabet for encoded names.
+    std::borrow::Cow::Owned(crate::id::hexadecimal(
+        "~",
+        Sha256::digest(profile_name.as_bytes()).as_ref(),
+    ))
 }
 
 #[cfg(any(feature = "codex-bridge", feature = "claude-bridge"))]
@@ -258,6 +268,15 @@ fn reject_cli_auth(profile: &ProfileConfig) -> Result<(), KuramaError> {
     } else {
         Ok(())
     }
+}
+
+#[cfg(any(feature = "codex-bridge", feature = "claude-bridge"))]
+fn cli_command(profile: &ProfileConfig) -> Result<&str, KuramaError> {
+    profile
+        .command
+        .as_deref()
+        .filter(|command| !command.trim().is_empty())
+        .ok_or_else(|| KuramaError::Configuration("CLI profile requires a nonempty command".into()))
 }
 
 #[cfg(not(all(

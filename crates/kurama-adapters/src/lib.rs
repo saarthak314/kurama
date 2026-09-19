@@ -10,6 +10,13 @@
 
 mod id;
 
+#[cfg(any(
+    feature = "tools",
+    feature = "fs-store",
+    feature = "native-credentials"
+))]
+mod fs_safe;
+
 #[cfg(all(
     feature = "native-credentials",
     feature = "http",

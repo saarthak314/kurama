@@ -1,9 +1,7 @@
 use std::{
     collections::BTreeMap,
-    fs::{self, File, OpenOptions},
-    io::Write,
+    fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use kurama_protocol::{
@@ -16,11 +14,12 @@ use kurama_protocol::{
     policy::{AutoBoundaries, ExecutionMode},
 };
 
-use crate::credentials::{format_auth_ref, parse_auth_ref};
+use crate::{
+    credentials::{format_auth_ref, parse_auth_ref},
+    fs_safe::Directory,
+};
 
 const CONFIG_VERSION: u32 = 1;
-const DIRECTORY_MODE: u32 = 0o700;
-const FILE_MODE: u32 = 0o600;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppPaths {
@@ -80,19 +79,20 @@ impl AppPaths {
 #[derive(Debug, Clone)]
 pub struct ConfigRepository {
     paths: AppPaths,
+    directory: Directory,
 }
 
 impl ConfigRepository {
     pub fn open(paths: AppPaths) -> Result<Self, KuramaError> {
-        ensure_directory(paths.root())?;
-        for directory in [paths.sessions(), paths.blobs(), paths.cache()] {
-            ensure_directory(directory)?;
+        let directory = Directory::ensure_root(paths.root())?;
+        for name in ["sessions", "blobs", "cache"] {
+            directory.ensure_dir(name)?;
         }
-        ensure_file(paths.config(), b"")?;
+        directory.ensure_file("config.toml", b"")?;
         let state = serde_json::to_vec(&MutableState::default())
             .map_err(|error| configuration_error("serialize initial state", error))?;
-        ensure_file(paths.state(), &state)?;
-        Ok(Self { paths })
+        directory.ensure_file("state.json", &state)?;
+        Ok(Self { paths, directory })
     }
 
     pub fn paths(&self) -> &AppPaths {
@@ -100,7 +100,8 @@ impl ConfigRepository {
     }
 
     pub fn read_config(&self) -> Result<Option<KuramaConfig>, KuramaError> {
-        let source = fs::read_to_string(self.paths.config())?;
+        let source = String::from_utf8(self.directory.read("config.toml")?)
+            .map_err(|error| configuration_error("read config.toml", error))?;
         if source.trim().is_empty() {
             return Ok(None);
         }
@@ -116,11 +117,13 @@ impl ConfigRepository {
         let document = ConfigDocument::from_config(config);
         let encoded = basic_toml::to_string(&document)
             .map_err(|error| configuration_error("serialize config.toml", error))?;
-        atomic_write(self.paths.config(), encoded.as_bytes())
+        let _lock = self.directory.lock(".config.lock")?;
+        self.directory.replace("config.toml", encoded.as_bytes())?;
+        Ok(())
     }
 
     pub fn read_state(&self) -> Result<MutableState, KuramaError> {
-        let bytes = fs::read(self.paths.state())?;
+        let bytes = self.directory.read("state.json")?;
         if bytes.iter().all(u8::is_ascii_whitespace) {
             return Ok(MutableState::default());
         }
@@ -131,10 +134,18 @@ impl ConfigRepository {
     }
 
     pub fn write_state(&self, state: &MutableState) -> Result<(), KuramaError> {
+        // Whole-document replacement intentionally supersedes earlier state, under the
+        // same stable lock used by all read-modify-write transactions.
+        let _lock = self.directory.lock(".state.lock")?;
+        self.write_state_locked(state)
+    }
+
+    fn write_state_locked(&self, state: &MutableState) -> Result<(), KuramaError> {
         validate_state(state)?;
         let bytes = serde_json::to_vec(state)
             .map_err(|error| configuration_error("serialize state.json", error))?;
-        atomic_write(self.paths.state(), &bytes)
+        self.directory.replace("state.json", &bytes)?;
+        Ok(())
     }
 
     pub fn resolve_profile(
@@ -164,11 +175,12 @@ impl ConfigRepository {
     ) -> Result<(), KuramaError> {
         let config = self.read_config()?;
         validate_profile_reference(config.as_ref(), profile)?;
+        let _lock = self.directory.lock(".state.lock")?;
         let mut state = self.read_state()?;
         state
             .project_profiles
             .insert(canonical_project(project)?, profile.to_owned());
-        self.write_state(&state)
+        self.write_state_locked(&state)
     }
 
     pub fn remember_latest_session(
@@ -176,11 +188,12 @@ impl ConfigRepository {
         project: &Path,
         session_id: &SessionId,
     ) -> Result<(), KuramaError> {
+        let _lock = self.directory.lock(".state.lock")?;
         let mut state = self.read_state()?;
         state
             .latest_sessions
             .insert(canonical_project(project)?, session_id.clone());
-        self.write_state(&state)
+        self.write_state_locked(&state)
     }
 
     pub fn remember_mode(&self, mode: ExecutionMode) -> Result<(), KuramaError> {
@@ -189,9 +202,34 @@ impl ConfigRepository {
                 "YOLO is launch-only and cannot be persisted".into(),
             ));
         }
+        let _lock = self.directory.lock(".state.lock")?;
         let mut state = self.read_state()?;
         state.last_mode = Some(mode);
-        self.write_state(&state)
+        self.write_state_locked(&state)
+    }
+
+    /// Persist a bootstrap selection as one transaction, without intermediate states.
+    /// `None` preserves the previous mode for launch-only YOLO sessions.
+    pub fn remember_session(
+        &self,
+        project: &Path,
+        profile: &str,
+        session_id: &SessionId,
+        mode: Option<ExecutionMode>,
+    ) -> Result<(), KuramaError> {
+        let config = self.read_config()?;
+        validate_profile_reference(config.as_ref(), profile)?;
+        let project = canonical_project(project)?;
+        let _lock = self.directory.lock(".state.lock")?;
+        let mut state = self.read_state()?;
+        state
+            .project_profiles
+            .insert(project.clone(), profile.to_owned());
+        state.latest_sessions.insert(project, session_id.clone());
+        if let Some(mode) = mode {
+            state.last_mode = Some(mode);
+        }
+        self.write_state_locked(&state)
     }
 }
 
@@ -532,114 +570,6 @@ fn canonical_project(project: &Path) -> Result<PathBuf, KuramaError> {
             project.display()
         ))
     })
-}
-
-fn ensure_directory(path: &Path) -> Result<(), KuramaError> {
-    if path.exists() {
-        reject_symlink(path)?;
-        if !path.is_dir() {
-            return Err(KuramaError::Configuration(format!(
-                "{} is not a directory",
-                path.display()
-            )));
-        }
-    } else {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-
-            let mut builder = fs::DirBuilder::new();
-            builder.mode(DIRECTORY_MODE);
-            builder.create(path)?;
-        }
-        #[cfg(not(unix))]
-        fs::create_dir(path)?;
-    }
-    set_directory_permissions(path)?;
-    Ok(())
-}
-
-fn ensure_file(path: &Path, initial: &[u8]) -> Result<(), KuramaError> {
-    if path.exists() {
-        reject_symlink(path)?;
-        if !path.is_file() {
-            return Err(KuramaError::Configuration(format!(
-                "{} is not a file",
-                path.display()
-            )));
-        }
-        set_file_permissions(path)?;
-        return Ok(());
-    }
-    create_file(path, initial, true)
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), KuramaError> {
-    reject_symlink(path)?;
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| KuramaError::Configuration(format!("system clock error: {error}")))?
-        .as_nanos();
-    let temporary = path.with_extension(format!("tmp-{}-{suffix}", std::process::id()));
-    create_file(&temporary, bytes, true)?;
-    if let Err(error) = fs::rename(&temporary, path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error.into());
-    }
-    set_file_permissions(path)?;
-    if let Some(parent) = path.parent() {
-        File::open(parent)?.sync_all()?;
-    }
-    Ok(())
-}
-
-fn create_file(path: &Path, bytes: &[u8], create_new: bool) -> Result<(), KuramaError> {
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut options = OpenOptions::new();
-    options
-        .write(true)
-        .create_new(create_new)
-        .truncate(!create_new);
-    #[cfg(unix)]
-    options.mode(FILE_MODE);
-    let mut file = options.open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    set_file_permissions(path)?;
-    Ok(())
-}
-
-fn reject_symlink(path: &Path) -> Result<(), KuramaError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(KuramaError::Configuration(
-            format!("refusing symbolic link {}", path.display()),
-        )),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn set_directory_permissions(path: &Path) -> Result<(), KuramaError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::set_permissions(path, fs::Permissions::from_mode(DIRECTORY_MODE))?;
-    }
-    Ok(())
-}
-
-fn set_file_permissions(path: &Path) -> Result<(), KuramaError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::set_permissions(path, fs::Permissions::from_mode(FILE_MODE))?;
-    }
-    Ok(())
 }
 
 fn configuration_error(context: &str, error: impl std::fmt::Display) -> KuramaError {

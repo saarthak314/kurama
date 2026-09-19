@@ -192,7 +192,12 @@ impl ContextManager {
         };
         for envelope in self.canonical[..=latest_user].iter().rev() {
             match &envelope.event {
-                SessionEvent::UserMessage { text } => return explicit_delegation(text),
+                SessionEvent::UserMessage {
+                    text,
+                    explicit_delegation: enabled,
+                } => {
+                    return *enabled || explicit_delegation(text);
+                }
                 SessionEvent::UserSteered {
                     text,
                     explicit_delegation: enabled,
@@ -562,7 +567,7 @@ impl ContextManager {
         events
             .iter()
             .filter_map(|event| match &event.event {
-                SessionEvent::UserMessage { text } | SessionEvent::UserSteered { text, .. } => {
+                SessionEvent::UserMessage { text, .. } | SessionEvent::UserSteered { text, .. } => {
                     Some(ModelItem::User { text: text.clone() })
                 }
                 SessionEvent::AssistantMessage { text } => {

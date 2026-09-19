@@ -124,7 +124,7 @@ fn inserting_a_joiner_does_not_redirect_backspace_into_json_syntax() {
     let request = kurama_protocol::policy::ApprovalRequest {
         operation_id: "edit".into(),
         operation: kurama_protocol::tool::Operation::Read {
-            path: ".".into(),
+            paths: vec![".".into()],
             external: false,
         },
         summary: "read".into(),

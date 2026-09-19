@@ -1,11 +1,15 @@
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    ffi::OsStr,
+    fs::{File, Permissions, TryLockError},
+    io::{Read, Write},
+    sync::atomic::AtomicBool,
+    time::Duration,
 };
 
-use super::{PathGuard, limits::sha256_hex};
+use crate::fs_safe::{Directory, blocking, checkpoint};
+use sha2::{Digest, Sha256};
+
+use super::PathGuard;
 use diffy::Patch;
 use kurama_protocol::{
     KuramaError,
@@ -14,8 +18,6 @@ use kurama_protocol::{
     traits::{BoxFuture, CancelSignal, Tool},
 };
 use serde::Deserialize;
-
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Default)]
 pub struct WriteTool {
@@ -74,21 +76,21 @@ impl Tool for WriteTool {
         invocation: ToolInvocation,
         cancel: &'a dyn CancelSignal,
     ) -> BoxFuture<'a, Result<ToolResult, KuramaError>> {
-        Box::pin(async move {
-            if cancel.is_cancelled() {
-                return Err(KuramaError::Cancelled);
-            }
+        Box::pin(blocking(cancel, move |cancel| {
             let arguments = parse_arguments(&invocation)?;
             let guarded =
                 PathGuard::new(&context)?.resolve_write(&arguments.path, &context.write_scope)?;
-            let existed = guarded.absolute.exists();
-            let original = if existed {
-                fs::read(&guarded.absolute)?
-            } else {
-                Vec::new()
+            let (directory, name) = guarded.parent_directory()?;
+            // A stable parent lock serializes cooperating writers across processes,
+            // including the original read and expected-hash check. Advisory locks
+            // cannot provide atomic compare-and-swap against noncooperating writers.
+            let _lock = lock_writes(&directory, &cancel)?;
+            let original_file = match directory.open_file(&name, false, false) {
+                Ok(file) => Some(file),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
             };
-            let original_hash = existed.then(|| sha256_hex(&original));
-
+            let existed = original_file.is_some();
             if existed && context.mode != ExecutionMode::Yolo && arguments.expected_sha256.is_none()
             {
                 return Err(KuramaError::Tool(format!(
@@ -96,34 +98,39 @@ impl Tool for WriteTool {
                     guarded.absolute.display()
                 )));
             }
-            if let Some(expected) = &arguments.expected_sha256 {
-                validate_sha256(expected)?;
-                if original_hash.as_deref() != Some(expected.as_str()) {
-                    return Err(KuramaError::Tool(format!(
-                        "stale expected_sha256 for {}",
-                        guarded.absolute.display()
-                    )));
+            let (original, original_hash, permissions) = match original_file {
+                Some(mut file) => {
+                    let permissions = file.metadata()?.permissions();
+                    let (bytes, hash) =
+                        read_original(&mut file, arguments.patch.is_some(), &cancel)?;
+                    (bytes, Some(hash), Some(permissions))
                 }
+                None => (Vec::new(), None, None),
+            };
+            if let Some(expected) = &arguments.expected_sha256
+                && original_hash.as_deref() != Some(expected.as_str())
+            {
+                return Err(KuramaError::Tool(format!(
+                    "stale expected_sha256 for {}",
+                    guarded.absolute.display()
+                )));
             }
-
+            checkpoint(&cancel)?;
             let post_image = match (arguments.content, arguments.patch) {
                 (Some(content), None) => content.into_bytes(),
                 (None, Some(patch)) => apply_patch(&original, &patch)?,
                 _ => unreachable!("validated payload"),
             };
-            let post_hash = sha256_hex(&post_image);
-
-            if cancel.is_cancelled() {
-                return Err(KuramaError::Cancelled);
-            }
+            checkpoint(&cancel)?;
+            let post_hash = hash_bytes(&post_image, &cancel)?;
             atomic_replace(
-                &guarded.absolute,
+                &directory,
+                &name,
                 &post_image,
                 original_hash.as_deref(),
-                existed,
-                cancel,
+                permissions,
+                &cancel,
             )?;
-
             Ok(ToolResult {
                 call_id: invocation.call_id,
                 output: format!(
@@ -143,7 +150,7 @@ impl Tool for WriteTool {
                 truncated: false,
                 blob_refs: Vec::new(),
             })
-        })
+        }))
     }
 }
 
@@ -154,7 +161,7 @@ fn parse_arguments(invocation: &ToolInvocation) -> Result<WriteArguments, Kurama
             invocation.name
         )));
     }
-    let arguments: WriteArguments = serde_json::from_value(invocation.arguments.clone())
+    let mut arguments: WriteArguments = serde_json::from_value(invocation.arguments.clone())
         .map_err(|error| KuramaError::Tool(format!("invalid write arguments: {error}")))?;
     if arguments.path.is_empty() {
         return Err(KuramaError::Tool("write path must not be empty".into()));
@@ -163,6 +170,10 @@ fn parse_arguments(invocation: &ToolInvocation) -> Result<WriteArguments, Kurama
         return Err(KuramaError::Tool(
             "write requires exactly one of content or patch".into(),
         ));
+    }
+    if let Some(expected) = &mut arguments.expected_sha256 {
+        validate_sha256(expected)?;
+        expected.make_ascii_lowercase();
     }
     Ok(arguments)
 }
@@ -187,67 +198,92 @@ fn apply_patch(original: &[u8], patch: &str) -> Result<Vec<u8>, KuramaError> {
 }
 
 fn atomic_replace(
-    target: &Path,
+    directory: &Directory,
+    name: &OsStr,
     post_image: &[u8],
     expected_hash: Option<&str>,
-    existed: bool,
-    cancel: &dyn CancelSignal,
+    permissions: Option<Permissions>,
+    cancel: &AtomicBool,
 ) -> Result<(), KuramaError> {
-    let parent = target
-        .parent()
-        .ok_or_else(|| KuramaError::Tool("write target has no parent".into()))?;
-    let temp_path = temporary_path(parent);
+    checkpoint(cancel)?;
+    let (temporary, mut file) = directory.temporary()?;
     let result = (|| {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+        for chunk in post_image.chunks(64 * 1024) {
+            checkpoint(cancel)?;
+            file.write_all(chunk)?;
         }
-        let mut file = options.open(&temp_path)?;
-        file.write_all(post_image)?;
-        if existed {
-            file.set_permissions(fs::metadata(target)?.permissions())?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
         }
         file.sync_all()?;
-
-        if cancel.is_cancelled() {
-            return Err(KuramaError::Cancelled);
+        checkpoint(cancel)?;
+        let current_hash = match directory.open_file(name, false, false) {
+            Ok(mut current) => Some(read_original(&mut current, false, cancel)?.1),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        if current_hash.as_deref() != expected_hash {
+            return Err(KuramaError::Tool(
+                "file changed before atomic rename".into(),
+            ));
         }
-        match (expected_hash, target.exists()) {
-            (Some(expected), true) if sha256_hex(&fs::read(target)?) != expected => {
-                return Err(KuramaError::Tool(format!(
-                    "file changed before atomic rename: {}",
-                    target.display()
-                )));
-            }
-            (Some(_), false) => {
-                return Err(KuramaError::Tool(format!(
-                    "file disappeared before atomic rename: {}",
-                    target.display()
-                )));
-            }
-            (None, true) if !existed => {
-                return Err(KuramaError::Tool(format!(
-                    "file appeared before atomic rename: {}",
-                    target.display()
-                )));
-            }
-            _ => {}
-        }
-
-        fs::rename(&temp_path, target)?;
-        fs::File::open(parent)?.sync_all()?;
+        checkpoint(cancel)?;
+        // Commit begins here. Cancellation after rename must not claim no write occurred.
+        directory.rename(&temporary, name)?;
+        directory.sync()?;
         Ok(())
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
+        let _ = directory.remove_file(&temporary);
     }
     result
 }
 
-fn temporary_path(parent: &Path) -> PathBuf {
-    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    parent.join(format!(".kurama-{}-{sequence}.tmp", std::process::id()))
+fn lock_writes(directory: &Directory, cancel: &AtomicBool) -> Result<File, KuramaError> {
+    let lock = directory.lock_handle()?;
+    loop {
+        checkpoint(cancel)?;
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(5)),
+            Err(TryLockError::Error(error)) => return Err(error.into()),
+        }
+    }
+}
+
+fn read_original(
+    file: &mut File,
+    retain: bool,
+    cancel: &AtomicBool,
+) -> Result<(Vec<u8>, String), KuramaError> {
+    let mut original = Vec::new();
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        checkpoint(cancel)?;
+        let count = match file.read(&mut buffer) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+        if retain {
+            original.extend_from_slice(&buffer[..count]);
+        }
+    }
+    Ok((
+        original,
+        crate::id::hexadecimal("", digest.finalize().as_ref()),
+    ))
+}
+
+fn hash_bytes(bytes: &[u8], cancel: &AtomicBool) -> Result<String, KuramaError> {
+    let mut digest = Sha256::new();
+    for chunk in bytes.chunks(64 * 1024) {
+        checkpoint(cancel)?;
+        digest.update(chunk);
+    }
+    Ok(crate::id::hexadecimal("", digest.finalize().as_ref()))
 }

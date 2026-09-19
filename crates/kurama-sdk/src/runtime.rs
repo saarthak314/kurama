@@ -256,11 +256,7 @@ impl ChildRunner for RuntimeChildRunner {
                             && let Some(summary) =
                                 salvage_summary(&last_assistant_text, &summary)
                         {
-                            let (changed_files, evidence_refs) = child_artifacts(
-                                store.as_ref(),
-                                &session.id,
-                                &child_id,
-                            )?;
+                            let (changed_files, evidence_refs) = child_artifacts(&replay);
                             return Ok(AgentResult {
                                 agent_id: child_id,
                                 summary,
@@ -336,11 +332,7 @@ impl ChildRunner for RuntimeChildRunner {
                                         ..ChildProgress::default()
                                     }).await;
                                     let _ = handle.shutdown().await;
-                                    let (changed_files, evidence_refs) = child_artifacts(
-                                        store.as_ref(),
-                                        &session.id,
-                                        &child_id,
-                                    )?;
+                                    let (changed_files, evidence_refs) = child_artifacts(&replay);
                                     return Ok(AgentResult {
                                         agent_id: child_id,
                                         summary: if summary.trim().is_empty() {
@@ -384,11 +376,7 @@ impl ChildRunner for RuntimeChildRunner {
                                     if let Some(summary) =
                                         salvage_summary(&last_assistant_text, &summary)
                                     {
-                                        let (changed_files, evidence_refs) = child_artifacts(
-                                            store.as_ref(),
-                                            &session.id,
-                                            &child_id,
-                                        )?;
+                                        let (changed_files, evidence_refs) = child_artifacts(&replay);
                                         return Ok(AgentResult {
                                             agent_id: child_id,
                                             summary,
@@ -543,22 +531,20 @@ fn child_prompt(context: &ChildRunContext) -> String {
 }
 
 fn child_artifacts(
-    store: &dyn SessionStore,
-    session_id: &kurama_protocol::id::SessionId,
-    agent_id: &kurama_protocol::id::AgentId,
-) -> Result<(Vec<String>, Vec<kurama_protocol::session::BlobRef>), KuramaError> {
+    replay: &[EventEnvelope],
+) -> (Vec<String>, Vec<kurama_protocol::session::BlobRef>) {
     let mut changed_files = Vec::new();
     let mut evidence_refs = Vec::new();
-    for event in store.replay_agent(session_id, agent_id)? {
-        match event.event {
+    for event in replay {
+        match &event.event {
             SessionEvent::ToolProposed {
                 operation: kurama_protocol::tool::Operation::Write { paths, .. },
                 ..
             } => {
-                changed_files.extend(paths.into_iter().map(|path| path.display().to_string()));
+                changed_files.extend(paths.iter().map(|path| path.display().to_string()));
             }
             SessionEvent::ToolCompleted { result, .. } => {
-                evidence_refs.extend(result.blob_refs);
+                evidence_refs.extend(result.blob_refs.iter().cloned());
             }
             _ => {}
         }
@@ -567,7 +553,7 @@ fn child_artifacts(
     changed_files.dedup();
     evidence_refs.sort_by(|left, right| left.sha256.cmp(&right.sha256));
     evidence_refs.dedup();
-    Ok((changed_files, evidence_refs))
+    (changed_files, evidence_refs)
 }
 
 impl fmt::Debug for AgentRuntime {

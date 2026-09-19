@@ -105,31 +105,6 @@ fn codex_initial_command_is_read_only_isolated_and_jsonl() {
 }
 
 #[test]
-fn bridge_prompt_anchors_relative_tools_to_the_kurama_workspace() {
-    let prompt = bridge_prompt(&request());
-
-    assert!(prompt.contains("Kurama workspace root: \"/workspace/project\""));
-    assert!(prompt.contains("never use the bridge process working directory"));
-}
-
-#[test]
-fn bridge_prompt_does_not_invent_tool_unavailability() {
-    let prompt = bridge_prompt(&request());
-
-    assert!(prompt.contains("listed Kurama tool is available through this control protocol"));
-    assert!(prompt.contains("CLI tools are deliberately disabled and irrelevant"));
-    assert!(prompt.contains("Kurama protocol operations, not CLI tools"));
-    assert!(prompt.contains("Kurama executes it after this response"));
-    assert!(prompt.contains("Do not claim any operation ran, failed, or was unavailable"));
-    assert!(prompt.contains("return kind=tool_calls instead of kind=final"));
-    assert!(prompt.contains("nonzero exit status"));
-    assert!(prompt.contains("is_error=true"));
-    assert!(prompt.contains("not evidence that the tool is missing or unavailable"));
-    assert!(prompt.contains("only from explicit tool-result content or an engine error"));
-    assert!(prompt.contains("Never invent an unavailable-tool failure"));
-}
-
-#[test]
 fn bridge_prompt_preserves_request_tail_beyond_legacy_limit() {
     let mut request = request();
     let tail_marker = "complete-request-tail-marker";
@@ -141,15 +116,6 @@ fn bridge_prompt_preserves_request_tail_beyond_legacy_limit() {
 
     assert!(prompt.len() > 256 * 1024);
     assert!(prompt.contains(tail_marker));
-}
-
-#[test]
-fn bridge_prompt_wrapper_fits_the_core_envelope_reserve() {
-    let request = request();
-    let serialized_request = serde_json::to_vec(&request).expect("serialize request");
-    let prompt = bridge_prompt(&request);
-
-    assert!(prompt.len() <= serialized_request.len() + 512 * 3);
 }
 
 #[test]
@@ -165,7 +131,23 @@ fn codex_resume_command_preserves_thread_cursor() {
         Path::new("/tmp/control.json"),
     );
 
-    assert_eq!(&command.args[..2], ["exec", "resume"]);
+    assert_eq!(command.args[0], "exec");
+    let resume = command
+        .args
+        .iter()
+        .position(|argument| argument == "resume")
+        .expect("resume subcommand");
+    for flag in ["--sandbox", "--color", "-C"] {
+        assert!(
+            command
+                .args
+                .iter()
+                .position(|argument| argument == flag)
+                .expect("isolation option")
+                < resume
+        );
+    }
+    assert_eq!(command.cwd.as_deref(), Some(Path::new("/tmp/bridge")));
     assert!(command.args.iter().any(|argument| argument == "thread-1"));
     assert!(
         command
@@ -173,6 +155,17 @@ fn codex_resume_command_preserves_thread_cursor() {
             .windows(2)
             .any(|pair| pair == ["--disable", "shell_tool"])
     );
+    for pair in [
+        ["--sandbox", "read-only"],
+        ["-c", "web_search=\"disabled\""],
+        ["--color", "never"],
+        ["-C", "/tmp/bridge"],
+    ] {
+        assert!(
+            command.args.windows(2).any(|args| args == pair),
+            "missing resume isolation setting {pair:?}"
+        );
+    }
 }
 
 #[test]
@@ -191,7 +184,7 @@ fn codex_rejects_native_tool_execution_events() {
 
 #[test]
 fn claude_command_uses_stream_json_and_disables_builtin_tools() {
-    let command = ClaudeBridge::command_for(&request(), None, Path::new("/tmp/control.json"));
+    let command = ClaudeBridge::command_for(&request(), None);
 
     assert_eq!(command.program, "claude");
     assert!(command.args.windows(2).any(|pair| pair == ["--tools", ""]));
@@ -220,19 +213,13 @@ fn claude_command_uses_stream_json_and_disables_builtin_tools() {
             .iter()
             .any(|argument| argument == "--strict-mcp-config")
     );
-    let system_prompt = command
+    let schema = command
         .args
         .windows(2)
-        .find(|pair| pair[0] == "--system-prompt")
-        .map(|pair| pair[1].as_str())
-        .expect("Claude bridge system prompt");
-    assert!(system_prompt.contains("You are a model bridge"));
-    assert!(!system_prompt.contains("Operate only through the supplied tools"));
-    assert!(system_prompt.contains("only Claude tool you may invoke is StructuredOutput"));
-    assert!(system_prompt.contains("Every listed Kurama tool is available"));
-    assert!(system_prompt.contains("Kurama executes it after this response"));
-    assert!(command.stdin.starts_with("Active context:\n"));
-    assert!(!command.stdin.contains("You are a model bridge"));
+        .find(|pair| pair[0] == "--json-schema")
+        .map(|pair| serde_json::from_str::<serde_json::Value>(&pair[1]).expect("inline schema"))
+        .expect("Claude inline schema");
+    assert_eq!(schema, control_schema(false));
 }
 
 #[test]
@@ -612,7 +599,7 @@ async fn silent_codex_bridge_times_out_after_inactivity() {
     let mut command = CodexBridge::command_for(
         &request(),
         None,
-        &temporary.path().join("work"),
+        temporary.path(),
         &temporary.path().join("control.json"),
     );
     command.program = executable.display().to_string();
@@ -665,10 +652,11 @@ sleep 10
     let mut command = CodexBridge::command_for(
         &request(),
         None,
-        &temporary.path().join("work"),
+        temporary.path(),
         &temporary.path().join("control.json"),
     );
-    command.program = executable.display().to_string();
+    command.program = "/bin/sh".into();
+    command.args.insert(0, executable.display().to_string());
 
     let bridge_task = tokio::spawn(async move {
         event_stream_with_inactivity(
@@ -842,8 +830,7 @@ printf '%s\n' '{{"type":"result","subtype":"success","session_id":"session-live"
             completed.display()
         ),
     );
-    let bridge = ClaudeBridge::new(temporary.path().join("control.json"))
-        .with_program(executable.display().to_string());
+    let bridge = ClaudeBridge::new().with_program(executable.display().to_string());
 
     let mut stream = bridge
         .stream(request(), &NeverCancel)
@@ -873,15 +860,22 @@ dd if=/dev/zero bs=1048576 count=16 2>/dev/null
 sleep 10
 "#,
     );
-    let bridge = CodexBridge::new(
-        temporary.path().join("work"),
-        temporary.path().join("control.json"),
-    )
-    .with_program(executable.display().to_string());
+    let command = bridges::BridgeCommand {
+        program: "/bin/sh".into(),
+        args: vec![executable.display().to_string()],
+        cwd: Some(temporary.path().to_owned()),
+        stdin: String::new(),
+    };
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        bridge.stream(request(), &NeverCancel),
+        event_stream_with_inactivity(
+            command,
+            TestBridgeDecoder::default(),
+            &NeverCancel,
+            Vec::new(),
+            Duration::from_secs(5),
+        ),
     )
     .await
     .expect("oversized record rejection timed out");
@@ -935,8 +929,7 @@ async fn bridge_cancellation_terminates_without_waiting_for_child() {
     let temporary = tempfile::tempdir().expect("tempdir");
     let executable = temporary.path().join("claude");
     write_executable(&executable, "#!/bin/sh\nsleep 10\n");
-    let bridge = ClaudeBridge::new(temporary.path().join("control.json"))
-        .with_program(executable.display().to_string());
+    let bridge = ClaudeBridge::new().with_program(executable.display().to_string());
     let started = Instant::now();
 
     let result = bridge.stream(request(), &DelayedCancel).await;
@@ -965,8 +958,7 @@ while :; do sleep 1; done
             pids.display()
         ),
     );
-    let bridge = ClaudeBridge::new(temporary.path().join("control.json"))
-        .with_program(executable.display().to_string());
+    let bridge = ClaudeBridge::new().with_program(executable.display().to_string());
 
     let mut stream = bridge
         .stream(request(), &NeverCancel)
@@ -1007,7 +999,7 @@ async fn bridge_nonzero_errors_are_bounded_and_redacted() {
         &executable,
         "#!/bin/sh\nprintf 'secret-value' >&2\nexit 7\n",
     );
-    let bridge = ClaudeBridge::new(temporary.path().join("control.json"))
+    let bridge = ClaudeBridge::new()
         .with_program(executable.display().to_string())
         .with_redactions(vec!["secret-value".into()]);
 
@@ -1063,7 +1055,7 @@ impl CancelSignal for NeverCancel {
         false
     }
 
-    fn cancelled(&self) -> BoxFuture<'_, ()> {
+    fn cancelled(&self) -> BoxFuture<'static, ()> {
         Box::pin(std::future::pending())
     }
 }
@@ -1105,7 +1097,7 @@ impl CancelSignal for DelayedCancel {
         false
     }
 
-    fn cancelled(&self) -> BoxFuture<'_, ()> {
+    fn cancelled(&self) -> BoxFuture<'static, ()> {
         Box::pin(tokio::time::sleep(std::time::Duration::from_millis(50)))
     }
 }
@@ -1121,4 +1113,350 @@ async fn wait_for_process_exit(process_id: i32) -> bool {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     false
+}
+
+#[test]
+fn control_parser_requires_nonempty_unique_call_ids() {
+    for ids in [["", "c2"], ["c1", "c1"]] {
+        let control = serde_json::json!({
+            "kind": "tool_calls", "text": "", "agents": [],
+            "calls": ids.map(|id| serde_json::json!({"call_id": id, "name": "read", "arguments": {"files": []}}))
+        });
+        assert!(matches!(
+            parse_control(&control.to_string(), false),
+            Err(KuramaError::Protocol(_))
+        ));
+    }
+    let events = parse_control(r#"{"kind":"tool_calls","calls":[{"call_id":"c1","name":"read","arguments":{}},{"call_id":"c2","name":"write","arguments":{}}]}"#, false).expect("distinct calls");
+    assert!(
+        matches!(events.as_slice(), [ModelEvent::ToolCall { call_id: first, .. }, ModelEvent::ToolCall { call_id: second, .. }] if first.as_ref() == "c1" && second.as_ref() == "c2")
+    );
+}
+
+#[test]
+fn claude_native_snapshots_are_idempotent_and_conflicting_ids_fail() {
+    let snapshot = |native_id: &str, call_id: &str, command: &str| {
+        serde_json::json!({
+        "type": "assistant", "message": {"content": [{"type": "tool_use", "id": native_id, "name": "bash", "input": {"call_id": call_id, "arguments": {"command": command}}}]}
+    }).to_string()
+    };
+    let first = snapshot("native-1", "c1", "pwd");
+    let result = r#"{"type":"result","subtype":"success"}"#;
+    let repeated = std::iter::repeat_n(first.as_str(), 12)
+        .chain([result])
+        .collect::<Vec<_>>()
+        .join("\n");
+    let events = ClaudeBridge::parse_fixture(&repeated).expect("repeated snapshot");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ModelEvent::ToolCall { .. }))
+            .count(),
+        1
+    );
+    for conflicting in [
+        snapshot("native-1", "c1", "ls"),
+        snapshot("native-1", "c2", "pwd"),
+        snapshot("native-2", "c1", "ls"),
+        snapshot("native-2", "c1", "pwd"),
+    ] {
+        assert!(matches!(
+            ClaudeBridge::parse_fixture(&format!("{first}\n{conflicting}\n{result}")),
+            Err(KuramaError::Protocol(_))
+        ));
+    }
+}
+
+#[test]
+fn control_schema_initialization_is_atomic_and_immutable() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("schema.json");
+    let barrier = std::sync::Barrier::new(8);
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let path = &path;
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                bridges::control::write_control_schema(path, false)
+                    .expect("concurrent schema initialization");
+                let schema: serde_json::Value =
+                    serde_json::from_slice(&fs::read(path).expect("published schema"))
+                        .expect("complete JSON");
+                assert_eq!(schema, control_schema(false));
+            });
+        }
+    });
+    assert!(bridges::control::write_control_schema(&path, true).is_err());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &fs::read(&path).expect("schema after conflict")
+        )
+        .expect("schema JSON"),
+        control_schema(false)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn concurrent_codex_requests_keep_delegation_schemas_isolated() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let executable = temporary.path().join("codex");
+    write_executable(
+        &executable,
+        &format!(
+            r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output-schema) schema="$2"; shift ;;
+    -m) mode="$2"; shift ;;
+  esac
+  shift
+done
+printf '%s\n' '{{"type":"thread.started","thread_id":"ready"}}'
+while [ ! -e '{root}/release' ]; do sleep 0.01; done
+cat "$schema" > '{root}/'"$mode"'.json'
+printf '%s\n' '{{"type":"item.completed","item":{{"type":"agent_message","text":"{{\"kind\":\"final\",\"text\":\"done\"}}"}}}}'
+printf '%s\n' '{{"type":"turn.completed"}}'
+"#,
+            root = temporary.path().display()
+        ),
+    );
+    let bridge = CodexBridge::new(
+        temporary.path().join("work"),
+        temporary.path().join("control.json"),
+    )
+    .with_program(executable.display().to_string());
+    let mut tools = request();
+    tools.profile.model = "tools".into();
+    let mut delegation = request();
+    delegation.profile.model = "delegation".into();
+    delegation.delegation = Some(kurama_protocol::model::DelegationSchema {
+        parameters: serde_json::json!({}),
+    });
+    let (tools, delegation) = tokio::join!(
+        bridge.stream(tools, &NeverCancel),
+        bridge.stream(delegation, &NeverCancel)
+    );
+    let tools = tools.expect("tools stream");
+    let delegation = delegation.expect("delegation stream");
+    fs::write(temporary.path().join("release"), "").expect("release readers");
+    let (tools, delegation) =
+        tokio::join!(tools.collect::<Vec<_>>(), delegation.collect::<Vec<_>>());
+    assert!(tools.iter().chain(&delegation).all(Result::is_ok));
+    for (mode, enabled) in [("tools", false), ("delegation", true)] {
+        let observed: serde_json::Value = serde_json::from_slice(
+            &fs::read(temporary.path().join(format!("{mode}.json"))).expect("captured schema"),
+        )
+        .expect("complete schema");
+        assert_eq!(observed, control_schema(enabled));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn exited_bridge_leader_cannot_leave_pipe_joins_pending() {
+    for blocked_stdin in [false, true] {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let executable = temporary.path().join("bridge");
+        let pids = temporary.path().join("pids");
+        let ready = temporary.path().join("ready");
+        let stderr = if blocked_stdin { "2>/dev/null" } else { "" };
+        write_executable(
+            &executable,
+            &format!(
+                r#"#!/bin/sh
+exec 3<&0
+sh -c 'trap "" TERM; : > "$1"; while :; do sleep 1; done' child '{ready}' <&3 >/dev/null {stderr} &
+descendant=$!
+printf '%s %s\n' "$$" "$descendant" > '{pids}'
+while [ ! -e '{ready}' ]; do sleep 0.01; done
+printf '%s\n' '{{"type":"heartbeat"}}'
+exit 0
+"#,
+                ready = ready.display(),
+                pids = pids.display()
+            ),
+        );
+        let command = bridges::BridgeCommand {
+            program: "/bin/sh".into(),
+            args: vec![executable.display().to_string()],
+            cwd: None,
+            stdin: if blocked_stdin {
+                "x".repeat(4 * 1024 * 1024)
+            } else {
+                String::new()
+            },
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            event_stream_with_inactivity(
+                command,
+                TestBridgeDecoder::default(),
+                &NeverCancel,
+                Vec::new(),
+                Duration::from_millis(100),
+            ),
+        )
+        .await;
+        let contents = fs::read_to_string(&pids).unwrap_or_else(|error| {
+            let outcome = match &result {
+                Ok(Err(error)) => error.to_string(),
+                Ok(Ok(_)) => "stream unexpectedly opened".into(),
+                Err(error) => error.to_string(),
+            };
+            panic!("process IDs missing (blocked_stdin={blocked_stdin}): {error}; {outcome}")
+        });
+        let ids: Vec<i32> = contents
+            .split_whitespace()
+            .map(|id| id.parse().expect("PID"))
+            .collect();
+        let gone = wait_for_process_exit(ids[1]).await;
+        if !gone {
+            unsafe {
+                libc::kill(-ids[0], libc::SIGKILL);
+            }
+        }
+        assert!(
+            matches!(result, Ok(Err(KuramaError::Model(_)))),
+            "post-exit pipe deadline was not observed"
+        );
+        assert!(gone, "descendant survived post-exit pipe cleanup");
+    }
+}
+
+struct ManualCancel(std::sync::Arc<tokio::sync::Notify>);
+
+impl CancelSignal for ManualCancel {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+    fn cancelled(&self) -> BoxFuture<'static, ()> {
+        let notify = self.0.clone();
+        Box::pin(async move { notify.notified().await })
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bridge_observes_owned_cancellation_after_first_event() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let executable = temporary.path().join("claude");
+    let pid_path = temporary.path().join("pid");
+    write_executable(
+        &executable,
+        &format!(
+            r#"#!/bin/sh
+printf '%s' "$$" > '{}'
+printf '%s\n' '{{"type":"system","subtype":"init","session_id":"ready"}}'
+exec sleep 10
+"#,
+            pid_path.display()
+        ),
+    );
+    let bridge = ClaudeBridge::new().with_program(executable.display().to_string());
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let cancel = ManualCancel(notify.clone());
+    let mut stream = bridge.stream(request(), &cancel).await.expect("stream");
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(ModelEvent::ResponseStarted { .. }))
+    ));
+    drop(cancel);
+    notify.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(1), stream.next()).await;
+    let pid: i32 = fs::read_to_string(pid_path)
+        .expect("PID")
+        .parse()
+        .expect("numeric PID");
+    let gone = wait_for_process_exit(pid).await;
+    if !gone {
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    assert!(matches!(result, Ok(Some(Err(KuramaError::Cancelled)))));
+    assert!(gone, "cancellation returned before process cleanup");
+    assert!(stream.next().await.is_none());
+}
+
+#[cfg(all(unix, feature = "tools", feature = "http"))]
+#[tokio::test]
+async fn native_search_limits_are_rejected_before_spawning() {
+    use kurama_adapters::{ClaudeNativeSearch, CodexNativeSearch, SearchBackend};
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let marker = temporary.path().join("spawned");
+    let executable = temporary.path().join("search");
+    write_executable(
+        &executable,
+        &format!("#!/bin/sh\n: > '{}'\nexit 9\n", marker.display()),
+    );
+    let backends: Vec<Box<dyn SearchBackend>> = vec![
+        Box::new(CodexNativeSearch::new(
+            executable.display().to_string(),
+            "test",
+        )),
+        Box::new(ClaudeNativeSearch::new(
+            executable.display().to_string(),
+            "test",
+        )),
+    ];
+    for backend in backends {
+        for limit in [0, 9] {
+            assert!(matches!(
+                backend.search("query", limit, &NeverCancel).await,
+                Err(KuramaError::Tool(_))
+            ));
+        }
+    }
+    assert!(!marker.exists(), "invalid native search spawned a CLI");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_relative_wrapper_still_launches_with_isolated_cwd() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let executable = temporary.path().join("codex");
+    let work = temporary.path().join("work");
+    let observed = temporary.path().join("cwd");
+    write_executable(
+        &executable,
+        &format!(
+            r#"#!/bin/sh
+pwd > '{}'
+printf '%s\n' '{{"type":"item.completed","item":{{"type":"agent_message","text":"{{\"kind\":\"final\",\"text\":\"done\"}}"}}}}'
+printf '%s\n' '{{"type":"turn.completed"}}'
+"#,
+            observed.display()
+        ),
+    );
+    let cwd = std::env::current_dir().expect("current directory");
+    let mut relative_program = std::path::PathBuf::new();
+    for _ in cwd.ancestors().skip(1) {
+        relative_program.push("..");
+    }
+    relative_program.push(
+        executable
+            .strip_prefix("/")
+            .expect("absolute temporary path"),
+    );
+    let bridge = CodexBridge::new(&work, temporary.path().join("schema.json"))
+        .with_program(relative_program.display().to_string());
+    let stream = bridge
+        .stream(request(), &NeverCancel)
+        .await
+        .expect("relative wrapper stream");
+    let events = stream.collect::<Vec<_>>().await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Ok(ModelEvent::TextDelta { text }) if text == "done"))
+    );
+    assert!(events.iter().all(Result::is_ok));
+    let observed =
+        std::path::PathBuf::from(fs::read_to_string(observed).expect("wrapper cwd").trim());
+    assert_eq!(
+        observed.canonicalize().expect("actual cwd"),
+        work.canonicalize().expect("isolated cwd")
+    );
 }

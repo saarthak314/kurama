@@ -94,13 +94,13 @@ pub(crate) fn highlight_code(code: &str, language: &str) -> Option<Vec<Highlight
 
         let first = rest.as_bytes()[0];
         if first.is_ascii_digit() {
-            let length = take_number(rest);
+            let length = take_number(rest, language);
             push_span(&mut spans, &rest[..length], Style::default().fg(NUMBER));
             offset += length;
             continue;
         }
         if is_identifier_start(first) {
-            let length = take_identifier(rest);
+            let length = take_identifier(rest, language);
             let word = &rest[..length];
             let tail = rest[length..].trim_start();
             let style = if is_keyword(language, word) {
@@ -260,25 +260,206 @@ fn take_line(value: &str) -> usize {
     value.find('\n').unwrap_or(value.len())
 }
 
-fn take_number(value: &str) -> usize {
-    value
-        .as_bytes()
-        .iter()
-        .take_while(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'+' | b'-')
-        })
-        .count()
+fn take_number(value: &str, language: Language) -> usize {
+    let bytes = value.as_bytes();
+    let radix = if bytes[0] == b'0' {
+        match bytes.get(1) {
+            Some(b'x') if !matches!(language, Language::Json | Language::Markdown) => 16,
+            Some(b'X')
+                if !matches!(
+                    language,
+                    Language::Rust
+                        | Language::Toml
+                        | Language::Yaml
+                        | Language::Json
+                        | Language::Markdown
+                ) =>
+            {
+                16
+            }
+            Some(b'b' | b'B')
+                if matches!(
+                    language,
+                    Language::JavaScript
+                        | Language::TypeScript
+                        | Language::Python
+                        | Language::Go
+                        | Language::C
+                        | Language::Cpp
+                ) || (bytes[1] == b'b'
+                    && matches!(language, Language::Rust | Language::Toml)) =>
+            {
+                2
+            }
+            Some(b'o' | b'O')
+                if matches!(
+                    language,
+                    Language::JavaScript | Language::TypeScript | Language::Python | Language::Go
+                ) || (bytes[1] == b'o'
+                    && matches!(language, Language::Rust | Language::Toml | Language::Yaml)) =>
+            {
+                8
+            }
+            _ => 10,
+        }
+    } else {
+        10
+    };
+    let start = if radix == 10 { 0 } else { 2 };
+    let (mut offset, has_digits) = take_digits(bytes, start, radix, language);
+    if !has_digits {
+        return 1;
+    }
+
+    let integer_end = offset;
+    let hex_float = radix == 16 && matches!(language, Language::C | Language::Cpp | Language::Go);
+    let float_allowed = (radix == 10 && language != Language::Shell) || hex_float;
+    if float_allowed && bytes.get(offset) == Some(&b'.') {
+        let next = bytes.get(offset + 1).copied();
+        let fraction_allowed = match language {
+            Language::Json | Language::Toml => next.is_some_and(|byte| byte.is_ascii_digit()),
+            Language::Rust => !next
+                .is_some_and(|byte| byte == b'.' || is_identifier_start(byte) || !byte.is_ascii()),
+            _ => next != Some(b'.'),
+        };
+        if fraction_allowed {
+            offset = take_digits(bytes, offset + 1, radix, language).0;
+        }
+    }
+    let mut has_exponent = false;
+    let exponent_marker = if hex_float { b'p' } else { b'e' };
+    if float_allowed
+        && bytes
+            .get(offset)
+            .is_some_and(|byte| byte.to_ascii_lowercase() == exponent_marker)
+    {
+        let mut exponent_start = offset + 1;
+        if matches!(bytes.get(exponent_start), Some(b'+' | b'-')) {
+            exponent_start += 1;
+        }
+        let (end, has_digits) = take_digits(bytes, exponent_start, 10, language);
+        if has_digits {
+            offset = end;
+            has_exponent = true;
+        }
+    }
+    // Hexadecimal fractions require a binary exponent; leave a following dot alone otherwise.
+    if hex_float && !has_exponent {
+        offset = integer_end;
+    }
+    let is_float = offset != integer_end;
+    let suffix_length = take_identifier(&value[offset..], language);
+    let suffix = &value[offset..offset + suffix_length];
+    let valid_suffix = match language {
+        Language::Rust => {
+            (radix == 10 && matches!(suffix, "f32" | "f64"))
+                || (!is_float
+                    && matches!(
+                        suffix,
+                        "i8" | "i16"
+                            | "i32"
+                            | "i64"
+                            | "i128"
+                            | "isize"
+                            | "u8"
+                            | "u16"
+                            | "u32"
+                            | "u64"
+                            | "u128"
+                            | "usize"
+                    ))
+        }
+        Language::JavaScript | Language::TypeScript => !is_float && suffix == "n",
+        Language::Python => radix == 10 && matches!(suffix, "j" | "J"),
+        Language::Go => suffix == "i",
+        Language::C | Language::Cpp if is_float => matches!(suffix, "f" | "F" | "l" | "L"),
+        Language::C | Language::Cpp => matches!(
+            suffix,
+            "u" | "U"
+                | "l"
+                | "L"
+                | "ll"
+                | "LL"
+                | "ul"
+                | "uL"
+                | "Ul"
+                | "UL"
+                | "lu"
+                | "lU"
+                | "Lu"
+                | "LU"
+                | "ull"
+                | "uLL"
+                | "Ull"
+                | "ULL"
+                | "llu"
+                | "llU"
+                | "LLu"
+                | "LLU"
+        ),
+        _ => false,
+    };
+    if valid_suffix
+        && value
+            .as_bytes()
+            .get(offset + suffix_length)
+            .is_none_or(u8::is_ascii)
+    {
+        offset += suffix_length;
+    }
+    offset
+}
+
+fn take_digits(bytes: &[u8], start: usize, radix: u8, language: Language) -> (usize, bool) {
+    let is_digit = |byte: u8| match radix {
+        2 => matches!(byte, b'0' | b'1'),
+        8 => matches!(byte, b'0'..=b'7'),
+        16 => byte.is_ascii_hexdigit(),
+        _ => byte.is_ascii_digit(),
+    };
+    let separator = match language {
+        Language::Rust
+        | Language::JavaScript
+        | Language::TypeScript
+        | Language::Python
+        | Language::Toml
+        | Language::Go => Some(b'_'),
+        Language::C | Language::Cpp => Some(b'\''),
+        _ => None,
+    };
+    let mut offset = start;
+    let mut has_digits = false;
+    while let Some(&byte) = bytes.get(offset) {
+        if is_digit(byte) {
+            has_digits = true;
+        } else if Some(byte) != separator
+            || !(language == Language::Rust
+                || ((has_digits
+                    || (start == 2
+                        && radix != 10
+                        && matches!(language, Language::Python | Language::Go)))
+                    && bytes.get(offset + 1).is_some_and(|&next| is_digit(next))))
+        {
+            break;
+        }
+        offset += 1;
+    }
+    (offset, has_digits)
 }
 
 fn is_identifier_start(byte: u8) -> bool {
     byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$')
 }
 
-fn take_identifier(value: &str) -> usize {
+fn take_identifier(value: &str, language: Language) -> usize {
     value
         .as_bytes()
         .iter()
-        .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'-'))
+        .take_while(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'_' | b'$')
+                || (**byte == b'-' && matches!(language, Language::Toml | Language::Yaml))
+        })
         .count()
 }
 
@@ -677,6 +858,126 @@ fn push_span(spans: &mut Vec<HighlightedSpan>, content: &str, style: Style) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_highlighted_spans(source: &str, language: &str, expected: &[(&str, Color)]) {
+        let spans = highlight_code(source, language).expect("known language");
+        let actual = spans
+            .iter()
+            .map(|span| (span.content.as_str(), span.style))
+            .collect::<Vec<_>>();
+        let expected = expected
+            .iter()
+            .map(|&(content, color)| (content, Style::default().fg(color)))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "{language}: {source}");
+        let reconstructed = spans
+            .iter()
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        assert_eq!(reconstructed, source, "{language}: source reconstruction");
+    }
+
+    #[test]
+    fn arithmetic_operators_and_identifiers_end_numbers() {
+        for language in ["rust", "javascript", "typescript"] {
+            assert_highlighted_spans(
+                "1+value",
+                language,
+                &[("1", NUMBER), ("+value", Color::Reset)],
+            );
+            assert_highlighted_spans("1-foo", language, &[("1", NUMBER), ("-foo", Color::Reset)]);
+            assert_highlighted_spans(
+                "1value",
+                language,
+                &[("1", NUMBER), ("value", Color::Reset)],
+            );
+            assert_highlighted_spans(
+                "foo-bar()",
+                language,
+                &[
+                    ("foo-", Color::Reset),
+                    ("bar", FUNCTION),
+                    ("()", Color::Reset),
+                ],
+            );
+            assert_highlighted_spans("1e-3", language, &[("1e-3", NUMBER)]);
+            assert_highlighted_spans(
+                "1e-3+value",
+                language,
+                &[("1e-3", NUMBER), ("+value", Color::Reset)],
+            );
+            assert_highlighted_spans(
+                "1e+foo",
+                language,
+                &[("1", NUMBER), ("e+foo", Color::Reset)],
+            );
+            assert_highlighted_spans(
+                "1..2",
+                language,
+                &[("1", NUMBER), ("..", Color::Reset), ("2", NUMBER)],
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_radices_and_suffixes_are_language_aware() {
+        assert_highlighted_spans(
+            "0xff_u8+value",
+            "rust",
+            &[("0xff_u8", NUMBER), ("+value", Color::Reset)],
+        );
+        assert_highlighted_spans(
+            "0xff_u8",
+            "javascript",
+            &[("0xff", NUMBER), ("_u8", Color::Reset)],
+        );
+        assert_highlighted_spans(
+            "1n-value",
+            "javascript",
+            &[("1n", NUMBER), ("-value", Color::Reset)],
+        );
+        assert_highlighted_spans("1n", "rust", &[("1", NUMBER), ("n", Color::Reset)]);
+        assert_highlighted_spans(
+            "1name",
+            "javascript",
+            &[("1", NUMBER), ("name", Color::Reset)],
+        );
+        assert_highlighted_spans("0xface", "json", &[("0", NUMBER), ("xface", Color::Reset)]);
+        assert_highlighted_spans(
+            "0x1.fp-3+value",
+            "c",
+            &[("0x1.fp-3", NUMBER), ("+value", Color::Reset)],
+        );
+        assert_highlighted_spans(
+            "1.foo()",
+            "rust",
+            &[
+                ("1", NUMBER),
+                (".", Color::Reset),
+                ("foo", FUNCTION),
+                ("()", Color::Reset),
+            ],
+        );
+    }
+
+    #[test]
+    fn configuration_keys_keep_hyphens_and_source_bytes() {
+        for (language, source, separator) in [
+            ("yaml", "some-key: \"café\"\n", ": "),
+            ("toml", "some-key = \"café\"\n", " = "),
+        ] {
+            assert_highlighted_spans(
+                source,
+                language,
+                &[
+                    ("some-key", FUNCTION),
+                    (separator, Color::Reset),
+                    ("\"café\"", STRING),
+                    ("\n", Color::Reset),
+                ],
+            );
+        }
+    }
 
     #[test]
     fn toml_literal_strings_use_string_style() {

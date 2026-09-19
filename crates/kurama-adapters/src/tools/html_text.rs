@@ -28,19 +28,26 @@ pub fn html_to_text(html: &str) -> String {
             let tag = tag_name(raw);
             let self_closing = raw.ends_with('/');
 
-            if !closing && DROPPED_TAGS.contains(&tag.as_str()) {
-                index = skip_dropped_element(html, tag_end + 1, &tag);
+            if !closing
+                && DROPPED_TAGS
+                    .iter()
+                    .any(|dropped| tag.eq_ignore_ascii_case(dropped))
+            {
+                index = skip_dropped_element(html, tag_end + 1, tag);
                 continue;
             }
-            if tag == "br" {
+            if tag.eq_ignore_ascii_case("br") {
                 output.newline();
-            } else if tag == "pre" {
+            } else if tag.eq_ignore_ascii_case("pre") {
                 output.newline();
                 output.preformatted = !closing;
                 if closing {
                     output.newline();
                 }
-            } else if BLOCK_TAGS.contains(&tag.as_str()) {
+            } else if BLOCK_TAGS
+                .iter()
+                .any(|block| tag.eq_ignore_ascii_case(block))
+            {
                 output.newline();
                 if closing || self_closing {
                     output.newline();
@@ -104,12 +111,12 @@ impl TextOutput {
     }
 
     fn finish(mut self) -> String {
-        while self.value.ends_with(char::is_whitespace) {
-            self.value.pop();
+        self.value.truncate(self.value.trim_end().len());
+        let leading = self.value.len() - self.value.trim_start().len();
+        if leading != 0 {
+            drop(self.value.drain(..leading));
         }
         self.value
-            .trim_start_matches(char::is_whitespace)
-            .to_owned()
     }
 }
 
@@ -126,22 +133,27 @@ fn find_tag_end(html: &str, start: usize) -> Option<usize> {
     None
 }
 
-fn tag_name(raw: &str) -> String {
-    raw.trim_start_matches(['/', '!', '?'])
-        .chars()
-        .take_while(|character| character.is_ascii_alphanumeric() || *character == '-')
-        .collect::<String>()
-        .to_ascii_lowercase()
+fn tag_name(raw: &str) -> &str {
+    let name = raw.trim_start_matches(['/', '!', '?']);
+    let end = name
+        .bytes()
+        .position(|byte| !byte.is_ascii_alphanumeric() && byte != b'-')
+        .unwrap_or(name.len());
+    &name[..end]
 }
 
 fn skip_dropped_element(html: &str, start: usize, tag: &str) -> usize {
-    let closing = format!("</{tag}");
-    let remaining = &html[start..];
-    let Some(offset) = find_ascii_case_insensitive(remaining, &closing) else {
-        return html.len();
-    };
-    let closing_start = start + offset;
-    find_tag_end(html, closing_start + closing.len())
+    let name_end = tag.len() + 2;
+    let closing = html.as_bytes()[start..]
+        .windows(name_end + 1)
+        .position(|candidate| {
+            candidate.starts_with(b"</")
+                && candidate[2..name_end].eq_ignore_ascii_case(tag.as_bytes())
+                && (candidate[name_end].is_ascii_whitespace()
+                    || matches!(candidate[name_end], b'>' | b'/'))
+        });
+    closing
+        .and_then(|offset| find_tag_end(html, start + offset + name_end))
         .map(|end| end + 1)
         .unwrap_or(html.len())
 }
@@ -172,11 +184,4 @@ fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
     value
         .get(..prefix.len())
         .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
-}
-
-fn find_ascii_case_insensitive(value: &str, needle: &str) -> Option<usize> {
-    value
-        .as_bytes()
-        .windows(needle.len())
-        .position(|candidate| candidate.eq_ignore_ascii_case(needle.as_bytes()))
 }

@@ -23,7 +23,7 @@ impl RandomIds {
 
 impl IdGenerator for RandomIds {
     fn session_id(&self) -> SessionId {
-        Self::next::<4>("ses_").into()
+        Self::next::<16>("ses_").into()
     }
 
     fn agent_id(&self) -> AgentId {
@@ -42,4 +42,17 @@ impl IdGenerator for RandomIds {
 fn nibble(value: u8) -> char {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     char::from(DIGITS[value as usize])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_session_ids_retain_128_bits_of_randomness() {
+        let id = RandomIds.session_id();
+        let suffix = id.as_ref().strip_prefix("ses_").expect("session prefix");
+        assert_eq!(suffix.len(), 32);
+        assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
 }

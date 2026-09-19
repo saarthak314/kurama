@@ -72,40 +72,30 @@ impl CodexBridge {
         schema_path: &Path,
     ) -> BridgeCommand {
         let cursor = cursor.filter(|cursor| cursor.backend == BACKEND);
-        let mut args = if cursor.is_some() {
-            vec![
-                "exec".into(),
-                "resume".into(),
-                "--json".into(),
-                "--ignore-user-config".into(),
-                "--ignore-rules".into(),
-                "--skip-git-repo-check".into(),
-                "--output-schema".into(),
-                schema_path.display().to_string(),
-                "-m".into(),
-                request.profile.model.clone(),
-            ]
-        } else {
-            vec![
-                "exec".into(),
-                "--json".into(),
-                "--color".into(),
-                "never".into(),
-                "--sandbox".into(),
-                "read-only".into(),
-                "--ignore-user-config".into(),
-                "--ignore-rules".into(),
-                "--skip-git-repo-check".into(),
-                "-c".into(),
-                "web_search=\"disabled\"".into(),
-                "-C".into(),
-                bridge_dir.display().to_string(),
-                "--output-schema".into(),
-                schema_path.display().to_string(),
-                "-m".into(),
-                request.profile.model.clone(),
-            ]
-        };
+        let mut args = vec!["exec".into()];
+        args.extend([
+            "--color".into(),
+            "never".into(),
+            "--sandbox".into(),
+            "read-only".into(),
+            "-c".into(),
+            "web_search=\"disabled\"".into(),
+            "-C".into(),
+            bridge_dir.display().to_string(),
+        ]);
+        if cursor.is_some() {
+            args.push("resume".into());
+        }
+        args.extend([
+            "--json".into(),
+            "--ignore-user-config".into(),
+            "--ignore-rules".into(),
+            "--skip-git-repo-check".into(),
+            "--output-schema".into(),
+            schema_path.display().to_string(),
+            "-m".into(),
+            request.profile.model.clone(),
+        ]);
         for feature in DISABLED_NATIVE_FEATURES {
             args.push("--disable".into());
             args.push(feature.into());
@@ -114,12 +104,11 @@ impl CodexBridge {
             args.push(cursor.value.clone());
         }
         args.push("-".into());
-        args.shrink_to_fit();
         BridgeCommand {
             program: program.into(),
             args,
             stdin: bridge_prompt(request),
-            cwd: None,
+            cwd: Some(bridge_dir.to_path_buf()),
         }
     }
 
@@ -149,13 +138,37 @@ impl ModelBackend for CodexBridge {
     ) -> BoxFuture<'a, Result<ModelStream, KuramaError>> {
         Box::pin(async move {
             fs::create_dir_all(&self.bridge_dir)?;
-            write_control_schema(&self.schema_path, request.delegation.is_some())?;
+            let bridge_dir = std::path::absolute(&self.bridge_dir)?;
+            let mut schema_path = self.schema_path.as_os_str().to_owned();
+            schema_path.push(if request.delegation.is_some() {
+                ".delegation.json"
+            } else {
+                ".tools.json"
+            });
+            let schema_path = std::path::absolute(PathBuf::from(schema_path))?;
+            write_control_schema(&schema_path, request.delegation.is_some())?;
+            // The explicit child cwd must not change how a configured relative
+            // wrapper executable is located. Bare names still resolve via PATH.
+            let program_path = Path::new(&self.program);
+            let absolute_program;
+            let program = if program_path.is_relative()
+                && program_path
+                    .parent()
+                    .is_some_and(|parent| !parent.as_os_str().is_empty())
+            {
+                absolute_program = std::path::absolute(program_path)?;
+                absolute_program.to_str().ok_or_else(|| {
+                    KuramaError::Configuration("Codex executable path is not UTF-8".into())
+                })?
+            } else {
+                self.program.as_str()
+            };
             let command = Self::command_for_program(
-                &self.program,
+                program,
                 &request,
                 request.continuation.as_ref(),
-                &self.bridge_dir,
-                &self.schema_path,
+                &bridge_dir,
+                &schema_path,
             );
             super::event_stream(
                 command,

@@ -13,3 +13,6 @@ kurama-protocol = { path = "../kurama-protocol" }
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+parking_lot.workspace = true

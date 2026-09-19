@@ -248,3 +248,53 @@ fn validate_goal_objective(objective: &str) -> Result<String, String> {
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_product_commands_and_rejects_unsupported_actions() {
+        assert_eq!(parse_command("/agents").unwrap(), Command::Agents);
+        assert_eq!(
+            parse_command("/model openai-main").unwrap(),
+            Command::Model(Some("openai-main".into()))
+        );
+        assert_eq!(
+            parse_command("/resume ses_deadbeef").unwrap(),
+            Command::Resume(SessionId::from("ses_deadbeef"))
+        );
+        assert_eq!(
+            parse_command("/mode auto").unwrap(),
+            Command::Mode(ExecutionMode::Auto)
+        );
+        assert_eq!(parse_command("/help").unwrap(), Command::Help);
+        assert_eq!(parse_command("/copy").unwrap(), Command::Copy);
+        assert_eq!(parse_command("/diff").unwrap(), Command::Diff);
+        assert_eq!(parse_command("/status").unwrap(), Command::Status);
+        assert_eq!(
+            parse_command("/goal").unwrap(),
+            Command::Goal(GoalAction::View)
+        );
+        assert_eq!(
+            parse_command("/goal keep tests green").unwrap(),
+            Command::Goal(GoalAction::Set("keep tests green".into()))
+        );
+        assert_eq!(
+            parse_command("/goal set ship the e2e pass").unwrap(),
+            Command::Goal(GoalAction::Set("ship the e2e pass".into()))
+        );
+        assert_eq!(
+            parse_command("/goal view").unwrap(),
+            Command::Goal(GoalAction::View)
+        );
+        assert_eq!(
+            parse_command("/goal pause").unwrap(),
+            Command::Goal(GoalAction::Pause)
+        );
+        assert!(parse_command("/goal set").is_err());
+        assert_eq!(parse_command("/exit").unwrap(), Command::Exit);
+        assert!(parse_command("/restart").is_err());
+        assert!(parse_command("/mode yolo").is_err());
+    }
+}

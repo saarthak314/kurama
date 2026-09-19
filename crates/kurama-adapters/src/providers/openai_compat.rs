@@ -11,9 +11,7 @@ use zeroize::Zeroizing;
 
 use crate::http::{HttpClient, SseNormalizer, sse_model_stream};
 
-use super::{
-    chat_messages, chat_tools, normalize_delegation_events, provider_instructions, sse::SseDecoder,
-};
+use super::{chat_messages, chat_tools, normalize_delegation_events, provider_instructions};
 
 use super::endpoint_url;
 
@@ -30,11 +28,11 @@ pub struct OpenAiCompatBackend {
 }
 
 impl OpenAiCompatBackend {
-    pub fn new(http: HttpClient, endpoint: Url, api_key: Option<String>) -> Self {
+    pub fn new(http: HttpClient, endpoint: Url, api_key: Option<Zeroizing<String>>) -> Self {
         Self {
             http,
             endpoint,
-            api_key: api_key.map(Zeroizing::new),
+            api_key,
             parallel_tool_calls: None,
         }
     }
@@ -42,7 +40,7 @@ impl OpenAiCompatBackend {
     pub fn from_endpoint(
         http: HttpClient,
         endpoint: &str,
-        api_key: Option<String>,
+        api_key: Option<Zeroizing<String>>,
     ) -> Result<Self, KuramaError> {
         let endpoint = Url::parse(endpoint).map_err(|error| {
             KuramaError::Configuration(format!("OpenAI-compatible endpoint: {error}"))
@@ -58,7 +56,7 @@ impl OpenAiCompatBackend {
     pub fn request_body(request: &ModelRequest, parallel_tool_calls: Option<bool>) -> Value {
         let mut body = json!({
             "model": request.profile.model,
-            "messages": chat_messages_with_system(request),
+            "messages": chat_messages(request, &provider_instructions(request)),
             "tools": chat_tools(&request.tools),
             "max_tokens": request.profile.max_output_tokens,
             "stream": true,
@@ -68,22 +66,6 @@ impl OpenAiCompatBackend {
             body["parallel_tool_calls"] = Value::Bool(enabled);
         }
         body
-    }
-
-    pub fn parse_fixture(fixture: &str) -> Result<Vec<ModelEvent>, KuramaError> {
-        let mut decoder = SseDecoder::default();
-        let mut normalizer = CompatNormalizer::default();
-        let mut events = Vec::new();
-        for byte in fixture.as_bytes() {
-            for event in decoder.push(&[*byte])? {
-                events.extend(normalizer.push(&event.data)?);
-            }
-        }
-        for event in decoder.finish()? {
-            events.extend(normalizer.push(&event.data)?);
-        }
-        events.extend(normalizer.finish()?);
-        Ok(events)
     }
 }
 
@@ -353,10 +335,4 @@ impl SseNormalizer for CompatNormalizer {
     fn finish(&mut self) -> Result<Vec<ModelEvent>, KuramaError> {
         CompatNormalizer::finish(self)
     }
-}
-
-fn chat_messages_with_system(request: &ModelRequest) -> Vec<Value> {
-    let mut request = request.clone();
-    request.system = provider_instructions(&request);
-    chat_messages(&request)
 }

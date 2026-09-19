@@ -1,8 +1,11 @@
-use std::{fs, time::UNIX_EPOCH};
+use std::{fs, io::Read, sync::atomic::AtomicBool, time::UNIX_EPOCH};
+
+use crate::fs_safe::{blocking, checkpoint};
+use sha2::{Digest, Sha256};
 
 use super::{
     BoundedOutput, PathGuard,
-    limits::{sha256_hex, staged_output, take_truncated_staging},
+    limits::{staged_output, take_truncated_staging},
 };
 use kurama_protocol::{
     KuramaError,
@@ -13,6 +16,7 @@ use serde::Deserialize;
 
 const MAX_FILES: usize = 16;
 const MAX_PRE_READ_BYTES: u64 = 16 * 1024 * 1024;
+const SCAN_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Default)]
 pub struct ReadTool {
@@ -33,6 +37,7 @@ struct ReadFile {
     end_byte: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
 enum RequestedRange {
     Lines { start: usize, end: usize },
     Bytes { start: usize, end: usize },
@@ -80,20 +85,15 @@ impl Tool for ReadTool {
     ) -> Result<Operation, KuramaError> {
         let arguments = parse_arguments(invocation)?;
         let guard = PathGuard::new(context)?;
-        let mut selected = None;
+        let mut paths = Vec::with_capacity(arguments.files.len());
         let mut external = false;
         for file in arguments.files {
             validate_range(&file)?;
             let path = guard.resolve_existing_file(&file.path)?;
-            if selected.is_none() || path.external {
-                selected = Some(path.absolute);
-            }
+            paths.push(path.absolute);
             external |= path.external;
         }
-        Ok(Operation::Read {
-            path: selected.expect("validated non-empty files"),
-            external,
-        })
+        Ok(Operation::Read { paths, external })
     }
 
     fn execute<'a>(
@@ -102,32 +102,26 @@ impl Tool for ReadTool {
         invocation: ToolInvocation,
         cancel: &'a dyn CancelSignal,
     ) -> BoxFuture<'a, Result<ToolResult, KuramaError>> {
-        Box::pin(async move {
-            if cancel.is_cancelled() {
-                return Err(KuramaError::Cancelled);
-            }
+        Box::pin(blocking(cancel, move |cancel| {
             let arguments = parse_arguments(&invocation)?;
             let guard = PathGuard::new(&context)?;
             let mut aggregate = staged_output(context.limits, "read", "output")?;
             let mut files = Vec::with_capacity(arguments.files.len());
 
             for file in arguments.files {
-                if cancel.is_cancelled() {
-                    return Err(KuramaError::Cancelled);
-                }
+                checkpoint(&cancel)?;
                 let range = validate_range(&file)?;
-                let guarded = guard.resolve_existing_file(&file.path)?;
-                let metadata = fs::metadata(&guarded.absolute)?;
+                let guarded = guard.resolve_existing(&file.path)?;
+                let mut input = guarded.open_file()?;
+                let metadata = input.metadata()?;
                 if metadata.len() > MAX_PRE_READ_BYTES {
                     return Err(KuramaError::Tool(format!(
                         "file exceeds {MAX_PRE_READ_BYTES} byte read ceiling: {}",
                         guarded.absolute.display()
                     )));
                 }
-                let bytes = fs::read(&guarded.absolute)?;
-                let sha256 = sha256_hex(&bytes);
-                let utf8 = std::str::from_utf8(&bytes).is_ok();
-                let (selected, range_metadata) = select_range(&bytes, range)?;
+                let scan = select_range(&mut input, range, &cancel)?;
+                let selected = scan.selected.as_slice();
                 let mut bounded = BoundedOutput::new(context.limits);
                 bounded.push(selected);
                 let bounded = bounded.finish();
@@ -142,19 +136,20 @@ impl Tool for ReadTool {
                     "path": file.path,
                     "absolute_path": guarded.absolute,
                     "external": guarded.external,
-                    "range": range_metadata,
-                    "total_bytes": bytes.len(),
+                    "range": scan.range,
+                    "total_bytes": scan.total_bytes,
                     "selected_bytes": selected.len(),
                     "modified_unix_ms": modified_unix_ms(&metadata),
-                    "sha256": sha256,
-                    "utf8": utf8,
-                    "lossy": !utf8,
+                    "sha256": scan.sha256,
+                    "utf8": scan.utf8,
+                    "lossy": !scan.utf8,
                     "truncated": bounded.truncated,
                     "omitted_bytes": bounded.omitted_bytes,
                     "omitted_lines": bounded.omitted_lines
                 }));
             }
 
+            checkpoint(&cancel)?;
             let mut aggregate = aggregate.finish();
             let staged_path = take_truncated_staging(&mut aggregate)?;
             let mut metadata = serde_json::json!({
@@ -177,7 +172,7 @@ impl Tool for ReadTool {
                 truncated: aggregate.truncated,
                 blob_refs: Vec::new(),
             })
-        })
+        }))
     }
 }
 
@@ -221,53 +216,111 @@ fn validate_range(file: &ReadFile) -> Result<RequestedRange, KuramaError> {
     }
 }
 
+struct SelectedRange {
+    selected: Vec<u8>,
+    range: serde_json::Value,
+    total_bytes: usize,
+    sha256: String,
+    utf8: bool,
+}
+
 fn select_range(
-    bytes: &[u8],
+    input: &mut impl Read,
     range: RequestedRange,
-) -> Result<(&[u8], serde_json::Value), KuramaError> {
-    match range {
-        RequestedRange::Bytes { start, end } => {
-            if end > bytes.len() {
-                return Err(KuramaError::Tool(format!(
-                    "byte range {start}..{end} exceeds file length {}",
-                    bytes.len()
-                )));
-            }
-            Ok((
-                &bytes[start..end],
-                serde_json::json!({"kind": "bytes", "start": start, "end": end}),
-            ))
+    cancel: &AtomicBool,
+) -> Result<SelectedRange, KuramaError> {
+    let mut selected = Vec::new();
+    let mut digest = Sha256::new();
+    let mut total_bytes = 0_usize;
+    let mut line = 1_usize;
+    let mut terminal_newline = false;
+    let mut utf8 = true;
+    let mut pending = 0;
+    let mut buffer = [0_u8; SCAN_BYTES + 3];
+    loop {
+        checkpoint(cancel)?;
+        let count = match input.read(&mut buffer[pending..pending + SCAN_BYTES]) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            break;
         }
-        RequestedRange::Lines { start, end } => {
-            let mut starts = vec![0];
-            for (index, &byte) in bytes.iter().enumerate() {
-                if byte == b'\n' && index + 1 < bytes.len() {
-                    starts.push(index + 1);
+        let next_total = total_bytes
+            .checked_add(count)
+            .filter(|total| *total as u64 <= MAX_PRE_READ_BYTES)
+            .ok_or_else(|| {
+                KuramaError::Tool(format!(
+                    "file exceeds {MAX_PRE_READ_BYTES} byte read ceiling"
+                ))
+            })?;
+        let bytes = &buffer[pending..pending + count];
+        digest.update(bytes);
+        match range {
+            RequestedRange::Bytes { start, end } => {
+                let first = start.saturating_sub(total_bytes).min(count);
+                let last = end.saturating_sub(total_bytes).min(count);
+                selected.extend_from_slice(&bytes[first..last]);
+            }
+            RequestedRange::Lines { start, end } => {
+                for part in bytes.split_inclusive(|byte| *byte == b'\n') {
+                    if (start..=end).contains(&line) {
+                        selected.extend_from_slice(part);
+                    }
+                    if part.last() == Some(&b'\n') {
+                        line += 1;
+                    }
                 }
             }
-            if bytes.is_empty() || start > starts.len() {
-                return Err(KuramaError::Tool(format!(
-                    "line {start} exceeds file line count {}",
-                    starts.len().saturating_sub(usize::from(bytes.is_empty()))
-                )));
+        }
+        terminal_newline = bytes.last() == Some(&b'\n');
+        total_bytes = next_total;
+        if utf8 {
+            let length = pending + count;
+            match std::str::from_utf8(&buffer[..length]) {
+                Ok(_) => pending = 0,
+                Err(error) if error.error_len().is_none() => {
+                    pending = length - error.valid_up_to();
+                    buffer.copy_within(error.valid_up_to()..length, 0);
+                }
+                Err(_) => {
+                    utf8 = false;
+                    pending = 0;
+                }
             }
-            let actual_end = end.min(starts.len());
-            let start_offset = starts[start - 1];
-            let end_offset = if actual_end < starts.len() {
-                starts[actual_end]
-            } else {
-                bytes.len()
-            };
-            Ok((
-                &bytes[start_offset..end_offset],
-                serde_json::json!({
-                    "kind": "lines",
-                    "start": start,
-                    "end": actual_end
-                }),
-            ))
         }
     }
+    utf8 &= pending == 0;
+    let range = match range {
+        RequestedRange::Bytes { start, end } => {
+            if end > total_bytes {
+                return Err(KuramaError::Tool(format!(
+                    "byte range {start}..{end} exceeds file length {total_bytes}"
+                )));
+            }
+            serde_json::json!({"kind": "bytes", "start": start, "end": end})
+        }
+        RequestedRange::Lines { start, end } => {
+            let lines = if total_bytes == 0 {
+                0
+            } else {
+                line - usize::from(terminal_newline)
+            };
+            if start > lines {
+                return Err(KuramaError::Tool(format!(
+                    "line {start} exceeds file line count {lines}"
+                )));
+            }
+            serde_json::json!({"kind": "lines", "start": start, "end": end.min(lines)})
+        }
+    };
+    Ok(SelectedRange {
+        selected,
+        range,
+        total_bytes,
+        sha256: crate::id::hexadecimal("", digest.finalize().as_ref()),
+        utf8,
+    })
 }
 
 fn modified_unix_ms(metadata: &fs::Metadata) -> u64 {
@@ -277,4 +330,29 @@ fn modified_unix_ms(metadata: &fs::Metadata) -> u64 {
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streamed_growth_cannot_bypass_the_read_ceiling_for_a_tiny_selection() {
+        struct GrowingFile(usize);
+        impl Read for GrowingFile {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                let count = bytes.len().min(self.0);
+                bytes[..count].fill(b'x');
+                self.0 -= count;
+                Ok(count)
+            }
+        }
+        let mut input = GrowingFile(MAX_PRE_READ_BYTES as usize + 1);
+        let result = select_range(
+            &mut input,
+            RequestedRange::Bytes { start: 0, end: 1 },
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(result, Err(KuramaError::Tool(_))));
+    }
 }

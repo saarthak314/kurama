@@ -10,7 +10,6 @@ use kurama_protocol::policy::ApprovalRequest;
 #[derive(Debug, Clone)]
 pub struct ApprovalState {
     pub request: ApprovalRequest,
-    pub arguments: serde_json::Value,
     pub editor: String,
     pub editor_cursor: usize,
     pub validation_error: Option<String>,
@@ -21,11 +20,10 @@ pub struct ApprovalState {
 
 impl ApprovalState {
     pub fn new(request: ApprovalRequest) -> Self {
-        let arguments = request.arguments.clone();
-        let editor = serde_json::to_string_pretty(&arguments).unwrap_or_else(|_| "{}".into());
+        let editor =
+            serde_json::to_string_pretty(&request.arguments).unwrap_or_else(|_| "{}".into());
         Self {
             request,
-            arguments,
             editor_cursor: editor.len(),
             editor,
             validation_error: None,

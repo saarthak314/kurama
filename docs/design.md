@@ -26,6 +26,11 @@ The standard binary exposes exactly four environment tools: `read`, `write`, `ba
 - The canonical in-memory event history remains authoritative for model context. Turn ranges, latest user/goal/todo positions, and evidence positions are maintained on append and rebuilt on replay. Live delegation detection does not reread the filesystem log. Recent completed turns fit as whole units or are omitted; current-turn content and the active goal keep their budget priority.
 - Explicit compaction carries the active summary as model input data alongside newly eligible events, excluding superseded compaction records. Both count toward the input allowance; oversized requests fail before contacting the backend or changing durable coverage. Compaction remains explicit, not automatic.
 - Assistant text flushes at a UTF-8-safe 4 KiB boundary or a 50 ms pending-text deadline, and at response termination. Chunking copies each emitted byte once rather than repeatedly moving the remaining suffix. No timer runs while the buffer is empty. Provider adapters may buffer their own control responses; runtime consumers must drain the bounded event channel. Received token usage is persisted before fallible display delivery.
+- Child launch order follows plan registration order, not random ID sorting. SDK artifact collection reuses the completed child's replay rather than loading it again. In-memory and filesystem stores both reject duplicate session creation and report the latest parent/child event timestamp.
+- Configuration updates hold stable transaction locks; bootstrap remembers profile/session/mode in one durable transaction. Session creation publishes a complete synced directory and syncs its parents. Clean log scans use shared locks, reacquiring and rechecking under an exclusive lock before repair.
+- Unix filesystem operations retain directory descriptors and reject symlink redirection. Cooperating writers serialize on the parent directory, without creating project lock files. This is not an atomic snapshot/CAS guarantee against unrelated writers modifying opened files or ignoring locks. Unsupported platforms fail closed.
+- Reads stream hash/UTF-8 validation while retaining only the requested range. Deduplicated blobs are verified in chunks. Read/write transactions run off the async scheduler with cancellation checkpoints; an already-committed rename never becomes a cancelled result. Individual filesystem syscalls and diff computation are not forcibly interruptible.
+- Display staging is lazy and disposable, with no staging fsync. Canonical sessions, configuration, and blobs retain their durability syncs. Tool output ceilings include notes and labels, while raw recovery streams retain their exact bytes.
 
 ## Terminal interface
 
@@ -38,6 +43,10 @@ Code blocks display highlighted code without backtick fences or language labels.
 The mouse wheel scrolls transcript output in both normal and expanded views without changing the composer draft or prompt history. Left-drag highlights text and copies it on release. A high-contrast green `Copied N chars` badge confirms the count of Unicode characters copied, including newlines; `Esc` clears selection and feedback. The same badge appears in normal and expanded views and after `/copy`. Selected text preserves Unicode graphemes, indentation, and multiline order. The transcript stays visually stable while the pointer is held even as the engine continues processing events. `Ctrl+L` returns the normal view to the latest output. Mouse reporting includes motion only while a button is held, never all-pointer motion, and is restored on exit. Opening a link does not block terminal input while the desktop handler runs.
 
 In the input bar, click to position the caret or drag to select and copy text. Typing or pasting replaces an input selection. Wrapped and multiline drafts keep stable hit positions and whole Unicode characters. Up/Down recall previous/next prompts, including the resumed session's history; returning past the newest prompt restores the unfinished draft and its caret. Alt+Up/Down move within multiline input, while file and command pickers retain their arrow-key navigation.
+
+Home/End operate on the current logical input line; Ctrl+A/E retain whole-buffer movement. Onboarding fields support the same grapheme-safe middle editing and keep secrets masked. Shortcuts and agent transcripts scroll at short heights; agent lists support page/Home/End navigation. Expanded transcript Tab/Shift+Tab selects visible links, Enter opens them, and `y` copies their targets.
+
+File completion is indexed off the render thread, refreshed on reopening a mention or workspace-mutating tools, and cooperatively cancelled when its app loop ends. Admission is deterministic and bounded to 400 files/directories and depth six; useful dot directories such as `.github` are included. Image paths and base64 are checked against the 8 MiB limit before payload allocation; failed raw-base64 guesses still allow valid image filenames.
 
 Enter submits a new prompt when idle and steers the active turn while working. Steering is applied between complete model/tool/delegation batches, not halfway through a tool call or an internal provider retry. Alt+Enter queues a separate follow-up. `/queue` selects, edits, and deletes follow-ups; Enter saves an edit without turning it into steering, and Esc restores the original draft. Interrupted queues stay paused until `s` resumes them. Both pending-input queues are bounded to 32 entries and 256 KiB; rejected or unapplied cancelled steering returns to the draft instead of running automatically. Applied steering is recorded in the current durable turn.
 
@@ -56,28 +65,29 @@ Every input event gives ready runtime/tool events a bounded processing opportuni
 ### Reproducing terminal checks
 
 ```sh
-cargo build --locked --release -p kurama-cli --bin kurama --example tui_bench --example control_plane_bench
-target/release/examples/tui_bench --turns 1000 --frames 100 --repetitions 5
-uv run --with pyte scripts/check-tui.py target/release/kurama .lavish/tui-check --no-images
-uv run --with pyte scripts/check-tui.py target/release/kurama .lavish/tui-no-cpr --no-images --no-cpr --seed-todos
-uv run --with pyte scripts/check-tui.py target/release/kurama .lavish/tui-recovery --no-images --torn-tail --seed-large-output-mib 8 --check-compaction
-uv run --with pyte scripts/check-tui.py target/release/kurama .lavish/tui-controls --no-images --check-controls
+cargo build --locked --release -p kurama-cli --bin kurama --examples
+target/release/examples/tui_bench --turns 1000 --frames 100 --repetitions 5 --width 100 --height 36
+uv run --with pyte scripts/check-tui.py target/release/kurama target/verification/tui-normal --no-images --check-controls
+uv run --with pyte scripts/check-tui.py target/release/kurama target/verification/tui-no-cpr --no-images --no-cpr --seed-todos --check-controls
+uv run --with pyte scripts/check-tui.py target/release/kurama target/verification/tui-recovery --no-images --torn-tail --seed-large-output-mib 8 --check-compaction --check-controls
+uv run --with pyte scripts/check-tui.py target/release/kurama target/verification/tui-vt100 --no-images --term vt100 --check-controls
 python3 scripts/bench-startup.py target/release/kurama
 python3 scripts/bench-idle.py target/release/kurama
-python3 scripts/bench-harness.py --bin-dir target/release/examples --output-dir .lavish/harness-measurements
+python3 scripts/bench-harness.py --bin-dir target/release/examples --output-dir target/verification/harness-run --include-adapters
+python3 scripts/test-verification.py
 ```
 
 The POSIX terminal gate drives the production binary through a PTY and a local SSE provider. It exercises multiline paste, read/write approval, Markdown and tool-output wrapping at 48×14, 72×18, and 120×40, narrower approval layouts, transcript browsing, draft preservation across overlay resize/dismissal, long output, and optional resumed todo navigation at 24×6. It requires bottom-anchored input/footer, exact write contents, successful tool results, one alternate-screen entry/exit, restored shell content and terminal modes, no cursor-position queries, and no scrollback purge. Add `--with pillow` to the `uv` invocation and omit `--no-images` for screenshots decoded from the PTY stream; these are not native terminal-window captures. These Python dependencies are development-only.
 
 The same gate checks fence-free code, real SGR click/drag/release handling, exact copied text and URL dispatch, visible selection feedback, drag-versus-click behavior, wheel navigation without draft changes, narrow resize while browsing, older-response separators, no latest-response separator, and restored mouse reporting modes. Isolated clipboard and URL-handler executables prevent desktop side effects in CI. Unit regressions cover link hit targets, Unicode selection, stale coordinates, selection during streaming, separator spacing, and incremental cache invalidation.
 
-`--check-controls` adds actual-provider-request assertions for selected-hunk feedback, model/tool-boundary steering, editable/deletable queued follow-ups, cancelled steering returned to the draft, and context inspection while idle, streaming, and running a tool. It captures normal and narrow inspector/diff views. The harness opens isolated PTYs rather than desktop terminal windows and closes the child process, PTY descriptors, and fixture server on success or failure.
+`--check-controls` checks actual provider requests for hunk feedback, safe-boundary steering, editable/deletable follow-ups, cancelled input restoration, and model-free context inspection. It also exercises short-height shortcuts, keyboard links, refreshed file mentions, bounded image attachment, onboarding/input editing, and live agent list/transcript navigation. The harness creates isolated PTYs, not desktop terminal windows. It closes process groups, PTY descriptors, and the fixture server on success, failure, and setup errors. Output directories must be empty so screenshots cannot silently survive from an older run.
 
 The combined recovery scenario seeds a complete tool lifecycle and a large display blob, adds a torn log suffix, resumes, expands/collapses full output, compacts twice around another turn, then exercises real read/write approval and transcript controls. It checks contiguous repaired history, exactly one repair, and the first decision in both compaction model requests and the final durable summary. It also reports observed composer readiness and process RSS before expansion, while expanded, and after collapse; fixture construction is outside the readiness interval.
 
-`tui_bench` measures the production `App` event loop with deterministic input and Ratatui's `TestBackend`, plus the compact-preview renderer. Compare identical benchmark source and release settings, run sequentially in alternating order, and retain raw samples. It isolates rendering work, not real-terminal paint time or model latency. The startup gate measures first terminal bytes, not interactive readiness; the PTY gate separately records composer readiness and verifies startup without cursor-position reports. The idle gate requires a live process before accepting RSS/CPU samples.
+`tui_bench` measures the production `App` event loop for scrolling, ignored events, history/file palettes, and interleaved tool streaming/input. Its separately labelled `compact_tool_preview` case is a full transcript rebuild, not cached steady-state rendering. `--width/--height` allow identical narrow/wide comparisons. `adapter_bench` covers fragmented/burst SSE decoding, tag-dense HTML, large request construction, small/large output bounds, and a first-line read that still hashes a 16 MiB file. Compare identical benchmark source/release settings, alternate retained binaries sequentially, and retain raw samples. These isolate local overhead, not model or network latency.
 
-PR CI runs the real PTY checks with normal cursor reports and without reports plus resumed todos. Nightly runs actual PTYs on Linux and macOS, including the combined repair/large-output/compaction scenario. It also runs the release control-plane and rendering benchmarks sequentially through `bench-harness.py`. The standard-library runner retains exact stdout/stderr, per-child CPU and peak RSS, binary hashes, and host/toolchain provenance; malformed results, child failures, and watchdog timeouts fail the run without skipping the second benchmark. Raw artifacts upload even on failure. Shared runners have no brittle absolute rendering-latency threshold.
+PR CI runs one locked all-features workspace suite and actual PTY controls. Nightly tests real `xterm-256color`, `screen-256color`, and `vt100` PTYs on Linux/macOS, plus repair/large-output/compaction. Startup samples restore identical configured state (not cold OS caches); idle measurements drain the PTY and use process-CPU deltas over three windows. The benchmark runner retains raw output, exact-child CPU/peak RSS, hashes, provenance, and failure/timeout records, and cleans residual process groups before the next benchmark. It does not claim accounting for unawaited descendants or impose fragile absolute rendering thresholds on shared runners.
 
 The terminal layout takes cues from [Pi's interactive interface](https://github.com/earendil-works/pi/tree/main/packages/coding-agent#interactive-mode): progressive tool disclosure, unboxed assistant text, and a restrained operational footer. Kurama retains its own workspace identity, explicit approvals, tool set, and keyboard conventions rather than copying another agent's branding or permission model. Transcript browsing stays in the application; the original shell screen and scrollback return on exit.
 
@@ -89,6 +99,9 @@ These are established design patterns, not a universal agent-orchestration stand
 - [OpenAI Agents SDK orchestration](https://openai.github.io/openai-agents-python/multi_agent/) distinguishes manager-owned specialist work from handoffs and recommends code-driven control when predictability matters. Kurama keeps policy, dependencies, approvals, and resource limits in deterministic code rather than handing those decisions to the model.
 - [Temporal workflow execution](https://docs.temporal.io/workflow-execution) separates event history from cached execution state and relies on deterministic replay. Kurama applies the local equivalent: serialized durable logs plus replayable in-memory projections, without adding a workflow service or database.
 - [Tokio channels](https://tokio.rs/tokio/tutorial/channels) provide bounded backpressure; [graceful shutdown](https://tokio.rs/tokio/topics/shutdown) requires signalling and then waiting. [OpenAI's `gather_with_cancel`](https://github.com/openai/openai-agents-python/blob/main/src/agents/util/_asyncio_tasks.py) likewise cancels and drains sibling tasks on failure. Kurama retains bounded event delivery and the existing child cleanup grace instead of dropping authoritative events to claim throughput.
+- [WHATWG SSE parsing](https://html.spec.whatwg.org/multipage/server-sent-events.html#parsing-an-event-stream) specifies UTF-8, a leading BOM, and CR/LF/CRLF line endings. The bounded incremental decoder handles those wire forms without repeatedly scanning or copying the buffered prefix. Provider completion validation remains separate from wire decoding.
+- [Tokio cancellation safety](https://docs.rs/tokio/latest/tokio/macro.select.html#cancellation-safety) distinguishes safe receive operations from operations that lose progress when dropped. Provider streams retain one owned cancellation future; subprocess cancellation signals and drains the process group rather than merely dropping a reader.
+- [Directory-relative filesystem APIs](https://man7.org/linux/man-pages/man2/open.2.html) retain a stable directory reference across renames. Kurama combines no-follow component traversal, descriptor-relative publication, and cooperating-writer locks. This narrows pathname races without claiming isolation from arbitrary external writers.
 
 Blanket parallel tool execution, asynchronous parent/child synthesis, background persistence, and a distributed scheduler are intentionally not part of this optimization. Each changes ordering, approval, recovery, or resource semantics; benchmark gains alone would not establish their safety. Slow event consumers still exert backpressure, full history is still retained in memory, and explicit resume still validates/replays the durable log.
 
@@ -102,3 +115,31 @@ cargo test -p kurama-adapters --all-features --test fs_store
 ```
 
 The offline benchmark uses production SDK orchestration, filesystem sessions, and atomic file writes; delayed streams use a loopback SSE provider. It measures warmed live turns after 100/1,000/5,000 completed turns, short-response visibility, two concurrent child tool loops, and a 16-round durable write loop. Setup, history seeding, initial replay, and end-state validation are outside the measured interval. JSON retains raw samples and correctness failures; successful-run latency statistics exclude failures explicitly. Compare the identical benchmark source and release settings on both revisions, run binaries sequentially in alternating order, and keep the machine/filesystem constant. These measurements isolate harness overhead and local I/O, not real-model reasoning speed or answer quality.
+
+### Repository audit measurements
+
+The September 2026 audit compares retained `a4b1956` binaries with the audit implementation, not with the original `origin/main` baseline. All 16 sequential ABBA runs passed their correctness checks. Each latency below is the median of ten measured samples per variant, with identical benchmark source and release settings on one macOS arm64 host. Local records are under `target/verification/paired-performance/`; CI retains fresh raw measurements as workflow artifacts.
+
+| Workload | Before | After |
+| --- | ---: | ---: |
+| SSE, 32 KiB delivered one byte at a time | 2,937.80 ms | 0.45 ms |
+| SSE, burst of 10,000 records | 26.37 ms | 1.03 ms |
+| Tag-dense 2 MiB HTML extraction | 27.06 ms | 19.07 ms |
+| Large compatible-provider request construction | 0.317 ms | 0.184 ms |
+| Small output with staging requested | 3.875 ms | 0.0013 ms |
+| Bounded 1 MiB output | 3.346 ms | 0.525 ms |
+| First-line read, hashing the full 16 MiB file | 27.95 ms | 16.18 ms |
+| History palette, 100×36 | 16.08 ms | 10.11 ms |
+| History palette, 48×14 | 10.69 ms | 4.63 ms |
+| 100 scroll steps, 100×36 | 80.67 ms | 83.09 ms |
+| 100 scroll steps, 48×14 | 79.88 ms | 73.23 ms |
+| Warm live turn after 100 completed turns | 9.79 ms | 10.69 ms |
+| Warm live turn after 5,000 completed turns | 10.49 ms | 9.73 ms |
+| Two-child orchestration | 511.06 ms | 506.48 ms |
+| 16-round durable write loop | 628.05 ms | 626.41 ms |
+
+The adapter stress process's median peak RSS across its two runs fell from 746.6 MiB to 18.7 MiB. This is a mixed synthetic workload, not ordinary CLI memory usage. The byte-fragmented SSE and small-staging cases deliberately expose pathological rescanning and unnecessary filesystem work; their speedups do not represent end-to-end model latency. Wide scrolling and the short-history live turn were slower in this run; other control-plane timings were essentially unchanged. No uniform speedup or statistical significance is claimed.
+
+The audit removes redundant CI suite invocations, fixture-only production APIs, operation counters, unused schema I/O, duplicate approval state, and tests of incidental wording. The replacement verification path uses production imports, isolated local providers, actual PTYs, retained failure/resource records, and a process-cleanup regression suite. It adds no daemon, watcher, distributed scheduler, or general-purpose testing framework.
+
+Separate ABBA startup/idle runs used the same restored, valid configured fixture for both binaries. Spawn-to-first-terminal-byte latency rose from 53.65 ms to 77.80 ms (30 samples each), remaining below the existing 100 ms gate; this is a startup regression, not a gain. Median idle RSS was 6,232 versus 6,240 KiB, with 0.0% measured process CPU in both variants across six five-second windows each (macOS CPU-time resolution: 0.01 s). All eight runner invocations passed and completed cleanup. These are neither cold-OS-cache nor full-composer-readiness measurements.

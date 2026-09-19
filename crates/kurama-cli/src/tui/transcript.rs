@@ -173,6 +173,28 @@ impl TranscriptLine {
             .map(|link| Arc::clone(&link.target))
     }
 
+    pub(crate) fn link_targets(&self) -> impl Iterator<Item = &Arc<str>> {
+        self.hyperlinks.iter().map(|link| &link.target)
+    }
+
+    fn render_link_focus(&self, frame: &mut Frame<'_>, area: Rect, target: &str) {
+        for link in self
+            .hyperlinks
+            .iter()
+            .filter(|link| link.target.as_ref() == target)
+        {
+            for column in link.column
+                ..link
+                    .column
+                    .saturating_add(link.width)
+                    .min(area.width as usize)
+            {
+                let cell = &mut frame.buffer_mut()[(area.x + column as u16, area.y)];
+                cell.set_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD));
+            }
+        }
+    }
+
     pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         frame.render_widget(&self.text, area);
     }
@@ -2177,6 +2199,17 @@ pub(crate) fn render_transcript_view(
     let start = transcript
         .len()
         .saturating_sub(viewport_height.saturating_add(scroll));
+    let mut focus = state.focused_link.borrow_mut();
+    if focus.as_ref().is_some_and(|target| {
+        !transcript
+            .iter()
+            .skip(start)
+            .take(viewport_height)
+            .flat_map(TranscriptLine::link_targets)
+            .any(|visible| visible == target)
+    }) {
+        *focus = None;
+    }
     for (row, line) in transcript
         .iter()
         .skip(start)
@@ -2192,6 +2225,18 @@ pub(crate) fn render_transcript_view(
                 1,
             ),
         );
+        if let Some(target) = focus.as_deref() {
+            line.render_link_focus(
+                frame,
+                Rect::new(
+                    transcript_area.x,
+                    transcript_area.y + row as u16,
+                    transcript_area.width,
+                    1,
+                ),
+                target,
+            );
+        }
     }
     if state.overlay == Overlay::None
         && let Some(selection) = &state.transcript_selection
@@ -2210,10 +2255,15 @@ pub(crate) fn render_transcript_view(
         {
             "Release to copy selection · Esc clear"
         } else {
-            "esc close · ↑↓ scroll · { } prompts"
+            expanded_hint(transcript_area.width as usize, focus.is_some())
         };
         let feedback = copied.map_or_else(
-            || Line::from(Span::styled(hint, Style::default().fg(DIM))),
+            || {
+                Line::from(Span::styled(
+                    truncate_display(hint, transcript_area.width as usize),
+                    Style::default().fg(DIM),
+                ))
+            },
             |characters| copied_feedback(characters, transcript_area.width as usize),
         );
         frame.render_widget(
@@ -2226,6 +2276,34 @@ pub(crate) fn render_transcript_view(
             ),
         );
     }
+}
+
+fn expanded_hint(width: usize, focused: bool) -> &'static str {
+    let variants = if focused {
+        [
+            "Esc close · ↑↓ scroll · { } prompts · Tab/Shift+Tab links · Enter open · y copy",
+            "Esc · ↑↓ · { } · Tab links · Enter open · y copy",
+            "Esc ↑↓ Tab Enter/y",
+            "Esc ↑↓ Tab",
+            "Esc ↑↓",
+            "Esc",
+            "E",
+        ]
+    } else {
+        [
+            "Esc close · ↑↓ scroll · { } prompts · Tab/Shift+Tab links · Enter open · y copy",
+            "Esc · ↑↓ · { } · Tab links · Enter open · y copy",
+            "Esc · ↑↓ · Tab links",
+            "Esc ↑↓ Tab",
+            "Esc ↑↓",
+            "Esc",
+            "E",
+        ]
+    };
+    variants
+        .into_iter()
+        .find(|hint| display_width(hint) <= width)
+        .unwrap_or("")
 }
 
 fn push_prefixed_lines(
@@ -2366,6 +2444,22 @@ fn tool_name(label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expanded_hints_fit_narrow_widths_and_expose_link_actions() {
+        for width in [0, 1, 8, 16, 32, 80] {
+            for focused in [false, true] {
+                let hint = expanded_hint(width, focused);
+                assert!(display_width(hint) <= width, "{width}: {hint}");
+                if width >= 8 {
+                    assert!(hint.contains("Esc"));
+                    assert!(hint.contains("↑↓"));
+                }
+            }
+        }
+        let hint = expanded_hint(80, true);
+        assert!(hint.contains("Enter open") && hint.contains("y copy"));
+    }
 
     fn plain(lines: &[Line<'_>]) -> Vec<String> {
         lines

@@ -18,6 +18,7 @@ use kurama_adapters::{
     ProviderFactory, ReadTool, SearchBackend, SecretValue, SessionSecrets, WebSearchTool,
     WriteTool,
 };
+use kurama_core::cancel::CancelToken;
 use kurama_protocol::{
     KuramaError,
     config::{
@@ -52,7 +53,6 @@ use crate::{
 };
 
 const TOOL_EVENT_CAPACITY: usize = 64;
-const MAX_PASTE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const READY_EVENT_BATCH_LIMIT: usize = 128;
 const STREAM_REDRAW_INTERVAL: Duration = Duration::from_millis(33);
 const ACTIVITY_FRAME_INTERVAL: Duration = Duration::from_millis(100);
@@ -294,6 +294,29 @@ pub struct App {
 struct DiffLoad {
     events: mpsc::Receiver<Result<DiffReview, String>>,
     _tasks: tokio::task::JoinSet<()>,
+}
+
+struct FileIndexLoad {
+    cancel: CancelToken,
+    task: tokio::task::JoinHandle<Vec<String>>,
+}
+
+impl FileIndexLoad {
+    fn start(root: PathBuf) -> Self {
+        let cancel = CancelToken::new();
+        let worker_cancel = cancel.clone();
+        let task =
+            tokio::task::spawn_blocking(move || crate::tui::collect_files(&root, &worker_cancel));
+        Self { cancel, task }
+    }
+}
+
+impl Drop for FileIndexLoad {
+    fn drop(&mut self) {
+        // Abort handles queued work; the token also stops an already-running scan.
+        self.cancel.cancel();
+        self.task.abort();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -578,16 +601,13 @@ impl App {
         };
 
         repository
-            .remember_project_profile(&project, &active_profile)
+            .remember_session(
+                &project,
+                &active_profile,
+                &session_id,
+                (mode != ExecutionMode::Yolo).then_some(mode),
+            )
             .map_err(|error| error.to_string())?;
-        repository
-            .remember_latest_session(&project, &session_id)
-            .map_err(|error| error.to_string())?;
-        if mode != ExecutionMode::Yolo {
-            repository
-                .remember_mode(mode)
-                .map_err(|error| error.to_string())?;
-        }
 
         let mut state = TuiState::new(
             active_profile,
@@ -784,6 +804,10 @@ impl App {
                     | KeyCode::PageDown
                     | KeyCode::Home
                     | KeyCode::End
+                    | KeyCode::Tab
+                    | KeyCode::BackTab
+                    | KeyCode::Enter
+                    | KeyCode::Char('y')
                     | KeyCode::Char('{' | '}')
             );
         }
@@ -851,7 +875,18 @@ impl App {
                     | KeyCode::PageDown
             ),
             Overlay::Shortcuts => {
-                matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?'))
+                matches!(
+                    key.code,
+                    KeyCode::Esc
+                        | KeyCode::Enter
+                        | KeyCode::Char('?')
+                        | KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                        | KeyCode::Home
+                        | KeyCode::End
+                )
             }
             Overlay::Agents => matches!(
                 key.code,
@@ -859,9 +894,23 @@ impl App {
                     | KeyCode::Enter
                     | KeyCode::Up
                     | KeyCode::Down
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
                     | KeyCode::Char('m' | 'x')
             ),
-            Overlay::AgentInspect => matches!(key.code, KeyCode::Esc | KeyCode::Char('m' | 'x')),
+            Overlay::AgentInspect => matches!(
+                key.code,
+                KeyCode::Esc
+                    | KeyCode::Char('m' | 'x')
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
+            ),
             Overlay::ConfirmAgentCancel => {
                 matches!(key.code, KeyCode::Esc | KeyCode::Char('y' | 'n'))
             }
@@ -909,6 +958,11 @@ impl App {
                 key.code,
                 KeyCode::Char(_)
                     | KeyCode::Backspace
+                    | KeyCode::Delete
+                    | KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Home
+                    | KeyCode::End
                     | KeyCode::Enter
                     | KeyCode::Esc
                     | KeyCode::Up
@@ -1067,6 +1121,22 @@ impl App {
             Overlay::Shortcuts => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter) {
                     self.state.close_overlay();
+                } else {
+                    let current = self.state.shortcuts_scroll.get();
+                    let max = self.state.shortcuts_max_scroll.get();
+                    let page = self.state.shortcuts_page_height.get();
+                    self.state.shortcuts_scroll.set(
+                        match key.code {
+                            KeyCode::Up => current.saturating_sub(1),
+                            KeyCode::Down => current.saturating_add(1),
+                            KeyCode::PageUp => current.saturating_sub(page),
+                            KeyCode::PageDown => current.saturating_add(page),
+                            KeyCode::Home => 0,
+                            KeyCode::End => max,
+                            _ => current,
+                        }
+                        .min(max),
+                    );
                 }
             }
             Overlay::None => self.handle_main_key(key)?,
@@ -1178,8 +1248,8 @@ impl App {
         }
         match key.code {
             KeyCode::BackTab => self.cycle_mode()?,
-            KeyCode::Home => self.state.cursor_home(),
-            KeyCode::End => self.state.cursor_end(),
+            KeyCode::Home => self.state.cursor_line_home(),
+            KeyCode::End => self.state.cursor_line_end(),
             KeyCode::Char('?') if self.state.composer.is_empty() => {
                 self.state.open_shortcuts();
             }
@@ -1509,6 +1579,11 @@ impl App {
             }
             KeyCode::Char(character) => self.state.onboarding.push(character),
             KeyCode::Backspace => self.state.onboarding.backspace(),
+            KeyCode::Left => self.state.onboarding.move_left(),
+            KeyCode::Right => self.state.onboarding.move_right(),
+            KeyCode::Home => self.state.onboarding.move_home(),
+            KeyCode::End => self.state.onboarding.move_end(),
+            KeyCode::Delete => self.state.onboarding.delete_forward(),
             KeyCode::Enter => match self.state.onboarding.submit() {
                 Ok(Some(submission)) => {
                     if let Err(error) = self.apply_onboarding_submission(submission) {
@@ -1726,6 +1801,48 @@ impl App {
         match (self.state.overlay, key.code) {
             (Overlay::Agents, KeyCode::Up) => self.state.select_previous_agent(),
             (Overlay::Agents, KeyCode::Down) => self.state.select_next_agent(),
+            (Overlay::Agents, KeyCode::Home) => self.state.selected_agent = 0,
+            (Overlay::Agents, KeyCode::End) => {
+                self.state.selected_agent = self.state.agents.len().saturating_sub(1)
+            }
+            (Overlay::Agents, KeyCode::PageUp) => {
+                self.state.selected_agent = self
+                    .state
+                    .selected_agent
+                    .saturating_sub(self.state.agents_page_height.get())
+            }
+            (Overlay::Agents, KeyCode::PageDown) => {
+                self.state.selected_agent = self
+                    .state
+                    .selected_agent
+                    .saturating_add(self.state.agents_page_height.get())
+                    .min(self.state.agents.len().saturating_sub(1))
+            }
+            (
+                Overlay::AgentInspect,
+                KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Home
+                | KeyCode::End,
+            ) => {
+                let current = self.state.agent_inspect_scroll.get();
+                let max = self.state.agent_inspect_max_scroll.get();
+                let page = self.state.agent_inspect_page_height.get();
+                self.state.agent_inspect_scroll.set(
+                    match key.code {
+                        KeyCode::Up => current.saturating_add(1),
+                        KeyCode::Down => current.saturating_sub(1),
+                        KeyCode::PageUp => current.saturating_add(page),
+                        KeyCode::PageDown => current.saturating_sub(page),
+                        KeyCode::Home => max,
+                        KeyCode::End => 0,
+                        _ => current,
+                    }
+                    .min(max),
+                );
+            }
             (Overlay::Agents, KeyCode::Enter) => self.state.inspect_selected_agent(),
             (Overlay::Agents | Overlay::AgentInspect, KeyCode::Char('m')) => {
                 self.state.begin_agent_message()
@@ -1815,11 +1932,14 @@ impl App {
 
     fn ingest_composer_paste(&mut self, text: &str) {
         self.state.normalize_composer_cursor();
-        if let Some((bytes, ext)) = crate::tui::decode_pasted_image(text) {
-            if bytes.len() > MAX_PASTE_IMAGE_BYTES {
-                self.state.push_error("pasted image is too large");
+        let image = match crate::tui::decode_pasted_image(text) {
+            Ok(image) => image,
+            Err(error) => {
+                self.state.push_error(error);
                 return;
             }
+        };
+        if let Some((bytes, ext)) = image {
             match save_pasted_image(&self.state.project, &bytes, ext) {
                 Ok(path) => {
                     self.state.insert_mention(&path);
@@ -2237,6 +2357,22 @@ fn handle_input_with_current_geometry(
     }
     if let Event::Key(key) = &event {
         if key.kind != KeyEventKind::Release && app.state.overlay() == Overlay::None {
+            if app.state.transcript_view_expanded()
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && matches!(
+                    key.code,
+                    KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter | KeyCode::Char('y')
+                )
+            {
+                cache.prepare(&mut app.state, area);
+                if let Some(action) = update_transcript_link_focus(&mut app.state, cache, key.code)
+                {
+                    apply_pointer_action(app, action);
+                }
+                return Ok(false);
+            }
             if key.code == KeyCode::Esc
                 && (app.state.transcript_selection.is_some()
                     || app.state.composer_selection.is_some()
@@ -2326,6 +2462,57 @@ fn handle_input_with_current_geometry(
 enum PointerAction {
     Open(Arc<str>),
     Copy(String),
+}
+
+fn update_transcript_link_focus(
+    state: &mut TuiState,
+    cache: &TranscriptRenderCache,
+    key: KeyCode,
+) -> Option<PointerAction> {
+    let height = cache.viewport_height as usize;
+    let start = cache
+        .lines
+        .len()
+        .saturating_sub(height.saturating_add(state.scroll));
+    let mut targets = Vec::new();
+    for target in cache
+        .lines
+        .iter()
+        .skip(start)
+        .take(height)
+        .flat_map(TranscriptLine::link_targets)
+    {
+        // A wrapped destination is one keyboard stop, not one stop per fragment.
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    let focus = state.focused_link.get_mut();
+    let current = focus
+        .as_ref()
+        .and_then(|target| targets.iter().position(|candidate| *candidate == target));
+    if targets.is_empty() {
+        *focus = None;
+        return None;
+    }
+    match key {
+        KeyCode::Tab | KeyCode::BackTab => {
+            let next = if key == KeyCode::BackTab {
+                current.map_or(targets.len() - 1, |index| {
+                    (index + targets.len() - 1) % targets.len()
+                })
+            } else {
+                current.map_or(0, |index| (index + 1) % targets.len())
+            };
+            *focus = Some(Arc::clone(targets[next]));
+            state.transcript_selection = None;
+            state.copied_characters = None;
+            None
+        }
+        KeyCode::Enter => current.map(|index| PointerAction::Open(Arc::clone(targets[index]))),
+        KeyCode::Char('y') => current.map(|index| PointerAction::Copy(targets[index].to_string())),
+        _ => None,
+    }
 }
 
 fn update_transcript_pointer(
@@ -2563,6 +2750,10 @@ where
     };
     let mut preapproval_overlay = Overlay::None;
     let mut transcript_cache = TranscriptRenderCache::default();
+    let root = PathBuf::from(&app.state.project);
+    let mut file_index_load = Some(FileIndexLoad::start(root));
+    let mut mention_open = app.state.file_mention().is_some();
+    app.state.file_index_dirty = false;
     // Establish a clean canvas once per run/restart. Ratatui's frame diff clears
     // cells removed by subsequent redraws without erasing the screen each tick.
     // resize resets the back buffer without clear's blocking cursor-position query.
@@ -2576,7 +2767,12 @@ where
     let mut next_activity_frame = last_draw + ACTIVITY_FRAME_INTERVAL;
     let mut redraw_pending = false;
 
-    while input_open || runtime_open || tool_open || app.diff_load.is_some() {
+    while input_open
+        || runtime_open
+        || tool_open
+        || app.diff_load.is_some()
+        || file_index_load.is_some()
+    {
         let mut exit = false;
         let mut force_redraw = false;
         let mut state_changed = false;
@@ -2721,6 +2917,23 @@ where
                 state_changed = true;
                 force_redraw = true;
             }
+            result = async {
+                match file_index_load.as_mut() {
+                    Some(load) => (&mut load.task).await,
+                    None => std::future::pending().await,
+                }
+            }, if file_index_load.is_some() => {
+                file_index_load = None;
+                match result {
+                    Ok(files) => app.state.set_file_index(files),
+                    Err(error) => {
+                        app.state.push_error(format!("file index failed: {error}"));
+                        state_changed = true;
+                    }
+                }
+                state_changed |= app.state.file_mention().is_some();
+                force_redraw = state_changed;
+            }
             result = app.link_tasks.join_next(), if !app.link_tasks.is_empty() => {
                 let error = match result {
                     Some(Ok(Err(error))) => Some(error),
@@ -2737,6 +2950,14 @@ where
             _ = &mut animation => {
                 force_redraw = true;
             }
+        }
+        let now_open = app.state.file_mention().is_some();
+        app.state.file_index_dirty |= now_open && !mention_open;
+        mention_open = now_open;
+        if app.state.file_index_dirty && file_index_load.is_none() {
+            app.state.file_index_dirty = false;
+            let root = PathBuf::from(&app.state.project);
+            file_index_load = Some(FileIndexLoad::start(root));
         }
         if app.state.overlay() != Overlay::Diff {
             app.diff_load = None;
@@ -3134,6 +3355,282 @@ mod tests {
             link_tasks: tokio::task::JoinSet::new(),
             diff_load: None,
         }
+    }
+
+    fn rendered_app(app: &App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| crate::tui::render(frame, &app.state))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn shortcuts_reach_last_entry_and_clamp_after_resize() {
+        let mut app = test_app();
+        for (width, height) in [(80, 8), (24, 10)] {
+            app.state.open_shortcuts();
+            let first = rendered_app(&app, width, height);
+            assert!(first.contains("ctrl+c"), "{first}");
+            let end = Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+            assert!(app.accepts_event(&end));
+            app.handle_event(end).unwrap();
+            let last = rendered_app(&app, width, height);
+            assert!(last.contains("shift+tab"), "{last}");
+            let wide = rendered_app(&app, 100, 30);
+            assert!(
+                wide.contains("ctrl+c") && wide.contains("shift+tab"),
+                "{wide}"
+            );
+            app.handle_event(Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)))
+                .unwrap();
+            assert!(rendered_app(&app, width, height).contains("ctrl+c"));
+        }
+    }
+
+    #[test]
+    fn agent_list_pages_and_inspection_reaches_old_wrapped_rows() {
+        let mut app = test_app();
+        app.state.agents = (0..30)
+            .map(|index| crate::tui::AgentRow {
+                id: format!("a_{index:02}").into(),
+                role: "reviewer".into(),
+                profile: "fixture".into(),
+                task: "inspect".into(),
+                state: kurama_protocol::agent::AgentState::Running,
+                activity: "reading".into(),
+                transcript: (0..30)
+                    .map(|row| format!("row-{row:02} {}", "wrapped content ".repeat(4)))
+                    .collect(),
+            })
+            .collect();
+        app.state.open_agents();
+        rendered_app(&app, 40, 8);
+        for code in [KeyCode::PageDown, KeyCode::End] {
+            let event = Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+            assert!(app.accepts_event(&event));
+            app.handle_event(event).unwrap();
+        }
+        assert!(rendered_app(&app, 40, 8).contains("a_29"));
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        let tail = rendered_app(&app, 40, 8);
+        assert!(!tail.contains("row-00"), "{tail}");
+        for code in [KeyCode::PageUp, KeyCode::Home] {
+            let event = Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+            assert!(app.accepts_event(&event));
+            app.handle_event(event).unwrap();
+        }
+        assert!(rendered_app(&app, 40, 8).contains("row-00"));
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(rendered_app(&app, 40, 8), tail);
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)))
+            .unwrap();
+        assert!(rendered_app(&app, 40, 8).contains("a_00"));
+    }
+
+    #[test]
+    fn expanded_keyboard_links_use_sanitized_pointer_actions_across_wraps() {
+        let mut app = test_app();
+        app.state.push_assistant("[a long first label](https://one.test/a) [second](https://two.test/b) [unsafe](javascript:alert(1))");
+        app.state.toggle_transcript_view();
+        let mut cache = TranscriptRenderCache::default();
+        let area = Rect::new(0, 0, 24, 16);
+        handle_input_with_current_geometry(
+            &mut app,
+            &mut cache,
+            area,
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+        )
+        .unwrap();
+        assert_eq!(
+            update_transcript_link_focus(&mut app.state, &cache, KeyCode::Enter),
+            Some(PointerAction::Open(Arc::from("https://one.test/a")))
+        );
+        update_transcript_link_focus(&mut app.state, &cache, KeyCode::Tab);
+        assert_eq!(
+            update_transcript_link_focus(&mut app.state, &cache, KeyCode::Char('y')),
+            Some(PointerAction::Copy("https://two.test/b".into()))
+        );
+        update_transcript_link_focus(&mut app.state, &cache, KeyCode::Tab);
+        assert_eq!(
+            update_transcript_link_focus(&mut app.state, &cache, KeyCode::Enter),
+            Some(PointerAction::Open(Arc::from("https://one.test/a")))
+        );
+        update_transcript_link_focus(&mut app.state, &cache, KeyCode::BackTab);
+        cache.prepare(&mut app.state, Rect::new(0, 0, 100, 24));
+        assert_eq!(
+            update_transcript_link_focus(&mut app.state, &cache, KeyCode::Enter),
+            Some(PointerAction::Open(Arc::from("https://two.test/b")))
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|frame| render_with_transcript(frame, &app.state, cache.lines()))
+            .unwrap();
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.modifier.contains(ratatui::style::Modifier::REVERSED))
+        );
+        app.state.toggle_transcript_view();
+        app.state.composer = "ordinary draft".into();
+        app.state.cursor = app.state.composer.len();
+        handle_input_with_current_geometry(
+            &mut app,
+            &mut cache,
+            area,
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+        )
+        .unwrap();
+        assert_eq!(app.state.composer, "ordinary draft");
+    }
+
+    #[test]
+    fn composer_line_boundaries_keep_shell_buffer_and_history_keys() {
+        let mut app = test_app();
+        app.state.remember_prompt("previous prompt");
+        app.state.composer = "first\nAe\u{301}界Z\nlast".into();
+        app.state.cursor = "first\nAe\u{301}".len();
+        for (code, modifiers, cursor) in [
+            (KeyCode::Home, KeyModifiers::NONE, "first\n".len()),
+            (
+                KeyCode::End,
+                KeyModifiers::NONE,
+                "first\nAe\u{301}界Z".len(),
+            ),
+            (KeyCode::Char('a'), KeyModifiers::CONTROL, 0),
+            (
+                KeyCode::Char('e'),
+                KeyModifiers::CONTROL,
+                app.state.composer.len(),
+            ),
+        ] {
+            app.handle_event(Event::Key(KeyEvent::new(code, modifiers)))
+                .unwrap();
+            assert_eq!(app.state.cursor, cursor);
+        }
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.state.composer, "previous prompt");
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.state.composer, "first\nAe\u{301}界Z\nlast");
+    }
+
+    #[test]
+    fn onboarding_dispatch_edits_secret_middle_without_exposing_it() {
+        let mut app = test_app();
+        app.state.overlay = Overlay::Onboarding;
+        app.state.onboarding = OnboardingState::credential("fixture");
+        app.handle_event(Event::Paste("Ae\u{301}👩‍👩‍👧‍👦Z".into()))
+            .unwrap();
+        for code in [
+            KeyCode::Home,
+            KeyCode::Right,
+            KeyCode::Delete,
+            KeyCode::Char('X'),
+            KeyCode::End,
+            KeyCode::Left,
+            KeyCode::Backspace,
+        ] {
+            let event = Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+            assert!(app.accepts_event(&event));
+            app.handle_event(event).unwrap();
+        }
+        assert!(!rendered_app(&app, 24, 8).contains("AXZ"));
+        match app.state.onboarding.submit().unwrap() {
+            Some(OnboardingSubmission::Credential { secret, .. }) => assert_eq!(secret, "AXZ"),
+            _ => panic!("expected corrected credential"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_file_index_load_stops_an_already_started_blocking_scan() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("visible.rs"), b"").unwrap();
+        let path = root.path().to_path_buf();
+        let cancel = CancelToken::new();
+        let worker_cancel = cancel.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (finished, result) = tokio::sync::oneshot::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(2)).unwrap();
+            let files = crate::tui::collect_files(&path, &worker_cancel);
+            let _ = finished.send(files);
+            Vec::new()
+        });
+        let load = FileIndexLoad { cancel, task };
+        tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .expect("blocking task starts")
+            .unwrap();
+        drop(load);
+        release.send(()).unwrap();
+        let files = tokio::time::timeout(Duration::from_secs(2), result)
+            .await
+            .expect("cancelled blocking task exits")
+            .unwrap();
+        assert!(
+            files.is_empty(),
+            "cancelled scan must not publish file suggestions"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_index_publishes_dot_directory_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
+        std::fs::write(dir.path().join(".github/workflows/ci.yml"), "name: CI").unwrap();
+        let mut app = test_app();
+        app.state.project = dir.path().display().to_string();
+        app.state.composer = "@ci".into();
+        app.state.cursor = 3;
+        assert!(app.state.file_suggestions().is_empty());
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let (sender, mut receiver) = mpsc::channel(1);
+        drop(sender);
+        run_loop(&mut app, &mut terminal, &mut receiver, None, None)
+            .await
+            .unwrap();
+        assert_eq!(app.state.file_suggestions(), [".github/workflows/ci.yml"]);
+        app.state.complete_selected_file();
+        assert_eq!(app.state.composer, "@.github/workflows/ci.yml ");
+    }
+
+    #[test]
+    fn oversized_image_paste_reports_error_without_changing_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.png");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(8 * 1024 * 1024 + 1).unwrap();
+        let mut app = test_app();
+        app.state.composer = "keep draft".into();
+        app.state.cursor = app.state.composer.len();
+        app.handle_event(Event::Paste(path.display().to_string()))
+            .unwrap();
+        assert_eq!(app.state.composer, "keep draft");
+        assert!(matches!(
+            app.state.transcript.last(),
+            Some(TranscriptEntry::Error { .. })
+        ));
     }
     #[test]
     fn late_steering_blocks_followups_until_its_turn_completes() {
@@ -3866,7 +4363,10 @@ Session ID: ses_cafebabe"
                     0,
                     "history".into(),
                     None,
-                    SessionEvent::UserMessage { text: text.into() },
+                    SessionEvent::UserMessage {
+                        text: text.into(),
+                        explicit_delegation: false,
+                    },
                 )
             })
             .collect::<Vec<_>>();
@@ -3966,7 +4466,7 @@ Session ID: ses_cafebabe"
                 request: ApprovalRequest {
                     operation_id: OperationId::from("operation_approval"),
                     operation: Operation::Read {
-                        path: "README.md".into(),
+                        paths: vec!["README.md".into()],
                         external: false,
                     },
                     summary: "Read README".into(),
@@ -4022,7 +4522,7 @@ Session ID: ses_cafebabe"
                 request: ApprovalRequest {
                     operation_id: OperationId::from("approval"),
                     operation: Operation::Read {
-                        path: "file".into(),
+                        paths: vec!["file".into()],
                         external: false,
                     },
                     summary: "Read file".into(),
@@ -4078,7 +4578,7 @@ Session ID: ses_cafebabe"
                     request: ApprovalRequest {
                         operation_id: OperationId::from("new-approval"),
                         operation: Operation::Read {
-                            path: "file".into(),
+                            paths: vec!["file".into()],
                             external: false,
                         },
                         summary: "Read file".into(),

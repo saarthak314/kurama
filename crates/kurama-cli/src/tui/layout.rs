@@ -66,7 +66,7 @@ pub(crate) fn main_layout(area: Rect, state: &TuiState) -> ResponsiveLayout {
     let area = main_area(area);
     let input_height = match state.overlay() {
         Overlay::Approval | Overlay::ApprovalEdit => approval_height(state, area.width),
-        Overlay::Shortcuts => 14.min(area.height).max(5),
+        Overlay::Shortcuts => 18.min(area.height).max(5),
         _ => composer_height(state, area.width),
     };
     let activity_visible = state.overlay() == Overlay::None

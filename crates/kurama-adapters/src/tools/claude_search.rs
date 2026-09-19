@@ -7,7 +7,10 @@ use kurama_protocol::{
 };
 use serde_json::Value;
 
-use crate::{SearchBackend, SearchResult, tools::web_search::search_result_schema};
+use crate::{
+    SearchBackend, SearchResult,
+    tools::web_search::{search_result_schema, validate_search_limit},
+};
 
 use super::native_search::{run_search, search_prompt};
 use crate::bridges::{BridgeCommand, BridgeDecoder, MAX_JSONL_LINE_BYTES};
@@ -37,6 +40,7 @@ impl SearchBackend for ClaudeNativeSearch {
         cancel: &'a dyn CancelSignal,
     ) -> BoxFuture<'a, Result<Vec<SearchResult>, KuramaError>> {
         Box::pin(async move {
+            validate_search_limit(limit)?;
             if cancel.is_cancelled() {
                 return Err(KuramaError::Cancelled);
             }

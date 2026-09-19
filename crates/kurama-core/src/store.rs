@@ -67,11 +67,17 @@ impl MemoryStore {
 
 impl SessionStore for MemoryStore {
     fn create(&self, metadata: &SessionMetadata) -> Result<(), KuramaError> {
-        self.metadata
-            .lock()
-            .expect("memory metadata lock")
-            .insert(metadata.id.clone(), metadata.clone());
-        Ok(())
+        let mut sessions = self.metadata.lock().expect("memory metadata lock");
+        match sessions.entry(metadata.id.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(metadata.clone());
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(_) => Err(KuramaError::Storage(format!(
+                "session {} already exists",
+                metadata.id
+            ))),
+        }
     }
 
     fn append(&self, event: &EventEnvelope) -> Result<(), KuramaError> {
@@ -129,12 +135,19 @@ impl SessionStore for MemoryStore {
 
     fn list(&self) -> Result<Vec<SessionSummary>, KuramaError> {
         let metadata = self.metadata.lock().expect("memory metadata lock");
+        let events = self.events.lock().expect("memory events lock");
         Ok(metadata
             .values()
             .map(|metadata| SessionSummary {
                 id: metadata.id.clone(),
                 created_at_ms: metadata.created_at_ms,
-                updated_at_ms: metadata.created_at_ms,
+                updated_at_ms: events
+                    .range((metadata.id.clone(), None)..)
+                    .take_while(|((session_id, _), _)| session_id == &metadata.id)
+                    .flat_map(|(_, log)| log.iter().map(|event| event.timestamp_ms))
+                    .max()
+                    .unwrap_or(metadata.created_at_ms)
+                    .max(metadata.created_at_ms),
                 project_root: metadata.project_root.clone(),
                 profile: metadata.profile.clone(),
                 mode: metadata.mode,
@@ -181,6 +194,47 @@ fn lowercase_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn duplicate_create_preserves_metadata_and_history() {
+        let store = MemoryStore::default();
+        let original = SessionMetadata {
+            id: "session".into(),
+            created_at_ms: 10,
+            project_root: "/original".into(),
+            profile: "first".into(),
+            mode: kurama_protocol::policy::ExecutionMode::Supervised,
+            redaction_best_effort: false,
+        };
+        store.create(&original).expect("create session");
+        let first_summary = store.list().expect("list");
+        assert_eq!(first_summary[0].updated_at_ms, 10);
+        let mut parent = event(0, None);
+        parent.timestamp_ms = 20;
+        store.append(&parent).expect("append parent");
+        let replacement = SessionMetadata {
+            profile: "replacement".into(),
+            project_root: "/other".into(),
+            ..original.clone()
+        };
+        assert!(matches!(
+            store.create(&replacement),
+            Err(KuramaError::Storage(_))
+        ));
+        assert_eq!(store.replay(&original.id).expect("replay"), vec![parent]);
+        let listed = store.list().expect("list");
+        assert_eq!(listed[0].profile, original.profile);
+        assert_eq!(listed[0].project_root, original.project_root);
+        assert_eq!(listed[0].updated_at_ms, 20);
+        let mut child = event(0, Some("child".into()));
+        child.timestamp_ms = 30;
+        store.append(&child).expect("append child");
+        // A later append with an older timestamp must not move updated_at backwards.
+        store
+            .append(&event(1, Some("child".into())))
+            .expect("older event");
+        assert_eq!(store.list().expect("list")[0].updated_at_ms, 30);
+    }
+
     use super::MemoryStore;
     use kurama_protocol::traits::SessionStore;
     use kurama_protocol::{
@@ -233,6 +287,7 @@ mod tests {
             agent_id,
             SessionEvent::UserMessage {
                 text: sequence.to_string(),
+                explicit_delegation: false,
             },
         )
     }

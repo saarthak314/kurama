@@ -4,6 +4,8 @@ pub enum KuramaError {
     Configuration(String),
     #[error("model error: {0}")]
     Model(String),
+    #[error("model error: {message}")]
+    Provider { message: String, retryable: bool },
     #[error("tool error: {0}")]
     Tool(String),
     #[error("policy error: {0}")]

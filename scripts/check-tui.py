@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the real CLI through a local SSE provider and a PTY, without credentials.
 
-Run: uv run --with pyte --with pillow scripts/check-tui.py target/release/kurama .lavish/tui-check
+Run: uv run --with pyte --with pillow scripts/check-tui.py target/release/kurama target/verification/tui-check
 Use --no-images to require only pyte. The VT model tracks separate primary and
 alternate buffers; screenshots are decoded PTY output, not a native terminal
 window capture. This is a POSIX-only development gate.
@@ -9,13 +9,13 @@ window capture. This is a POSIX-only development gate.
 
 import argparse
 import copy
+from contextlib import ExitStack
 import fcntl
 import hashlib
 import http.server
 import json
 import os
 from pathlib import Path
-import pty
 import select
 import signal
 import struct
@@ -25,6 +25,16 @@ import tempfile
 import termios
 import threading
 import time
+import traceback
+import zlib
+
+from verification import (
+    empty_output_dir,
+    opened_pty,
+    provenance,
+    run_command,
+    terminate_process,
+)
 
 import pyte
 
@@ -231,6 +241,11 @@ class Fixture(http.server.BaseHTTPRequestHandler):
     control_release = threading.Event()
     control_cancel_release = threading.Event()
     control_tool_proposed = False
+    agents_issued = False
+
+    def setup(self):
+        self.request.settimeout(3)
+        super().setup()
 
     def log_message(self, *args):
         pass
@@ -259,10 +274,15 @@ class Fixture(http.server.BaseHTTPRequestHandler):
         # todos). Route this fixture by its authored prompts, not their position.
         for message in reversed(messages):
             content = message.get("content", "")
-            if message.get("role") == "user" and isinstance(content, str) and (
-                content.startswith("CONTROL_")
-                or "FEEDBACK_E2E" in content
-                or content in ("advance compaction fixture", "inspect fixture", "long answer")
+            if (
+                message.get("role") == "user"
+                and isinstance(content, str)
+                and (
+                    content.startswith("CONTROL_")
+                    or "FEEDBACK_E2E" in content
+                    or content
+                    in ("advance compaction fixture", "inspect fixture", "long answer")
+                )
             ):
                 latest_user = content
                 break
@@ -288,6 +308,54 @@ class Fixture(http.server.BaseHTTPRequestHandler):
             event({"content": "CONTROL_MODEL_WAITING"})
             if not type(self).control_release.wait(30):
                 raise RuntimeError("control fixture was not released")
+            event({}, "stop")
+        elif str(latest_user).startswith("CONTROL_AGENTS"):
+            if not type(self).agents_issued:
+                type(self).agents_issued = True
+                delegation = {
+                    "agents": [
+                        {
+                            "objective": f"review CHILD_E2E_{index} output",
+                            "context_refs": [],
+                            "write_scope": {"roots": [], "files": []},
+                            "budget": {
+                                "max_input_tokens": 16000,
+                                "max_output_tokens": 4000,
+                                "max_turns": 2,
+                                "max_seconds": 30,
+                            },
+                            "depends_on": [],
+                        }
+                        for index in range(8)
+                    ]
+                }
+                event(
+                    {
+                        "content": "<kurama_delegate>"
+                        + json.dumps(delegation)
+                        + "</kurama_delegate>"
+                    }
+                )
+            else:
+                child_results = [
+                    message
+                    for message in messages
+                    if str(message.get("content", "")).startswith("Child agent ")
+                ]
+                assert len(child_results) == 8, "missing delegated results"
+                assert all("NEW29" in message["content"] for message in child_results)
+                event({"content": "CONTROL_AGENTS_DONE"})
+            event({}, "stop")
+        elif "CHILD_E2E_" in str(latest_user):
+            body = (
+                "OLD00\n"
+                + "\n".join(
+                    f"history {index}: " + "verified child output " * 3
+                    for index in range(1, 29)
+                )
+                + "\nNEW29"
+            )
+            event({"content": body})
             event({}, "stop")
         elif latest_user == "CONTROL_CANCEL":
             event({"content": "CONTROL_CANCEL_WAITING"})
@@ -399,6 +467,9 @@ def main():
     parser.add_argument("--no-cpr", action="store_true")
     parser.add_argument("--seed-todos", action="store_true")
     parser.add_argument(
+        "--term", default="xterm-256color", help="TERM for the actual PTY child"
+    )
+    parser.add_argument(
         "--torn-tail",
         action="store_true",
         help="Resume a session with an incomplete final log record",
@@ -425,31 +496,117 @@ def main():
     args = parser.parse_args()
     if args.seed_large_output_mib < 0:
         parser.error("--seed-large-output-mib cannot be negative")
+    output_dir = Path(args.output).resolve()
+    try:
+        empty_output_dir(output_dir)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+    result = {
+        "frames": [],
+        "findings": {},
+        "resources": {},
+        "provenance": provenance(Path(args.binary).resolve()),
+        "parameters": vars(args),
+    }
+    raw = bytearray()
+    artifacts = {}
+    status = 0
+    try:
+        run_check(args, output_dir, result, raw, artifacts)
+    except Exception as error:
+        result["fatal_error"] = str(error)
+        result["traceback"] = traceback.format_exc()
+        status = 1
+    finally:
+        result["exit_status"] = status
+        artifacts.update(
+            {
+                "terminal.raw": bytes(raw),
+                "provider-requests.json": json.dumps(
+                    Fixture.requests, indent=2
+                ).encode(),
+            }
+        )
+        for name, content in artifacts.items():
+            try:
+                (output_dir / name).write_bytes(content)
+            except OSError as error:
+                result.setdefault("artifact_errors", []).append(f"{name}: {error}")
+                result["exit_status"] = status = 1
+        try:
+            (output_dir / "audit.json").write_text(json.dumps(result, indent=2))
+        except OSError as error:
+            result.setdefault("artifact_errors", []).append(f"audit.json: {error}")
+            result["exit_status"] = status = 1
+    print(
+        json.dumps(
+            {
+                "output": str(output_dir),
+                "audit": str(output_dir / "audit.json"),
+                "frames": len(result["frames"]),
+                **result["findings"],
+                "exit": result.get("exit_code"),
+                "exit_status": status,
+                "resources": result["resources"],
+                **{
+                    key: result[key]
+                    for key in ("fatal_error", "traceback", "artifact_errors")
+                    if key in result
+                },
+            }
+        )
+    )
+    return status
+
+
+def run_check(args, output_dir, result, raw, artifacts):
     seed_session = (
         args.seed_todos
         or args.torn_tail
         or args.seed_large_output_mib > 0
         or args.check_compaction
     )
-    output_dir = Path(args.output).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Fixture)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    result = {"frames": [], "findings": {}, "resources": {}}
-    with tempfile.TemporaryDirectory(prefix="kurama-tui-") as temp:
-        root = Path(temp)
+    process = None
+    thread = None
+    with ExitStack() as cleanup:
+
+        def closed():
+            result["findings"]["pty_process_and_server_closed"] = (
+                process is None or process.returncode is not None
+            ) and (thread is None or not thread.is_alive())
+
+        cleanup.callback(closed)
+        root = Path(
+            cleanup.enter_context(tempfile.TemporaryDirectory(prefix="kurama-tui-"))
+        )
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Fixture)
+        server.daemon_threads = False
+        cleanup.callback(server.server_close)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        cleanup.callback(thread.join)
+        cleanup.callback(server.shutdown)
+        cleanup.callback(Fixture.control_release.set)
+
+        def collect_session_events():
+            if args.check_controls:
+                for log in (root / ".kurama" / "sessions").glob("*/events.jsonl"):
+                    artifacts["session-events.jsonl"] = log.read_bytes()
+
+        cleanup.callback(collect_session_events)
+        cleanup.callback(Fixture.control_cancel_release.set)
         state = root / ".kurama"
         state.mkdir()
         (root / "input.txt").write_text("fixture input\n")
         if args.check_controls:
 
             def git(*arguments):
-                return subprocess.run(
+                return run_command(
                     ["git", *arguments],
                     cwd=root,
                     check=True,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
                 )
 
@@ -524,6 +681,7 @@ endpoint = "http://127.0.0.1:9/search"
         if seed_session:
             directory = state / "sessions" / "ui-session"
             directory.mkdir(parents=True)
+            (directory / "agents").mkdir()
             metadata = {
                 "id": "ui-session",
                 "created_at_ms": 0,
@@ -644,7 +802,8 @@ endpoint = "http://127.0.0.1:9/search"
             if args.torn_tail:
                 with (directory / "events.jsonl").open("ab") as log:
                     log.write(b'{"schema_version":1')
-        master, slave = pty.openpty()
+        master_file, slave_file = cleanup.enter_context(opened_pty())
+        master, slave = master_file.fileno(), slave_file.fileno()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 36, 100, 0, 0))
         command = [
             "/bin/sh",
@@ -656,7 +815,7 @@ endpoint = "http://127.0.0.1:9/search"
         if seed_session:
             command.extend(["--resume", "ui-session"])
         environment = dict(
-            os.environ, HOME=str(root), TERM="xterm-256color", COLORTERM="truecolor"
+            os.environ, HOME=str(root), TERM=args.term, COLORTERM="truecolor"
         )
         environment["PATH"] = (
             str(helper_directory) + os.pathsep + os.environ.get("PATH", os.defpath)
@@ -673,13 +832,17 @@ endpoint = "http://127.0.0.1:9/search"
             stderr=slave,
             start_new_session=True,
         )
-        os.close(slave)
+
+        def stop_process():
+            result["resources"]["process_group_cleanup"] = terminate_process(process)
+
+        cleanup.callback(stop_process)
+        slave_file.close()
         screen = Screen(100, 36)
         screen.reply = lambda value: (
             None if args.no_cpr else os.write(master, value.encode())
         )
         stream = pyte.ByteStream(screen)
-        raw = bytearray()
 
         def pump(seconds=0.1):
             end = time.monotonic() + seconds
@@ -732,15 +895,17 @@ endpoint = "http://127.0.0.1:9/search"
                 return []
             return [json.loads(line) for line in pointer_log.read_text().splitlines()]
 
+        expected_opens = [["https://example.com/reference"]]
+
         def assert_pointer_actions(copies):
             actions = pointer_actions()
             assert [
                 action["args"] for action in actions if action["kind"] == "open"
-            ] == [["https://example.com/reference"]], actions
+            ] == expected_opens, actions
             assert [
                 action["text"] for action in actions if action["kind"] == "copy"
             ] == (copies), actions
-            assert len(actions) == 1 + len(copies), actions
+            assert len(actions) == len(expected_opens) + len(copies), actions
 
         def contrast_ratio(foreground, background):
             def luminance(rgb):
@@ -762,7 +927,12 @@ endpoint = "http://127.0.0.1:9/search"
             return (second + 0.05) / (first + 0.05)
 
         def wait_for_copy(count):
-            wait_for(lambda: len(pointer_actions()) >= count + 1)
+            wait_for(
+                lambda: (
+                    sum(action["kind"] == "copy" for action in pointer_actions())
+                    >= count
+                )
+            )
             text = [
                 action["text"]
                 for action in pointer_actions()
@@ -782,9 +952,10 @@ endpoint = "http://127.0.0.1:9/search"
             result["findings"]["copied_count_and_high_contrast_badge"] = True
 
         def rss_kib():
-            measured = subprocess.run(
+            measured = run_command(
                 ["ps", "-o", "rss=", "-p", str(process.pid)],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 check=True,
             )
@@ -822,9 +993,9 @@ endpoint = "http://127.0.0.1:9/search"
                     wait_for(lambda: main_ready(composer_text))
                 elif view == "transcript":
                     wait_for(
-                        lambda: any(
+                        lambda: screen.cursor.hidden and any(
                             label in screen.display[-1].lower()
-                            for label in ("esc close", "release to copy", "copied")
+                            for label in ("esc", "release to copy", "copied")
                         )
                     )
                 assert screen.primary is not None, (
@@ -834,8 +1005,6 @@ endpoint = "http://127.0.0.1:9/search"
                 assert "SHELL_HISTORY_MARKER" in screen.primary_text()
                 assert raw.count(b"\x1b[?1049h") == 1, "nested alternate-screen entry"
                 assert raw.count(b"\x1b[?1049l") == 0, "overlay restored the shell"
-                if view == "main":
-                    assert "esc close · ↑↓ scroll" not in "\n".join(screen.display)
             assert raw.count(b"\x1b[6n") + raw.count(b"\x1b[?6n") == 0, (
                 "fullscreen startup must not request a cursor-position report"
             )
@@ -1427,6 +1596,172 @@ endpoint = "http://127.0.0.1:9/search"
                 result["findings"][
                     "cancel_returns_unapplied_steering_without_autorun"
                 ] = True
+
+                resize(24, 8)
+                send("?")
+                send(b"\x1b[F")
+                wait_for(lambda: "shift+tab" in display_text().lower())
+                capture("shortcuts-last-narrow", view="shortcuts")
+                send(b"\x1b[H")
+                wait_for(lambda: "ctrl+c" in display_text().lower())
+                capture("shortcuts-first-narrow", view="shortcuts")
+                resize(100, 36)
+                capture("shortcuts-wide", view="shortcuts")
+                send(b"\x1b")
+                result["findings"]["shortcuts_reachable_at_short_heights"] = True
+
+                send(b"\x0f")
+                for _ in range(32):
+                    if "reference" in display_text():
+                        break
+                    send(b"\x1b[5~")
+                else:
+                    raise AssertionError("keyboard link fixture not reachable")
+                send(b"\t")
+                column, row = visible_point("reference")
+                assert any(
+                    screen.buffer[row][x].reverse for x in range(column, column + 9)
+                )
+                capture("keyboard-link-focused", view="transcript")
+                expected_opens.append(["https://example.com/reference"])
+                send("\r")
+                wait_for(
+                    lambda: (
+                        sum(action["kind"] == "open" for action in pointer_actions())
+                        == len(expected_opens)
+                    )
+                )
+                send("y")
+                copied_texts.append("https://example.com/reference")
+                wait_for_copy(len(copied_texts))
+                assert_pointer_actions(copied_texts)
+                capture("keyboard-link-copied", view="transcript")
+                send(b"\x1b")
+                send(b"\x1b")
+                capture("keyboard-links-restored")
+                result["findings"]["keyboard_links_open_and_copy_exact_targets"] = True
+
+                workflow = root / ".github" / "workflows"
+                workflow.mkdir(parents=True)
+                (workflow / "audit.yml").write_text("name: fixture\n")
+                send("@.github/")
+                wait_for(lambda: ".github/workflows/audit.yml" in display_text())
+                capture("mention-dot-directory", composer_text="@.github/")
+                send(b"\x03")
+                (root / "new_late.rs").write_text("fn refreshed() {}\n")
+                send("@new_late")
+                wait_for(lambda: "new_late.rs" in display_text())
+                capture("mention-refreshed", composer_text="@new_late")
+                send(b"\x03")
+                result["findings"][
+                    "mention_index_refreshes_and_includes_dot_directories"
+                ] = True
+
+                def png_chunk(kind, payload):
+                    return (
+                        struct.pack(">I", len(payload))
+                        + kind
+                        + payload
+                        + struct.pack(">I", zlib.crc32(kind + payload))
+                    )
+
+                png = (
+                    b"\x89PNG\r\n\x1a\n"
+                    + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+                    + png_chunk(b"IDAT", zlib.compress(b"\x00" * 5))
+                    + png_chunk(b"IEND", b"")
+                )
+                (root / "R0lGOD-screenshot.png").write_bytes(png)
+                paste_dir = root / ".kurama" / "paste"
+                before_paste = set(paste_dir.glob("*"))
+                send(b"\x1b[200~R0lGOD-screenshot.png\x1b[201~")
+                wait_for(lambda: len(set(paste_dir.glob("*")) - before_paste) == 1)
+                attached = (set(paste_dir.glob("*")) - before_paste).pop()
+                assert attached.read_bytes() == png
+                capture("relative-image-attached", composer_text=None)
+                send(b"\x03")
+                with (root / "oversized.png").open("wb") as image_file:
+                    image_file.write(png)
+                    image_file.truncate(8 * 1024 * 1024 + 1)
+                send("KEEP_IMAGE_DRAFT")
+                send(b"\x1b[200~oversized.png\x1b[201~")
+                wait_for(lambda: "8 MiB limit" in display_text())
+                capture("oversized-image-rejected", composer_text="KEEP_IMAGE_DRAFT")
+                assert set(paste_dir.glob("*")) == before_paste | {attached}
+                send(b"\x03")
+                result["findings"][
+                    "bounded_image_paste_preserves_draft_and_relative_paths"
+                ] = True
+
+                send(b"\x1b[200~alpha\nbeta\x1b[201~")
+                send(b"\x1b[HX\x01Y\x05")
+                capture("composer-line-boundaries", composer_text="Yalpha\nXbeta")
+                send(b"\x03")
+                result["findings"][
+                    "composer_line_and_buffer_boundaries_are_distinct"
+                ] = True
+
+                config_before = (state / "config.toml").read_bytes()
+                send("/connect\r")
+                send(b"\x1b[B\x1b[B\r")
+                send("\r")
+                send("fixture-model\r")
+                wait_for(lambda: "API key" in display_text())
+                secret_fixture = "A\U0001f469\u200d\U0001f4bbe\u0301Z"
+                send(secret_fixture)
+                wait_for(lambda: display_text().count("•") == 4)
+                send(b"\x1b[H\x1b[C\x1b[3~")
+                wait_for(lambda: display_text().count("•") == 3)
+                send("Ω")
+                wait_for(lambda: display_text().count("•") == 4)
+                resize(24, 8)
+                capture("onboarding-secret-middle-narrow", view="onboarding")
+                assert secret_fixture not in display_text()
+                assert secret_fixture.encode() not in raw
+                resize(100, 36)
+                send(b"\x03")
+                capture("onboarding-cancel-restores-session")
+                assert (state / "config.toml").read_bytes() == config_before
+                result["findings"][
+                    "onboarding_grapheme_editing_stays_masked_and_cancels_cleanly"
+                ] = True
+
+                send("CONTROL_AGENTS use sub-agents to review\r")
+                wait_for(lambda: "CONTROL_AGENTS_DONE" in display_text(), timeout=30)
+                completed_agents = [
+                    event["snapshot"]
+                    for event in session_events()
+                    if event["type"] == "agent_completed"
+                ]
+                assert len(completed_agents) == 8
+                send("/agents\r")
+                resize(24, 8)
+                send(b"\x1b[H")
+                first_agents = capture("agents-first-narrow", view="agents")
+                send(b"\x1b[F")
+                last_agents = capture("agents-last-narrow", view="agents")
+                assert first_agents["screen"] != last_agents["screen"]
+                send("\r")
+                wait_for(lambda: "NEW29" in display_text())
+                capture("agent-inspection-tail", view="agents")
+                send(b"\x1b[H")
+                for _ in range(20):
+                    if "OLD00" in display_text():
+                        break
+                    send(b"\x1b[B")
+                else:
+                    raise AssertionError("older child transcript is unreachable")
+                capture("agent-inspection-first", view="agents")
+                send(b"\x1b[F")
+                wait_for(lambda: "NEW29" in display_text())
+                resize(100, 36)
+                capture("agent-inspection-wide", view="agents")
+                send(b"\x1b")
+                send(b"\x1b")
+                capture("agents-restored")
+                result["findings"][
+                    "live_agent_list_and_transcript_navigation_are_reachable"
+                ] = True
             send("/exit\r")
             wait_for(lambda: process.poll() is not None)
             result["exit_code"] = process.returncode
@@ -1467,42 +1802,7 @@ endpoint = "http://127.0.0.1:9/search"
                 Fixture.control_release.set()
                 Fixture.control_cancel_release.set()
                 (root / "release-tool").touch()
-            try:
-                if process.poll() is None:
-                    os.killpg(process.pid, signal.SIGTERM)
-                    try:
-                        process.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(process.pid, signal.SIGKILL)
-                        process.wait(timeout=3)
-            finally:
-                os.close(master)
-                server.shutdown()
-                server.server_close()
-                thread.join(timeout=3)
-            result["findings"]["pty_process_and_server_closed"] = (
-                process.poll() is not None and not thread.is_alive()
-            )
-            (output_dir / "terminal.raw").write_bytes(raw)
-            if args.check_controls:
-                (output_dir / "provider-requests.json").write_text(
-                    json.dumps(Fixture.requests, indent=2)
-                )
-                for log in (state / "sessions").glob("*/events.jsonl"):
-                    (output_dir / "session-events.jsonl").write_bytes(log.read_bytes())
-            (output_dir / "audit.json").write_text(json.dumps(result, indent=2))
-    print(
-        json.dumps(
-            {
-                "output": str(output_dir),
-                "frames": len(result["frames"]),
-                **result.get("findings", {}),
-                "exit": result.get("exit_code"),
-                "resources": result["resources"],
-            }
-        )
-    )
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

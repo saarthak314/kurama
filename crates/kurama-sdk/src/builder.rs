@@ -138,6 +138,14 @@ impl AgentBuilder {
                 "unknown active profile: {active_profile}"
             )));
         }
+        for (profile, _) in self.profiles.values() {
+            if profile.max_input_tokens == 0 || profile.max_output_tokens == 0 {
+                return Err(KuramaError::Configuration(format!(
+                    "profile {} token limits must be non-zero",
+                    profile.name
+                )));
+            }
+        }
 
         Ok(AgentRuntime::new(RuntimeParts {
             profiles: self.profiles,

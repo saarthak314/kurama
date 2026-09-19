@@ -13,7 +13,6 @@ use crate::http::{HttpClient, SseNormalizer, sse_model_stream};
 
 use super::{
     anthropic_messages, anthropic_tools, normalize_delegation_events, provider_instructions,
-    sse::SseDecoder,
 };
 
 use super::endpoint_url;
@@ -30,18 +29,18 @@ pub struct AnthropicBackend {
 }
 
 impl AnthropicBackend {
-    pub fn new(http: HttpClient, endpoint: Url, api_key: impl Into<String>) -> Self {
+    pub fn new(http: HttpClient, endpoint: Url, api_key: impl Into<Zeroizing<String>>) -> Self {
         Self {
             http,
             endpoint,
-            api_key: Zeroizing::new(api_key.into()),
+            api_key: api_key.into(),
         }
     }
 
     pub fn from_endpoint(
         http: HttpClient,
         endpoint: &str,
-        api_key: impl Into<String>,
+        api_key: impl Into<Zeroizing<String>>,
     ) -> Result<Self, KuramaError> {
         let endpoint = Url::parse(endpoint)
             .map_err(|error| KuramaError::Configuration(format!("Anthropic endpoint: {error}")))?;
@@ -57,22 +56,6 @@ impl AnthropicBackend {
             "max_tokens": request.profile.max_output_tokens,
             "stream": true
         })
-    }
-
-    pub fn parse_fixture(fixture: &str) -> Result<Vec<ModelEvent>, KuramaError> {
-        let mut decoder = SseDecoder::default();
-        let mut normalizer = AnthropicNormalizer::default();
-        let mut events = Vec::new();
-        for byte in fixture.as_bytes() {
-            for event in decoder.push(&[*byte])? {
-                events.extend(normalizer.push(&event.data)?);
-            }
-        }
-        for event in decoder.finish()? {
-            events.extend(normalizer.push(&event.data)?);
-        }
-        events.extend(normalizer.finish()?);
-        Ok(events)
     }
 }
 
@@ -187,14 +170,15 @@ impl AnthropicNormalizer {
                     let index = value.get("index").and_then(Value::as_u64).ok_or_else(|| {
                         KuramaError::Protocol("Anthropic tool block omitted index".into())
                     })?;
-                    let input = value
-                        .pointer("/content_block/input")
-                        .cloned()
-                        .unwrap_or_else(|| json!({}));
-                    let json = if input.as_object().is_some_and(|object| object.is_empty()) {
-                        String::new()
-                    } else {
-                        input.to_string()
+                    let input = value.pointer("/content_block/input");
+                    let json = match input {
+                        None => String::new(),
+                        Some(input)
+                            if input.as_object().is_some_and(|object| object.is_empty()) =>
+                        {
+                            String::new()
+                        }
+                        Some(input) => input.to_string(),
                     };
                     let previous_arguments = self
                         .calls
@@ -255,6 +239,11 @@ impl AnthropicNormalizer {
                     KuramaError::Protocol("Anthropic block stop omitted index".into())
                 })?;
                 if let Some(call) = self.calls.remove(&index) {
+                    if call.call_id.is_empty() || call.name.is_empty() {
+                        return Err(KuramaError::Protocol(
+                            "Anthropic tool call omitted id or name".into(),
+                        ));
+                    }
                     let arguments = serde_json::from_str(if call.json.is_empty() {
                         "{}"
                     } else {
@@ -289,6 +278,11 @@ impl AnthropicNormalizer {
                 });
             }
             "message_stop" => {
+                if !self.calls.is_empty() {
+                    return Err(KuramaError::Protocol(
+                        "Anthropic stopped with unfinished tool calls".into(),
+                    ));
+                }
                 events.push(self.completion());
                 self.completed = true;
             }

@@ -186,7 +186,7 @@ fn recovery_retries_interrupted_reads_with_same_operation_id() {
                 operation_id: operation_id.clone(),
                 call_id: "call".into(),
                 operation: Operation::Read {
-                    path: "Cargo.toml".into(),
+                    paths: vec!["Cargo.toml".into()],
                     external: false,
                 },
             },

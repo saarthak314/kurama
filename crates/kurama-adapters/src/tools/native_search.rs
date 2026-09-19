@@ -20,12 +20,7 @@ pub(super) async fn run_search(
 ) -> Result<Vec<SearchResult>, KuramaError> {
     let mut stream = event_stream(command, decoder, cancel, Vec::new()).await?;
     let mut output = String::new();
-    loop {
-        let event = tokio::select! {
-            _ = cancel.cancelled() => return Err(KuramaError::Cancelled),
-            event = stream.next() => event,
-        };
-        let Some(event) = event else { break };
+    while let Some(event) = stream.next().await {
         if let ModelEvent::TextDelta { text } = event? {
             if output.len().saturating_add(text.len()) > MAX_JSONL_LINE_BYTES {
                 return Err(KuramaError::Tool(

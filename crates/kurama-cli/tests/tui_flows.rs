@@ -10,6 +10,19 @@ use kurama_protocol::{
 };
 
 #[test]
+fn history_query_matches_unicode_case_and_preserves_prompt() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.remember_prompt("review café parser");
+    state.start_history_search();
+    for character in "CAFÉ".chars() {
+        state.push_history_search_char(character);
+    }
+    assert_eq!(state.history_matches(), ["review café parser"]);
+    assert!(state.accept_history_search());
+    assert_eq!(state.composer, "review café parser");
+}
+
+#[test]
 fn onboarding_offers_only_supported_connection_types() {
     let state = OnboardingState::new();
     assert_eq!(
@@ -210,7 +223,7 @@ fn inspector_and_queued_steering_preserve_stream_queue_and_closed_overlay() {
     state.begin_approval(ApprovalRequest {
         operation_id: OperationId::from("pending-approval"),
         operation: Operation::Read {
-            path: "outside.txt".into(),
+            paths: vec!["outside.txt".into()],
             external: true,
         },
         summary: "read outside workspace".into(),
@@ -359,6 +372,7 @@ fn replay_hydrates_explicit_transcript_variants() {
     state.hydrate_replay(&[
         replay_event(SessionEvent::UserMessage {
             text: "inspect".into(),
+            explicit_delegation: false,
         }),
         replay_event(SessionEvent::AssistantMessage {
             text: "checking".into(),
@@ -367,7 +381,7 @@ fn replay_hydrates_explicit_transcript_variants() {
             operation_id: OperationId::from("operation_1"),
             call_id: CallId::from("call_1"),
             operation: Operation::Read {
-                path: "src/lib.rs".into(),
+                paths: vec!["src/lib.rs".into()],
                 external: false,
             },
         }),
@@ -474,7 +488,6 @@ fn runtime_approval_hydrates_editor_from_request_arguments() {
 
     assert_eq!(state.activity(), &ActivityState::AwaitingApproval);
     let approval = state.approval.as_ref().expect("approval");
-    assert_eq!(approval.arguments, arguments);
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&approval.editor).expect("editor JSON"),
         arguments

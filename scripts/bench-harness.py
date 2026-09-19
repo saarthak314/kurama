@@ -4,18 +4,24 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
-import platform
 import signal
 import subprocess
 import sys
 import threading
 import time
+import traceback
+
+from verification import (
+    cleanup_group,
+    empty_output_dir,
+    provenance as run_provenance,
+    signal_group,
+)
 
 
 BENCHMARKS = (
@@ -30,52 +36,16 @@ def write_json(path: Path, value: object) -> None:
     )
 
 
-def command_version(command: list[str]) -> dict[str, object]:
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=5)
-        return {
-            "command": command,
-            "returncode": result.returncode,
-            "stdout": result.stdout.strip(),
-            "stderr": result.stderr.strip(),
-        }
-    except (OSError, subprocess.TimeoutExpired) as error:
-        return {"command": command, "error": str(error)}
-
-
 def provenance() -> dict[str, object]:
     return {
-        "started_at_utc": datetime.now(timezone.utc).isoformat(),
-        "platform": platform.platform(),
-        "system": platform.system(),
-        "machine": platform.machine(),
-        "python": sys.version,
-        "python_executable": sys.executable,
-        "cwd": str(Path.cwd()),
-        "argv": sys.argv,
-        "revision": command_version(["git", "rev-parse", "HEAD"]),
-        "rustc": command_version(["rustc", "--version", "--verbose"]),
-        "ci": {
-            key: os.environ[key]
-            for key in (
-                "GITHUB_SHA",
-                "GITHUB_REF",
-                "GITHUB_RUN_ID",
-                "GITHUB_RUN_ATTEMPT",
-                "GITHUB_REPOSITORY",
-                "RUNNER_OS",
-                "RUNNER_ARCH",
-                "ImageOS",
-                "ImageVersion",
-            )
-            if key in os.environ
-        },
+        **run_provenance(),
         "resource_method": "os.wait4(exact_child_pid, 0); not cumulative RUSAGE_CHILDREN",
         "peak_rss_native_unit": "bytes" if sys.platform == "darwin" else "KiB",
         "resource_scope": (
-            "Per benchmark process, with descendant accounting as supplied by the OS. "
-            "Peak RSS is not the sum of concurrent process-tree RSS. Wall time and CPU "
-            "include process startup, warmups, setup, validation, and all measured samples; "
+            "Exact-child wait4 accounting, including only descendants accounted by the OS. "
+            "Unwaited or surviving descendants are not full process-tree accounting; residual "
+            "group members are terminated after measurement. Peak RSS is not a tree sum. "
+            "Wall/CPU include startup, warmups, setup, validation and all measured samples; "
             "benchmark JSON retains its narrower internal latency measurements."
         ),
     }
@@ -99,6 +69,8 @@ def validate_output(path: Path, benchmark: str) -> list[str]:
         return [f"stdout is not one valid JSON document: {error}"]
     if not isinstance(value, dict):
         return ["benchmark output must be a JSON object"]
+    if benchmark == "kurama-adapters":
+        return validate_adapters(value)
     errors = []
     if value.get("benchmark") != benchmark:
         errors.append(f"expected benchmark {benchmark!r}")
@@ -156,7 +128,13 @@ def validate_output(path: Path, benchmark: str) -> list[str]:
         repetitions = value.get("repetitions")
         if type(repetitions) is not int or repetitions <= 0:
             errors.append("missing or invalid TUI repetitions")
-        for name in ("expanded_scroll", "ignored_events", "compact_tool_preview"):
+        names = {"expanded_scroll", "ignored_events", "compact_tool_preview"}
+        names.update(
+            name
+            for name, group in value.items()
+            if isinstance(group, dict) and "samples" in group
+        )
+        for name in sorted(names):
             group = value.get(name)
             if not isinstance(group, dict):
                 errors.append(f"missing TUI group {name}")
@@ -179,14 +157,66 @@ def validate_output(path: Path, benchmark: str) -> list[str]:
     return errors
 
 
+def validate_adapters(value: dict) -> list[str]:
+    errors = []
+    if value.get("schema_version") != 1:
+        errors.append("adapter benchmark requires schema_version=1")
+    if "fatal_error" in value:
+        errors.append(f"fatal_error: {value['fatal_error']}")
+    groups = value.get("benchmarks")
+    if not isinstance(groups, list):
+        return errors + ["missing adapter benchmarks"]
+    expected = {
+        "sse_byte_fragmented_32k",
+        "sse_burst_10k_records",
+        "html_tag_dense_2mb",
+        "compatible_large_request",
+        "small_staged_output",
+        "bounded_output_1mb",
+        "read_first_line_16mb",
+    }
+    seen = set()
+    for index, group in enumerate(groups):
+        if not isinstance(group, dict):
+            errors.append(f"benchmarks[{index}] must be an object")
+            continue
+        name = group.get("name")
+        if not isinstance(name, str):
+            errors.append(f"benchmarks[{index}] has invalid name")
+            continue
+        if name in seen or name not in expected:
+            errors.append(f"unexpected or duplicate adapter benchmark {name!r}")
+        seen.add(name)
+        for key in ("iterations_per_sample", "observable_size"):
+            if type(group.get(key)) is not int or group[key] <= 0:
+                errors.append(f"{name} has invalid {key}")
+        samples = group.get("samples_ms")
+        if (
+            not isinstance(samples, list)
+            or len(samples) != 5
+            or not all(map(nonnegative_number, samples))
+        ):
+            errors.append(f"{name} requires five finite nonnegative raw samples")
+        elif (
+            not nonnegative_number(group.get("median_ms"))
+            or group["median_ms"] != sorted(samples)[2]
+        ):
+            errors.append(f"{name} median disagrees with raw samples")
+        if "fatal_error" in group:
+            errors.append(f"{name} fatal_error: {group['fatal_error']}")
+    if seen != expected:
+        errors.append(f"missing adapter benchmarks: {sorted(expected - seen)}")
+    return errors
+
+
 def measure(
-    binary: Path, benchmark: str, output_dir: Path, timeout: float
+    binary: Path, benchmark: str, output_dir: Path, timeout: float, arguments: tuple[str, ...] = ()
 ) -> dict[str, object]:
     stdout_path = output_dir / f"{binary.name}.stdout.json"
     stderr_path = output_dir / f"{binary.name}.stderr.txt"
     resources_path = output_dir / f"{binary.name}.resources.json"
     result = {
-        "command": [str(binary)],
+        "command": [str(binary), *arguments],
         "benchmark": benchmark,
         "provenance": "summary.json",
         "stdout": stdout_path.name,
@@ -198,75 +228,83 @@ def measure(
         "system_cpu_seconds": None,
         "peak_rss_bytes": None,
         "timed_out": False,
+        "residual_group_cleanup": False,
         "status": "starting",
+        "exit_status": 1,
     }
-    write_json(resources_path, result)
     timed_out = threading.Event()
-    with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
-        try:
+    try:
+        write_json(resources_path, result)
+        with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
             with binary.open("rb") as executable:
                 result["binary_sha256"] = hashlib.file_digest(
                     executable, "sha256"
                 ).hexdigest()
             started = time.monotonic()
             process = subprocess.Popen(
-                [str(binary)],
+                result["command"],
                 stdin=subprocess.DEVNULL,
                 stdout=stdout,
                 stderr=stderr,
                 start_new_session=True,
             )
-        except OSError as error:
-            result["spawn_error"] = str(error)
-            result["exit_status"] = 127 if isinstance(error, FileNotFoundError) else 126
-            stderr.write((str(error) + "\n").encode())
-        else:
-
-            def kill_group() -> None:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    return
-                timed_out.set()
-
-            # A one-shot watchdog also covers a benchmark stalled in synchronous I/O.
-            # Only wait4 reaps this child: Popen.wait/poll would discard its rusage.
-            watchdog = threading.Timer(timeout, kill_group)
-            watchdog.daemon = True
-            watchdog.start()
+            watchdog = None
             try:
+
+                def timeout_group():
+                    if signal_group(process.pid, signal.SIGKILL):
+                        timed_out.set()
+
+                # Only wait4 may reap this exact child; Popen.wait/poll loses rusage.
+                watchdog = threading.Timer(timeout, timeout_group)
+                watchdog.daemon = True
+                watchdog.start()
                 _, status, usage = os.wait4(process.pid, 0)
                 process.returncode = os.waitstatus_to_exitcode(status)
-                result["wall_seconds"] = time.monotonic() - started
+                result.update(
+                    {
+                        "wall_seconds": time.monotonic() - started,
+                        "returncode": process.returncode,
+                        "user_cpu_seconds": usage.ru_utime,
+                        "system_cpu_seconds": usage.ru_stime,
+                        "peak_rss_bytes": int(usage.ru_maxrss)
+                        * (1 if sys.platform == "darwin" else 1024),
+                    }
+                )
             finally:
-                watchdog.cancel()
-                watchdog.join()
-                if process.returncode is None:
-                    kill_group()
-                    _, status, _ = os.wait4(process.pid, 0)
-                    process.returncode = os.waitstatus_to_exitcode(status)
-            result.update(
-                {
-                    "returncode": process.returncode,
-                    "user_cpu_seconds": usage.ru_utime,
-                    "system_cpu_seconds": usage.ru_stime,
-                    "peak_rss_bytes": int(usage.ru_maxrss)
-                    * (1 if sys.platform == "darwin" else 1024),
-                    "timed_out": timed_out.is_set(),
-                    "exit_status": (
-                        124
-                        if timed_out.is_set()
-                        else process.returncode
-                        if process.returncode >= 0
-                        else 128 - process.returncode
-                    ),
-                }
+                if watchdog is not None:
+                    watchdog.cancel()
+                    if watchdog.ident is not None:
+                        watchdog.join()
+                try:
+                    if process.returncode is None:
+                        signal_group(process.pid, signal.SIGKILL)
+                        _, status, _ = os.wait4(process.pid, 0)
+                        process.returncode = os.waitstatus_to_exitcode(status)
+                finally:
+                    result["residual_group_cleanup"] = cleanup_group(process.pid)
+                    result["timed_out"] = timed_out.is_set()
+            result["exit_status"] = (
+                124
+                if timed_out.is_set()
+                else process.returncode
+                if process.returncode >= 0
+                else 128 - process.returncode
             )
+    except Exception as error:
+        result["fatal_error"] = str(error)
+        result["traceback"] = traceback.format_exc()
+        result["exit_status"] = 127 if isinstance(error, FileNotFoundError) else 1
     result["validation_errors"] = validate_output(stdout_path, benchmark)
     if result["exit_status"] == 0 and result["validation_errors"]:
         result["exit_status"] = 1
     result["status"] = "passed" if result["exit_status"] == 0 else "failed"
-    write_json(resources_path, result)
+    try:
+        write_json(resources_path, result)
+    except OSError as error:
+        result["artifact_error"] = str(error)
+        result["exit_status"] = 1
+        result["status"] = "failed"
     return result
 
 
@@ -299,6 +337,11 @@ def main() -> int:
         "--output-dir", required=True, type=Path, help="directory for raw artifacts"
     )
     parser.add_argument(
+        "--include-adapters",
+        action="store_true",
+        help="also require adapter_bench; omit for older two-binary baselines",
+    )
+    parser.add_argument(
         "--timeout-seconds",
         type=positive_seconds,
         default=300.0,
@@ -309,19 +352,31 @@ def main() -> int:
         parser.error("per-child RSS measurement requires Linux or macOS with os.wait4")
     output_dir = args.output_dir.resolve()
     try:
-        output_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as error:
-        parser.error(f"cannot create output directory: {error}")
+        empty_output_dir(output_dir)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
         "provenance": provenance(),
         "runs": [],
         "status": "running",
         "exit_status": 0,
     }
     summary_path = output_dir / "summary.json"
-    write_json(summary_path, summary)
-    for executable, benchmark in BENCHMARKS:
+
+    def save_summary():
+        try:
+            write_json(summary_path, summary)
+        except OSError as error:
+            summary["artifact_error"] = str(error)
+            summary["exit_status"] = summary["exit_status"] or 1
+            summary["status"] = "failed"
+
+    save_summary()
+    benchmarks = BENCHMARKS + (
+        (("adapter_bench", "kurama-adapters"),) if args.include_adapters else ()
+    )
+    for executable, benchmark in benchmarks:
         result = measure(
             args.bin_dir.resolve() / executable,
             benchmark,
@@ -331,14 +386,14 @@ def main() -> int:
         summary["runs"].append(result)
         if summary["exit_status"] == 0:
             summary["exit_status"] = result["exit_status"]
-        write_json(summary_path, summary)
+        save_summary()
         if result["exit_status"]:
             print(
                 f"{executable} failed: see {output_dir / (executable + '.resources.json')}",
                 file=sys.stderr,
             )
     summary["status"] = "passed" if summary["exit_status"] == 0 else "failed"
-    write_json(summary_path, summary)
+    save_summary()
     print(json.dumps(summary, allow_nan=False))
     return summary["exit_status"]
 

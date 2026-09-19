@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, time::Instant};
+use std::time::Instant;
 use unicode_segmentation::UnicodeSegmentation;
 
 use ratatui::{
@@ -14,7 +14,7 @@ use kurama_protocol::{agent::AgentState, session::TodoStatus};
 use super::{
     Overlay, TranscriptEntry, TuiState, activity_line,
     agents::state_label,
-    command_palette_height,
+    command_palette::Palette,
     composer::{render_approval, render_composer, render_footer, render_queue},
     context::render_context,
     diff::render_diff,
@@ -190,11 +190,17 @@ fn render_main(
         !approval_visible && state.overlay == Overlay::None,
     );
 
-    let palette_height = command_palette_height(state, layout.input.y.saturating_sub(area.y));
+    let palette_available = layout.input.y.saturating_sub(area.y);
+    if palette_available == 0 {
+        return;
+    }
+    let palette = Palette::prepare(state);
+    let palette_height = palette.height(palette_available);
     if palette_height > 0 {
         render_command_palette(
             frame,
             state,
+            &palette,
             Rect::new(
                 area.x,
                 layout.input.y.saturating_sub(palette_height),
@@ -205,40 +211,60 @@ fn render_main(
     }
 }
 
-fn render_shortcuts(frame: &mut Frame<'_>, _state: &TuiState, area: Rect) {
+fn render_shortcuts(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
     if area.is_empty() {
         return;
     }
     frame.render_widget(Clear, area);
-    let lines = [
-        ("ctrl+c", "interrupt, then clear, then exit"),
-        ("esc", "close overlay, then interrupt"),
-        ("enter", "send, or steer active work"),
-        ("alt+enter", "queue a follow-up"),
-        ("shift+enter", "newline (also Ctrl+J)"),
-        ("/queue", "edit or remove follow-ups"),
-        ("/diff", "review hunks and prepare feedback"),
-        ("/context", "inspect request estimates"),
-        ("ctrl+o", "expand transcript"),
-        ("ctrl+t", "todo list"),
-        ("ctrl+r", "search history"),
-        ("shift+tab", "cycle supervised/auto"),
-    ]
-    .into_iter()
-    .map(|(key, hint)| {
-        Line::from(vec![
-            Span::styled(format!(" {key:<12} "), Style::default().fg(ACCENT)),
-            Span::styled(hint, Style::default().fg(DIM)),
-        ])
-    })
-    .collect::<Vec<_>>();
     let block = modal_block(area);
     let block = if area.height >= 3 && area.width >= 4 {
         block.title(" shortcuts ")
     } else {
         block
     };
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+    let mut lines = Vec::new();
+    for (key, hint) in [
+        ("ctrl+c", "interrupt, then clear, then exit"),
+        ("esc", "close overlay, then interrupt"),
+        ("enter", "send, or steer active work"),
+        ("alt+enter", "queue a follow-up"),
+        ("shift+enter", "newline (also Ctrl+J)"),
+        ("↑↓", "prompt history"),
+        ("alt+↑↓", "move within composer"),
+        ("home/end", "logical line start/end"),
+        ("ctrl+a/e", "whole prompt start/end"),
+        ("/queue", "edit or remove follow-ups"),
+        ("/diff", "review hunks and prepare feedback"),
+        ("/context", "inspect request estimates"),
+        ("ctrl+o", "expand transcript; Tab links, Enter open, y copy"),
+        ("ctrl+t", "todo list"),
+        ("ctrl+r", "search history"),
+        ("shift+tab", "cycle supervised/auto"),
+    ] {
+        let text = if inner.width >= 60 {
+            format!(" {key:<12} {hint}")
+        } else {
+            format!("{key} · {hint}")
+        };
+        for_each_wrapped_line(&text, inner.width as usize, |line| {
+            lines.push(Line::from(line.to_owned()))
+        });
+    }
+    let page = inner.height as usize;
+    let max = lines.len().saturating_sub(page);
+    let start = state.shortcuts_scroll.get().min(max);
+    state.shortcuts_scroll.set(start);
+    state.shortcuts_max_scroll.set(max);
+    state.shortcuts_page_height.set(page.max(1));
+    frame.render_widget(
+        Paragraph::new(lines.into_iter().skip(start).take(page).collect::<Vec<_>>()),
+        inner,
+    );
 }
 
 fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) -> Option<Position> {
@@ -342,7 +368,7 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState) -> Option<Position
     let gutter = inner.width.saturating_sub(2).min(2);
     let (shown, cursor_column) = state
         .onboarding
-        .display_input_tail(width.saturating_sub(gutter as usize));
+        .display_input_window(width.saturating_sub(gutter as usize));
     let input_row = inner.y + title as u16;
     frame.render_widget(
         Line::from(vec![
@@ -392,6 +418,7 @@ fn render_agents(frame: &mut Frame<'_>, state: &TuiState) {
     let list_height = (inner.height as usize)
         .saturating_sub(header + footer)
         .max(1);
+    state.agents_page_height.set(list_height);
     if header != 0 {
         let title = format!(
             "/agents  {} running · {} queued",
@@ -746,30 +773,35 @@ fn render_agent_inspect(frame: &mut Frame<'_>, state: &TuiState) -> Option<Posit
     }
     let message_controls = usize::from(state.overlay == Overlay::AgentMessage && inner.height >= 2);
     let body_height = (inner.height as usize).saturating_sub(header + 1 + message_controls);
-    let mut visible = Vec::with_capacity(body_height);
-    for entry in agent.transcript.iter().rev().take(body_height) {
-        let remaining = body_height - visible.len();
-        let mut tail = VecDeque::<String>::with_capacity(remaining);
+    let mut count = 0usize;
+    for entry in &agent.transcript {
+        for_each_wrapped_line(entry, width, |_| count += 1);
+    }
+    let max = count.saturating_sub(body_height);
+    let scroll = state.agent_inspect_scroll.get().min(max);
+    state.agent_inspect_scroll.set(scroll);
+    state.agent_inspect_max_scroll.set(max);
+    state.agent_inspect_page_height.set(body_height.max(1));
+    let start = max.saturating_sub(scroll);
+    let mut index = 0usize;
+    for entry in &agent.transcript {
         for_each_wrapped_line(entry, width, |line| {
-            let mut row = if tail.len() == remaining {
-                tail.pop_front().unwrap_or_default()
-            } else {
-                String::new()
-            };
-            row.clear();
-            row.push_str(line);
-            tail.push_back(row);
+            if index >= start && index - start < body_height {
+                frame.render_widget(
+                    Line::from(line),
+                    Rect::new(
+                        inner.x,
+                        inner.y + (header + index - start) as u16,
+                        inner.width,
+                        1,
+                    ),
+                );
+            }
+            index += 1;
         });
-        visible.extend(tail.into_iter().rev());
-        if visible.len() == body_height {
+        if index >= start.saturating_add(body_height) {
             break;
         }
-    }
-    for (row, line) in visible.into_iter().rev().enumerate() {
-        frame.render_widget(
-            Line::from(line),
-            Rect::new(inner.x, inner.y + (header + row) as u16, inner.width, 1),
-        );
     }
     let action_area = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
     if state.overlay == Overlay::AgentMessage {

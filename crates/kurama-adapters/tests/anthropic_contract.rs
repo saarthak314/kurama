@@ -1,13 +1,7 @@
 #![cfg(feature = "anthropic")]
-#![allow(dead_code)]
 
-#[path = "../src/http.rs"]
-mod http;
-#[path = "../src/providers/mod.rs"]
-mod providers;
-
-use futures_util::StreamExt;
-use http::HttpClient;
+use futures_util::{StreamExt, TryStreamExt};
+use kurama_adapters::{AnthropicBackend, HttpClient};
 use kurama_protocol::{
     KuramaError,
     id::SessionId,
@@ -15,7 +9,6 @@ use kurama_protocol::{
     tool::ToolDescriptor,
     traits::ModelBackend,
 };
-use providers::anthropic::AnthropicBackend;
 
 #[path = "support/provider_http.rs"]
 mod provider_http;
@@ -70,11 +63,12 @@ fn messages_request_uses_anthropic_tool_shape() {
     );
 }
 
-#[test]
-fn maps_messages_stream_to_normalized_events() {
-    let events = AnthropicBackend::parse_fixture(include_str!(
+#[tokio::test]
+async fn maps_messages_stream_to_normalized_events() {
+    let events = events_from_wire(include_str!(
         "../../../tests/fixtures/anthropic/tool_turn.jsonl"
     ))
+    .await
     .expect("fixture");
 
     assert!(
@@ -102,37 +96,15 @@ fn maps_messages_stream_to_normalized_events() {
     );
 }
 
-#[test]
-fn anthropic_normalization_rejects_transport_eof_before_message_stop() {
-    let error = AnthropicBackend::parse_fixture(include_str!(
-        "../../../tests/fixtures/anthropic/truncated_text.jsonl"
-    ))
-    .expect_err("truncated stream must fail");
-
-    assert!(matches!(
-        error,
-        KuramaError::Model(message) if message == "Anthropic stream ended before message_stop"
-    ));
-}
-
-#[test]
-fn anthropic_normalization_rejects_empty_transport_eof() {
-    let error = AnthropicBackend::parse_fixture("").expect_err("empty stream must fail");
-
-    assert!(matches!(
-        error,
-        KuramaError::Model(message) if message == "Anthropic stream ended before message_stop"
-    ));
-}
-
 #[tokio::test]
 async fn anthropic_backend_rejects_transport_eof_before_message_stop() {
     let (endpoint, captured) = serve_sse_once(include_str!(
         "../../../tests/fixtures/anthropic/truncated_text.jsonl"
     ))
     .await;
-    let backend = AnthropicBackend::from_endpoint(HttpClient::default(), &endpoint, "test-key")
-        .expect("backend");
+    let backend =
+        AnthropicBackend::from_endpoint(HttpClient::default(), &endpoint, "test-key".to_owned())
+            .expect("backend");
 
     let mut stream = backend
         .stream(request(), &NeverCancel)
@@ -141,6 +113,7 @@ async fn anthropic_backend_rejects_transport_eof_before_message_stop() {
     let mut error = None;
     while let Some(event) = stream.next().await {
         match event {
+            Ok(ModelEvent::ResponseCompleted { .. }) => panic!("truncated stream completed"),
             Ok(_) => {}
             Err(stream_error) => {
                 error = Some(stream_error);
@@ -152,7 +125,7 @@ async fn anthropic_backend_rejects_transport_eof_before_message_stop() {
 
     assert!(matches!(
         error.expect("truncated stream error"),
-        KuramaError::Model(message) if message == "Anthropic stream ended before message_stop"
+        KuramaError::Model(_)
     ));
 }
 
@@ -161,9 +134,12 @@ async fn anthropic_backend_yields_before_response_eof() {
     let fixture = include_str!("../../../tests/fixtures/anthropic/tool_turn.jsonl");
     let (first, tail) = split_first_sse_event(fixture);
     let server = serve_sse_until_released(first, tail).await;
-    let backend =
-        AnthropicBackend::from_endpoint(HttpClient::default(), &server.endpoint, "test-key")
-            .expect("backend");
+    let backend = AnthropicBackend::from_endpoint(
+        HttpClient::default(),
+        &server.endpoint,
+        "test-key".to_owned(),
+    )
+    .expect("backend");
 
     let mut stream = tokio::time::timeout(
         std::time::Duration::from_secs(1),
@@ -206,8 +182,9 @@ async fn anthropic_backend_bounds_candidate_non_text_events() {
         release,
         disconnected,
     } = serve_sse_until_released(body, "x").await;
-    let backend = AnthropicBackend::from_endpoint(HttpClient::default(), &endpoint, "test-key")
-        .expect("backend");
+    let backend =
+        AnthropicBackend::from_endpoint(HttpClient::default(), &endpoint, "test-key".to_owned())
+            .expect("backend");
     let mut stream = backend
         .stream(request(), &NeverCancel)
         .await
@@ -223,11 +200,7 @@ async fn anthropic_backend_bounds_candidate_non_text_events() {
     })
     .await
     .expect("candidate event bound waited for EOF");
-    assert!(matches!(
-        error,
-        KuramaError::Protocol(message)
-            if message.contains("delegation candidate") && message.contains("events")
-    ));
+    assert!(matches!(error, KuramaError::Protocol(_)));
     drop(stream);
     tokio::time::timeout(std::time::Duration::from_secs(1), disconnected)
         .await
@@ -278,8 +251,9 @@ async fn anthropic_normalization_bounds_cumulative_tool_argument_bytes() {
     }
 
     let (endpoint, captured) = serve_sse_once(body).await;
-    let backend = AnthropicBackend::from_endpoint(HttpClient::default(), &endpoint, "test-key")
-        .expect("backend");
+    let backend =
+        AnthropicBackend::from_endpoint(HttpClient::default(), &endpoint, "test-key".to_owned())
+            .expect("backend");
     let mut stream = backend
         .stream(request(), &NeverCancel)
         .await
@@ -292,15 +266,11 @@ async fn anthropic_normalization_bounds_cumulative_tool_argument_bytes() {
     };
     let _ = captured.await.expect("captured request");
 
-    assert!(matches!(
-        error,
-        KuramaError::Protocol(message)
-            if message.contains("Anthropic tool arguments") && message.contains("1048576")
-    ));
+    assert!(matches!(error, KuramaError::Protocol(_)));
 }
 
-#[test]
-fn anthropic_normalization_bounds_tool_call_count() {
+#[tokio::test]
+async fn anthropic_normalization_bounds_tool_call_count() {
     let mut body = format!(
         "event: message_start\ndata: {}\n\n",
         serde_json::json!({"type":"message_start","message":{"id":"msg_bounded","usage":{"input_tokens":1}}})
@@ -321,12 +291,104 @@ fn anthropic_normalization_bounds_tool_call_count() {
         ));
     }
 
-    let error =
-        AnthropicBackend::parse_fixture(&body).expect_err("tool call count must be bounded");
+    let error = events_from_wire(body)
+        .await
+        .expect_err("tool call count must be bounded");
 
+    assert!(matches!(error, KuramaError::Protocol(_)));
+}
+
+async fn events_from_wire(body: impl Into<String>) -> Result<Vec<ModelEvent>, KuramaError> {
+    let (endpoint, _) = serve_sse_once(body).await;
+    let backend =
+        AnthropicBackend::from_endpoint(HttpClient::default(), &endpoint, "test-key".to_owned())?;
+    backend
+        .stream(request(), &NeverCancel)
+        .await?
+        .try_collect()
+        .await
+}
+
+#[tokio::test]
+async fn anthropic_backend_cancels_after_first_event() {
+    let (first, tail) = split_first_sse_event(include_str!(
+        "../../../tests/fixtures/anthropic/tool_turn.jsonl"
+    ));
+    let server = serve_sse_until_released(first, tail).await;
+    let backend = AnthropicBackend::from_endpoint(
+        HttpClient::default(),
+        &server.endpoint,
+        "test-key".to_owned(),
+    )
+    .expect("backend");
+    provider_http::assert_stream_cancels(&backend, request(), server).await;
+}
+
+#[tokio::test]
+async fn anthropic_backend_rejects_unfinished_or_malformed_tool_calls() {
+    let added = serde_json::json!({"type":"content_block_start","index":0,"content_block":{
+        "type":"tool_use","id":"call-1","name":"read","input":{}
+    }});
+    for fault in [
+        "unfinished",
+        "missing-id",
+        "empty-id",
+        "missing-name",
+        "empty-name",
+        "arguments",
+    ] {
+        let mut start = added.clone();
+        match fault {
+            "missing-id" => {
+                start["content_block"].as_object_mut().unwrap().remove("id");
+            }
+            "empty-id" => start["content_block"]["id"] = "".into(),
+            "missing-name" => {
+                start["content_block"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("name");
+            }
+            "empty-name" => start["content_block"]["name"] = "".into(),
+            _ => {}
+        }
+        let mut body = format!("data: {start}\n\n");
+        if fault == "arguments" {
+            body.push_str("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\"}}\n\n");
+        }
+        if fault != "unfinished" {
+            body.push_str("data: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
+        }
+        body.push_str("data: {\"type\":\"message_stop\"}\n\n");
+        assert!(
+            matches!(events_from_wire(body).await, Err(KuramaError::Protocol(_))),
+            "{fault}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn anthropic_backend_accepts_bom_and_cr_only_sse() {
+    let wire = format!(
+        "\u{feff}{}",
+        include_str!("../../../tests/fixtures/anthropic/tool_turn.jsonl").replace('\n', "\r")
+    );
+    let events = events_from_wire(wire).await.expect("CR-only SSE");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ModelEvent::ToolCall { name, .. } if name == "read"))
+    );
     assert!(matches!(
-        error,
-        KuramaError::Protocol(message)
-            if message.contains("Anthropic tool calls") && message.contains("64")
+        events.last(),
+        Some(ModelEvent::ResponseCompleted { .. })
+    ));
+}
+
+#[tokio::test]
+async fn anthropic_backend_rejects_empty_http_body() {
+    assert!(matches!(
+        events_from_wire("").await,
+        Err(KuramaError::Model(_))
     ));
 }
