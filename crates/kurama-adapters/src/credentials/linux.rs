@@ -53,7 +53,7 @@ struct NativeChild {
 
 impl Drop for NativeChild {
     fn drop(&mut self) {
-        let _ = kill_process_group(self.group, Signal::Kill);
+        let _ = kill_process_group(self.group, Signal::KILL);
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
