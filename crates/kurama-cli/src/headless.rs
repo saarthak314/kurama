@@ -730,7 +730,7 @@ mod unix {
     }
     impl Pipe {
         pub(super) fn new(source: impl AsFd, interest: Interest) -> io::Result<Self> {
-            let fd = rustix::io::dup(&source)?;
+            let fd = rustix::io::fcntl_dupfd_cloexec(&source, 3)?;
             let original = fcntl_getfl(&fd)?;
             fcntl_setfl(&fd, original | OFlags::NONBLOCK)?;
             match AsyncFd::with_interest(fd, interest) {
@@ -790,6 +790,26 @@ mod unix {
         }
         fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::os::{fd::AsRawFd, unix::net::UnixStream};
+
+        #[tokio::test]
+        async fn executed_children_cannot_access_protocol_descriptors() {
+            let (source, _peer) = UnixStream::pair().unwrap();
+            let pipe = Pipe::new(source, Interest::READABLE).unwrap();
+            let inherited = std::process::Command::new("/bin/test")
+                .args(["-e", &format!("/dev/fd/{}", pipe.fd.get_ref().as_raw_fd())])
+                .status()
+                .unwrap();
+            assert!(
+                !inherited.success(),
+                "child inherited a protocol descriptor"
+            );
         }
     }
 }

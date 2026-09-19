@@ -104,7 +104,7 @@ export class Agent {
   private readonly cleanupMs: number;
 
   private constructor(private readonly options: AgentOptions) {
-    this.cleanupMs = options.shutdownTimeoutMs ?? 2_000;
+    this.cleanupMs = options.shutdownTimeoutMs ?? 5_000;
     const env = { ...process.env, ...options.env };
     const binary = options.binary ?? env.KURAMA_BIN ?? "kurama";
     this.child = spawn(binary, options.mode === "yolo" ? ["--stdio", "--yolo"] : ["--stdio"], {
