@@ -15,6 +15,9 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
       - name: Install Rust 1.98.0
         run: |
           rustup toolchain install 1.98.0 --profile minimal
@@ -28,6 +31,10 @@ jobs:
             target
           key: cargo-release-tests-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-release-tests-${{ runner.os }}-
+      - name: Check release tag and regression tests
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_release_version.py' -v
+          python3 scripts/check-release-version.py "$GITHUB_REF_NAME"
       - name: Test release source
         run: cargo test --locked --workspace --all-features
 
@@ -52,6 +59,9 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
       - name: Install Rust 1.98.0
         run: |
           rustup toolchain install 1.98.0 --profile minimal --target ${{ matrix.target }}
@@ -69,6 +79,8 @@ jobs:
         run: cargo build --locked --release -p kurama-cli --target ${{ matrix.target }}
       - name: Enforce 10 MiB stripped limit
         run: scripts/check-size.sh target/${{ matrix.target }}/release/kurama
+      - name: Verify built binary version
+        run: python3 scripts/check-release-version.py "$GITHUB_REF_NAME" --binary target/${{ matrix.target }}/release/kurama
       - name: Package archive and checksum
         shell: bash
         run: |
