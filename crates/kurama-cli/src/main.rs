@@ -13,6 +13,14 @@ async fn main() {
         }
     };
 
+    if args.stdio {
+        if let Err(error) = kurama_cli::headless::run(args).await {
+            eprintln!("kurama: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
+
     if args.help {
         print!("{HELP}");
         return;

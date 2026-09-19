@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kurama-sdk"
+version = "0.2.0"
+description = "Typed asynchronous Python client for the Kurama coding agent"
+readme = {text = "Typed async Kurama agents with streaming, approvals, cancellation, resume, and verification. See https://github.com/saarthak314/kurama/blob/main/docs/sdk.md for setup and examples.", content-type = "text/plain"}
+requires-python = ">=3.11"
+license = "MIT OR Apache-2.0"
+authors = [{name = "Kurama contributors"}]
+keywords = ["kurama", "agent", "sdk", "asyncio"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Operating System :: POSIX",
+  "Typing :: Typed",
+]
+
+[project.urls]
+Documentation = "https://github.com/saarthak314/kurama/blob/main/docs/sdk.md"
+Repository = "https://github.com/saarthak314/kurama"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+kurama = ["py.typed"]

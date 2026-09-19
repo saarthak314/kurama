@@ -1,7 +1,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -24,6 +27,7 @@ use kurama_protocol::{
     traits::{
         ApprovalPolicy, EventSink, IdGenerator, ModelBackend, Orchestrator, SessionStore, Tool,
     },
+    verification::{VerificationRecipe, VerificationReport, VerificationStatus},
 };
 use tokio::sync::mpsc;
 
@@ -47,6 +51,7 @@ const MAX_PENDING_STEERING_BYTES: usize = 262_144;
 #[derive(Clone)]
 pub struct EngineHandle {
     commands: mpsc::Sender<EngineCommand>,
+    active_batches: Arc<AtomicUsize>,
 }
 
 impl EngineHandle {
@@ -75,6 +80,26 @@ impl EngineHandle {
 
     pub async fn inspect_context(&self) -> Result<(), KuramaError> {
         self.send(EngineCommand::InspectContext).await
+    }
+
+    pub async fn verify(
+        &self,
+        name: impl Into<String>,
+        recipe: VerificationRecipe,
+    ) -> Result<(), KuramaError> {
+        self.send(EngineCommand::Verify {
+            name: name.into(),
+            recipe,
+        })
+        .await
+    }
+
+    pub async fn inspect_verifications(
+        &self,
+        recipes: BTreeMap<String, VerificationRecipe>,
+    ) -> Result<(), KuramaError> {
+        self.send(EngineCommand::InspectVerifications { recipes })
+            .await
     }
 
     pub async fn resolve_approval(
@@ -136,10 +161,28 @@ impl EngineHandle {
     }
 
     async fn send(&self, command: EngineCommand) -> Result<(), KuramaError> {
-        self.commands
-            .send(command)
+        let verification = matches!(command, EngineCommand::Verify { .. });
+        if verification && self.active_batches.load(Ordering::Acquire) != 0 {
+            return Err(KuramaError::Policy(
+                "another command cannot start during an active turn".into(),
+            ));
+        }
+        let permit = self
+            .commands
+            .reserve()
             .await
-            .map_err(|_| KuramaError::Cancelled)
+            .map_err(|_| KuramaError::Cancelled)?;
+        if verification {
+            self.active_batches
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| {
+                    KuramaError::Policy("another command cannot start during an active turn".into())
+                })?;
+        } else if starts_command_batch(&command) {
+            self.active_batches.fetch_add(1, Ordering::AcqRel);
+        }
+        permit.send(command);
+        Ok(())
     }
 }
 
@@ -236,6 +279,13 @@ impl Engine {
             StreamRecovery::Continue(cursor) => Some(cursor),
             StreamRecovery::None | StreamRecovery::RestartFromBoundary => None,
         };
+        let startup_batch = resume_incomplete_turn
+            || !recovery.interrupted_agents.is_empty()
+            || recovery
+                .operations
+                .values()
+                .any(|action| !matches!(action, RecoveryAction::Completed { .. }));
+        let active_batches = Arc::new(AtomicUsize::new(usize::from(startup_batch)));
 
         let (command_tx, command_rx) = mpsc::channel(config.command_capacity);
         let (runtime_tx, runtime_rx) = mpsc::channel(config.event_capacity);
@@ -253,6 +303,7 @@ impl Engine {
         );
         let mut context = ContextManager::new(config.context_policy);
         let goal = latest_goal(&replay);
+        let verifications = replay_verifications(&replay);
         context.replay(replay);
         let agent_manager = config.orchestration.as_ref().map(|orchestration| {
             Arc::new(
@@ -312,11 +363,17 @@ impl Engine {
             goal,
             goal_pause_requested: false,
             goal_clear_requested: false,
+            verifications,
+            active_verification: None,
+            active_batches: active_batches.clone(),
+            startup_batch,
+            command_batch_active: false,
         };
         tokio::spawn(actor.run());
         Ok((
             EngineHandle {
                 commands: command_tx,
+                active_batches,
             },
             runtime_rx,
         ))
@@ -361,6 +418,11 @@ struct EngineActor {
     goal: Option<SessionGoal>,
     goal_pause_requested: bool,
     goal_clear_requested: bool,
+    verifications: BTreeMap<String, (VerificationRecipe, VerificationReport)>,
+    active_verification: Option<String>,
+    active_batches: Arc<AtomicUsize>,
+    startup_batch: bool,
+    command_batch_active: bool,
 }
 
 struct CommandInbox {
@@ -431,8 +493,15 @@ impl EngineActor {
             let _ = self.reject_ended_steering().await;
             let _ = self.emit(RuntimeEvent::TurnCompleted).await;
         }
+        if self.startup_batch {
+            self.active_batches.fetch_sub(1, Ordering::AcqRel);
+        }
+        if self.emit(RuntimeEvent::Ready).await.is_err() {
+            return;
+        }
         while let Some(command) = self.command_rx.recv().await {
             let starts_batch = starts_command_batch(&command);
+            self.command_batch_active = starts_batch;
             let result = match command {
                 EngineCommand::SubmitTurn {
                     text,
@@ -443,6 +512,10 @@ impl EngineActor {
                     explicit_delegation,
                 } => self.start_steered_turn(text, explicit_delegation).await,
                 EngineCommand::InspectContext => self.inspect_context().await,
+                EngineCommand::Verify { name, recipe } => self.run_verification(name, recipe).await,
+                EngineCommand::InspectVerifications { recipes } => {
+                    self.inspect_verifications(recipes).await
+                }
                 EngineCommand::ResolveApproval { .. } => {
                     self.emit(RuntimeEvent::Error {
                         message: "there is no pending approval".into(),
@@ -479,6 +552,7 @@ impl EngineActor {
                     Ok(())
                 }
             };
+            self.finish_command_batch();
             self.delegation_available = false;
             if result.is_err() || self.shutdown_requested {
                 let _ = if starts_batch {
@@ -501,7 +575,221 @@ impl EngineActor {
         }
     }
 
+    async fn run_verification(
+        &mut self,
+        name: String,
+        recipe: VerificationRecipe,
+    ) -> Result<(), KuramaError> {
+        self.completed_tool_calls.clear();
+        self.seen_tool_calls.clear();
+        let mut report = VerificationReport::not_run(name.clone(), &recipe);
+        report.status = VerificationStatus::Running;
+        report.started_at_ms = Some(now_ms());
+        self.append(SessionEvent::VerificationStarted {
+            recipe: recipe.clone(),
+            report: report.clone(),
+        })?;
+        self.active_verification = Some(name.clone());
+        self.emit(RuntimeEvent::VerificationUpdated { report })
+            .await?;
+        let cancel = CancelToken::new();
+        let invocation = ToolInvocation {
+            call_id: self.ids.call_id(),
+            name: "bash".into(),
+            arguments: serde_json::json!({ "command": recipe.command, "cwd": recipe.cwd, "timeout_ms": recipe.timeout_ms }),
+        };
+        let result = self.execute_tool(invocation, &cancel).await;
+        // Reject commands submitted during this deterministic turn, including
+        // ones received while delivering its final tool output.
+        let boundary = self.drain_turn_commands(&cancel).await;
+        self.reject_pending_steering().await?;
+        self.active_verification = None;
+        let mut report = self.verifications[&name].1.clone();
+        report.finished_at_ms = Some(now_ms());
+        let edited = report.command != recipe.command
+            || report.cwd != recipe.cwd
+            || report.timeout_ms != recipe.timeout_ms;
+        match &result {
+            Ok(result) => {
+                if let Some((operation_id, _)) = self.completed_tool_calls.get(&result.call_id) {
+                    report.operation_id = Some(operation_id.clone());
+                }
+                report.exit_code = result
+                    .metadata
+                    .get("exit_code")
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|code| i32::try_from(code).ok());
+                report.output_refs = result.blob_refs.clone();
+                if let Some(blobs) = result
+                    .metadata
+                    .get("display_blobs")
+                    .and_then(serde_json::Value::as_object)
+                {
+                    for value in blobs.values() {
+                        let reference: BlobRef = serde_json::from_value(value.clone())
+                            .map_err(|error| KuramaError::Protocol(error.to_string()))?;
+                        if !report.output_refs.contains(&reference) {
+                            report.output_refs.push(reference);
+                        }
+                    }
+                }
+                if cancel.is_cancelled()
+                    || result
+                        .metadata
+                        .get("cancelled")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                {
+                    report.status = VerificationStatus::Cancelled;
+                    report.message = Some("verification cancelled".into());
+                } else if report.status != VerificationStatus::Denied {
+                    report.status = if !edited
+                        && !result.is_error
+                        && report.exit_code == Some(0)
+                        && result
+                            .metadata
+                            .get("timed_out")
+                            .and_then(serde_json::Value::as_bool)
+                            != Some(true)
+                    {
+                        VerificationStatus::Passed
+                    } else {
+                        VerificationStatus::Failed
+                    };
+                    report.message = if edited {
+                        Some("approval edited the recipe; this execution does not certify the configured check".into())
+                    } else if result.is_error {
+                        Some(result.output.clone())
+                    } else if report.exit_code != Some(0) {
+                        Some("no successful zero exit was observed".into())
+                    } else {
+                        None
+                    };
+                }
+            }
+            Err(error) => {
+                report.status = if cancel.is_cancelled() || matches!(error, KuramaError::Cancelled)
+                {
+                    VerificationStatus::Cancelled
+                } else {
+                    VerificationStatus::Failed
+                };
+                report.message = Some(error.to_string());
+            }
+        }
+        if let Err(error) = &boundary
+            && !matches!(error, KuramaError::Cancelled)
+        {
+            report.status = VerificationStatus::Failed;
+            report.message = Some(error.to_string());
+        }
+        self.append(SessionEvent::VerificationCompleted {
+            report: report.clone(),
+        })?;
+        self.emit(RuntimeEvent::VerificationUpdated { report })
+            .await?;
+        if let Err(error) = result {
+            self.append(SessionEvent::TurnFailed {
+                error: error.to_string(),
+            })?;
+            return Err(error);
+        }
+        if let Err(error) = boundary
+            && !matches!(error, KuramaError::Cancelled)
+        {
+            self.append(SessionEvent::TurnFailed {
+                error: error.to_string(),
+            })?;
+            return Err(error);
+        }
+        // Verification is not a model goal boundary and must not auto-continue.
+        self.append(SessionEvent::TurnCompleted)?;
+        self.finish_command_batch();
+        self.emit(RuntimeEvent::TurnCompleted).await
+    }
+
+    async fn inspect_verifications(
+        &self,
+        recipes: BTreeMap<String, VerificationRecipe>,
+    ) -> Result<(), KuramaError> {
+        let reports = recipes
+            .into_iter()
+            .map(|(name, recipe)| match self.verifications.get(&name) {
+                Some((previous, report)) if previous == &recipe => report.clone(),
+                previous => {
+                    let mut report = VerificationReport::not_run(name, &recipe);
+                    if previous.is_some() {
+                        report.message =
+                            Some("recipe definition changed since its last run".into());
+                    }
+                    report
+                }
+            })
+            .collect();
+        self.emit(RuntimeEvent::VerificationsInspected { reports })
+            .await
+    }
+
+    fn record_verification_operation(
+        &mut self,
+        operation_id: &OperationId,
+        invocation: &ToolInvocation,
+    ) -> Result<(), KuramaError> {
+        let Some(name) = &self.active_verification else {
+            return Ok(());
+        };
+        let mut report = self.verifications[name].1.clone();
+        report.operation_id = Some(operation_id.clone());
+        if let Some(command) = invocation
+            .arguments
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+        {
+            report.command = command.into();
+        }
+        report.cwd = invocation
+            .arguments
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(".")
+            .into();
+        report.timeout_ms = invocation
+            .arguments
+            .get("timeout_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(30_000);
+        self.append(SessionEvent::VerificationUpdated { report })
+    }
+
+    fn deny_verification(&mut self, reason: &str) {
+        if let Some(name) = &self.active_verification {
+            let report = &mut self
+                .verifications
+                .get_mut(name)
+                .expect("active verification")
+                .1;
+            report.status = VerificationStatus::Denied;
+            report.message = Some(reason.into());
+        }
+    }
+
     async fn recover_startup(&mut self) -> Result<(), KuramaError> {
+        let interrupted: Vec<_> = self
+            .verifications
+            .values()
+            .filter(|(_, report)| report.status == VerificationStatus::Running)
+            .map(|(_, report)| report.clone())
+            .collect();
+        for mut report in interrupted {
+            report.status = VerificationStatus::Interrupted;
+            report.finished_at_ms = Some(now_ms());
+            report.message = Some("interrupted during previous process; not rerun".into());
+            self.append(SessionEvent::VerificationCompleted {
+                report: report.clone(),
+            })?;
+            self.emit(RuntimeEvent::VerificationUpdated { report })
+                .await?;
+        }
         for snapshot in std::mem::take(&mut self.interrupted_agents) {
             let error = snapshot
                 .last_error
@@ -980,6 +1268,7 @@ impl EngineActor {
                     self.append(SessionEvent::TurnCompleted)?;
                     self.apply_goal_turn_boundary().await?;
                     if !self.should_continue_goal() {
+                        self.finish_command_batch();
                         return self.emit(RuntimeEvent::TurnCompleted).await;
                     }
                     self.completed_tool_calls.clear();
@@ -1085,6 +1374,7 @@ impl EngineActor {
                 break;
             };
             if let EngineCommand::Steer { text, .. } = command {
+                self.active_batches.fetch_sub(1, Ordering::AcqRel);
                 rejected.push(text);
             } else {
                 let starts_batch = starts_command_batch(&command);
@@ -1173,6 +1463,9 @@ impl EngineActor {
             }
             for invocation in round.tool_calls {
                 self.execute_tool(invocation, cancel).await?;
+                if cancel.is_cancelled() {
+                    return Err(KuramaError::Cancelled);
+                }
             }
             for request in round.delegations {
                 if self
@@ -1381,6 +1674,7 @@ impl EngineActor {
         };
         loop {
             let operation_id = self.ids.operation_id();
+            self.record_verification_operation(&operation_id, &invocation)?;
             let tool_context = self.tool_context();
             let operation = match tool.classify(&tool_context, &invocation) {
                 Ok(operation) => operation,
@@ -1404,7 +1698,6 @@ impl EngineActor {
                     operation_id: operation_id.clone(),
                     invocation: invocation.clone(),
                 })?;
-                record_invocation = false;
             }
 
             let policy_context = PolicyContext {
@@ -1422,6 +1715,7 @@ impl EngineActor {
             };
             match decision {
                 PolicyDecision::Deny { reason } => {
+                    self.deny_verification(&reason);
                     let result = error_result(invocation.call_id, reason, &invocation.name);
                     return self.complete_tool(operation_id, result).await;
                 }
@@ -1440,13 +1734,25 @@ impl EngineActor {
                         },
                     })
                     .await?;
-                    let response = self.await_approval(&operation_id, cancel).await?;
+                    let response = match self.await_approval(&operation_id, cancel).await {
+                        Ok(response) => response,
+                        Err(KuramaError::Cancelled) => {
+                            let result = error_result(
+                                invocation.call_id,
+                                "operation cancelled".into(),
+                                &invocation.name,
+                            );
+                            return self.complete_tool(operation_id, result).await;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     self.append(SessionEvent::ApprovalResolved {
                         operation_id: operation_id.clone(),
                         response: response.clone(),
                     })?;
                     match response {
                         ApprovalResponse::Deny => {
+                            self.deny_verification("operation denied by user");
                             let result = error_result(
                                 invocation.call_id,
                                 "operation denied by user".into(),
@@ -1469,6 +1775,7 @@ impl EngineActor {
                                 result,
                             })?;
                             invocation.arguments = arguments;
+                            record_invocation = true;
                             self.seen_tool_calls
                                 .insert(invocation.call_id.clone(), invocation.clone());
                             continue;
@@ -1529,7 +1836,17 @@ impl EngineActor {
                 result = &mut execution => {
                     break result.unwrap_or_else(|error| error_result(call_id.clone(), error.to_string(), &tool_name));
                 }
-                command = self.command_rx.recv() => self.handle_turn_command(command, cancel).await?,
+                command = self.command_rx.recv() => {
+                    match self.handle_turn_command(command, cancel).await {
+                        Ok(()) => {}
+                        Err(KuramaError::Cancelled) => {
+                            // Let the tool observe cancellation and reap its process group.
+                            // Dropping Bash here would abandon its child and captured output.
+                            break execution.await.unwrap_or_else(|error| error_result(call_id.clone(), error.to_string(), &tool_name));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
             }
         };
         attach_tool_name(&mut result, &tool_name);
@@ -1755,11 +2072,13 @@ impl EngineActor {
             tokio::select! {
                 result = &mut execution => break result?,
                 command = self.command_rx.recv() => {
+                    self.retire_active_command(command.as_ref());
                     match command {
                         Some(EngineCommand::Steer { text, explicit_delegation }) => {
                             self.queue_steering(text, explicit_delegation).await?;
                         }
                         Some(EngineCommand::InspectContext) => self.inspect_context().await?,
+                        Some(EngineCommand::InspectVerifications { recipes }) => self.inspect_verifications(recipes).await?,
                         Some(EngineCommand::Agent(command)) => manager.command(command).await?,
                         Some(EngineCommand::ResolveApproval {
                             operation_id,
@@ -1818,7 +2137,9 @@ impl EngineActor {
         cancel: &CancelToken,
     ) -> Result<ApprovalResponse, KuramaError> {
         loop {
-            match self.command_rx.recv().await {
+            let command = self.command_rx.recv().await;
+            self.retire_active_command(command.as_ref());
+            match command {
                 Some(EngineCommand::ResolveApproval {
                     operation_id,
                     response,
@@ -1830,6 +2151,9 @@ impl EngineActor {
                     self.queue_steering(text, explicit_delegation).await?;
                 }
                 Some(EngineCommand::InspectContext) => self.inspect_context().await?,
+                Some(EngineCommand::InspectVerifications { recipes }) => {
+                    self.inspect_verifications(recipes).await?
+                }
                 Some(EngineCommand::ResolveApproval { .. }) => {
                     self.emit(RuntimeEvent::Error {
                         message: "approval request is no longer pending".into(),
@@ -1856,11 +2180,24 @@ impl EngineActor {
         }
     }
 
+    fn finish_command_batch(&mut self) {
+        if std::mem::take(&mut self.command_batch_active) {
+            self.active_batches.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    fn retire_active_command(&self, command: Option<&EngineCommand>) {
+        if command.is_some_and(starts_command_batch) {
+            self.active_batches.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
     async fn handle_turn_command(
         &mut self,
         command: Option<EngineCommand>,
         cancel: &CancelToken,
     ) -> Result<(), KuramaError> {
+        self.retire_active_command(command.as_ref());
         match command {
             Some(EngineCommand::CancelTurn) => {
                 cancel.cancel();
@@ -1882,6 +2219,9 @@ impl EngineActor {
                 explicit_delegation,
             }) => self.queue_steering(text, explicit_delegation).await,
             Some(EngineCommand::InspectContext) => self.inspect_context().await,
+            Some(EngineCommand::InspectVerifications { recipes }) => {
+                self.inspect_verifications(recipes).await
+            }
             Some(EngineCommand::Agent(command)) => self.agent_command(command).await,
             Some(EngineCommand::EditGoal { objective }) => self.edit_goal(objective).await,
             Some(EngineCommand::PauseGoal) => {
@@ -2210,6 +2550,19 @@ impl EngineActor {
     }
 
     fn append(&mut self, event: SessionEvent) -> Result<(), KuramaError> {
+        match &event {
+            SessionEvent::VerificationStarted { recipe, report } => {
+                self.verifications
+                    .insert(report.name.clone(), (recipe.clone(), report.clone()));
+            }
+            SessionEvent::VerificationUpdated { report }
+            | SessionEvent::VerificationCompleted { report } => {
+                if let Some((_, previous)) = self.verifications.get_mut(&report.name) {
+                    *previous = report.clone();
+                }
+            }
+            _ => {}
+        }
         let mut envelope = EventEnvelope::new(
             self.sequence,
             now_ms(),
@@ -2247,11 +2600,32 @@ impl EngineActor {
         }
     }
 }
+fn replay_verifications(
+    events: &[EventEnvelope],
+) -> BTreeMap<String, (VerificationRecipe, VerificationReport)> {
+    let mut reports = BTreeMap::new();
+    for envelope in events {
+        match &envelope.event {
+            SessionEvent::VerificationStarted { recipe, report } => {
+                reports.insert(report.name.clone(), (recipe.clone(), report.clone()));
+            }
+            SessionEvent::VerificationUpdated { report }
+            | SessionEvent::VerificationCompleted { report } => {
+                if let Some((_, previous)) = reports.get_mut(&report.name) {
+                    *previous = report.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+    reports
+}
 
 fn starts_command_batch(command: &EngineCommand) -> bool {
     matches!(
         command,
         EngineCommand::SubmitTurn { .. }
+            | EngineCommand::Verify { .. }
             | EngineCommand::Steer { .. }
             | EngineCommand::Compact
             | EngineCommand::SetGoal { .. }

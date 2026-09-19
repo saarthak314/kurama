@@ -10,6 +10,36 @@ use kurama_protocol::{
 };
 
 #[test]
+fn verification_rejects_busy_submission_and_returns_cancelled_input_without_advancing_queue() {
+    use kurama_protocol::verification::{
+        VerificationRecipe, VerificationReport, VerificationStatus,
+    };
+    let recipe = VerificationRecipe {
+        command: "cargo test".into(),
+        cwd: ".".into(),
+        timeout_ms: 60_000,
+    };
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.set_thinking();
+    assert!(!state.submit_verification("quick".into(), recipe.clone()));
+    state.apply_runtime_event(RuntimeEvent::TurnCompleted);
+    assert!(state.submit_verification("quick".into(), recipe.clone()));
+    state.take_commands();
+    state.submit_turn("keep this follow-up", false);
+    let mut report = VerificationReport::not_run("quick".into(), &recipe);
+    report.status = VerificationStatus::Cancelled;
+    state.apply_runtime_event(RuntimeEvent::VerificationUpdated { report });
+    state.apply_runtime_event(RuntimeEvent::TurnCompleted);
+    assert_eq!(state.composer, "/verify quick");
+    assert_eq!(
+        state.pending_prompts().collect::<Vec<_>>(),
+        vec!["keep this follow-up"]
+    );
+    assert!(state.take_commands().is_empty());
+    assert_eq!(state.activity(), &ActivityState::Idle);
+}
+
+#[test]
 fn history_query_matches_unicode_case_and_preserves_prompt() {
     let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
     state.remember_prompt("review café parser");

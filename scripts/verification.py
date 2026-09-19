@@ -86,11 +86,15 @@ def opened_pty():
             yield master_file, slave_file
 
 
-def run_command(command, *, timeout=5.0, check=False, **kwargs):
+def run_command(command, *, timeout=5.0, check=False, input=None, **kwargs):
     """communicate with bounded runtime and group cleanup, including spawn failures."""
+    if input is not None:
+        if "stdin" in kwargs:
+            raise ValueError("input and stdin cannot both be supplied")
+        kwargs["stdin"] = subprocess.PIPE
     process = subprocess.Popen(command, start_new_session=True, **kwargs)
     try:
-        stdout, stderr = process.communicate(timeout=timeout)
+        stdout, stderr = process.communicate(input=input, timeout=timeout)
         result = subprocess.CompletedProcess(
             command, process.returncode, stdout, stderr
         )

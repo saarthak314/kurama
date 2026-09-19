@@ -217,8 +217,23 @@ impl RecoveryPlanner {
         let mut agents: BTreeMap<_, AgentSnapshot> = BTreeMap::new();
         let mut cursor = None;
         let mut turn_terminal = false;
+        let mut verification_active = false;
 
         for envelope in events {
+            match &envelope.event {
+                SessionEvent::VerificationStarted { .. } => {
+                    verification_active = true;
+                    turn_terminal = true;
+                    cursor = None;
+                    continue;
+                }
+                SessionEvent::VerificationCompleted { .. } => {
+                    verification_active = false;
+                    continue;
+                }
+                _ if verification_active => continue,
+                _ => {}
+            }
             match &envelope.event {
                 SessionEvent::ToolProposed {
                     operation_id,

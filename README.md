@@ -37,6 +37,8 @@ kurama --yolo
 
 `/diff` reviews changes and prepares hunk feedback. `/context` explains the current request budget. While working, Enter steers and Alt+Enter queues a follow-up; `/queue` edits pending work.
 
+`/verify` lists named project checks; `/verify quick` runs one with normal approvals and records its result. Recipes live in `.kurama/verification.toml`.
+
 non-secret config is `~/.kurama/config.toml`. auth is `env:NAME`, `keychain:SERVICE/ACCOUNT`, or in-memory `session`. plaintext keys are rejected.
 
 see [configuration](docs/configuration.md) and [architecture](docs/design.md).
@@ -54,6 +56,8 @@ let reply = Kurama::openai(std::env::var("OPENAI_API_KEY")?)
 ```
 
 `.yolo()` is launch-only, same as the cli. without it, `prompt` returns an error on the first write that needs approval. `reply.session_id` is what you pass to `resume`. more: [sdk](docs/sdk.md).
+
+TypeScript and Python clients use the same Rust engine through `kurama --stdio`; no daemon or native bindings. See [SDK setup, streaming, approvals, and resume](docs/sdk.md#typescript-and-python).
 
 ## develop
 

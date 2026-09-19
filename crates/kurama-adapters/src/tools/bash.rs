@@ -208,11 +208,12 @@ impl Tool for BashTool {
             };
             drop(wait);
 
-            let (status, stdout, stderr, timed_out) = match outcome {
+            let (status, stdout, stderr, timed_out, was_cancelled) = match outcome {
                 WaitOutcome::Completed => (
                     Some(status.expect("completed command has an exit status")),
                     stdout.expect("completed command has captured stdout"),
                     stderr.expect("completed command has captured stderr"),
+                    false,
                     false,
                 ),
                 WaitOutcome::TimedOut => {
@@ -229,22 +230,30 @@ impl Tool for BashTool {
                         stderr,
                     )
                     .await?;
-                    (status, stdout, stderr, true)
+                    (status, stdout, stderr, true, false)
                 }
                 WaitOutcome::Cancelled => {
                     terminate_process_group(&mut child, pid).await?;
                     if status.is_none() {
-                        child.wait().await?;
+                        status = Some(child.wait().await?);
                     }
                     request_capture_stop(&mut stdout_stop);
                     request_capture_stop(&mut stderr_stop);
-                    finish_remaining_capture(&mut stdout_task, &mut stderr_task, stdout, stderr)
-                        .await?;
-                    return Err(KuramaError::Cancelled);
+                    let (stdout, stderr) = finish_remaining_capture(
+                        &mut stdout_task,
+                        &mut stderr_task,
+                        stdout,
+                        stderr,
+                    )
+                    .await?;
+                    (status, stdout, stderr, false, true)
                 }
             };
-            let timeout_message =
-                timed_out.then(|| format!("command timed out after {} ms", arguments.timeout_ms));
+            let timeout_message = if was_cancelled {
+                Some("command cancelled".into())
+            } else {
+                timed_out.then(|| format!("command timed out after {} ms", arguments.timeout_ms))
+            };
             // Keep original bytes until the combined preview (including labels
             // and timeout notes) decides whether both streams need recovery.
             let aggregate = stdout
@@ -266,7 +275,9 @@ impl Tool for BashTool {
             let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
             let exit_code = status.as_ref().and_then(ExitStatus::code);
             let signal = status.as_ref().and_then(exit_signal);
-            let is_error = timed_out || status.as_ref().is_none_or(|status| !status.success());
+            let is_error = timed_out
+                || was_cancelled
+                || status.as_ref().is_none_or(|status| !status.success());
             let output = aggregate.unwrap_or_else(|| {
                 combined_output(
                     stdout.text.as_bytes(),
@@ -283,6 +294,7 @@ impl Tool for BashTool {
                 "signal": signal,
                 "elapsed_ms": elapsed_ms,
                 "timed_out": timed_out,
+                "cancelled": was_cancelled,
                 "stdout": stdout.text.clone(),
                 "stderr": stderr.text.clone(),
                 "stdout_truncated": stdout.truncated,
