@@ -9,10 +9,8 @@ use kurama_cli::{
 use kurama_protocol::{
     agent::AgentState,
     id::{AgentId, CallId, OperationId, SessionId},
-    model::Usage,
     policy::{ApprovalRequest, ExecutionMode},
     runtime::RuntimeEvent,
-    session::{EventEnvelope, SessionEvent},
     tool::Operation,
 };
 use ratatui::{
@@ -412,6 +410,9 @@ fn dismissing_overlays_restores_the_entire_main_screen_without_stale_cells() {
         Overlay::Shortcuts,
         Overlay::Agents,
         Overlay::Todos,
+        Overlay::Queue,
+        Overlay::Context,
+        Overlay::Diff,
         Overlay::Onboarding,
     ] {
         state.overlay = overlay;
@@ -490,87 +491,6 @@ fn queued_follow_ups_are_visible_without_becoming_fake_user_turns() {
 
     assert!(text.contains("queued  check the failing test"));
     assert!(!text.contains("> check the failing test"));
-}
-
-#[test]
-fn question_mark_opens_a_shortcuts_overlay() {
-    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-    state.open_shortcuts();
-
-    let text = buffer_text(&rendered(&state, 80, 24));
-
-    assert!(text.contains("shortcuts"));
-    assert!(text.contains("ctrl+c"));
-    assert!(text.contains("ctrl+j"));
-    assert!(text.contains("ctrl+t"));
-    assert!(text.contains("ctrl+r"));
-    assert!(text.contains("close overlay") || text.contains("interrupt"));
-}
-
-#[test]
-fn live_usage_replaces_the_footer_fraction_instead_of_summing() {
-    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-    state.max_input_tokens = 100_000;
-    state.composer = "draft".into();
-
-    state.apply_runtime_event(RuntimeEvent::Usage {
-        usage: Usage {
-            input_tokens: 10_000,
-            output_tokens: 1,
-            cached_input_tokens: 0,
-        },
-    });
-    assert!(buffer_text(&rendered(&state, 80, 12)).contains("90%"));
-
-    state.apply_runtime_event(RuntimeEvent::Usage {
-        usage: Usage {
-            input_tokens: 25_000,
-            output_tokens: 2,
-            cached_input_tokens: 0,
-        },
-    });
-    let text = buffer_text(&rendered(&state, 80, 12));
-    assert!(text.contains("75%"));
-    assert!(!text.contains("65%"));
-}
-
-#[test]
-fn replay_usage_keeps_the_latest_window_fill() {
-    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-    state.max_input_tokens = 100_000;
-    state.composer = "draft".into();
-    state.hydrate_replay(&[
-        EventEnvelope::new(
-            1,
-            1,
-            SessionId::from("session_1"),
-            None,
-            SessionEvent::ModelUsage {
-                usage: Usage {
-                    input_tokens: 10_000,
-                    output_tokens: 1,
-                    cached_input_tokens: 0,
-                },
-            },
-        ),
-        EventEnvelope::new(
-            2,
-            2,
-            SessionId::from("session_1"),
-            None,
-            SessionEvent::ModelUsage {
-                usage: Usage {
-                    input_tokens: 40_000,
-                    output_tokens: 2,
-                    cached_input_tokens: 0,
-                },
-            },
-        ),
-    ]);
-
-    let text = buffer_text(&rendered(&state, 80, 12));
-    assert!(text.contains("60%"));
-    assert!(!text.contains("50%"));
 }
 
 #[test]

@@ -437,6 +437,10 @@ impl ChildRunner for RuntimeChildRunner {
                                 handle.resolve_approval(operation_id, response).await?;
                             }
                             RuntimeEvent::Status { .. }
+                            | RuntimeEvent::SteeringQueued { .. }
+                            | RuntimeEvent::SteeringApplied { .. }
+                            | RuntimeEvent::SteeringRejected { .. }
+                            | RuntimeEvent::ContextInspected { .. }
                             | RuntimeEvent::ToolOutputDelta { .. }
                             | RuntimeEvent::AgentUpdated { .. }
                             | RuntimeEvent::AgentInspection { .. }

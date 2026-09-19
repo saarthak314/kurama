@@ -4,7 +4,7 @@ use kurama_cli::tui::{
 use kurama_protocol::{
     id::{CallId, OperationId, SessionId},
     policy::{ApprovalRequest, ApprovalResponse, ExecutionMode},
-    runtime::{EngineCommand, RuntimeEvent},
+    runtime::{ContextCategory, ContextInspection, EngineCommand, RuntimeEvent},
     session::{EventEnvelope, SessionEvent},
     tool::{Operation, ToolResult},
 };
@@ -158,6 +158,117 @@ fn non_terminal_command_error_preserves_the_active_assistant_stream() {
         [TranscriptEntry::AssistantMessage { body }, TranscriptEntry::Error { .. }]
             if body == "before after"
     ));
+}
+
+fn inspection() -> ContextInspection {
+    ContextInspection {
+        max_input_tokens: 1_000,
+        reserved_output_tokens: 100,
+        usable_tokens: 900,
+        estimated_tokens: 650,
+        categories: vec![ContextCategory {
+            name: "recent turns".into(),
+            tokens: 650,
+        }],
+        total_completed_turns: 4,
+        included_recent_turns: 2,
+        omitted_turns: 2,
+        summary_covered_through_sequence: Some(8),
+        compaction: None,
+        assembly_error: None,
+    }
+}
+
+#[test]
+fn inspector_and_queued_steering_preserve_stream_queue_and_closed_overlay() {
+    let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    state.set_thinking();
+    state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+        text: "before".into(),
+    });
+    state.submit_turn("follow-up", false);
+    let activity = state.activity().clone();
+    state.overlay = Overlay::Context;
+    state.close_overlay();
+    state.apply_runtime_event(RuntimeEvent::ContextInspected {
+        inspection: inspection(),
+    });
+    state.apply_runtime_event(RuntimeEvent::SteeringQueued {
+        text: "steer".into(),
+    });
+    state.apply_runtime_event(RuntimeEvent::AssistantDelta {
+        text: " after".into(),
+    });
+    assert_eq!(state.activity(), &activity);
+    assert_eq!(state.overlay(), Overlay::None);
+    assert_eq!(state.pending_turn_count(), 1);
+    assert!(state.sent_commands().is_empty());
+    assert!(
+        matches!(state.transcript.as_slice(), [TranscriptEntry::AssistantMessage { body }] if body == "before after")
+    );
+
+    state.begin_approval(ApprovalRequest {
+        operation_id: OperationId::from("pending-approval"),
+        operation: Operation::Read {
+            path: "outside.txt".into(),
+            external: true,
+        },
+        summary: "read outside workspace".into(),
+        arguments: serde_json::json!({"path": "outside.txt"}),
+    });
+    state.composer = "existing draft".into();
+    state.apply_runtime_event(RuntimeEvent::ContextInspected {
+        inspection: inspection(),
+    });
+    state.apply_runtime_event(RuntimeEvent::SteeringApplied {
+        text: "steer".into(),
+    });
+    state.apply_runtime_event(RuntimeEvent::SteeringRejected {
+        text: "retry later".into(),
+        message: "queue full".into(),
+    });
+    assert_eq!(state.activity(), &ActivityState::AwaitingApproval);
+    assert_eq!(state.overlay(), Overlay::Approval);
+    assert_eq!(
+        state
+            .approval
+            .as_ref()
+            .unwrap()
+            .request
+            .operation_id
+            .as_ref(),
+        "pending-approval"
+    );
+    assert_eq!(state.pending_turn_count(), 1);
+    assert!(state.sent_commands().is_empty());
+    assert_eq!(state.composer, "existing draft\n\nretry later");
+}
+
+#[test]
+fn applied_steering_is_visible_once_live_and_once_on_replay() {
+    let mut live = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    live.apply_runtime_event(RuntimeEvent::SteeringQueued {
+        text: "use the existing API".into(),
+    });
+    live.apply_runtime_event(RuntimeEvent::SteeringApplied {
+        text: "use the existing API".into(),
+    });
+    let mut replay = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
+    replay.hydrate_replay(&[EventEnvelope::new(
+        1,
+        1,
+        SessionId::from("s"),
+        None,
+        SessionEvent::UserSteered {
+            text: "use the existing API".into(),
+            explicit_delegation: false,
+        },
+    )]);
+    for state in [live, replay] {
+        assert!(
+            matches!(state.transcript.as_slice(), [TranscriptEntry::Notice { body, .. }] if body == "use the existing API")
+        );
+    }
 }
 
 #[test]

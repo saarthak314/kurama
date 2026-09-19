@@ -227,6 +227,10 @@ def image(screen, path):
 class Fixture(http.server.BaseHTTPRequestHandler):
     calls = 0
     compaction_inputs = []
+    requests = []
+    control_release = threading.Event()
+    control_cancel_release = threading.Event()
+    control_tool_proposed = False
 
     def log_message(self, *args):
         pass
@@ -251,6 +255,18 @@ class Fixture(http.server.BaseHTTPRequestHandler):
             ),
             "",
         )
+        # Context also includes synthetic user messages (for example session
+        # todos). Route this fixture by its authored prompts, not their position.
+        for message in reversed(messages):
+            content = message.get("content", "")
+            if message.get("role") == "user" and isinstance(content, str) and (
+                content.startswith("CONTROL_")
+                or "FEEDBACK_E2E" in content
+                or content in ("advance compaction fixture", "inspect fixture", "long answer")
+            ):
+                latest_user = content
+                break
+        type(self).requests.append(request)
         advancing = latest_user == "advance compaction fixture"
         if not is_compaction and not advancing:
             type(self).calls += 1
@@ -268,7 +284,59 @@ class Fixture(http.server.BaseHTTPRequestHandler):
             self.wfile.write(("data: " + json.dumps(data) + "\n\n").encode())
             self.wfile.flush()
 
-        if is_compaction:
+        if latest_user == "CONTROL_BEGIN":
+            event({"content": "CONTROL_MODEL_WAITING"})
+            if not type(self).control_release.wait(30):
+                raise RuntimeError("control fixture was not released")
+            event({}, "stop")
+        elif latest_user == "CONTROL_CANCEL":
+            event({"content": "CONTROL_CANCEL_WAITING"})
+            type(self).control_cancel_release.wait(30)
+            return
+        elif latest_user == "CONTROL_STEER":
+            assert not type(self).control_tool_proposed, "control tool repeated"
+            type(self).control_tool_proposed = True
+            event(
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "control_bash",
+                            "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "arguments": json.dumps(
+                                    {
+                                        "command": "while [ ! -f release-tool ]; do sleep 0.02; done; printf CONTROL_TOOL_DONE",
+                                        "cwd": ".",
+                                        "timeout_ms": 30000,
+                                    }
+                                ),
+                            },
+                        }
+                    ]
+                }
+            )
+            event({}, "tool_calls")
+        elif latest_user == "CONTROL_STEER_TOOL":
+            assert "CONTROL_TOOL_DONE" in json.dumps(messages), "tool result lost"
+            assert "CONTROL_BEGIN" in json.dumps(messages), "original user turn lost"
+            event({"content": "CONTROL_STEERING_DONE"})
+            event({}, "stop")
+        elif latest_user == "CONTROL_SCROLL":
+            event({"content": "CONTROL_SCROLL_DONE"})
+            event({}, "stop")
+        elif latest_user == "CONTROL_FOLLOWUP_EDITED":
+            event({"content": "CONTROL_FOLLOWUP_DONE"})
+            event({}, "stop")
+        elif "FEEDBACK_E2E" in str(latest_user):
+            assert "DIFF_FIRST_NEW" in latest_user, "selected hunk missing"
+            assert "DIFF_FIRST_OLD" in latest_user, "old hunk missing"
+            assert "DIFF_SECOND_NEW" not in latest_user, "unselected hunk leaked"
+            assert "diff-control.txt" in latest_user, "selected path missing"
+            event({"content": "CONTROL_FEEDBACK_DONE"})
+            event({}, "stop")
+        elif is_compaction:
             retained = "COMP_KEEP_ALPHA" in json.dumps(request)
             type(self).compaction_inputs.append(retained)
             summary = "COMP_KEEP_ALPHA" if retained else "PRIOR_DECISION_MISSING"
@@ -349,6 +417,11 @@ def main():
     parser.add_argument(
         "--no-images", action="store_true", help="Skip optional Pillow screenshots"
     )
+    parser.add_argument(
+        "--check-controls",
+        action="store_true",
+        help="Exercise diff feedback, live steering, editable queue and context inspection",
+    )
     args = parser.parse_args()
     if args.seed_large_output_mib < 0:
         parser.error("--seed-large-output-mib cannot be negative")
@@ -369,6 +442,43 @@ def main():
         state = root / ".kurama"
         state.mkdir()
         (root / "input.txt").write_text("fixture input\n")
+        if args.check_controls:
+
+            def git(*arguments):
+                return subprocess.run(
+                    ["git", *arguments],
+                    cwd=root,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            git("init", "-q")
+            (root / ".gitignore").write_text(
+                ".kurama/\nfixture-bin/\npointer-actions.jsonl\nrelease-tool\n"
+            )
+            diff_lines = [f"unchanged line {index}" for index in range(40)]
+            diff_lines[2] = "DIFF_FIRST_OLD"
+            diff_lines[32] = "DIFF_SECOND_OLD"
+            (root / "diff-control.txt").write_text("\n".join(diff_lines) + "\n")
+            (root / "staged.txt").write_text("STAGED_OLD\n")
+            git("add", ".gitignore", "input.txt", "diff-control.txt", "staged.txt")
+            git(
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "fixture baseline",
+            )
+            diff_lines[2] = "DIFF_FIRST_NEW"
+            diff_lines[32] = "DIFF_SECOND_NEW"
+            (root / "diff-control.txt").write_text("\n".join(diff_lines) + "\n")
+            (root / "staged.txt").write_text("STAGED_NEW\n")
+            git("add", "staged.txt")
+            (root / "untracked.txt").write_text("UNTRACKED_VISIBLE\n")
+            (root / "binary.dat").write_bytes(b"\x00BINARY_VISIBLE\xff")
         pointer_log = root / "pointer-actions.jsonl"
         helper_directory = root / "fixture-bin"
         helper_directory.mkdir()
@@ -1130,6 +1240,193 @@ endpoint = "http://127.0.0.1:9/search"
             result["findings"]["main_footer_and_input_bottom_anchored"] = True
             result["findings"]["overlays_kept_alternate_screen"] = True
             result["findings"]["overlay_dismissal_cleared_controls"] = True
+            if args.check_controls:
+
+                def display_text():
+                    return "\n".join(screen.display)
+
+                def session_events():
+                    return [
+                        json.loads(line)["event"]
+                        for line in logs[0].read_text().splitlines()
+                    ]
+
+                def inspect_context(name):
+                    before = len(Fixture.requests)
+                    send("/context\r")
+                    wait_for(
+                        lambda: (
+                            "compaction" in display_text().lower()
+                            and "estimated" in display_text().lower()
+                        )
+                    )
+                    capture(name, view="context")
+                    resize(48, 14)
+                    capture(name + "-narrow", view="context")
+                    send(b"\x1b[6~")
+                    capture(name + "-scrolled", view="context")
+                    send(b"\x1b")
+                    resize(100, 36)
+                    assert len(Fixture.requests) == before, "inspection called provider"
+
+                inspect_context("context-idle")
+                send("CONTROL_BEGIN\r")
+                wait_for(lambda: "CONTROL_MODEL_WAITING" in display_text())
+                send("CONTROL_STEER\r")
+                send("CONTROL_FOLLOWUP_OLD\x1b\r")
+                send("CONTROL_DELETE\x1b\r")
+                send("/queue\r")
+                wait_for(lambda: "CONTROL_DELETE" in display_text())
+                capture("queue-two", view="queue")
+                send(b"\x1b[B\x1b[3~")
+                wait_for(lambda: "CONTROL_DELETE" not in display_text())
+                send(b"\x1b[A\r")
+                send(b"\x15CONTROL_FOLLOWUP_EDITED\r")
+                wait_for(lambda: "CONTROL_FOLLOWUP_EDITED" in display_text())
+                capture("queue-edited", view="queue")
+                send(b"\x1b")
+                inspect_context("context-streaming")
+                assert not any(
+                    "CONTROL_FOLLOWUP_EDITED" in json.dumps(request)
+                    for request in Fixture.requests
+                ), "follow-up ran while busy"
+                Fixture.control_release.set()
+                wait_for(lambda: "approve once" in display_text().lower())
+                capture("steering-tool-approval", composer_text=None)
+                send("a")
+                wait_for(
+                    lambda: (
+                        any(
+                            event.get("type") == "tool_started"
+                            and event.get("operation_id") is not None
+                            for event in session_events()
+                        )
+                        and "bash" in display_text().lower()
+                    )
+                )
+                send("CONTROL_STEER_TOOL\r")
+                inspect_context("context-tool-running")
+                (root / "release-tool").touch()
+                wait_for(lambda: "CONTROL_FOLLOWUP_DONE" in display_text())
+                capture("steering-followup-complete")
+                control_events = session_events()
+                steering = [
+                    event["text"]
+                    for event in control_events
+                    if event["type"] == "user_steered"
+                ]
+                assert steering == ["CONTROL_STEER", "CONTROL_STEER_TOOL"], steering
+                control_users = [
+                    event["text"]
+                    for event in control_events
+                    if event["type"] == "user_message"
+                    and event["text"].startswith("CONTROL_")
+                ]
+                assert control_users == ["CONTROL_BEGIN", "CONTROL_FOLLOWUP_EDITED"], (
+                    control_users
+                )
+                control_results = [
+                    event["result"]
+                    for event in control_events
+                    if event["type"] == "tool_completed"
+                    and event["result"].get("call_id") == "control_bash"
+                ]
+                assert (
+                    len(control_results) == 1 and not control_results[0]["is_error"]
+                ), control_results
+                all_requests = json.dumps(Fixture.requests)
+                assert "CONTROL_DELETE" not in all_requests
+                assert "CONTROL_FOLLOWUP_OLD" not in all_requests
+                result["findings"][
+                    "steering_preserves_current_turn_and_tool_results"
+                ] = True
+                result["findings"]["edited_followup_runs_only_after_steered_work"] = (
+                    True
+                )
+                result["findings"]["deleted_followup_never_reaches_provider"] = True
+                result["findings"][
+                    "context_inspection_idle_streaming_tool_no_provider_call"
+                ] = True
+
+                before_diff = (root / "diff-control.txt").read_bytes()
+                send("/diff\r")
+                wait_for(lambda: "hunk" in display_text().lower())
+                seen = set()
+                for _ in range(20):
+                    text = display_text()
+                    for marker in (
+                        "DIFF_FIRST_NEW",
+                        "DIFF_SECOND_NEW",
+                        "STAGED_NEW",
+                        "UNTRACKED_VISIBLE",
+                        "binary.dat",
+                    ):
+                        if marker in text:
+                            seen.add(marker)
+                    if len(seen) == 5:
+                        break
+                    send("n")
+                assert len(seen) == 5, seen
+                capture("diff-review", view="diff")
+                for _ in range(20):
+                    if "DIFF_FIRST_NEW" in display_text():
+                        break
+                    send("n")
+                else:
+                    raise AssertionError("first diff hunk not reachable")
+                capture("diff-first-hunk", view="diff")
+                resize(48, 14)
+                capture("diff-narrow", view="diff")
+                send(b"\x1b[6~\x1b[5~")
+                resize(100, 36)
+                send("\r")
+                wait_for(lambda: "Feedback:" in display_text())
+                capture("diff-feedback-draft", composer_text=None)
+                send("FEEDBACK_E2E\r")
+                wait_for(lambda: "CONTROL_FEEDBACK_DONE" in display_text())
+                capture("diff-feedback-complete")
+                assert (root / "diff-control.txt").read_bytes() == before_diff
+                result["findings"]["diff_reviews_staged_unstaged_untracked_binary"] = (
+                    True
+                )
+                result["findings"][
+                    "selected_hunk_feedback_reaches_provider_exactly"
+                ] = True
+                result["findings"]["diff_review_does_not_mutate_files"] = True
+                inspect_context("context-after-controls")
+                send(b"\x1b[<64;5;10M" * 30)
+                send("CONTROL_SCROLL\r")
+                wait_for(lambda: "CONTROL_SCROLL_DONE" in display_text())
+                capture("new-turn-returns-to-latest")
+                result["findings"]["new_turn_restores_live_transcript_position"] = True
+                send("CONTROL_CANCEL\r")
+                wait_for(lambda: "CONTROL_CANCEL_WAITING" in display_text())
+                send("CONTROL_RETURNED\r")
+                send(b"\x1b")
+                wait_for(
+                    lambda: (
+                        any(
+                            event["type"] == "turn_failed" for event in session_events()
+                        )
+                        and "CONTROL_RETURNED" in display_text()
+                    )
+                )
+                capture("cancel-restores-steering", composer_text="CONTROL_RETURNED")
+                Fixture.control_cancel_release.set()
+                assert not any(
+                    "CONTROL_RETURNED" in json.dumps(request)
+                    for request in Fixture.requests
+                )
+                assert not any(
+                    event["type"] == "user_steered"
+                    and event["text"] == "CONTROL_RETURNED"
+                    for event in session_events()
+                )
+                send(b"\x03")
+                capture("cancel-draft-cleared")
+                result["findings"][
+                    "cancel_returns_unapplied_steering_without_autorun"
+                ] = True
             send("/exit\r")
             wait_for(lambda: process.poll() is not None)
             result["exit_code"] = process.returncode
@@ -1166,14 +1463,34 @@ endpoint = "http://127.0.0.1:9/search"
                 b"\x1b[6n"
             ) + raw.count(b"\x1b[?6n")
         finally:
+            if args.check_controls:
+                Fixture.control_release.set()
+                Fixture.control_cancel_release.set()
+                (root / "release-tool").touch()
+            try:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait(timeout=3)
+            finally:
+                os.close(master)
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=3)
+            result["findings"]["pty_process_and_server_closed"] = (
+                process.poll() is not None and not thread.is_alive()
+            )
             (output_dir / "terminal.raw").write_bytes(raw)
+            if args.check_controls:
+                (output_dir / "provider-requests.json").write_text(
+                    json.dumps(Fixture.requests, indent=2)
+                )
+                for log in (state / "sessions").glob("*/events.jsonl"):
+                    (output_dir / "session-events.jsonl").write_bytes(log.read_bytes())
             (output_dir / "audit.json").write_text(json.dumps(result, indent=2))
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
-                process.wait(timeout=3)
-            os.close(master)
-            server.shutdown()
-            server.server_close()
     print(
         json.dumps(
             {

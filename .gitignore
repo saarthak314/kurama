@@ -3,5 +3,6 @@ AGENTS.md
 docs/superpowers/
 /target/
 /scripts/__pycache__/
+/.lavish/
 /tools/**/target/
 *.tmp

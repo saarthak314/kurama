@@ -66,7 +66,7 @@ pub(crate) fn main_layout(area: Rect, state: &TuiState) -> ResponsiveLayout {
     let area = main_area(area);
     let input_height = match state.overlay() {
         Overlay::Approval | Overlay::ApprovalEdit => approval_height(state, area.width),
-        Overlay::Shortcuts => 10.min(area.height).max(5),
+        Overlay::Shortcuts => 14.min(area.height).max(5),
         _ => composer_height(state, area.width),
     };
     let activity_visible = state.overlay() == Overlay::None
@@ -96,7 +96,10 @@ pub(crate) fn queue_height(state: &TuiState, _width: u16) -> u16 {
     if state.overlay() != Overlay::None || state.transcript_view_expanded() {
         return 0;
     }
-    state.pending_prompts().count().min(3) as u16
+    state
+        .pending_turn_count()
+        .saturating_add(usize::from(state.pending_steering > 0))
+        .min(3) as u16
 }
 
 pub(crate) fn main_area(area: Rect) -> Rect {

@@ -16,6 +16,8 @@ use super::{
     agents::state_label,
     command_palette_height,
     composer::{render_approval, render_composer, render_footer, render_queue},
+    context::render_context,
+    diff::render_diff,
     layout::{main_area, main_layout},
     render_command_palette,
     theme::{ACCENT, AMBER, BORDER, DIM, GREEN, RED, TEXT},
@@ -55,6 +57,31 @@ pub(crate) fn render_with_transcript(
         }
         Overlay::Agents => render_agents(frame, state),
         Overlay::Todos => render_todos(frame, state),
+        Overlay::Queue => render_follow_ups(frame, state),
+        Overlay::Context => render_context(frame, &state.context_view, main_area(frame.area())),
+        Overlay::Diff => {
+            let area = main_area(frame.area());
+            if let Some(review) = &state.diff_review {
+                render_diff(frame, review, area);
+            } else {
+                frame.render_widget(Clear, frame.area());
+                let message = state
+                    .diff_error
+                    .as_deref()
+                    .unwrap_or(if state.diff_loading {
+                        "Loading staged, unstaged and untracked changes…"
+                    } else {
+                        "No diff loaded"
+                    });
+                let text = format!("{}\n\nEsc close", sanitize_terminal_text(message));
+                frame.render_widget(
+                    Paragraph::new(text)
+                        .block(modal_block(area).title(" /diff "))
+                        .wrap(ratatui::widgets::Wrap { trim: false }),
+                    area,
+                );
+            }
+        }
         Overlay::AgentInspect | Overlay::AgentMessage | Overlay::ConfirmAgentCancel => {
             if let Some(position) = render_agent_inspect(frame, state) {
                 frame.set_cursor_position(position);
@@ -186,8 +213,12 @@ fn render_shortcuts(frame: &mut Frame<'_>, _state: &TuiState, area: Rect) {
     let lines = [
         ("ctrl+c", "interrupt, then clear, then exit"),
         ("esc", "close overlay, then interrupt"),
-        ("enter", "send"),
-        ("ctrl+j", "newline"),
+        ("enter", "send, or steer active work"),
+        ("alt+enter", "queue a follow-up"),
+        ("shift+enter", "newline (also Ctrl+J)"),
+        ("/queue", "edit or remove follow-ups"),
+        ("/diff", "review hunks and prepare feedback"),
+        ("/context", "inspect request estimates"),
         ("ctrl+o", "expand transcript"),
         ("ctrl+t", "todo list"),
         ("ctrl+r", "search history"),
@@ -406,6 +437,94 @@ fn render_agents(frame: &mut Frame<'_>, state: &TuiState) {
         }
     }
     if footer != 0 {
+        render_footer(
+            frame,
+            state,
+            Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+            false,
+        );
+    }
+}
+
+fn render_follow_ups(frame: &mut Frame<'_>, state: &TuiState) {
+    frame.render_widget(Clear, frame.area());
+    let area = main_area(frame.area());
+    if area.is_empty() {
+        return;
+    }
+    let block = modal_block(area);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+    let width = usize::from(inner.width);
+    let header = u16::from(inner.height > 2);
+    let footer = u16::from(inner.height > 1);
+    let visible = usize::from(inner.height.saturating_sub(header + footer)).max(1);
+    if header > 0 {
+        let title = format!(
+            "/queue  {} follow-ups · {}",
+            state.pending_turn_count(),
+            if state.queue_paused {
+                "paused after interrupt"
+            } else {
+                "held while reviewing"
+            }
+        );
+        frame.render_widget(
+            Line::styled(
+                truncate(&title, width),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+    }
+    if state.pending_turn_count() == 0 {
+        frame.render_widget(
+            Line::styled(
+                truncate(
+                    "No follow-ups. Alt+Enter queues input while working.",
+                    width,
+                ),
+                Style::default().fg(DIM),
+            ),
+            Rect::new(inner.x, inner.y + header, inner.width, 1),
+        );
+    } else {
+        let selected = state.selected_follow_up.min(state.pending_turn_count() - 1);
+        let start = selected
+            .saturating_sub(visible / 2)
+            .min(state.pending_turn_count().saturating_sub(visible));
+        for (index, prompt) in state
+            .pending_prompts()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+        {
+            let marker = if index == selected { ">" } else { " " };
+            let safe = sanitize_terminal_text(prompt);
+            let summary = safe.lines().next().unwrap_or("");
+            let text = format!(
+                "{marker} {}  {summary}{}",
+                index + 1,
+                if safe.contains('\n') { " …" } else { "" }
+            );
+            frame.render_widget(
+                Line::styled(
+                    truncate(&text, width),
+                    Style::default().fg(if index == selected { ACCENT } else { DIM }),
+                ),
+                Rect::new(
+                    inner.x,
+                    inner.y + header + (index - start) as u16,
+                    inner.width,
+                    1,
+                ),
+            );
+        }
+    }
+    if footer > 0 {
         render_footer(
             frame,
             state,

@@ -1,12 +1,12 @@
 use kurama_core::context::{CompactionRequest, ContextManager, ContextPolicy, estimate_text};
 use kurama_protocol::{
     id::{CallId, OperationId, SessionId},
-    model::{ModelItem, ModelProfile},
+    model::{ModelItem, ModelProfile, ModelRequest},
     policy::ExecutionMode,
     session::{
         EventEnvelope, GoalStatus, SessionEvent, SessionGoal, SessionMetadata, TodoItem, TodoStatus,
     },
-    tool::ToolResult,
+    tool::{ToolDescriptor, ToolResult},
 };
 use serde_json::json;
 
@@ -79,7 +79,7 @@ fn keeps_recent_turns_and_summary_within_budget() {
 }
 
 #[test]
-fn current_turn_keeps_complete_tool_output_when_it_fits() {
+fn steering_retains_the_complete_current_turn_and_tool_output() {
     let output = (0..300)
         .map(|line| format!("tracked-file-{line}.rs"))
         .collect::<Vec<_>>()
@@ -109,6 +109,13 @@ fn current_turn_keeps_complete_tool_output_when_it_fits() {
                 result,
             },
         ),
+        event(
+            3,
+            SessionEvent::UserSteered {
+                text: "Focus on the public API.".into(),
+                explicit_delegation: false,
+            },
+        ),
     ];
     let mut manager = ContextManager::new(ContextPolicy {
         max_input_tokens: 16_000,
@@ -127,16 +134,28 @@ fn current_turn_keeps_complete_tool_output_when_it_fits() {
         )
         .expect("assemble context");
 
-    assert!(assembled.request.items.iter().any(|item| {
-        matches!(
-            item,
-            ModelItem::ToolResult { content, .. } if content == &output
-        )
-    }));
+    assert_eq!(
+        assembled.request.items,
+        vec![
+            ModelItem::User {
+                text: "Summarize the repository.".into(),
+            },
+            ModelItem::ToolResult {
+                call_id: CallId::from("call"),
+                name: "bash".into(),
+                content: output,
+                is_error: false,
+                blob_refs: Vec::new(),
+            },
+            ModelItem::User {
+                text: "Focus on the public API.".into(),
+            },
+        ]
+    );
 }
 
 #[test]
-fn current_turn_reports_context_overflow_instead_of_dropping_tool_output() {
+fn steering_cannot_hide_current_turn_context_overflow() {
     let metadata = SessionMetadata {
         id: SessionId::from("session"),
         created_at_ms: 0,
@@ -166,6 +185,13 @@ fn current_turn_reports_context_overflow_instead_of_dropping_tool_output() {
             SessionEvent::ToolCompleted {
                 operation_id: OperationId::from("operation"),
                 result,
+            },
+        ),
+        event(
+            3,
+            SessionEvent::UserSteered {
+                text: "Do not discard the output.".into(),
+                explicit_delegation: false,
             },
         ),
     ]);
@@ -752,9 +778,16 @@ fn oversized_recent_turn_is_omitted_whole_without_blocking_later_turns() {
                 text: "small answer".into(),
             },
         ),
-        event(6, SessionEvent::TurnCompleted),
         event(
-            7,
+            6,
+            SessionEvent::UserSteered {
+                text: "Use both small messages.".into(),
+                explicit_delegation: false,
+            },
+        ),
+        event(7, SessionEvent::TurnCompleted),
+        event(
+            8,
             SessionEvent::UserMessage {
                 text: "current question".into(),
             },
@@ -779,10 +812,23 @@ fn oversized_recent_turn_is_omitted_whole_without_blocking_later_turns() {
                 text: "small answer".into()
             },
             ModelItem::User {
+                text: "Use both small messages.".into()
+            },
+            ModelItem::User {
                 text: "current question".into()
             },
         ]
     );
+    let inspection = manager.inspect(
+        &ModelProfile::new("test", "frontier", 2_000, 0),
+        Vec::new(),
+        false,
+        ".",
+    );
+    assert_eq!(inspection.total_completed_turns, 2);
+    assert_eq!(inspection.included_recent_turns, 1);
+    assert_eq!(inspection.omitted_turns, 1);
+    assert_eq!(inspection.estimated_tokens, assembled.estimated_tokens);
 }
 
 #[test]
@@ -1160,6 +1206,153 @@ fn zero_recent_turns_compacts_completed_history_but_not_the_current_turn() {
         },
     ));
     assert!(manager.compaction_request().is_none());
+}
+
+#[test]
+fn inspector_partitions_the_selected_request_without_mutating_history() {
+    let mut manager = ContextManager::new(ContextPolicy {
+        recent_turns: 2,
+        ..ContextPolicy::default()
+    });
+    manager.replay(long_session());
+    manager.apply_compaction(18, "durable facts".into(), 4);
+    manager.record(event(
+        31,
+        SessionEvent::GoalUpdated {
+            goal: SessionGoal::new("Keep the active goal").expect("valid goal"),
+        },
+    ));
+    manager.record(event(
+        32,
+        SessionEvent::TodoUpdated {
+            items: vec![TodoItem {
+                id: "todo".into(),
+                content: "Keep the task list".into(),
+                status: TodoStatus::InProgress,
+            }],
+        },
+    ));
+    manager.record(event(
+        33,
+        SessionEvent::UserMessage {
+            text: "Inspect the latest evidence".into(),
+        },
+    ));
+    let mut result = ToolResult::success(CallId::from("call"), "source excerpt");
+    result.metadata = json!({"evidence": [{"path": "src/lib.rs", "content": "verified fact"}]});
+    manager.record(event(
+        34,
+        SessionEvent::ToolCompleted {
+            operation_id: OperationId::from("operation"),
+            result,
+        },
+    ));
+    let profile = ModelProfile::new("test", "frontier", 64_000, 500);
+    let tools = vec![ToolDescriptor {
+        name: "read".into(),
+        description: "Read a file".into(),
+        parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+    }];
+    let before = manager
+        .assemble(&profile, tools.clone(), true, ".")
+        .expect("assemble before inspection");
+    let inspection = manager.inspect(&profile, tools.clone(), true, ".");
+    assert!(inspection.assembly_error.is_none());
+    assert_eq!(inspection.max_input_tokens, 64_000);
+    assert_eq!(inspection.reserved_output_tokens, 500);
+    assert_eq!(inspection.usable_tokens, 63_500);
+    assert_eq!(inspection.estimated_tokens, before.estimated_tokens);
+    assert_eq!(
+        inspection
+            .categories
+            .iter()
+            .map(|category| category.tokens)
+            .sum::<u64>(),
+        inspection.estimated_tokens
+    );
+    assert_eq!(inspection.total_completed_turns, 10);
+    assert_eq!(inspection.included_recent_turns, 2);
+    assert_eq!(inspection.omitted_turns, 8);
+    assert_eq!(inspection.summary_covered_through_sequence, Some(18));
+    assert_eq!(
+        manager
+            .assemble(&profile, tools, true, ".")
+            .expect("assemble after inspection")
+            .request,
+        before.request
+    );
+}
+
+#[test]
+fn overflow_inspection_still_previews_the_complete_compaction_request() {
+    let mut manager = ContextManager::new(ContextPolicy {
+        reserve_output_tokens: 100,
+        recent_turns: 3,
+        ..ContextPolicy::default()
+    });
+    manager.replay(long_session());
+    manager.apply_compaction(6, "earlier facts with \"quoted\" details".into(), 10);
+    manager.record(event(
+        31,
+        SessionEvent::UserMessage {
+            text: "x".repeat(12_000),
+        },
+    ));
+    let profile = ModelProfile::new("test", "frontier", 1_000, 100);
+    let inspection = manager.inspect(&profile, Vec::new(), false, ".");
+    assert!(inspection.assembly_error.is_some());
+    assert!(inspection.estimated_tokens > inspection.usable_tokens);
+    assert_eq!(
+        inspection
+            .categories
+            .iter()
+            .map(|category| category.tokens)
+            .sum::<u64>(),
+        inspection.estimated_tokens
+    );
+    assert_eq!(inspection.total_completed_turns, 10);
+    assert_eq!(inspection.included_recent_turns, 0);
+    assert_eq!(inspection.omitted_turns, 10);
+    assert_eq!(inspection.summary_covered_through_sequence, Some(6));
+    let preview = inspection
+        .compaction
+        .expect("pending compaction despite overflow");
+    assert_eq!(preview.covered_through_sequence, 21);
+    assert_eq!(preview.event_count, 15);
+    let compaction = manager.compaction_request().expect("pending compaction");
+    let request = ModelRequest {
+        session_id: SessionId::from("session"),
+        agent_id: None,
+        workspace_root: ".".into(),
+        profile,
+        system: compaction.prompt,
+        items: compaction.items,
+        tools: Vec::new(),
+        delegation: None,
+        continuation: None,
+    };
+    assert_eq!(
+        preview.estimated_tokens,
+        (serde_json::to_vec(&request)
+            .expect("serialized compaction request")
+            .len() as u64)
+            .div_ceil(3)
+            + 512
+    );
+    assert!(!preview.fits_budget);
+    let roomy = manager.inspect(
+        &ModelProfile::new("test", "frontier", 64_000, 100),
+        Vec::new(),
+        false,
+        ".",
+    );
+    assert!(roomy.assembly_error.is_none());
+    assert!(
+        roomy
+            .compaction
+            .expect("same pending compaction")
+            .fits_budget
+    );
 }
 
 fn schema_is_valid(schema: &serde_json::Value, value: &serde_json::Value) -> bool {

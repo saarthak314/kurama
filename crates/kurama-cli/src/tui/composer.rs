@@ -259,12 +259,40 @@ pub(crate) fn render_queue(frame: &mut Frame<'_>, state: &TuiState, area: Rect) 
     if area.is_empty() {
         return;
     }
+    let mut area = area;
+    if state.pending_steering > 0 {
+        frame.render_widget(
+            Line::styled(
+                truncate_display(
+                    &format!(
+                        "steering queued ({}) · applies after this batch",
+                        state.pending_steering
+                    ),
+                    area.width as usize,
+                ),
+                Style::default().fg(AMBER),
+            ),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+        area.y += 1;
+        area.height -= 1;
+        if area.is_empty() {
+            return;
+        }
+    }
     let width = area.width as usize;
     let lines = state
         .pending_prompts()
         .take(area.height as usize)
         .map(|prompt| {
-            let prefix = truncate_display("queued  ", width);
+            let prefix = truncate_display(
+                if state.queue_paused {
+                    "paused  "
+                } else {
+                    "queued  "
+                },
+                width,
+            );
             let available = width.saturating_sub(Span::raw(prefix.as_str()).width());
             let safe = sanitize_terminal_text(prompt);
             let text = if available == 0 {
@@ -325,6 +353,17 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect,
                 "↵/Esc",
             ],
             Overlay::Todos => ["↑↓ scroll · Esc close", "↑↓ Esc", "Esc"],
+            Overlay::Queue => [
+                "↑↓ select · Enter edit · Delete remove · s resume · Esc close",
+                "↑↓ ↵ edit · Del remove · s run · Esc",
+                "↵ edit",
+            ],
+            Overlay::Context => [
+                "↑↓ scroll · r refresh · Esc close",
+                "r refresh · Esc",
+                "Esc",
+            ],
+            Overlay::Diff => ["n/p hunk · Enter feedback · Esc close", "n/p ↵ Esc", "Esc"],
             Overlay::AgentInspect => ["m message · x cancel · Esc agents", "m x Esc", "Esc"],
             Overlay::AgentMessage => ["Enter send · Esc back", "Enter/Esc", "↵"],
             Overlay::ConfirmAgentCancel => [
@@ -352,6 +391,26 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect,
         } else {
             ["Ctrl+C copy selection · Esc clear", "Ctrl+C copy", "Copy"]
         }
+    } else if state.editing_follow_up() {
+        [
+            "Enter save queued edit · Esc cancel (draft preserved)",
+            "Enter save queue · Esc cancel",
+            "↵ save",
+        ]
+    } else if state.editing_feedback() {
+        if state.activity().is_animated() {
+            [
+                "Enter steer · Alt+Enter queue · Esc restore draft",
+                "Enter steer · Alt+Enter queue",
+                "↵ steer",
+            ]
+        } else {
+            [
+                "Enter send feedback · Esc restore draft",
+                "Enter send · Esc cancel",
+                "↵ send",
+            ]
+        }
     } else if state.history_search_active() {
         ["Enter use · Esc cancel", "Enter use", "↵"]
     } else if state.selected_command().is_some() {
@@ -363,14 +422,14 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect,
     } else if state.activity().is_animated() {
         if state.composer.is_empty() {
             [
-                "Esc interrupt · type to queue · Ctrl+O transcript",
-                "Esc interrupt · type to queue",
+                "Enter steer · Alt+Enter queue · Esc interrupt · /queue edit",
+                "Enter steer · Alt+Enter queue",
                 "Esc",
             ]
         } else {
             [
-                "Enter queue · Esc interrupt · Ctrl+J newline",
-                "Enter queue · Esc stop",
+                "Enter steer · Alt+Enter queue · Esc interrupt · Shift+Enter newline",
+                "Enter steer · Alt+Enter queue",
                 "Esc",
             ]
         }
@@ -394,6 +453,9 @@ pub(crate) fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect,
         Overlay::Onboarding
             | Overlay::Agents
             | Overlay::Todos
+            | Overlay::Queue
+            | Overlay::Context
+            | Overlay::Diff
             | Overlay::AgentInspect
             | Overlay::AgentMessage
             | Overlay::ConfirmAgentCancel

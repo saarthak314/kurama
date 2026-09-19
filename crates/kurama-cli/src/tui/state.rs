@@ -23,10 +23,13 @@ use super::input::{
     grapheme_boundary_at_or_after, next_grapheme_boundary, previous_grapheme_boundary,
 };
 use super::{
-    AgentRow, ApprovalState, ComposerSelection, OnboardingState, TranscriptSelection, sort_agents,
+    AgentRow, ApprovalState, ComposerSelection, OnboardingState, TranscriptSelection,
+    context::ContextView, diff::DiffReview, sort_agents,
 };
 
 const MAX_LIVE_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
+const MAX_PENDING_TURNS: usize = 32;
+const MAX_PENDING_TURN_BYTES: usize = 256 * 1024;
 const LIVE_OUTPUT_OMITTED: &str = "[earlier live output omitted]\n";
 const OUTPUT_OMITTED: &str = "[earlier output omitted; Ctrl+O for full output]\n";
 
@@ -191,6 +194,9 @@ pub enum Overlay {
     ApprovalEdit,
     Agents,
     Todos,
+    Queue,
+    Context,
+    Diff,
     AgentInspect,
     AgentMessage,
     ConfirmAgentCancel,
@@ -245,6 +251,17 @@ pub struct ToolTranscript {
 struct PendingTurn {
     text: String,
     explicit_delegation: bool,
+}
+
+struct ComposerDraft {
+    text: String,
+    cursor: usize,
+    selection: Option<ComposerSelection>,
+}
+
+enum ComposerTask {
+    Queue { index: usize },
+    Feedback,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,6 +328,14 @@ pub struct TuiState {
     file_index: RefCell<Option<Vec<String>>>,
     history_search: Option<HistorySearch>,
     pending_turns: VecDeque<PendingTurn>,
+    pub(crate) selected_follow_up: usize,
+    pub(crate) pending_steering: usize,
+    pub(crate) queue_paused: bool,
+    composer_task: Option<(ComposerTask, ComposerDraft)>,
+    pub(crate) context_view: ContextView,
+    pub(crate) diff_review: Option<DiffReview>,
+    pub(crate) diff_loading: bool,
+    pub(crate) diff_error: Option<String>,
     composer_history: Vec<String>,
     history_index: Option<usize>,
     history_draft: String,
@@ -386,6 +411,14 @@ impl TuiState {
             file_index: RefCell::new(None),
             history_search: None,
             pending_turns: VecDeque::new(),
+            selected_follow_up: 0,
+            pending_steering: 0,
+            queue_paused: false,
+            composer_task: None,
+            context_view: ContextView::default(),
+            diff_review: None,
+            diff_loading: false,
+            diff_error: None,
             composer_history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
@@ -426,6 +459,7 @@ impl TuiState {
 
     pub fn command_suggestions(&self) -> Vec<CommandSpec> {
         if self.history_search.is_some()
+            || self.composer_task.is_some()
             || self.command_palette_dismissed
             || self.overlay != Overlay::None
             || self.transcript_view_expanded
@@ -978,7 +1012,28 @@ impl TuiState {
     pub fn submit_turn(&mut self, text: impl Into<String>, explicit_delegation: bool) {
         let text = text.into();
         self.scroll = 0;
-        if !matches!(self.activity, ActivityState::Idle) {
+        if !matches!(self.activity, ActivityState::Idle)
+            || self.pending_steering != 0
+            || self.overlay == Overlay::Queue
+            || self.editing_follow_up()
+            || self.queue_paused
+            || !self.pending_turns.is_empty()
+        {
+            let queued_bytes = self
+                .pending_turns
+                .iter()
+                .map(|turn| turn.text.len())
+                .sum::<usize>();
+            if self.pending_turns.len() >= MAX_PENDING_TURNS
+                || queued_bytes.saturating_add(text.len()) > MAX_PENDING_TURN_BYTES
+            {
+                self.restore_unsent_input(text);
+                self.push_transcript_entry(TranscriptEntry::Notice {
+                    label: Some("QUEUE".into()),
+                    body: "Follow-up queue is full; input restored to draft. /queue can remove pending work.".into(),
+                });
+                return;
+            }
             self.pending_turns.push_back(PendingTurn {
                 text,
                 explicit_delegation,
@@ -996,12 +1051,149 @@ impl TuiState {
         self.pending_turns.iter().map(|turn| turn.text.as_str())
     }
 
+    pub fn steer_or_submit(&mut self, text: String, explicit_delegation: bool) {
+        if matches!(self.activity, ActivityState::Idle) && self.pending_steering == 0 {
+            self.scroll = 0;
+            self.start_turn(text, explicit_delegation);
+        } else {
+            self.queue_command(EngineCommand::Steer {
+                text,
+                explicit_delegation,
+            });
+        }
+    }
+
+    pub fn open_queue(&mut self) {
+        self.selected_follow_up = self
+            .selected_follow_up
+            .min(self.pending_turns.len().saturating_sub(1));
+        self.overlay = Overlay::Queue;
+    }
+
+    pub fn edit_selected_follow_up(&mut self) {
+        let Some(turn) = self.pending_turns.get(self.selected_follow_up) else {
+            return;
+        };
+        let text = turn.text.clone();
+        self.begin_composer_task(
+            ComposerTask::Queue {
+                index: self.selected_follow_up,
+            },
+            text,
+        );
+    }
+
+    pub fn remove_selected_follow_up(&mut self) {
+        self.pending_turns.remove(self.selected_follow_up);
+        self.selected_follow_up = self
+            .selected_follow_up
+            .min(self.pending_turns.len().saturating_sub(1));
+    }
+
+    pub fn resume_follow_ups(&mut self) {
+        self.queue_paused = false;
+        self.close_overlay();
+    }
+
+    pub(crate) fn editing_follow_up(&self) -> bool {
+        matches!(&self.composer_task, Some((ComposerTask::Queue { .. }, _)))
+    }
+
+    pub(crate) fn editing_feedback(&self) -> bool {
+        matches!(&self.composer_task, Some((ComposerTask::Feedback, _)))
+    }
+
+    pub(crate) fn begin_diff_feedback(&mut self, text: String) {
+        self.begin_composer_task(ComposerTask::Feedback, text);
+    }
+
+    fn begin_composer_task(&mut self, task: ComposerTask, text: String) {
+        if self.composer_task.is_some() {
+            return;
+        }
+        let draft = ComposerDraft {
+            text: std::mem::replace(&mut self.composer, text),
+            cursor: self.cursor,
+            selection: self.composer_selection.take(),
+        };
+        self.cursor = self.composer.len();
+        self.composer_edited();
+        self.composer_task = Some((task, draft));
+        self.overlay = Overlay::None;
+    }
+
+    pub(crate) fn restore_composer_draft(&mut self) -> bool {
+        let Some((task, draft)) = self.composer_task.take() else {
+            return false;
+        };
+        self.composer = draft.text;
+        self.cursor = draft.cursor;
+        self.composer_edited();
+        self.composer_selection = draft.selection;
+        if matches!(task, ComposerTask::Queue { .. }) {
+            self.overlay = Overlay::Queue;
+        }
+        true
+    }
+
+    pub(crate) fn save_follow_up(&mut self, text: String, explicit_delegation: bool) {
+        let Some((ComposerTask::Queue { index }, _)) = &self.composer_task else {
+            return;
+        };
+        let index = *index;
+        let queued_bytes = self
+            .pending_turns
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| *position != index)
+            .map(|(_, turn)| turn.text.len())
+            .sum::<usize>();
+        if queued_bytes.saturating_add(text.len()) > MAX_PENDING_TURN_BYTES {
+            self.push_transcript_entry(TranscriptEntry::Notice {
+                label: Some("QUEUE".into()),
+                body: "Edited follow-up exceeds the queue size limit; shorten it or Esc to keep the original.".into(),
+            });
+            return;
+        }
+        if let Some(turn) = self.pending_turns.get_mut(index) {
+            *turn = PendingTurn {
+                text,
+                explicit_delegation,
+            };
+        }
+        self.restore_composer_draft();
+    }
+
+    pub(crate) fn inspect_context(&mut self) {
+        self.overlay = Overlay::Context;
+        if !self.context_view.loading {
+            self.context_view.loading = true;
+            self.sent_commands.push(EngineCommand::InspectContext);
+        }
+    }
+
+    fn restore_unsent_input(&mut self, text: String) {
+        let target = if let Some((_, draft)) = &mut self.composer_task {
+            &mut draft.text
+        } else {
+            &mut self.composer
+        };
+        if !target.is_empty() {
+            target.push_str("\n\n");
+        }
+        target.push_str(&text);
+        if self.composer_task.is_none() {
+            self.cursor = self.composer.len();
+            self.composer_edited();
+        }
+    }
+
     pub fn context_label(&self) -> Option<String> {
         if self.max_input_tokens == 0 {
             return None;
         }
         let used = self.usage.input_tokens.saturating_mul(100) / self.max_input_tokens;
-        Some(format!("{}% context left", 100_u64.saturating_sub(used)))
+        Some(format!("last request: {}% of input limit", used))
     }
 
     pub fn open_shortcuts(&mut self) {
@@ -1088,7 +1280,7 @@ impl TuiState {
             self.overlay = Overlay::None;
             self.sent_commands.push(EngineCommand::CancelTurn);
             self.activity = ActivityState::Interrupted;
-            self.pending_turns.clear();
+            self.queue_paused = true;
             return true;
         }
         if !self.activity.is_animated() {
@@ -1096,12 +1288,8 @@ impl TuiState {
         }
         self.sent_commands.push(EngineCommand::CancelTurn);
         self.activity = ActivityState::Interrupted;
-        self.pending_turns.clear();
+        self.queue_paused = true;
         true
-    }
-
-    pub fn pop_queued_follow_up(&mut self) -> bool {
-        self.pending_turns.pop_back().is_some()
     }
 
     fn push_transcript_entry(&mut self, entry: TranscriptEntry) {
@@ -1139,6 +1327,10 @@ impl TuiState {
                 SessionEvent::UserMessage { text } => {
                     self.remember_prompt(text);
                     self.push_user(text.clone());
+                }
+                SessionEvent::UserSteered { text, .. } => {
+                    self.remember_prompt(text);
+                    self.push_notice(Some("STEER".into()), text.clone());
                 }
                 SessionEvent::AssistantMessage { text } => self.push_assistant(text.clone()),
                 SessionEvent::ToolProposed {
@@ -1427,6 +1619,7 @@ impl TuiState {
     }
 
     pub fn close_overlay(&mut self) {
+        let closing_queue = self.overlay == Overlay::Queue;
         self.overlay = match self.overlay {
             Overlay::Approval => Overlay::Approval,
             Overlay::ApprovalEdit => {
@@ -1439,6 +1632,9 @@ impl TuiState {
             Overlay::AgentInspect => Overlay::Agents,
             _ => Overlay::None,
         };
+        if closing_queue && matches!(self.activity, ActivityState::Idle) {
+            self.start_next_pending_turn();
+        }
     }
 
     pub(crate) const fn approval_generation(&self) -> u64 {
@@ -1528,6 +1724,9 @@ impl TuiState {
     }
 
     pub fn queue_command(&mut self, command: EngineCommand) {
+        if matches!(command, EngineCommand::Steer { .. }) {
+            self.pending_steering = self.pending_steering.saturating_add(1);
+        }
         self.sent_commands.push(command);
     }
 
@@ -1549,12 +1748,37 @@ impl TuiState {
         );
         if !matches!(
             &event,
-            RuntimeEvent::AssistantDelta { .. } | RuntimeEvent::Usage { .. }
+            RuntimeEvent::AssistantDelta { .. }
+                | RuntimeEvent::Usage { .. }
+                | RuntimeEvent::ContextInspected { .. }
+                | RuntimeEvent::SteeringQueued { .. }
+                | RuntimeEvent::SteeringRejected { .. }
         ) && !preserves_active_streams
         {
             self.active_assistant_entry = None;
         }
         match event {
+            RuntimeEvent::ContextInspected { inspection } => self.context_view.update(inspection),
+            RuntimeEvent::SteeringQueued { .. } => {}
+            RuntimeEvent::SteeringRejected { text, message } => {
+                self.pending_steering = self.pending_steering.saturating_sub(1);
+                self.restore_unsent_input(text);
+                self.push_transcript_entry(TranscriptEntry::Notice {
+                    label: Some("STEER".into()),
+                    body: format!("{message}; input restored to draft"),
+                });
+                if matches!(self.activity, ActivityState::Idle) {
+                    self.start_next_pending_turn();
+                }
+            }
+            RuntimeEvent::SteeringApplied { text } => {
+                self.pending_steering = self.pending_steering.saturating_sub(1);
+                self.remember_prompt(&text);
+                self.push_notice(Some("STEER".into()), text);
+                if matches!(self.activity, ActivityState::Idle) {
+                    self.set_thinking();
+                }
+            }
             RuntimeEvent::Status { message } => {
                 self.push_notice(None, message);
                 self.activity = ActivityState::Idle;
@@ -1665,6 +1889,13 @@ impl TuiState {
     }
 
     fn start_next_pending_turn(&mut self) {
+        if self.queue_paused
+            || self.pending_steering != 0
+            || self.overlay == Overlay::Queue
+            || self.editing_follow_up()
+        {
+            return;
+        }
         let Some(turn) = self.pending_turns.pop_front() else {
             return;
         };

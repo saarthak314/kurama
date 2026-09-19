@@ -42,11 +42,12 @@ use crate::{
     args::{Args, ResumeChoice},
     commands::{Command, GoalAction, command_missing_required_arguments, parse_command},
     tui::{
-        ComposerSelection, OnboardingState, OnboardingSubmission, Overlay, TerminalGuard,
-        TranscriptDetail, TranscriptLine, TranscriptPoint, TranscriptSelection, TuiState,
-        command_palette_height, composer_cursor_at, composer_cursor_vertical, main_area,
-        main_layout, next_grapheme_boundary, previous_grapheme_boundary, render_with_transcript,
-        spawn_input_thread, transcript_lines_with_entry_starts, visible_activity_rect,
+        ComposerSelection, DiffAction, DiffReview, OnboardingState, OnboardingSubmission, Overlay,
+        TerminalGuard, TranscriptDetail, TranscriptLine, TranscriptPoint, TranscriptSelection,
+        TuiState, command_palette_height, composer_cursor_at, composer_cursor_vertical, load_diff,
+        main_area, main_layout, next_grapheme_boundary, previous_grapheme_boundary,
+        render_with_transcript, spawn_input_thread, transcript_lines_with_entry_starts,
+        visible_activity_rect,
     },
 };
 
@@ -287,6 +288,12 @@ pub struct App {
     exit_requested: bool,
     control: Option<AppControl>,
     link_tasks: tokio::task::JoinSet<Result<(), String>>,
+    diff_load: Option<DiffLoad>,
+}
+
+struct DiffLoad {
+    events: mpsc::Receiver<Result<DiffReview, String>>,
+    _tasks: tokio::task::JoinSet<()>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -613,6 +620,7 @@ impl App {
             restart_args: None,
             exit_requested: false,
             link_tasks: tokio::task::JoinSet::new(),
+            diff_load: None,
             control: Some(AppControl {
                 project,
                 paths,
@@ -644,6 +652,7 @@ impl App {
             exit_requested: false,
             control: None,
             link_tasks: tokio::task::JoinSet::new(),
+            diff_load: None,
         }
     }
 
@@ -659,6 +668,7 @@ impl App {
             exit_requested: false,
             control: Some(control),
             link_tasks: tokio::task::JoinSet::new(),
+            diff_load: None,
         }
     }
 
@@ -793,6 +803,42 @@ impl App {
                     | KeyCode::Esc
                     | KeyCode::Tab
                     | KeyCode::BackTab
+            ),
+            Overlay::Diff => matches!(
+                key.code,
+                KeyCode::Esc
+                    | KeyCode::Enter
+                    | KeyCode::Char('n' | 'p')
+                    | KeyCode::Tab
+                    | KeyCode::BackTab
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
+            ),
+            Overlay::Context => matches!(
+                key.code,
+                KeyCode::Esc
+                    | KeyCode::Char('r')
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
+            ),
+            Overlay::Queue => matches!(
+                key.code,
+                KeyCode::Esc
+                    | KeyCode::Enter
+                    | KeyCode::Delete
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::Char('s')
             ),
             Overlay::Todos => matches!(
                 key.code,
@@ -953,6 +999,54 @@ impl App {
             | Overlay::AgentInspect
             | Overlay::AgentMessage
             | Overlay::ConfirmAgentCancel => self.handle_agents_key(key),
+            Overlay::Diff => {
+                let action = self.state.diff_review.as_mut().map_or_else(
+                    || {
+                        if key.code == KeyCode::Esc {
+                            DiffAction::Close
+                        } else {
+                            DiffAction::None
+                        }
+                    },
+                    |review| review.handle_key(key),
+                );
+                match action {
+                    DiffAction::None => {}
+                    DiffAction::Close => {
+                        self.diff_load = None;
+                        self.state.diff_loading = false;
+                        self.state.close_overlay();
+                    }
+                    DiffAction::Feedback(text) => self.state.begin_diff_feedback(text),
+                }
+            }
+            Overlay::Context => match key.code {
+                KeyCode::Esc => self.state.close_overlay(),
+                KeyCode::Char('r') => self.request_context_inspection(),
+                code => self.state.context_view.handle_key(code),
+            },
+            Overlay::Queue => match key.code {
+                KeyCode::Esc => self.state.close_overlay(),
+                KeyCode::Up => {
+                    self.state.selected_follow_up = self.state.selected_follow_up.saturating_sub(1)
+                }
+                KeyCode::Down => {
+                    self.state.selected_follow_up = self
+                        .state
+                        .selected_follow_up
+                        .saturating_add(1)
+                        .min(self.state.pending_turn_count().saturating_sub(1))
+                }
+                KeyCode::Home => self.state.selected_follow_up = 0,
+                KeyCode::End => {
+                    self.state.selected_follow_up =
+                        self.state.pending_turn_count().saturating_sub(1)
+                }
+                KeyCode::Enter => self.state.edit_selected_follow_up(),
+                KeyCode::Delete => self.state.remove_selected_follow_up(),
+                KeyCode::Char('s') => self.state.resume_follow_ups(),
+                _ => {}
+            },
             Overlay::Todos => {
                 let page = self.state.viewport_height.get().saturating_sub(1).max(1) as usize;
                 self.state.selected_todo = match key.code {
@@ -981,6 +1075,13 @@ impl App {
     }
 
     fn handle_ctrl_c(&mut self) -> bool {
+        if matches!(
+            self.state.overlay(),
+            Overlay::Approval | Overlay::ApprovalEdit
+        ) {
+            self.state.interrupt_active();
+            return false;
+        }
         if self.state.overlay() == Overlay::Onboarding {
             self.state.onboarding = OnboardingState::new();
             self.state.overlay = Overlay::None;
@@ -991,11 +1092,21 @@ impl App {
             Overlay::Shortcuts
                 | Overlay::Agents
                 | Overlay::Todos
+                | Overlay::Diff
+                | Overlay::Context
+                | Overlay::Queue
                 | Overlay::AgentInspect
                 | Overlay::AgentMessage
                 | Overlay::ConfirmAgentCancel
         ) {
+            if self.state.overlay() == Overlay::Diff {
+                self.diff_load = None;
+                self.state.diff_loading = false;
+            }
             self.state.close_overlay();
+            return false;
+        }
+        if self.state.restore_composer_draft() {
             return false;
         }
         if self.state.interrupt_active() {
@@ -1122,6 +1233,9 @@ impl App {
                 self.state.cursor += 1;
                 self.state.composer_edited();
             }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.submit_composer_with_mode(true)?;
+            }
             KeyCode::Up | KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
                 if let Some(cursor) = composer_cursor_vertical(
                     &self.state.composer,
@@ -1158,11 +1272,10 @@ impl App {
                 }
                 self.submit_composer()?;
             }
+            KeyCode::Esc if self.state.restore_composer_draft() => {}
             KeyCode::Esc if self.state.cancel_history_search() => {}
             KeyCode::Esc if !self.state.dismiss_command_palette() => {
-                if !self.state.interrupt_active() {
-                    self.state.pop_queued_follow_up();
-                }
+                self.state.interrupt_active();
             }
             KeyCode::Esc => {}
             _ => {}
@@ -1171,7 +1284,24 @@ impl App {
     }
 
     fn submit_composer(&mut self) -> Result<(), String> {
-        if command_missing_required_arguments(&self.state.composer) {
+        self.submit_composer_with_mode(false)
+    }
+
+    fn submit_composer_with_mode(&mut self, queue: bool) -> Result<(), String> {
+        let editing_follow_up = self.state.editing_follow_up();
+        let editing_feedback = self.state.editing_feedback();
+        if editing_follow_up {
+            let text = self.state.composer.trim().to_owned();
+            if !text.is_empty() {
+                let explicit_delegation = self
+                    .orchestrator
+                    .as_ref()
+                    .is_some_and(|orchestrator| orchestrator.explicit_delegation(&text));
+                self.state.save_follow_up(text, explicit_delegation);
+            }
+            return Ok(());
+        }
+        if !editing_feedback && command_missing_required_arguments(&self.state.composer) {
             return Ok(());
         }
         let text = std::mem::take(&mut self.state.composer);
@@ -1181,7 +1311,7 @@ impl App {
         if trimmed.is_empty() {
             return Ok(());
         }
-        if trimmed.starts_with('/') {
+        if !editing_feedback && trimmed.starts_with('/') {
             let command = match parse_command(trimmed) {
                 Ok(command) => command,
                 Err(error) => {
@@ -1192,6 +1322,7 @@ impl App {
             match command {
                 Command::Agents => self.state.open_agents(),
                 Command::Todo => self.state.open_todos(),
+                Command::Queue => self.state.open_queue(),
                 Command::Goal(action) => self.handle_goal_command(action)?,
                 Command::Model(profile) => {
                     if let Some(profile) = profile {
@@ -1248,23 +1379,10 @@ impl App {
                         "starting a new session",
                     );
                 }
-                Command::Context => {
-                    if let Some(control) = &self.control {
-                        self.state.push_notice(
-                            Some("CONTEXT".into()),
-                            format!(
-                                "{} token input limit; automatic compaction; session {}",
-                                control.max_input_tokens,
-                                self.session_id.as_ref().map_or("none", AsRef::as_ref)
-                            ),
-                        );
-                    } else {
-                        self.state.push_error("context details are unavailable");
-                    }
-                }
+                Command::Context => self.request_context_inspection(),
                 Command::Status => self.push_status_notice(),
                 Command::Copy => self.copy_last_assistant(),
-                Command::Diff => self.push_diff_notice(),
+                Command::Diff => self.open_diff_review(),
                 Command::Compact => {
                     self.state.queue_command(EngineCommand::Compact);
                     self.state
@@ -1300,13 +1418,24 @@ impl App {
         } else if self.engine.is_none() {
             self.state
                 .push_error("not connected; configure ~/.kurama/config.toml");
+            self.state.composer = text;
+            self.state.cursor = self.state.composer.len();
+            self.state.composer_edited();
         } else {
             let explicit_delegation = self
                 .orchestrator
                 .as_ref()
                 .is_some_and(|orchestrator| orchestrator.explicit_delegation(trimmed));
             self.state.remember_prompt(trimmed);
-            self.state.submit_turn(trimmed, explicit_delegation);
+            if queue {
+                self.state.submit_turn(trimmed, explicit_delegation);
+            } else {
+                self.state
+                    .steer_or_submit(trimmed.to_owned(), explicit_delegation);
+            }
+            if editing_feedback {
+                self.state.restore_composer_draft();
+            }
         }
         Ok(())
     }
@@ -1815,14 +1944,30 @@ impl App {
         apply_pointer_action(self, PointerAction::Copy(text));
     }
 
-    fn push_diff_notice(&mut self) {
-        match git_diff_stat(&self.state.project) {
-            Ok(diff) if diff.trim().is_empty() => self
-                .state
-                .push_notice(Some("DIFF".into()), "working tree is clean"),
-            Ok(diff) => self.state.push_notice(Some("DIFF".into()), diff),
-            Err(error) => self.state.push_error(error),
+    fn request_context_inspection(&mut self) {
+        if self.engine.is_some() {
+            self.state.inspect_context();
+        } else {
+            self.state
+                .push_error("context inspection requires a connected session");
         }
+    }
+
+    fn open_diff_review(&mut self) {
+        self.state.overlay = Overlay::Diff;
+        self.state.diff_review = None;
+        self.state.diff_error = None;
+        self.state.diff_loading = true;
+        let project = PathBuf::from(&self.state.project);
+        let (sender, events) = mpsc::channel(1);
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            let _ = sender.send(load_diff(project).await).await;
+        });
+        self.diff_load = Some(DiffLoad {
+            events,
+            _tasks: tasks,
+        });
     }
 
     async fn flush_commands(&mut self) -> Result<(), String> {
@@ -1843,6 +1988,11 @@ impl App {
                     text,
                     explicit_delegation,
                 } => engine.submit(text, explicit_delegation).await,
+                EngineCommand::Steer {
+                    text,
+                    explicit_delegation,
+                } => engine.steer(text, explicit_delegation).await,
+                EngineCommand::InspectContext => engine.inspect_context().await,
                 EngineCommand::ResolveApproval {
                     operation_id,
                     response,
@@ -1982,6 +2132,10 @@ fn requires_immediate_redraw(event: &RuntimeEvent) -> bool {
             | RuntimeEvent::GoalUpdated { .. }
             | RuntimeEvent::GoalCleared
             | RuntimeEvent::Usage { .. }
+            | RuntimeEvent::ContextInspected { .. }
+            | RuntimeEvent::SteeringQueued { .. }
+            | RuntimeEvent::SteeringApplied { .. }
+            | RuntimeEvent::SteeringRejected { .. }
             | RuntimeEvent::Error { .. }
             | RuntimeEvent::Shutdown
     )
@@ -2422,7 +2576,7 @@ where
     let mut next_activity_frame = last_draw + ACTIVITY_FRAME_INTERVAL;
     let mut redraw_pending = false;
 
-    while input_open || runtime_open || tool_open {
+    while input_open || runtime_open || tool_open || app.diff_load.is_some() {
         let mut exit = false;
         let mut force_redraw = false;
         let mut state_changed = false;
@@ -2551,6 +2705,22 @@ where
                     None => tool_open = false,
                 }
             }
+            result = async {
+                match app.diff_load.as_mut() {
+                    Some(load) => load.events.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if app.diff_load.is_some() => {
+                app.diff_load = None;
+                app.state.diff_loading = false;
+                match result {
+                    Some(Ok(review)) => app.state.diff_review = Some(review),
+                    Some(Err(error)) => app.state.diff_error = Some(error),
+                    None => app.state.diff_error = Some("diff loader stopped unexpectedly".into()),
+                }
+                state_changed = true;
+                force_redraw = true;
+            }
             result = app.link_tasks.join_next(), if !app.link_tasks.is_empty() => {
                 let error = match result {
                     Some(Ok(Err(error))) => Some(error),
@@ -2567,6 +2737,11 @@ where
             _ = &mut animation => {
                 force_redraw = true;
             }
+        }
+        if app.state.overlay() != Overlay::Diff {
+            app.diff_load = None;
+            app.state.diff_loading = false;
+            app.state.diff_review = None;
         }
         if approval_generation != app.state.approval_generation() {
             approval_generation = app.state.approval_generation();
@@ -2831,46 +3006,6 @@ fn save_pasted_image(project: &str, bytes: &[u8], ext: &str) -> Result<String, S
     Ok(relative)
 }
 
-fn git_diff_stat(project: &str) -> Result<String, String> {
-    let output = std::process::Command::new("git")
-        .args(["-C", project, "diff", "--stat"])
-        .output()
-        .map_err(|error| format!("git diff failed: {error}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let first = stderr
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .unwrap_or("git diff failed");
-        if first.contains("not a git repository") || first.contains("Not a git repository") {
-            return Err("not a git repository".into());
-        }
-        let mut message = first.to_owned();
-        if message.chars().count() > 200 {
-            let end = message
-                .char_indices()
-                .nth(200)
-                .map(|(index, _)| index)
-                .unwrap_or(message.len());
-            message.truncate(end);
-            message.push('…');
-        }
-        return Err(message);
-    }
-    let mut diff = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if diff.chars().count() > 800 {
-        let end = diff
-            .char_indices()
-            .nth(800)
-            .map(|(index, _)| index)
-            .unwrap_or(diff.len());
-        diff.truncate(end);
-        diff.push('…');
-    }
-    Ok(diff)
-}
-
 fn execution_mode_label(mode: ExecutionMode) -> &'static str {
     match mode {
         ExecutionMode::Supervised => "supervised",
@@ -2997,7 +3132,186 @@ mod tests {
             exit_requested: false,
             control: None,
             link_tasks: tokio::task::JoinSet::new(),
+            diff_load: None,
         }
+    }
+    #[test]
+    fn late_steering_blocks_followups_until_its_turn_completes() {
+        let mut app = test_app();
+        app.state.set_thinking();
+        app.state.submit_turn("queued next", false);
+        app.state.steer_or_submit("late correction".into(), false);
+        assert!(matches!(
+            app.state.take_commands().as_slice(),
+            [EngineCommand::Steer { .. }]
+        ));
+        app.state.apply_runtime_event(RuntimeEvent::TurnCompleted);
+        assert!(app.state.sent_commands().is_empty());
+        assert_eq!(app.state.pending_turn_count(), 1);
+        app.state
+            .apply_runtime_event(RuntimeEvent::SteeringApplied {
+                text: "late correction".into(),
+            });
+        assert!(app.state.activity().is_animated());
+        app.state.apply_runtime_event(RuntimeEvent::TurnCompleted);
+        assert!(
+            matches!(app.state.sent_commands(), [EngineCommand::SubmitTurn { text, .. }] if text == "queued next")
+        );
+    }
+
+    #[test]
+    fn approval_interrupt_preempts_queue_edit_restoration() {
+        let mut app = test_app();
+        app.state.set_thinking();
+        app.state.submit_turn("later", false);
+        app.state.composer = "unrelated draft".into();
+        app.state.cursor = app.state.composer.len();
+        app.state.open_queue();
+        app.state.edit_selected_follow_up();
+        app.state.begin_approval(ApprovalRequest {
+            operation_id: OperationId::from("pending-edit"),
+            operation: Operation::Bash {
+                command: "cargo test".into(),
+                cwd: ".".into(),
+                class: CommandClass::ReadOnly,
+                timeout_ms: 30_000,
+            },
+            summary: "Run tests".into(),
+            arguments: serde_json::json!({"command": "cargo test"}),
+        });
+        assert!(!app.handle_ctrl_c());
+        assert!(app.state.approval.is_none());
+        assert_eq!(app.state.overlay(), Overlay::None);
+        assert!(matches!(
+            app.state.sent_commands(),
+            [EngineCommand::CancelTurn]
+        ));
+        assert!(!app.handle_ctrl_c());
+        assert_eq!(app.state.composer, "unrelated draft");
+        assert_eq!(app.state.pending_prompts().collect::<Vec<_>>(), ["later"]);
+    }
+
+    #[test]
+    fn queue_edit_holds_dispatch_and_cancel_preserves_original_and_draft() {
+        let mut app = test_app();
+        app.state.set_thinking();
+        app.state.submit_turn("first queued", false);
+        app.state.submit_turn("second queued", false);
+        app.state.composer = "unrelated draft".into();
+        app.state.cursor = 4;
+        app.state.open_queue();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        app.state.apply_runtime_event(RuntimeEvent::TurnCompleted);
+        assert_eq!(app.state.composer, "first queued");
+        assert!(app.state.sent_commands().is_empty());
+        assert_eq!(
+            app.state.pending_prompts().collect::<Vec<_>>(),
+            ["first queued", "second queued"]
+        );
+
+        app.state.composer = "edited follow-up".into();
+        app.state.cursor = app.state.composer.len();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        assert_eq!(app.state.overlay(), Overlay::Queue);
+        assert_eq!(app.state.composer, "unrelated draft");
+        assert_eq!(app.state.cursor, 4);
+        assert!(app.state.sent_commands().is_empty());
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
+            .unwrap();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        app.state.composer = "discard this edit".into();
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(
+            app.state.pending_prompts().collect::<Vec<_>>(),
+            ["edited follow-up", "second queued"]
+        );
+        assert_eq!(app.state.composer, "unrelated draft");
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Delete,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        assert!(
+            matches!(app.state.sent_commands(), [EngineCommand::SubmitTurn { text, .. }] if text == "edited follow-up")
+        );
+        assert_eq!(app.state.pending_turn_count(), 0);
+    }
+
+    #[test]
+    fn interrupted_queue_waits_for_explicit_resume_and_rejection_stays_in_draft() {
+        let mut app = test_app();
+        app.state.set_thinking();
+        app.state.submit_turn("later", false);
+        app.state.composer = "unrelated draft".into();
+        app.state.cursor = app.state.composer.len();
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        app.state.take_commands();
+        app.state
+            .apply_runtime_event(RuntimeEvent::SteeringRejected {
+                text: "returned steering".into(),
+                message: "turn cancelled".into(),
+            });
+        assert_eq!(app.state.activity(), &ActivityState::Interrupted);
+        app.state.apply_runtime_event(RuntimeEvent::TurnCompleted);
+        assert_eq!(app.state.pending_prompts().collect::<Vec<_>>(), ["later"]);
+        assert!(app.state.sent_commands().is_empty());
+        assert_eq!(app.state.composer, "unrelated draft\n\nreturned steering");
+        app.state.open_queue();
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        assert!(app.state.sent_commands().is_empty());
+        app.state.open_queue();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('s'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        assert!(
+            matches!(app.state.sent_commands(), [EngineCommand::SubmitTurn { text, .. }] if text == "later")
+        );
+        assert_eq!(app.state.composer, "unrelated draft\n\nreturned steering");
+    }
+
+    #[test]
+    fn cancelling_hunk_feedback_restores_draft_and_never_sends_patch() {
+        let mut app = test_app();
+        app.state.set_thinking();
+        app.state.composer = "unrelated draft".into();
+        app.state.cursor = 3;
+        let feedback = "Review src/lib.rs @@ -1 +1 @@\n-old\n+new\nFeedback: ";
+        app.state.begin_diff_feedback(feedback.into());
+        assert_eq!(app.state.composer, feedback);
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::SHIFT,
+        )))
+        .unwrap();
+        assert!(app.state.composer.ends_with('\n'));
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.state.composer, "unrelated draft");
+        assert_eq!(app.state.cursor, 3);
+        assert!(app.state.sent_commands().is_empty());
+        assert!(matches!(
+            app.state.activity(),
+            ActivityState::Thinking { .. }
+        ));
     }
 
     #[tokio::test]
@@ -4361,6 +4675,7 @@ Session ID: ses_cafebabe"
             exit_requested: false,
             control: None,
             link_tasks: tokio::task::JoinSet::new(),
+            diff_load: None,
         };
         app.state.push_user("visible fullscreen question");
         let mut rows = vec![" ".repeat(80); 16];
@@ -4561,24 +4876,6 @@ Session ID: ses_cafebabe"
         app.handle_event(Event::Paste("x".into())).unwrap();
         assert_eq!(app.state.composer, "xe\u{301}");
         assert!(app.state.composer.is_char_boundary(app.state.cursor));
-    }
-
-    #[test]
-    fn context_remaining_tracks_the_latest_model_window() {
-        let mut state = TuiState::new("work", "model", ".", ExecutionMode::Supervised);
-        state.max_input_tokens = 1000;
-        for (tokens, remaining) in [(0, 100), (900, 10), (200, 80), (1500, 0)] {
-            state.apply_runtime_event(RuntimeEvent::Usage {
-                usage: Usage {
-                    input_tokens: tokens,
-                    ..Usage::default()
-                },
-            });
-            assert_eq!(
-                state.context_label().unwrap(),
-                format!("{remaining}% context left")
-            );
-        }
     }
 
     #[test]

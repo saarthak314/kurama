@@ -80,6 +80,10 @@ Event-driven UIs (the Kurama CLI) call `agent.launch(metadata, replay)` and driv
 
 Assistant text is coalesced to at most 4 KiB UTF-8-safe chunks, with a 50 ms flush deadline while text is pending. This is an engine buffering bound, not an end-to-end provider latency guarantee. Drain runtime events continuously: the bounded channel applies backpressure rather than dropping text or terminal events.
 
+`Handle::steer(text, explicit_delegation)` redirects an active turn at the next complete model/tool/delegation boundary; an idle handle starts a normal turn. Internal retries retain their in-flight request. `SteeringQueued` is a receipt, `SteeringApplied` marks durable application, and `SteeringRejected` returns input that could not be applied. These are nonterminal events; callers must preserve rejected text rather than resubmitting it automatically. Only applied steering enters durable history.
+
+`Handle::inspect_context()` emits `ContextInspected` without calling the model or ending the turn. Its `ContextInspection` partitions an estimated request budget into categories, reports omitted/included completed turns and summary coverage, and previews explicit compaction. `assembly_error` explains a request that cannot fit while preserving inspection data. Token estimates are not provider billing counts.
+
 ## Explicit composition
 
 `AgentBuilder` still requires every component:
@@ -118,3 +122,5 @@ Custom SDK tools do not enter the standard Kurama CLI automatically. The CLI reg
 ## Compatibility
 
 Kurama follows semantic versioning with `0.x` expectations. Breaking public API changes require a minor-version bump and migration notes. Patch releases preserve the public contracts, while trait additions are driven by working first-party implementations rather than speculative extension points.
+
+The control additions extend `EngineCommand`, `RuntimeEvent`, SDK `Event`, and `SessionEvent`; downstream exhaustive matches must handle the new variants. `SessionEvent::UserSteered` stays within the original user turn and carries a default-false `explicit_delegation` flag. Direct compaction request constructors must also provide `CompactionRequest::event_count`. Older sessions remain readable; older binaries do not understand the new steering event.

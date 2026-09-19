@@ -21,7 +21,7 @@ use kurama_protocol::{
     id::{CallId, OperationId, SessionId},
     model::ModelProfile,
     policy::{ApprovalRequest, ApprovalResponse, AutoBoundaries, ExecutionMode},
-    runtime::RuntimeEvent,
+    runtime::{ContextInspection, RuntimeEvent},
     session::{EventEnvelope, SessionEvent, SessionMetadata},
     tool::ToolResult,
     traits::{
@@ -60,6 +60,17 @@ impl Handle {
         explicit_delegation: bool,
     ) -> Result<(), KuramaError> {
         self.inner.submit(text, explicit_delegation).await
+    }
+    pub async fn steer(
+        &self,
+        text: impl Into<String>,
+        explicit_delegation: bool,
+    ) -> Result<(), KuramaError> {
+        self.inner.steer(text, explicit_delegation).await
+    }
+
+    pub async fn inspect_context(&self) -> Result<(), KuramaError> {
+        self.inner.inspect_context().await
     }
 
     pub async fn resolve_approval(
@@ -129,6 +140,13 @@ impl fmt::Display for TurnOutcome {
 #[derive(Debug, Clone)]
 pub enum Event {
     Status(String),
+    SteeringQueued(String),
+    SteeringApplied(String),
+    SteeringRejected {
+        text: String,
+        message: String,
+    },
+    ContextInspected(ContextInspection),
     Text(String),
     Approval(ApprovalRequest),
     ToolStarted {
@@ -178,6 +196,14 @@ impl Turn<'_> {
                 | RuntimeEvent::GoalUpdated { .. }
                 | RuntimeEvent::GoalCleared => continue,
                 RuntimeEvent::Status { message } => Event::Status(message),
+                RuntimeEvent::SteeringQueued { text } => Event::SteeringQueued(text),
+                RuntimeEvent::SteeringApplied { text } => Event::SteeringApplied(text),
+                RuntimeEvent::SteeringRejected { text, message } => {
+                    Event::SteeringRejected { text, message }
+                }
+                RuntimeEvent::ContextInspected { inspection } => {
+                    Event::ContextInspected(inspection)
+                }
                 RuntimeEvent::AssistantDelta { text } => {
                     self.text.push_str(&text);
                     Event::Text(text)

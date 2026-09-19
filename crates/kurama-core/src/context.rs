@@ -5,6 +5,7 @@ use kurama_protocol::{
     agent::AgentBudget,
     id::{AgentId, SessionId},
     model::{DelegationSchema, ModelItem, ModelProfile, ModelRequest},
+    runtime::{CompactionPreview, ContextCategory, ContextInspection},
     session::{EventEnvelope, SessionEvent},
     tool::ToolDescriptor,
 };
@@ -37,12 +38,19 @@ pub struct ContextReport {
     pub estimated_tokens: u64,
     pub system_tokens: u64,
     pub tool_tokens: u64,
+    pub delegation_tokens: u64,
+    pub framing_tokens: u64,
+    pub provider_reserve_tokens: u64,
     pub summary_tokens: u64,
     pub current_turn_tokens: u64,
     pub recent_turn_tokens: u64,
     pub evidence_tokens: u64,
+    pub goal_tokens: u64,
+    pub todo_tokens: u64,
     pub usable_tokens: u64,
     pub canonical_events: usize,
+    pub total_completed_turns: usize,
+    pub included_recent_turns: usize,
     pub compaction_recommended: bool,
 }
 
@@ -56,6 +64,7 @@ pub struct AssembledContext {
 #[derive(Debug, Clone)]
 pub struct CompactionRequest {
     pub covered_through_sequence: u64,
+    pub event_count: usize,
     pub items: Vec<ModelItem>,
     pub prompt: String,
     pub estimated_tokens: u64,
@@ -136,7 +145,9 @@ impl ContextManager {
         }
         let index = self.canonical.len();
         match &event.event {
-            SessionEvent::UserMessage { .. } => self.latest_user = Some(index),
+            SessionEvent::UserMessage { .. } | SessionEvent::UserSteered { .. } => {
+                self.latest_user = Some(index);
+            }
             SessionEvent::GoalUpdated { .. } => self.latest_goal = Some(index),
             SessionEvent::GoalCleared => self.latest_goal = None,
             SessionEvent::TodoUpdated { .. } => self.latest_todos = Some(index),
@@ -172,11 +183,25 @@ impl ContextManager {
         self.canonical.push(event);
     }
 
-    pub(crate) fn latest_user_text(&self) -> Option<&str> {
-        match &self.canonical[self.latest_user?].event {
-            SessionEvent::UserMessage { text } => Some(text),
-            _ => None,
+    pub(crate) fn latest_turn_allows_delegation(
+        &self,
+        explicit_delegation: impl Fn(&str) -> bool,
+    ) -> bool {
+        let Some(latest_user) = self.latest_user else {
+            return false;
+        };
+        for envelope in self.canonical[..=latest_user].iter().rev() {
+            match &envelope.event {
+                SessionEvent::UserMessage { text } => return explicit_delegation(text),
+                SessionEvent::UserSteered {
+                    text,
+                    explicit_delegation: enabled,
+                } if *enabled || explicit_delegation(text) => return true,
+                SessionEvent::TurnCompleted | SessionEvent::TurnFailed { .. } => return false,
+                _ => {}
+            }
         }
+        false
     }
 
     fn current_turn(&self) -> Option<&Range<usize>> {
@@ -191,6 +216,7 @@ impl ContextManager {
         ContextReport {
             summary_tokens: self.summary.as_ref().map_or(0, |summary| summary.tokens),
             canonical_events: self.canonical.len(),
+            total_completed_turns: self.completed_turns.len(),
             compaction_recommended: self.compaction_recommended(),
             ..ContextReport::default()
         }
@@ -246,6 +272,7 @@ impl ContextManager {
         });
         Some(CompactionRequest {
             covered_through_sequence,
+            event_count: events.len(),
             estimated_tokens: estimate_items(&items).ok()?,
             items,
             prompt: crate::prompts::COMPACTION_PROMPT.into(),
@@ -256,8 +283,7 @@ impl ContextManager {
         &self,
         request: &ModelRequest,
     ) -> Result<(), KuramaError> {
-        let tokens = estimate_serialized(serde_json::to_vec(request))?
-            .saturating_add(PROVIDER_ENVELOPE_RESERVE_TOKENS);
+        let tokens = estimate_request(request)?;
         if tokens > self.usable_tokens(&request.profile) {
             return Err(KuramaError::Session(
                 "compaction summary and events exceed the model input context budget".into(),
@@ -284,12 +310,119 @@ impl ContextManager {
         delegation_enabled: bool,
         workspace_root: &str,
     ) -> Result<AssembledContext, KuramaError> {
+        let mut report = ContextReport::default();
+        let request = self.assemble_request(
+            profile,
+            tools,
+            delegation_enabled,
+            workspace_root,
+            &mut report,
+        )?;
+        Ok(AssembledContext {
+            request,
+            estimated_tokens: report.estimated_tokens,
+            report,
+        })
+    }
+
+    pub fn inspect(
+        &self,
+        profile: &ModelProfile,
+        tools: Vec<ToolDescriptor>,
+        delegation_enabled: bool,
+        workspace_root: &str,
+    ) -> ContextInspection {
+        let mut report = ContextReport::default();
+        let assembly_error = self
+            .assemble_request(
+                profile,
+                tools,
+                delegation_enabled,
+                workspace_root,
+                &mut report,
+            )
+            .err()
+            .map(|error| error.to_string());
+        let compaction = self.compaction_request().and_then(|compaction| {
+            let (session_id, agent_id) = self.identity.clone()?;
+            let request = ModelRequest {
+                session_id,
+                agent_id,
+                workspace_root: workspace_root.into(),
+                profile: profile.clone(),
+                system: compaction.prompt,
+                items: compaction.items,
+                tools: Vec::new(),
+                delegation: None,
+                continuation: None,
+            };
+            let estimated_tokens = estimate_request(&request).ok()?;
+            Some(CompactionPreview {
+                covered_through_sequence: compaction.covered_through_sequence,
+                event_count: compaction.event_count,
+                estimated_tokens,
+                fits_budget: estimated_tokens <= report.usable_tokens,
+            })
+        });
+        ContextInspection {
+            max_input_tokens: self.policy.max_input_tokens.min(profile.max_input_tokens),
+            reserved_output_tokens: self
+                .policy
+                .reserve_output_tokens
+                .min(profile.max_output_tokens),
+            usable_tokens: report.usable_tokens,
+            estimated_tokens: report.estimated_tokens,
+            categories: [
+                ("System instructions", report.system_tokens),
+                ("Tool schemas", report.tool_tokens),
+                ("Delegation schema", report.delegation_tokens),
+                ("Request framing", report.framing_tokens),
+                ("Provider envelope reserve", report.provider_reserve_tokens),
+                ("Summary", report.summary_tokens),
+                ("Recent completed turns", report.recent_turn_tokens),
+                ("Current turn", report.current_turn_tokens),
+                ("Goal", report.goal_tokens),
+                ("Todo list", report.todo_tokens),
+                ("Evidence", report.evidence_tokens),
+            ]
+            .into_iter()
+            .map(|(name, tokens)| ContextCategory {
+                name: name.into(),
+                tokens,
+            })
+            .collect(),
+            total_completed_turns: report.total_completed_turns,
+            included_recent_turns: report.included_recent_turns,
+            omitted_turns: report.total_completed_turns - report.included_recent_turns,
+            summary_covered_through_sequence: self
+                .summary
+                .as_ref()
+                .map(|summary| summary.covered_through_sequence),
+            compaction,
+            assembly_error,
+        }
+    }
+
+    fn assemble_request(
+        &self,
+        profile: &ModelProfile,
+        tools: Vec<ToolDescriptor>,
+        delegation_enabled: bool,
+        workspace_root: &str,
+        report: &mut ContextReport,
+    ) -> Result<ModelRequest, KuramaError> {
+        let usable_tokens = self.usable_tokens(profile);
+        *report = ContextReport {
+            usable_tokens,
+            canonical_events: self.canonical.len(),
+            total_completed_turns: self.completed_turns.len(),
+            ..ContextReport::default()
+        };
         let (session_id, agent_id) = self.identity.clone().ok_or_else(|| {
             KuramaError::Session("cannot assemble context without a session event".into())
         })?;
-        let usable_tokens = self.usable_tokens(profile);
-        let system_tokens = estimate_text(SYSTEM_PROMPT);
-        let tool_tokens = estimate_serialized(serde_json::to_vec(&tools))?;
+        report.system_tokens = estimate_serialized(serde_json::to_vec(SYSTEM_PROMPT))?;
+        report.tool_tokens = estimate_serialized(serde_json::to_vec(&tools))?;
         let request_shell = ModelRequest {
             session_id,
             agent_id,
@@ -303,23 +436,20 @@ impl ContextManager {
             }),
             continuation: None,
         };
-        let fixed_tokens = estimate_serialized(serde_json::to_vec(&request_shell))?
-            .saturating_add(PROVIDER_ENVELOPE_RESERVE_TOKENS);
-        if fixed_tokens > usable_tokens {
-            return Err(KuramaError::Session(
-                "model request instructions and tool schemas exceed the input budget".into(),
-            ));
-        }
+        report.delegation_tokens = request_shell.delegation.as_ref().map_or(Ok(0), |schema| {
+            estimate_serialized(serde_json::to_vec(schema))
+        })?;
+        let fixed_tokens = estimate_request(&request_shell)?;
+        report.provider_reserve_tokens = PROVIDER_ENVELOPE_RESERVE_TOKENS;
+        report.framing_tokens = fixed_tokens
+            - report.system_tokens
+            - report.tool_tokens
+            - report.delegation_tokens
+            - report.provider_reserve_tokens;
 
         let mut items = Vec::new();
         let mut used = fixed_tokens;
-        let mut report = ContextReport {
-            system_tokens,
-            tool_tokens,
-            usable_tokens,
-            canonical_events: self.canonical.len(),
-            ..ContextReport::default()
-        };
+        report.estimated_tokens = fixed_tokens;
 
         let current_items = self.current_turn().map_or_else(Vec::new, |turn| {
             self.items_for_events(&self.canonical[turn.clone()])
@@ -339,6 +469,15 @@ impl ContextManager {
             .as_ref()
             .map_or(Ok(0), |item| estimate_serialized(serde_json::to_vec(item)))?;
         let reserved_tail = current_tokens.saturating_add(goal_tokens);
+        // Required data remains visible to inspection even when no request can fit.
+        report.current_turn_tokens = current_tokens;
+        report.goal_tokens = goal_tokens;
+        report.estimated_tokens = fixed_tokens.saturating_add(reserved_tail);
+        if fixed_tokens > usable_tokens {
+            return Err(KuramaError::Session(
+                "model request instructions and tool schemas exceed the input budget".into(),
+            ));
+        }
         if fixed_tokens.saturating_add(reserved_tail) > usable_tokens {
             return Err(KuramaError::Session(
                 "current turn exceeds the model input context budget; tool output was preserved"
@@ -372,23 +511,21 @@ impl ContextManager {
                 items.extend(turn_items);
                 used += turn_tokens;
                 report.recent_turn_tokens += turn_tokens;
+                report.included_recent_turns += 1;
             }
         }
 
         items.extend(current_items);
         used += current_tokens;
-        report.current_turn_tokens += current_tokens;
         if let Some(goal_item) = goal_item {
             items.push(goal_item);
             used += goal_tokens;
-            report.current_turn_tokens += goal_tokens;
         }
 
         if let Some(index) = self.latest_todos
             && let SessionEvent::TodoUpdated { items: todos } = &self.canonical[index].event
             && !todos.is_empty()
         {
-            let mut todo_tokens = 0;
             push_if_fits(
                 &mut items,
                 ModelItem::TodoList {
@@ -396,7 +533,7 @@ impl ContextManager {
                 },
                 &mut used,
                 usable_tokens,
-                &mut todo_tokens,
+                &mut report.todo_tokens,
             )?;
         }
 
@@ -415,13 +552,9 @@ impl ContextManager {
         report.estimated_tokens = used;
         report.compaction_recommended = used.saturating_mul(100)
             >= usable_tokens.saturating_mul(self.policy.compact_at_percent.into());
-        Ok(AssembledContext {
-            request: ModelRequest {
-                items,
-                ..request_shell
-            },
-            estimated_tokens: used,
-            report,
+        Ok(ModelRequest {
+            items,
+            ..request_shell
         })
     }
 
@@ -429,7 +562,9 @@ impl ContextManager {
         events
             .iter()
             .filter_map(|event| match &event.event {
-                SessionEvent::UserMessage { text } => Some(ModelItem::User { text: text.clone() }),
+                SessionEvent::UserMessage { text } | SessionEvent::UserSteered { text, .. } => {
+                    Some(ModelItem::User { text: text.clone() })
+                }
                 SessionEvent::AssistantMessage { text } => {
                     Some(ModelItem::Assistant { text: text.clone() })
                 }
@@ -526,6 +661,7 @@ fn opens_context_turn(event: &SessionEvent) -> bool {
     matches!(
         event,
         SessionEvent::UserMessage { .. }
+            | SessionEvent::UserSteered { .. }
             | SessionEvent::AssistantMessage { .. }
             | SessionEvent::ToolProposed { .. }
             | SessionEvent::ToolInvocationRecorded { .. }
@@ -538,6 +674,11 @@ fn opens_context_turn(event: &SessionEvent) -> bool {
             | SessionEvent::AgentCancelled { .. }
             | SessionEvent::AgentMessage { .. }
     )
+}
+
+fn estimate_request(request: &ModelRequest) -> Result<u64, KuramaError> {
+    estimate_serialized(serde_json::to_vec(request))
+        .map(|tokens| tokens.saturating_add(PROVIDER_ENVELOPE_RESERVE_TOKENS))
 }
 
 fn estimate_items(items: &[ModelItem]) -> Result<u64, KuramaError> {
@@ -711,45 +852,5 @@ mod tests {
                 .expect("normalize")
                 .contains("summary: s")
         );
-    }
-
-    #[test]
-    fn latest_user_is_preserved_between_turns_and_reset_by_replay() {
-        let event = |sequence, event| {
-            EventEnvelope::new(sequence, sequence, SessionId::from("session"), None, event)
-        };
-        let mut manager = ContextManager::new(ContextPolicy::default());
-        manager.record(event(
-            0,
-            SessionEvent::UserMessage {
-                text: "first".into(),
-            },
-        ));
-        manager.record(event(
-            1,
-            SessionEvent::UserMessage {
-                text: "latest".into(),
-            },
-        ));
-        manager.record(event(2, SessionEvent::TurnCompleted));
-        manager.record(event(
-            3,
-            SessionEvent::AssistantMessage {
-                text: "continuation".into(),
-            },
-        ));
-        assert_eq!(manager.latest_user_text(), Some("latest"));
-
-        manager.replay(vec![event(
-            0,
-            SessionEvent::UserMessage {
-                text: "replacement".into(),
-            },
-        )]);
-        assert_eq!(manager.latest_user_text(), Some("replacement"));
-        manager.replay(vec![event(0, SessionEvent::TurnCompleted)]);
-        assert_eq!(manager.latest_user_text(), None);
-        manager.replay(Vec::new());
-        assert_eq!(manager.latest_user_text(), None);
     }
 }

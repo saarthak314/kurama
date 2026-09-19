@@ -505,7 +505,7 @@ async fn slash_palette_completes_selection_and_waits_for_required_arguments() {
 }
 
 #[tokio::test]
-async fn live_controls_list_context_persist_mode_and_switch_profile() {
+async fn live_controls_list_sessions_persist_mode_and_switch_profile() {
     let (_temp, paths, project) = fixture();
     let repository = ConfigRepository::open(paths.clone()).expect("repository");
     let mut config = bridge_config();
@@ -523,9 +523,6 @@ async fn live_controls_list_context_persist_mode_and_switch_profile() {
     let session_id = app.session_id().expect("session id").to_string();
 
     submit_command(&mut app, "/sessions");
-    assert!(transcript_has_notice(&app, &session_id));
-    submit_command(&mut app, "/context");
-    assert!(transcript_has_notice(&app, "100000 token input limit"));
     assert!(transcript_has_notice(&app, &session_id));
     submit_command(&mut app, "/mode auto");
     assert_eq!(
@@ -547,7 +544,7 @@ async fn live_controls_list_context_persist_mode_and_switch_profile() {
 }
 
 #[tokio::test]
-async fn normal_submit_queues_the_turn_and_sets_thinking() {
+async fn enter_starts_a_turn_then_steers_without_queueing_a_follow_up() {
     let (_temp, paths, project) = fixture();
     let repository = ConfigRepository::open(paths.clone()).expect("repository");
     repository
@@ -567,6 +564,13 @@ async fn normal_submit_queues_the_turn_and_sets_thinking() {
         app.state.sent_commands().last(),
         Some(EngineCommand::SubmitTurn { text, .. }) if text == "inspect the repository"
     ));
+    app.state.take_commands();
+    submit_command(&mut app, "change direction now");
+    assert_eq!(app.state.pending_turn_count(), 0);
+    assert!(
+        matches!(app.state.sent_commands(), [EngineCommand::Steer { text, .. }] if text == "change direction now")
+    );
+    assert!(!app.state.transcript.iter().any(|entry| matches!(entry, TranscriptEntry::UserTurn { body } if body == "change direction now")));
 }
 
 #[tokio::test]
@@ -581,8 +585,11 @@ async fn follow_up_turns_wait_for_the_active_turn_and_dispatch_in_order() {
             .expect("bootstrap");
     app.state.set_thinking();
 
-    submit_command(&mut app, "second turn");
-    submit_command(&mut app, "third turn");
+    for text in ["second turn", "third turn"] {
+        type_command(&mut app, text);
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)))
+            .expect("queue follow-up");
+    }
 
     assert_eq!(app.state.pending_turn_count(), 2);
     assert!(app.state.sent_commands().is_empty());

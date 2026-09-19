@@ -32,6 +32,8 @@ kurama --yolo
 - auto allows only the `write_roots`, `allowed_commands`, and `allowed_hosts` in config; anything else is denied
 - yolo skips approvals for this launch only (`--yolo` is required every time; it cannot be saved in config)
 
+`/diff` reviews changes and prepares hunk feedback. `/context` explains the current request budget. While working, Enter steers and Alt+Enter queues a follow-up; `/queue` edits pending work.
+
 non-secret config is `~/.kurama/config.toml`. auth is `env:NAME`, `keychain:SERVICE/ACCOUNT`, or in-memory `session`. plaintext keys are rejected.
 
 see [configuration](docs/configuration.md) and [architecture](docs/design.md).

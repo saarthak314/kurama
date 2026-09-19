@@ -231,6 +231,11 @@ pub enum SessionEvent {
     UserMessage {
         text: String,
     },
+    UserSteered {
+        text: String,
+        #[serde(default)]
+        explicit_delegation: bool,
+    },
     AssistantMessage {
         text: String,
     },

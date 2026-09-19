@@ -897,6 +897,291 @@ fn partial_stream_config(
     }
 }
 
+struct FirstRoundGateBackend {
+    inner: RecordingBackend,
+    blocked: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl ModelBackend for FirstRoundGateBackend {
+    fn backend_name(&self) -> &'static str {
+        self.inner.backend_name()
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: ModelRequest,
+        cancel: &'a dyn CancelSignal,
+    ) -> BoxFuture<'a, Result<ModelStream, kurama_protocol::KuramaError>> {
+        Box::pin(async move {
+            let first = self.inner.requests.lock().expect("requests").is_empty();
+            let stream = self.inner.stream(request, cancel).await?;
+            let blocked = self.blocked.clone();
+            let release = self.release.clone();
+            Ok(Box::pin(stream.then(move |event| {
+                let blocked = blocked.clone();
+                let release = release.clone();
+                async move {
+                    if first && matches!(event, Ok(ModelEvent::ResponseCompleted { .. })) {
+                        blocked.notify_one();
+                        release.notified().await;
+                    }
+                    event
+                }
+            })) as ModelStream)
+        })
+    }
+}
+
+async fn control_event(events: &mut kurama_core::engine::RuntimeEvents) -> RuntimeEvent {
+    tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+        .await
+        .expect("control event timed out")
+        .expect("engine event stream closed")
+}
+
+#[tokio::test]
+async fn steering_at_text_completion_continues_before_turn_completed() {
+    let backend = Arc::new(FirstRoundGateBackend {
+        inner: RecordingBackend {
+            inner: ScriptedBackend::new(vec![
+                vec![
+                    Ok(ModelEvent::TextDelta {
+                        text: "first answer".into(),
+                    }),
+                    Ok(ModelEvent::ResponseCompleted {
+                        cursor: None,
+                        finish_reason: FinishReason::Stop,
+                    }),
+                ],
+                vec![Ok(ModelEvent::ResponseCompleted {
+                    cursor: None,
+                    finish_reason: FinishReason::Stop,
+                })],
+            ]),
+            requests: Mutex::new(Vec::new()),
+        },
+        blocked: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+    });
+    let store = Arc::new(MemoryStore::default());
+    let (handle, mut events) = Engine::spawn(
+        partial_stream_config("steer-stop", backend.clone(), store.clone()),
+        Vec::new(),
+    )
+    .expect("spawn");
+    handle.inspect_context().await.expect("idle inspection");
+    assert!(matches!(
+        control_event(&mut events).await,
+        RuntimeEvent::ContextInspected { .. }
+    ));
+    assert!(backend.inner.requests.lock().expect("requests").is_empty());
+    handle
+        .submit("original request", false)
+        .await
+        .expect("submit");
+    backend.blocked.notified().await;
+    handle.steer("new direction", true).await.expect("steer");
+    handle.inspect_context().await.expect("active inspection");
+    let mut queued = false;
+    loop {
+        match control_event(&mut events).await {
+            RuntimeEvent::SteeringQueued { text } => {
+                assert_eq!(text, "new direction");
+                queued = true;
+            }
+            RuntimeEvent::ContextInspected { inspection } => {
+                assert!(queued);
+                assert!(inspection.assembly_error.is_none());
+                assert_eq!(backend.inner.requests.lock().expect("requests").len(), 1);
+                break;
+            }
+            RuntimeEvent::SteeringApplied { .. } | RuntimeEvent::TurnCompleted => {
+                panic!("steering crossed an incomplete model batch");
+            }
+            RuntimeEvent::Error { message } => panic!("{message}"),
+            _ => {}
+        }
+    }
+    backend.release.notify_one();
+    let mut applied = false;
+    loop {
+        match control_event(&mut events).await {
+            RuntimeEvent::SteeringApplied { text } => {
+                assert_eq!(text, "new direction");
+                applied = true;
+            }
+            RuntimeEvent::TurnCompleted => {
+                assert!(applied);
+                break;
+            }
+            RuntimeEvent::Error { message } => panic!("{message}"),
+            _ => {}
+        }
+    }
+    {
+        let requests = backend.inner.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].delegation.is_none());
+        assert!(requests[1].delegation.is_some());
+        let users: Vec<_> = requests[1]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ModelItem::User { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, ["original request", "new direction"]);
+        assert!(requests[1].items.iter().any(|item| matches!(item,
+            ModelItem::Assistant { text } if text == "first answer")));
+    }
+    let durable = store.events("steer-stop");
+    assert_eq!(
+        durable
+            .iter()
+            .filter(|e| matches!(e.event, SessionEvent::TurnCompleted))
+            .count(),
+        1
+    );
+    assert_eq!(
+        durable
+            .iter()
+            .filter(|e| matches!(e.event, SessionEvent::UserMessage { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        durable
+            .iter()
+            .filter(|e| matches!(e.event, SessionEvent::UserSteered { .. }))
+            .count(),
+        1
+    );
+    handle.shutdown().await.expect("shutdown");
+    assert!(matches!(
+        control_event(&mut events).await,
+        RuntimeEvent::Shutdown
+    ));
+
+    // Restart from the applied steering boundary. The text itself does not
+    // request delegation; authorization must survive through the durable flag.
+    let replay = durable[..durable.len() - 1].to_vec();
+    let replay_store = Arc::new(MemoryStore::default());
+    seed_replay(&replay_store, &replay);
+    let replay_backend = Arc::new(RecordingBackend {
+        inner: ScriptedBackend::new(vec![vec![Ok(ModelEvent::ResponseCompleted {
+            cursor: None,
+            finish_reason: FinishReason::Stop,
+        })]]),
+        requests: Mutex::new(Vec::new()),
+    });
+    let (handle, mut events) = Engine::spawn(
+        partial_stream_config("steer-stop", replay_backend.clone(), replay_store),
+        replay,
+    )
+    .expect("resume explicitly authorized steering");
+    loop {
+        match control_event(&mut events).await {
+            RuntimeEvent::TurnCompleted => break,
+            RuntimeEvent::Error { message } => panic!("{message}"),
+            _ => {}
+        }
+    }
+    assert!(
+        replay_backend.requests.lock().expect("requests")[0]
+            .delegation
+            .is_some()
+    );
+    handle.shutdown().await.expect("shutdown resumed engine");
+    assert!(matches!(
+        control_event(&mut events).await,
+        RuntimeEvent::Shutdown
+    ));
+}
+
+#[tokio::test]
+async fn rejected_and_cancelled_steering_returns_input_without_applying_it() {
+    let blocked = Arc::new(Notify::new());
+    let store = Arc::new(MemoryStore::default());
+    let (handle, mut events) = Engine::spawn(
+        partial_stream_config(
+            "steer-cancel",
+            Arc::new(BlockingPartialBackend {
+                blocked: blocked.clone(),
+            }),
+            store.clone(),
+        ),
+        Vec::new(),
+    )
+    .expect("spawn");
+    handle.submit("original", false).await.expect("submit");
+    blocked.notified().await;
+    handle.steer("keep this draft", false).await.expect("steer");
+    let oversized = "x".repeat(262_145);
+    handle
+        .steer(oversized.clone(), false)
+        .await
+        .expect("oversized steer");
+    let mut accepted = false;
+    loop {
+        match control_event(&mut events).await {
+            RuntimeEvent::SteeringQueued { text } => {
+                assert_eq!(text, "keep this draft");
+                accepted = true;
+            }
+            RuntimeEvent::SteeringRejected { text, .. } => {
+                assert_eq!(text, oversized);
+                assert!(accepted);
+                break;
+            }
+            RuntimeEvent::SteeringApplied { .. }
+            | RuntimeEvent::Error { .. }
+            | RuntimeEvent::TurnCompleted => panic!("rejection terminated the active turn"),
+            _ => {}
+        }
+    }
+    handle
+        .inspect_context()
+        .await
+        .expect("inspect after rejection");
+    loop {
+        match control_event(&mut events).await {
+            RuntimeEvent::ContextInspected { .. } => break,
+            RuntimeEvent::Error { message } => panic!("{message}"),
+            _ => {}
+        }
+    }
+    handle.cancel_turn().await.expect("cancel");
+    let mut returned = Vec::new();
+    loop {
+        match control_event(&mut events).await {
+            RuntimeEvent::SteeringRejected { text, .. } => returned.push(text),
+            RuntimeEvent::Error { .. } => break,
+            RuntimeEvent::SteeringApplied { .. } | RuntimeEvent::TurnCompleted => {
+                panic!("cancelled steering was applied")
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(returned, ["keep this draft"]);
+    assert!(
+        !store
+            .events("steer-cancel")
+            .iter()
+            .any(|e| matches!(e.event, SessionEvent::UserSteered { .. }))
+    );
+    handle.shutdown().await.expect("shutdown");
+    assert!(matches!(
+        control_event(&mut events).await,
+        RuntimeEvent::Shutdown
+    ));
+}
+
 #[tokio::test]
 async fn eof_without_response_completed_fails_and_preserves_partial_text() {
     let store = Arc::new(MemoryStore::default());
@@ -2767,4 +3052,751 @@ async fn resume_marks_interrupted_children_failed() {
             if snapshot.id.as_ref() == "child"
                 && snapshot.state == AgentState::Failed
     )));
+}
+
+struct GatedCountTool {
+    inner: CountingTool,
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl Tool for GatedCountTool {
+    fn descriptor(&self) -> ToolDescriptor {
+        self.inner.descriptor()
+    }
+
+    fn classify(
+        &self,
+        context: &ToolContext,
+        invocation: &ToolInvocation,
+    ) -> Result<Operation, kurama_protocol::KuramaError> {
+        self.inner.classify(context, invocation)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        context: ToolContext,
+        invocation: ToolInvocation,
+        cancel: &'a dyn CancelSignal,
+    ) -> BoxFuture<'a, Result<ToolResult, kurama_protocol::KuramaError>> {
+        Box::pin(async move {
+            self.started.notify_one();
+            self.release.notified().await;
+            self.inner.execute(context, invocation, cancel).await
+        })
+    }
+}
+
+#[tokio::test]
+async fn steering_waits_for_the_entire_approved_tool_batch() {
+    let backend = Arc::new(RecordingBackend {
+        inner: ScriptedBackend::new(vec![
+            vec![
+                Ok(ModelEvent::ToolCall {
+                    call_id: "first".into(),
+                    name: "count".into(),
+                    arguments: serde_json::json!({}),
+                }),
+                Ok(ModelEvent::ToolCall {
+                    call_id: "second".into(),
+                    name: "count".into(),
+                    arguments: serde_json::json!({}),
+                }),
+                Ok(ModelEvent::ResponseCompleted {
+                    cursor: None,
+                    finish_reason: FinishReason::ToolCalls,
+                }),
+            ],
+            vec![Ok(ModelEvent::ResponseCompleted {
+                cursor: None,
+                finish_reason: FinishReason::Stop,
+            })],
+        ]),
+        requests: Mutex::new(Vec::new()),
+    });
+    let tool = Arc::new(GatedCountTool {
+        inner: CountingTool::default(),
+        started: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+    });
+    let store = Arc::new(MemoryStore::default());
+    let (handle, mut events) = Engine::spawn(
+        approval_config(
+            "steer-tools",
+            backend.clone(),
+            tool.clone(),
+            Arc::new(AskPolicy),
+            store.clone(),
+        ),
+        Vec::new(),
+    )
+    .expect("spawn");
+    handle.submit("count twice", false).await.expect("submit");
+    let first = loop {
+        match control_event(&mut events).await {
+            RuntimeEvent::ApprovalRequired { request } => break request.operation_id,
+            RuntimeEvent::Error { message } => panic!("{message}"),
+            _ => {}
+        }
+    };
+    handle
+        .steer("during approval", false)
+        .await
+        .expect("approval steering");
+    handle.inspect_context().await.expect("approval inspection");
+    loop {
+        match control_event(&mut events).await {
+            RuntimeEvent::ContextInspected { .. } => break,
+            RuntimeEvent::SteeringApplied { .. }
+            | RuntimeEvent::TurnCompleted
+            | RuntimeEvent::Error { .. } => panic!("inspection or steering resolved approval"),
+            _ => {}
+        }
+    }
+    handle
+        .resolve_approval(first, ApprovalResponse::ApproveOnce)
+        .await
+        .expect("approve first");
+    tool.started.notified().await;
+    handle
+        .steer("during execution", false)
+        .await
+        .expect("tool steering");
+    handle.inspect_context().await.expect("tool inspection");
+    loop {
+        match control_event(&mut events).await {
+            RuntimeEvent::ContextInspected { .. } => break,
+            RuntimeEvent::SteeringApplied { .. }
+            | RuntimeEvent::TurnCompleted
+            | RuntimeEvent::Error { .. } => panic!("steering interrupted execution"),
+            _ => {}
+        }
+    }
+    tool.release.notify_one();
+    let second = loop {
+        match control_event(&mut events).await {
+            RuntimeEvent::ApprovalRequired { request } => break request.operation_id,
+            RuntimeEvent::SteeringApplied { .. } => panic!("steering split a tool batch"),
+            RuntimeEvent::Error { message } => panic!("{message}"),
+            _ => {}
+        }
+    };
+    handle
+        .resolve_approval(second, ApprovalResponse::ApproveOnce)
+        .await
+        .expect("approve second");
+    tool.started.notified().await;
+    tool.release.notify_one();
+    let mut applied = Vec::new();
+    loop {
+        match control_event(&mut events).await {
+            RuntimeEvent::SteeringApplied { text } => applied.push(text),
+            RuntimeEvent::TurnCompleted => break,
+            RuntimeEvent::Error { message } => panic!("{message}"),
+            _ => {}
+        }
+    }
+    assert_eq!(applied, ["during approval", "during execution"]);
+    assert_eq!(tool.inner.executions.load(Ordering::Relaxed), 2);
+    {
+        let requests = backend.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        let items = &requests[1].items;
+        let last_tool = items
+            .iter()
+            .rposition(|item| matches!(item, ModelItem::ToolResult { .. }))
+            .expect("tool results");
+        let first_steer = items
+            .iter()
+            .position(|item| matches!(item, ModelItem::User { text } if text == "during approval"))
+            .expect("steering input");
+        assert!(last_tool < first_steer);
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| matches!(item, ModelItem::ToolResult { .. }))
+                .count(),
+            2
+        );
+    }
+    let durable = store.events("steer-tools");
+    let last_result = durable
+        .iter()
+        .rposition(|event| matches!(event.event, SessionEvent::ToolCompleted { .. }))
+        .expect("completed tool");
+    let first_steer = durable
+        .iter()
+        .position(|event| matches!(event.event, SessionEvent::UserSteered { .. }))
+        .expect("durable steering");
+    assert!(last_result < first_steer);
+    handle.shutdown().await.expect("shutdown");
+    assert!(matches!(
+        control_event(&mut events).await,
+        RuntimeEvent::Shutdown
+    ));
+}
+
+#[tokio::test]
+async fn recovered_steering_retains_history_and_does_not_repeat_completed_tools() {
+    let invocation = ToolInvocation {
+        call_id: "old-call".into(),
+        name: "count".into(),
+        arguments: serde_json::json!({}),
+    };
+    let operation_id = OperationId::from("old-operation");
+    let replay = vec![
+        replay_event(
+            0,
+            SessionEvent::UserMessage {
+                text: "original request".into(),
+            },
+        ),
+        replay_event(
+            1,
+            SessionEvent::ToolProposed {
+                operation_id: operation_id.clone(),
+                call_id: invocation.call_id.clone(),
+                operation: Operation::Read {
+                    path: PathBuf::from("."),
+                    external: false,
+                },
+            },
+        ),
+        replay_event(
+            2,
+            SessionEvent::ToolInvocationRecorded {
+                operation_id: operation_id.clone(),
+                invocation: invocation.clone(),
+            },
+        ),
+        replay_event(
+            3,
+            SessionEvent::ToolCompleted {
+                operation_id,
+                result: ToolResult::success(invocation.call_id.clone(), "earlier result"),
+            },
+        ),
+        replay_event(
+            4,
+            SessionEvent::ModelCursor {
+                cursor: kurama_protocol::model::BackendCursor {
+                    backend: "scripted".into(),
+                    value: "before-steering".into(),
+                },
+            },
+        ),
+        replay_event(
+            5,
+            SessionEvent::UserSteered {
+                text: "preserve new direction".into(),
+                explicit_delegation: false,
+            },
+        ),
+    ];
+    let store = Arc::new(MemoryStore::default());
+    seed_replay(&store, &replay);
+    let backend = Arc::new(RecordingBackend {
+        inner: ScriptedBackend::new(vec![
+            vec![
+                Ok(ModelEvent::ToolCall {
+                    call_id: invocation.call_id,
+                    name: invocation.name,
+                    arguments: invocation.arguments,
+                }),
+                Ok(ModelEvent::ResponseCompleted {
+                    cursor: None,
+                    finish_reason: FinishReason::ToolCalls,
+                }),
+            ],
+            vec![Ok(ModelEvent::ResponseCompleted {
+                cursor: None,
+                finish_reason: FinishReason::Stop,
+            })],
+        ]),
+        requests: Mutex::new(Vec::new()),
+    });
+    let tool = Arc::new(CountingTool::default());
+    let mut config = resume_config(store, vec![tool.clone()], Arc::new(AllowAllPolicy));
+    config.backend = backend.clone();
+    let (handle, mut events) = Engine::spawn(config, replay).expect("resume");
+    loop {
+        match control_event(&mut events).await {
+            RuntimeEvent::TurnCompleted => break,
+            RuntimeEvent::Error { message } => panic!("{message}"),
+            _ => {}
+        }
+    }
+    assert_eq!(tool.executions.load(Ordering::Relaxed), 0);
+    {
+        let requests = backend.requests.lock().expect("requests");
+        assert!(requests[0].continuation.is_none());
+        let users: Vec<_> = requests[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ModelItem::User { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, ["original request", "preserve new direction"]);
+        assert!(requests[0].items.iter().any(|item| matches!(item, ModelItem::ToolResult { content, .. } if content == "earlier result")));
+    }
+    handle.shutdown().await.expect("shutdown");
+    assert!(matches!(
+        control_event(&mut events).await,
+        RuntimeEvent::Shutdown
+    ));
+}
+
+#[tokio::test]
+async fn idle_steering_starts_a_visible_normal_turn() {
+    let store = Arc::new(MemoryStore::default());
+    let (handle, mut events) = Engine::spawn(
+        resume_config(store.clone(), Vec::new(), Arc::new(AllowAllPolicy)),
+        Vec::new(),
+    )
+    .expect("spawn");
+    handle.steer("idle request", false).await.expect("steer");
+    assert!(
+        matches!(control_event(&mut events).await, RuntimeEvent::SteeringApplied { text } if text == "idle request")
+    );
+    loop {
+        match control_event(&mut events).await {
+            RuntimeEvent::TurnCompleted => break,
+            RuntimeEvent::Error { message } => panic!("{message}"),
+            _ => {}
+        }
+    }
+    let durable = store.events("resume");
+    assert!(durable.iter().any(
+        |event| matches!(&event.event, SessionEvent::UserMessage { text } if text == "idle request")
+    ));
+    assert!(
+        !durable
+            .iter()
+            .any(|event| matches!(event.event, SessionEvent::UserSteered { .. }))
+    );
+    handle.shutdown().await.expect("shutdown");
+    assert!(matches!(
+        control_event(&mut events).await,
+        RuntimeEvent::Shutdown
+    ));
+}
+
+#[tokio::test]
+async fn buffered_cancel_rejects_steering_and_preserves_later_submit_cancel_order() {
+    let store = Arc::new(MemoryStore::default());
+    let backend = Arc::new(RecordingBackend {
+        inner: ScriptedBackend::new(vec![vec![Ok(ModelEvent::ResponseCompleted {
+            cursor: None,
+            finish_reason: FinishReason::Stop,
+        })]]),
+        requests: Mutex::new(Vec::new()),
+    });
+    let (handle, mut events) = Engine::spawn(
+        partial_stream_config("buffered-cancel", backend.clone(), store.clone()),
+        Vec::new(),
+    )
+    .expect("spawn");
+    // These sends all fit in the channel without yielding on this current-thread
+    // runtime. Both cancellation batches are ready before the actor starts.
+    handle.submit("first", false).await.expect("first submit");
+    handle.cancel_turn().await.expect("first cancel");
+    handle
+        .steer("first draft", false)
+        .await
+        .expect("first steer");
+    handle.inspect_context().await.expect("inspection");
+    handle.submit("second", false).await.expect("second submit");
+    handle.cancel_turn().await.expect("second cancel");
+    handle
+        .steer("second draft", false)
+        .await
+        .expect("second steer");
+    handle.submit("third", false).await.expect("third submit");
+
+    let mut rejected = Vec::new();
+    let mut failures = 0;
+    let mut inspected = false;
+    loop {
+        match control_event(&mut events).await {
+            RuntimeEvent::SteeringRejected { text, .. } => rejected.push(text),
+            RuntimeEvent::Error { .. } => failures += 1,
+            RuntimeEvent::ContextInspected { .. } => inspected = true,
+            RuntimeEvent::SteeringApplied { .. } => panic!("cancelled input was applied"),
+            RuntimeEvent::TurnCompleted => break,
+            _ => {}
+        }
+    }
+    assert_eq!(rejected, ["first draft", "second draft"]);
+    assert_eq!(failures, 2);
+    assert!(inspected);
+    {
+        let requests = backend.requests.lock().expect("requests");
+        assert_eq!(
+            requests.len(),
+            1,
+            "both cancelled turns must stay cancelled"
+        );
+        let users: Vec<_> = requests[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ModelItem::User { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, ["first", "second", "third"]);
+    }
+    handle.shutdown().await.expect("shutdown");
+    assert!(matches!(
+        control_event(&mut events).await,
+        RuntimeEvent::Shutdown
+    ));
+}
+
+struct ReadySteeringFailureBackend {
+    handle: Mutex<Option<kurama_core::engine::EngineHandle>>,
+    requests: Mutex<Vec<ModelRequest>>,
+}
+
+impl ModelBackend for ReadySteeringFailureBackend {
+    fn backend_name(&self) -> &'static str {
+        "ready-steering-failure"
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::remote_default()
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: ModelRequest,
+        _cancel: &'a dyn CancelSignal,
+    ) -> BoxFuture<'a, Result<ModelStream, kurama_protocol::KuramaError>> {
+        Box::pin(async move {
+            self.requests.lock().expect("requests").push(request);
+            let handle = self.handle.lock().expect("handle").take();
+            if let Some(handle) = handle {
+                // Queue commands in the same poll that returns the provider
+                // error, so the provider branch necessarily wins this select.
+                handle
+                    .steer("failed draft", false)
+                    .await
+                    .expect("failed steer");
+                handle.inspect_context().await.expect("inspection");
+                handle
+                    .submit("explicit next", false)
+                    .await
+                    .expect("next submit");
+                handle
+                    .steer("next direction", false)
+                    .await
+                    .expect("next steer");
+                return Err(kurama_protocol::KuramaError::Model(
+                    "provider failed".into(),
+                ));
+            }
+            Ok(Box::pin(stream::iter([Ok(ModelEvent::ResponseCompleted {
+                cursor: None,
+                finish_reason: FinishReason::Stop,
+            })])) as ModelStream)
+        })
+    }
+}
+
+#[tokio::test]
+async fn provider_failure_rejects_ready_steering_without_eating_the_next_explicit_batch() {
+    let backend = Arc::new(ReadySteeringFailureBackend {
+        handle: Mutex::new(None),
+        requests: Mutex::new(Vec::new()),
+    });
+    let (handle, mut events) = Engine::spawn(
+        partial_stream_config(
+            "ready-failure",
+            backend.clone(),
+            Arc::new(MemoryStore::default()),
+        ),
+        Vec::new(),
+    )
+    .expect("spawn");
+    *backend.handle.lock().expect("handle") = Some(handle.clone());
+    handle.submit("original", false).await.expect("submit");
+    let mut rejected = Vec::new();
+    let mut applied = Vec::new();
+    let mut failures = 0;
+    let mut inspected = false;
+    loop {
+        match control_event(&mut events).await {
+            RuntimeEvent::SteeringRejected { text, .. } => rejected.push(text),
+            RuntimeEvent::SteeringApplied { text } => applied.push(text),
+            RuntimeEvent::Error { .. } => failures += 1,
+            RuntimeEvent::ContextInspected { .. } => inspected = true,
+            RuntimeEvent::TurnCompleted => break,
+            _ => {}
+        }
+    }
+    assert_eq!(rejected, ["failed draft"]);
+    assert_eq!(applied, ["next direction"]);
+    assert_eq!(failures, 1);
+    assert!(inspected);
+    {
+        let requests = backend.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        let users: Vec<_> = requests[1]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ModelItem::User { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, ["original", "explicit next", "next direction"]);
+    }
+    handle.shutdown().await.expect("shutdown");
+    assert!(matches!(
+        control_event(&mut events).await,
+        RuntimeEvent::Shutdown
+    ));
+}
+
+#[tokio::test]
+async fn startup_only_recovery_rejects_steering_and_becomes_idle_without_leaking_input() {
+    let operation_id = OperationId::from("interrupted-read");
+    let invocation = ToolInvocation {
+        call_id: "interrupted-call".into(),
+        name: "count".into(),
+        arguments: serde_json::json!({}),
+    };
+    let replay = vec![
+        replay_event(
+            0,
+            SessionEvent::UserMessage {
+                text: "old request".into(),
+            },
+        ),
+        replay_event(
+            1,
+            SessionEvent::ToolProposed {
+                operation_id: operation_id.clone(),
+                call_id: invocation.call_id.clone(),
+                operation: Operation::Read {
+                    path: ".".into(),
+                    external: false,
+                },
+            },
+        ),
+        replay_event(
+            2,
+            SessionEvent::ToolInvocationRecorded {
+                operation_id: operation_id.clone(),
+                invocation,
+            },
+        ),
+        replay_event(3, SessionEvent::ToolStarted { operation_id }),
+        replay_event(
+            4,
+            SessionEvent::TurnFailed {
+                error: "cancelled".into(),
+            },
+        ),
+    ];
+    let store = Arc::new(MemoryStore::default());
+    seed_replay(&store, &replay);
+    let tool = Arc::new(GatedCountTool {
+        inner: CountingTool::default(),
+        started: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+    });
+    let backend = Arc::new(RecordingBackend {
+        inner: ScriptedBackend::new(vec![vec![Ok(ModelEvent::ResponseCompleted {
+            cursor: None,
+            finish_reason: FinishReason::Stop,
+        })]]),
+        requests: Mutex::new(Vec::new()),
+    });
+    let mut config = resume_config(store.clone(), vec![tool.clone()], Arc::new(AllowAllPolicy));
+    config.backend = backend.clone();
+    let (handle, mut events) = Engine::spawn(config, replay).expect("spawn recovery");
+    tool.started.notified().await;
+    handle.steer("recovery draft", false).await.expect("steer");
+    loop {
+        match control_event(&mut events).await {
+            RuntimeEvent::SteeringQueued { .. } => break,
+            RuntimeEvent::Error { message } => panic!("{message}"),
+            _ => {}
+        }
+    }
+    tool.release.notify_one();
+    let mut rejected = Vec::new();
+    let mut tool_completed = false;
+    loop {
+        match control_event(&mut events).await {
+            RuntimeEvent::ToolCompleted { .. } => tool_completed = true,
+            RuntimeEvent::SteeringRejected { text, .. } => rejected.push(text),
+            RuntimeEvent::TurnCompleted => break,
+            RuntimeEvent::SteeringApplied { .. } => panic!("terminal recovery applied steering"),
+            RuntimeEvent::Error { message } => panic!("{message}"),
+            _ => {}
+        }
+    }
+    assert!(tool_completed);
+    assert_eq!(rejected, ["recovery draft"]);
+    assert!(backend.requests.lock().expect("requests").is_empty());
+    assert!(
+        !store
+            .events("resume")
+            .iter()
+            .any(|event| matches!(event.event, SessionEvent::TurnCompleted))
+    );
+    handle.submit("new request", false).await.expect("submit");
+    loop {
+        match control_event(&mut events).await {
+            RuntimeEvent::TurnCompleted => break,
+            RuntimeEvent::SteeringApplied { .. } => {
+                panic!("recovery steering leaked into next turn")
+            }
+            RuntimeEvent::Error { message } => panic!("{message}"),
+            _ => {}
+        }
+    }
+    {
+        let requests = backend.requests.lock().expect("requests");
+        let users: Vec<_> = requests[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ModelItem::User { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, ["old request", "new request"]);
+    }
+    handle.shutdown().await.expect("shutdown");
+    assert!(matches!(
+        control_event(&mut events).await,
+        RuntimeEvent::Shutdown
+    ));
+
+    // Completed tool history is not startup recovery work. On a later clean
+    // restart, idle steering must still start a visible turn rather than being
+    // rejected by terminal recovery cleanup.
+    let replay = store.events("resume");
+    let (handle, mut events) = Engine::spawn(
+        resume_config(store, vec![tool], Arc::new(AllowAllPolicy)),
+        replay,
+    )
+    .expect("restart completed history");
+    handle
+        .steer("intentional idle request", false)
+        .await
+        .expect("idle steer");
+    assert!(matches!(
+        control_event(&mut events).await,
+        RuntimeEvent::SteeringApplied { text } if text == "intentional idle request"
+    ));
+    loop {
+        match control_event(&mut events).await {
+            RuntimeEvent::TurnCompleted => break,
+            RuntimeEvent::SteeringRejected { .. } => panic!("clean restart rejected idle input"),
+            RuntimeEvent::Error { message } => panic!("{message}"),
+            _ => {}
+        }
+    }
+    handle.shutdown().await.expect("shutdown clean restart");
+    assert!(matches!(
+        control_event(&mut events).await,
+        RuntimeEvent::Shutdown
+    ));
+}
+
+#[tokio::test]
+async fn replay_recovers_same_turn_delegation_without_importing_earlier_authorization() {
+    let legacy_steering: SessionEvent =
+        serde_json::from_str(r#"{"type":"user_steered","text":"focus on error handling"}"#)
+            .expect("legacy steering event");
+    let histories = [
+        (
+            vec![
+                SessionEvent::UserMessage {
+                    text: "delegate the parser review".into(),
+                },
+                legacy_steering.clone(),
+            ],
+            true,
+        ),
+        (
+            vec![
+                SessionEvent::UserMessage {
+                    text: "review the parser".into(),
+                },
+                SessionEvent::UserSteered {
+                    text: "use helpers".into(),
+                    explicit_delegation: true,
+                },
+                legacy_steering.clone(),
+            ],
+            true,
+        ),
+        (
+            vec![
+                SessionEvent::UserMessage {
+                    text: "delegate an earlier review".into(),
+                },
+                SessionEvent::TurnCompleted,
+                SessionEvent::UserMessage {
+                    text: "review the parser".into(),
+                },
+                legacy_steering.clone(),
+            ],
+            false,
+        ),
+        (
+            vec![
+                SessionEvent::UserMessage {
+                    text: "delegate an earlier review".into(),
+                },
+                SessionEvent::TurnCompleted,
+                legacy_steering,
+            ],
+            false,
+        ),
+    ];
+    for (history, expected) in histories {
+        let replay: Vec<_> = history
+            .into_iter()
+            .enumerate()
+            .map(|(sequence, event)| replay_event(sequence as u64, event))
+            .collect();
+        let store = Arc::new(MemoryStore::default());
+        seed_replay(&store, &replay);
+        let backend = Arc::new(RecordingBackend {
+            inner: ScriptedBackend::new(vec![vec![Ok(ModelEvent::ResponseCompleted {
+                cursor: None,
+                finish_reason: FinishReason::Stop,
+            })]]),
+            requests: Mutex::new(Vec::new()),
+        });
+        let (handle, mut events) =
+            Engine::spawn(delegation_config("resume", backend.clone(), store), replay)
+                .expect("resume");
+        loop {
+            match control_event(&mut events).await {
+                RuntimeEvent::TurnCompleted => break,
+                RuntimeEvent::Error { message } => panic!("{message}"),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            backend.requests.lock().expect("requests")[0]
+                .delegation
+                .is_some(),
+            expected
+        );
+        handle.shutdown().await.expect("shutdown");
+        assert!(matches!(
+            control_event(&mut events).await,
+            RuntimeEvent::Shutdown
+        ));
+    }
 }

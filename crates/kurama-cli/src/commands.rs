@@ -12,7 +12,7 @@ pub struct CommandSpec {
     pub requires_arguments: bool,
 }
 
-pub const COMMAND_SPECS: [CommandSpec; 16] = [
+pub const COMMAND_SPECS: [CommandSpec; 17] = [
     CommandSpec {
         name: "model",
         description: "select or list profiles",
@@ -69,7 +69,7 @@ pub const COMMAND_SPECS: [CommandSpec; 16] = [
     },
     CommandSpec {
         name: "context",
-        description: "show context and session details",
+        description: "inspect assembled context estimates and compaction coverage",
         accepts_arguments: false,
         requires_arguments: false,
     },
@@ -93,7 +93,13 @@ pub const COMMAND_SPECS: [CommandSpec; 16] = [
     },
     CommandSpec {
         name: "diff",
-        description: "show the working tree diff",
+        description: "review changes and prepare hunk feedback",
+        accepts_arguments: false,
+        requires_arguments: false,
+    },
+    CommandSpec {
+        name: "queue",
+        description: "edit, remove, or resume pending follow-ups",
         accepts_arguments: false,
         requires_arguments: false,
     },
@@ -125,6 +131,7 @@ pub enum Command {
     Compact,
     Copy,
     Diff,
+    Queue,
     Status,
     Mode(ExecutionMode),
     Help,
@@ -193,6 +200,7 @@ pub fn parse_command(input: &str) -> Result<Command, String> {
         ("/compact", []) => Ok(Command::Compact),
         ("/copy", []) => Ok(Command::Copy),
         ("/diff", []) => Ok(Command::Diff),
+        ("/queue", []) => Ok(Command::Queue),
         ("/help", []) => Ok(Command::Help),
         ("/mode", ["supervised"]) => Ok(Command::Mode(ExecutionMode::Supervised)),
         ("/mode", ["auto"]) => Ok(Command::Mode(ExecutionMode::Auto)),
