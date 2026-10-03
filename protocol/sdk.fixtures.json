@@ -1,7 +1,7 @@
 {
   "protocol_version": 1,
   "frames": {
-    "hello": {"type":"hello","protocol_version":1,"server_version":"0.2.0","max_frame_bytes":1048576,"capabilities":["prompt","stream","approval","cancel","resume","verify"]},
+    "hello": {"type":"hello","protocol_version":1,"server_version":"0.2.1","max_frame_bytes":1048576,"capabilities":["prompt","stream","approval","cancel","resume","verify"]},
     "initialize_request": {"id":"1","method":"initialize","params":{"protocol_version":1,"workspace":"/workspace","profile":"fixture","mode":"supervised"}},
     "initialize_response": {"type":"response","id":"1","result":{"session_id":"ses_fixture","workspace":"/workspace","profile":"fixture","mode":"supervised"}},
     "prompt_request": {"id":"2","method":"prompt","params":{"text":"Check the workspace","explicit_delegation":false}},
