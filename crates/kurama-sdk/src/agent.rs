@@ -27,6 +27,7 @@ use kurama_protocol::{
     traits::{
         ApprovalPolicy, EventSink, IdGenerator, ModelBackend, Orchestrator, SessionStore, Tool,
     },
+    verification::{VerificationRecipe, VerificationReport},
 };
 
 use crate::{AgentBuilder, AgentRuntime};
@@ -71,6 +72,21 @@ impl Handle {
 
     pub async fn inspect_context(&self) -> Result<(), KuramaError> {
         self.inner.inspect_context().await
+    }
+
+    pub async fn verify(
+        &self,
+        name: impl Into<String>,
+        recipe: VerificationRecipe,
+    ) -> Result<(), KuramaError> {
+        self.inner.verify(name, recipe).await
+    }
+
+    pub async fn inspect_verifications(
+        &self,
+        recipes: BTreeMap<String, VerificationRecipe>,
+    ) -> Result<(), KuramaError> {
+        self.inner.inspect_verifications(recipes).await
     }
 
     pub async fn resolve_approval(
@@ -147,6 +163,8 @@ pub enum Event {
         message: String,
     },
     ContextInspected(ContextInspection),
+    VerificationUpdated(VerificationReport),
+    VerificationsInspected(Vec<VerificationReport>),
     Text(String),
     Approval(ApprovalRequest),
     ToolStarted {
@@ -192,7 +210,8 @@ impl Turn<'_> {
                 return Ok(None);
             };
             let event = match event {
-                RuntimeEvent::Usage { .. }
+                RuntimeEvent::Ready
+                | RuntimeEvent::Usage { .. }
                 | RuntimeEvent::GoalUpdated { .. }
                 | RuntimeEvent::GoalCleared => continue,
                 RuntimeEvent::Status { message } => Event::Status(message),
@@ -200,6 +219,10 @@ impl Turn<'_> {
                 RuntimeEvent::SteeringApplied { text } => Event::SteeringApplied(text),
                 RuntimeEvent::SteeringRejected { text, message } => {
                     Event::SteeringRejected { text, message }
+                }
+                RuntimeEvent::VerificationUpdated { report } => Event::VerificationUpdated(report),
+                RuntimeEvent::VerificationsInspected { reports } => {
+                    Event::VerificationsInspected(reports)
                 }
                 RuntimeEvent::ContextInspected { inspection } => {
                     Event::ContextInspected(inspection)

@@ -66,6 +66,29 @@ Without a `[search]` section, the CLI automatically uses native search for `open
 
 Auto mode approves only operations contained by `write_roots`, commands whose executable is listed in `allowed_commands`, and network requests to `allowed_hosts`. A boundary violation is denied rather than converted into an approval prompt. Concurrency defaults to four and must remain between one and eight; children cannot create further children. The parent may run up to three delegation waves per user turn. A child is asked to wrap up at 80% of its turn, token, or time budget; the hard limit cancels unless the child already produced a summary, which is kept.
 
+## Verification Recipes
+
+Project-owned checks live in `.kurama/verification.toml`, separate from personal `~/.kurama/config.toml`:
+
+```toml
+version = 1
+
+[recipes.quick]
+command = "cargo test -p kurama-core"
+timeout_ms = 120000
+
+[recipes.full]
+command = "cargo test --locked --workspace --all-features"
+cwd = "."
+timeout_ms = 600000
+```
+
+`/verify` lists configured recipes and last-run results; `/verify quick` explicitly executes one. Reading a recipe is not permission to run it. Execution uses the existing Bash tool, approval/auto boundaries, cancellation, output limits, and durable journal, without a model request. Another model or verification turn must finish before a new verification can start.
+
+Reports distinguish `not_run`, `running`, `passed`, `failed`, `cancelled`, `denied`, and `interrupted`. They retain the executed command, cwd, timestamps, exit code, operation ID, and blob references where output was spilled. The operation ID identifies canonical output even without a separate blob. Approval edits cannot certify the original recipe. A changed recipe becomes `not_run`; an interrupted check is not rerun automatically on resume. A prior pass is a **last-run result**, not proof the current working files are unchanged.
+
+The file is bounded to 64 KiB and 32 recipes. Names and commands are validated; unknown fields or versions are rejected. `cwd` defaults to `.` and must remain inside the workspace; `timeout_ms` defaults to 60,000 and must be positive and at most 3,600,000. Missing configuration produces an empty list rather than running inferred commands.
+
 ## Resolution and State
 
 Profile resolution order is:
@@ -75,7 +98,7 @@ Profile resolution order is:
 3. `default_profile`.
 4. The first-launch connection wizard.
 
-All user-owned state is under `~/.kurama`:
+Personal configuration and resumable state are under `~/.kurama`:
 
 ```text
 ~/.kurama/

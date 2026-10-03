@@ -6,3 +6,11 @@ docs/superpowers/
 /.lavish/
 /tools/**/target/
 *.tmp
+/sdk/**/node_modules/
+/sdk/**/dist/
+/sdk/**/build/
+/sdk/**/__pycache__/
+/sdk/**/*.egg-info/
+/sdk/**/.venv/
+/.mypy_cache/
+/.ruff_cache/

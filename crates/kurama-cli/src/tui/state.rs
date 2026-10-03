@@ -14,6 +14,7 @@ use kurama_protocol::{
     session::{BlobRef, EventEnvelope, GoalStatus, SessionEvent, SessionGoal, TodoItem},
     tool::ToolResult,
     traits::SessionStore,
+    verification::{VerificationRecipe, VerificationReport, VerificationStatus},
 };
 
 use crate::commands::{CommandSpec, command_suggestions};
@@ -381,6 +382,7 @@ pub struct TuiState {
     activity: ActivityState,
     turn_started_at: Option<Instant>,
     last_turn_elapsed: Option<Duration>,
+    verification_input: Option<String>,
     transcript_view_expanded: bool,
     active_assistant_entry: Option<usize>,
     active_tool_entries: HashMap<CallId, usize>,
@@ -473,6 +475,7 @@ impl TuiState {
             activity: ActivityState::Idle,
             turn_started_at: None,
             last_turn_elapsed: None,
+            verification_input: None,
             transcript_view_expanded: false,
             active_assistant_entry: None,
             active_tool_entries: HashMap::new(),
@@ -1081,6 +1084,62 @@ impl TuiState {
         self.activity = ActivityState::Thinking { started_at: now };
     }
 
+    pub fn submit_verification(&mut self, name: String, recipe: VerificationRecipe) -> bool {
+        if !matches!(self.activity, ActivityState::Idle) || self.pending_steering != 0 {
+            return false;
+        }
+        self.verification_input = Some(format!("/verify {name}"));
+        self.sent_commands
+            .push(EngineCommand::Verify { name, recipe });
+        self.scroll = 0;
+        self.set_thinking();
+        true
+    }
+
+    pub fn reject_verification(&mut self, message: String) {
+        if let Some(input) = self.verification_input.take() {
+            self.restore_unsent_input(input);
+        }
+        self.queue_paused = true;
+        self.finish_turn();
+        self.push_error(message);
+    }
+
+    fn push_verification_report(&mut self, report: &VerificationReport) {
+        let mut body = format!(
+            "{} — {}\n{}\ncwd: {} · timeout: {} ms",
+            report.name,
+            report.status.as_str(),
+            report.command,
+            report.cwd,
+            report.timeout_ms
+        );
+        if let Some(started) = report.started_at_ms {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            body.push_str(&format!(
+                "\nlast run: {} s ago",
+                now.saturating_sub(u128::from(started)) / 1_000
+            ));
+            if let Some(finished) = report.finished_at_ms {
+                body.push_str(&format!(
+                    " · duration: {} ms",
+                    finished.saturating_sub(started)
+                ));
+            }
+        }
+        if let Some(code) = report.exit_code {
+            body.push_str(&format!(" · exit: {code}"));
+        }
+        if let Some(message) = &report.message {
+            body.push('\n');
+            body.push_str(message);
+        }
+        self.push_notice(Some("VERIFY".into()), body);
+    }
+
     pub fn submit_turn(&mut self, text: impl Into<String>, explicit_delegation: bool) {
         let text = text.into();
         self.scroll = 0;
@@ -1379,6 +1438,7 @@ impl TuiState {
         self.activity = ActivityState::Idle;
         self.turn_started_at = None;
         self.last_turn_elapsed = None;
+        self.verification_input = None;
         self.active_assistant_entry = None;
         self.active_tool_entries.clear();
         self.active_tool_streams.clear();
@@ -1472,6 +1532,10 @@ impl TuiState {
                 SessionEvent::TodoUpdated { items } => self.replace_todos(items.clone()),
                 SessionEvent::GoalUpdated { goal } => self.apply_goal(Some(goal.clone()), false),
                 SessionEvent::GoalCleared => self.apply_goal(None, false),
+                SessionEvent::VerificationStarted { report, .. }
+                | SessionEvent::VerificationCompleted { report } => {
+                    self.push_verification_report(report)
+                }
                 _ => {}
             }
         }
@@ -1824,6 +1888,8 @@ impl TuiState {
             RuntimeEvent::AssistantDelta { .. }
                 | RuntimeEvent::Usage { .. }
                 | RuntimeEvent::ContextInspected { .. }
+                | RuntimeEvent::Ready
+                | RuntimeEvent::VerificationsInspected { .. }
                 | RuntimeEvent::SteeringQueued { .. }
                 | RuntimeEvent::SteeringRejected { .. }
         ) && !preserves_active_streams
@@ -1831,6 +1897,37 @@ impl TuiState {
             self.active_assistant_entry = None;
         }
         match event {
+            RuntimeEvent::Ready => {}
+            RuntimeEvent::VerificationsInspected { reports } => {
+                if reports.is_empty() {
+                    self.push_notice(
+                        Some("VERIFY".into()),
+                        "no recipes configured in .kurama/verification.toml",
+                    );
+                } else {
+                    self.push_notice(
+                        Some("VERIFY".into()),
+                        "last-run results; not proof the current working files are unchanged",
+                    );
+                    for report in reports {
+                        self.push_verification_report(&report);
+                    }
+                }
+            }
+            RuntimeEvent::VerificationUpdated { report } => {
+                self.push_verification_report(&report);
+                if report.status == VerificationStatus::Running {
+                    self.set_thinking();
+                } else if matches!(
+                    report.status,
+                    VerificationStatus::Denied | VerificationStatus::Cancelled
+                ) {
+                    self.queue_paused = true;
+                    if let Some(input) = self.verification_input.take() {
+                        self.restore_unsent_input(input);
+                    }
+                }
+            }
             RuntimeEvent::ContextInspected { inspection } => self.context_view.update(inspection),
             RuntimeEvent::SteeringQueued { .. } => {}
             RuntimeEvent::SteeringRejected { text, message } => {
@@ -1930,6 +2027,10 @@ impl TuiState {
             RuntimeEvent::TurnCompleted => self.finish_turn(),
             RuntimeEvent::Error { message } => {
                 if terminal_turn_event {
+                    if let Some(input) = self.verification_input.take() {
+                        self.restore_unsent_input(input);
+                        self.queue_paused = true;
+                    }
                     self.push_error(message);
                     self.finish_turn();
                 } else {
@@ -1979,6 +2080,7 @@ impl TuiState {
     }
 
     fn finish_turn(&mut self) {
+        self.verification_input = None;
         if let Some(started_at) = self.turn_started_at.take() {
             self.last_turn_elapsed = Some(Instant::now().saturating_duration_since(started_at));
         }

@@ -1,0 +1,36 @@
+{
+  "protocol_version": 1,
+  "frames": {
+    "hello": {"type":"hello","protocol_version":1,"server_version":"0.2.0","max_frame_bytes":1048576,"capabilities":["prompt","stream","approval","cancel","resume","verify"]},
+    "initialize_request": {"id":"1","method":"initialize","params":{"protocol_version":1,"workspace":"/workspace","profile":"fixture","mode":"supervised"}},
+    "initialize_response": {"type":"response","id":"1","result":{"session_id":"ses_fixture","workspace":"/workspace","profile":"fixture","mode":"supervised"}},
+    "prompt_request": {"id":"2","method":"prompt","params":{"text":"Check the workspace","explicit_delegation":false}},
+    "prompt_response": {"type":"response","id":"2","result":{"accepted":true}},
+    "text_event": {"type":"event","request_id":"2","session_id":"ses_fixture","event":{"type":"text","text":"Hello, 世界\n"}},
+    "approval_event": {"type":"event","request_id":"2","session_id":"ses_fixture","event":{"type":"approval","request":{"operation_id":"op_fixture","operation":{"type":"bash","command":"cargo test","cwd":"/workspace","class":"mutating","timeout_ms":60000},"summary":"Run cargo test","arguments":{"command":"cargo test","cwd":"/workspace","timeout_ms":60000}}}},
+    "approve_request": {"id":"3","method":"approve","params":{"operation_id":"op_fixture","response":"approve_once"}},
+    "approve_response": {"type":"response","id":"3","result":{"accepted":true}},
+    "tool_started_event": {"type":"event","request_id":"2","session_id":"ses_fixture","event":{"type":"tool_started","operation_id":"op_fixture","name":"bash","context":"cargo test"}},
+    "tool_output_event": {"type":"event","request_id":"2","session_id":"ses_fixture","event":{"type":"tool_output","call_id":"call_fixture","stream":"stdout","chunk":"tests passed\n"}},
+    "tool_completed_event": {"type":"event","request_id":"2","session_id":"ses_fixture","event":{"type":"tool_completed","operation_id":"op_fixture","result":{"call_id":"call_fixture","output":"tests passed\n","is_error":false,"metadata":{"exit_code":0},"truncated":false,"blob_refs":[]}}},
+    "agent_updated_event": {"type":"event","request_id":"2","session_id":"ses_fixture","event":{"type":"agent_updated","snapshot":{"id":"agent_fixture","role":"reviewer","objective":"review SDK_CHILD output","profile":"fixture","state":"completed","phase":null,"active_operation":null,"changed_files":[],"last_error":null}}},
+    "usage_event": {"type":"event","request_id":"2","session_id":"ses_fixture","event":{"type":"usage","usage":{"input_tokens":12,"output_tokens":8,"cached_input_tokens":0}}},
+    "verification_event": {"type":"event","request_id":"2","session_id":"ses_fixture","event":{"type":"verification","report":{"name":"quick","command":"cargo test","cwd":"/workspace","timeout_ms":60000,"status":"passed","operation_id":"op_fixture","started_at_ms":1000,"finished_at_ms":1100,"exit_code":0,"output_refs":[],"message":null}}},
+    "done_event": {"type":"event","request_id":"2","session_id":"ses_fixture","event":{"type":"done","status":"completed"}},
+    "cancel_request": {"id":"4","method":"cancel","params":{}},
+    "cancel_response": {"type":"response","id":"4","result":{"cancelled":true}},
+    "cancelled_event": {"type":"event","request_id":"2","session_id":"ses_fixture","event":{"type":"done","status":"cancelled"}},
+    "failed_event": {"type":"event","request_id":"2","session_id":"ses_fixture","event":{"type":"done","status":"failed","error":{"code":"runtime_error","message":"Provider connection closed"}}},
+    "protocol_error_response": {"type":"response","id":"1","error":{"code":"incompatible_protocol","message":"Protocol version 1 is required"}},
+    "verify_request": {"id":"5","method":"verify","params":{"name":"quick"}},
+    "verification_status_request": {"id":"6","method":"verification_status","params":{}},
+    "verification_status_response": {"type":"response","id":"6","result":{"recipes":[{"name":"quick","command":"cargo test","cwd":"/workspace","timeout_ms":60000,"status":"not_run","operation_id":null,"started_at_ms":null,"finished_at_ms":null,"exit_code":null,"output_refs":[],"message":null}]}},
+    "shutdown_request": {"id":"7","method":"shutdown","params":{}},
+    "shutdown_response": {"type":"response","id":"7","result":{"closed":true}}
+  },
+  "invalid_lines": [
+    {"name":"malformed_json","line":"{bad json}\n"},
+    {"name":"non_object","line":"[]\n"},
+    {"name":"invalid_request_id","line":"{\"id\":\"01\",\"method\":\"prompt\",\"params\":{\"text\":\"hello\"}}\n"}
+  ]
+}

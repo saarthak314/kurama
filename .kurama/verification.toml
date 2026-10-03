@@ -1,0 +1,9 @@
+version = 1
+
+[recipes.quick]
+command = "cargo fmt --all --check && cargo test --locked -p kurama-core"
+timeout_ms = 120000
+
+[recipes.full]
+command = "cargo fmt --all --check && cargo clippy --locked --workspace --all-targets --all-features -- -D warnings && cargo test --locked --workspace --all-features && python3 scripts/test-verification.py && python3 -m unittest discover -s scripts -p test_release_version.py && npm --prefix sdk/typescript test && PYTHONPATH=sdk/python/src python3 -m unittest discover -s sdk/python/tests"
+timeout_ms = 600000

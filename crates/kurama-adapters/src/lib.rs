@@ -44,6 +44,8 @@ mod credentials;
 mod redact;
 #[cfg(feature = "fs-store")]
 mod storage;
+#[cfg(feature = "native-credentials")]
+mod verification;
 
 #[cfg(any(feature = "codex-bridge", feature = "claude-bridge"))]
 mod bridges;
@@ -121,5 +123,7 @@ pub use tools::{
 pub use tools::{
     JsonSearchBackend, OpenAiNativeSearch, SearchBackend, SearchResult, WebSearchTool,
 };
+#[cfg(feature = "native-credentials")]
+pub use verification::read_verification_recipes;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

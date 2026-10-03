@@ -12,7 +12,7 @@ pub struct CommandSpec {
     pub requires_arguments: bool,
 }
 
-pub const COMMAND_SPECS: [CommandSpec; 17] = [
+pub const COMMAND_SPECS: [CommandSpec; 18] = [
     CommandSpec {
         name: "model",
         description: "select or list profiles",
@@ -104,6 +104,12 @@ pub const COMMAND_SPECS: [CommandSpec; 17] = [
         requires_arguments: false,
     },
     CommandSpec {
+        name: "verify",
+        description: "list project checks or run one by name",
+        accepts_arguments: true,
+        requires_arguments: false,
+    },
+    CommandSpec {
         name: "help",
         description: "list slash commands",
         accepts_arguments: false,
@@ -122,6 +128,7 @@ pub enum Command {
     Agents,
     Todo,
     Goal(GoalAction),
+    Verify(Option<String>),
     Model(Option<String>),
     Connect,
     Sessions,
@@ -189,6 +196,8 @@ pub fn parse_command(input: &str) -> Result<Command, String> {
         ("/agents", []) => Ok(Command::Agents),
         ("/todo", []) => Ok(Command::Todo),
         ("/goal", _) => parse_goal(input),
+        ("/verify", []) => Ok(Command::Verify(None)),
+        ("/verify", [name]) => Ok(Command::Verify(Some((*name).to_owned()))),
         ("/model", []) => Ok(Command::Model(None)),
         ("/model", [profile]) => Ok(Command::Model(Some((*profile).to_owned()))),
         ("/connect", []) => Ok(Command::Connect),

@@ -98,3 +98,83 @@ jobs:
           name: kurama-pty-pr-${{ runner.os }}-${{ github.run_id }}
           path: tui-artifacts/
           if-no-files-found: error
+
+  sdk:
+    name: SDK contracts (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Install Rust 1.98.0
+        run: |
+          export RUSTUP_HOME="$RUNNER_TEMP/kurama-rustup"
+          printf 'RUSTUP_HOME=%s\n' "$RUSTUP_HOME" >> "$GITHUB_ENV"
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.98.0
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-sdk-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-sdk-${{ runner.os }}-
+      - name: Build real runtime and native SDK reference
+        run: cargo build --locked -p kurama-cli --bin kurama --example sdk_contract
+      - name: Typecheck, check unused code, and test TypeScript
+        run: |
+          npm --prefix sdk/typescript ci --ignore-scripts
+          npm --prefix sdk/typescript test
+      - name: Typecheck, lint, and test Python
+        run: |
+          python -m pip install mypy==2.3.1 ruff==0.12.5
+          mypy --strict sdk/python/src
+          ruff check sdk/python/src scripts/check-sdk.py scripts/check-sdk-release.py tests/fixtures/sdk/client.py
+          PYTHONPATH=sdk/python/src python -m unittest discover -s sdk/python/tests -v
+      - name: Build and install distribution artifacts
+        run: |
+          mkdir -p sdk-artifacts/typescript sdk-artifacts/python sdk-artifacts/typescript-installed
+          npm pack ./sdk/typescript --pack-destination sdk-artifacts/typescript
+          python -m pip wheel --no-deps --wheel-dir sdk-artifacts/python ./sdk/python
+          python -m pip install --no-deps --target sdk-artifacts/python-installed sdk-artifacts/python/*.whl
+          tar -xzf sdk-artifacts/typescript/*.tgz -C sdk-artifacts/typescript-installed
+      - name: Exercise installed packages against the real Rust runtime
+        run: >-
+          python scripts/check-sdk.py target/debug/kurama sdk-artifacts/e2e
+          --python-path sdk-artifacts/python-installed
+          --typescript-module sdk-artifacts/typescript-installed/package/dist/index.js
+      - name: Smoke test packaged binary protocol metadata
+        run: |
+          cargo build --locked --release -p kurama-cli
+          version=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          archive="kurama-$version-${{ matrix.target }}.tar.gz"
+          mkdir -p sdk-artifacts/runtime
+          tar -czf "sdk-artifacts/runtime/$archive" -C target/release kurama
+          (cd sdk-artifacts/runtime && shasum -a 256 "$archive" > "$archive.sha256")
+          python scripts/check-sdk-release.py "v$version" --binary target/release/kurama --target ${{ matrix.target }} --directory sdk-artifacts/runtime
+      - name: Upload SDK packages and contract evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kurama-sdk-${{ runner.os }}-${{ github.run_id }}
+          path: |
+            sdk-artifacts/typescript/*.tgz
+            sdk-artifacts/python/*.whl
+            sdk-artifacts/e2e/
+            sdk-artifacts/runtime/
+          if-no-files-found: error

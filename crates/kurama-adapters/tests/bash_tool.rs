@@ -463,11 +463,12 @@ async fn bash_timeout_and_cancellation_terminate_descendants() {
         trigger.trigger();
     });
 
-    let error = BashTool::default()
+    let result = BashTool::default()
         .execute(fixture.context(limits()), cancel_call, cancel.as_ref())
         .await
-        .expect_err("cancelled");
-    assert!(matches!(error, KuramaError::Cancelled));
+        .expect("cancelled result");
+    assert!(result.is_error);
+    assert_eq!(result.metadata["cancelled"], true);
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(!cancel_marker.exists());
 }

@@ -5,6 +5,7 @@ use crate::{
     policy::{ApprovalRequest, ApprovalResponse, ExecutionMode},
     session::SessionGoal,
     tool::ToolResult,
+    verification::{VerificationRecipe, VerificationReport},
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -19,6 +20,13 @@ pub enum EngineCommand {
         explicit_delegation: bool,
     },
     InspectContext,
+    Verify {
+        name: String,
+        recipe: VerificationRecipe,
+    },
+    InspectVerifications {
+        recipes: std::collections::BTreeMap<String, VerificationRecipe>,
+    },
     ResolveApproval {
         operation_id: OperationId,
         response: ApprovalResponse,
@@ -79,6 +87,13 @@ pub struct CompactionPreview {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEvent {
+    Ready,
+    VerificationUpdated {
+        report: VerificationReport,
+    },
+    VerificationsInspected {
+        reports: Vec<VerificationReport>,
+    },
     Status {
         message: String,
     },

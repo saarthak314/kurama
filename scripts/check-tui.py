@@ -599,6 +599,17 @@ def run_check(args, output_dir, result, raw, artifacts):
         state.mkdir()
         (root / "input.txt").write_text("fixture input\n")
         if args.check_controls:
+            recipe_commands = {
+                "quick": "printf 'VERIFY_OK\\n' > verify-result.txt; cat verify-result.txt",
+                "fail": "sh -c 'exit 7'",
+                "slow": "printf waiting > verify-waiting; sleep 20",
+            }
+            (state / "verification.toml").write_text(
+                "version = 1\n" + "".join(
+                    f"[recipes.{name}]\ncommand = {json.dumps(command)}\ntimeout_ms = 30000\n"
+                    for name, command in recipe_commands.items()
+                )
+            )
 
             def git(*arguments):
                 return run_command(
@@ -1762,6 +1773,54 @@ endpoint = "http://127.0.0.1:9/search"
                 result["findings"][
                     "live_agent_list_and_transcript_navigation_are_reachable"
                 ] = True
+
+                verification_requests = len(Fixture.requests)
+                send("/verify\r")
+                wait_for(lambda: "not_run" in display_text() and "quick" in display_text())
+                capture("verification-not-run")
+                resize(48, 14)
+                capture("verification-list-narrow")
+                resize(100, 36)
+
+                def check_reports(name, start):
+                    return [event["report"] for event in session_events()[start:]
+                            if event["type"] == "verification_completed"
+                            and event["report"]["name"] == name]
+
+                def run_recipe(name, decision, status):
+                    start = len(session_events())
+                    send(f"/verify {name}\r")
+                    wait_for(lambda: "approve once" in display_text().lower())
+                    capture(f"verification-{name}-{status}-approval", composer_text=None)
+                    send(decision)
+                    wait_for(lambda: any(report["status"] == status for report in check_reports(name, start)))
+                    wait_for(lambda: f"{name} — {status}" in display_text())
+                    capture(f"verification-{name}-{status}",
+                            composer_text=f"/verify {name}" if status == "denied" else "")
+                    return check_reports(name, start)[-1]
+
+                passed = run_recipe("quick", "a", "passed")
+                assert passed["exit_code"] == 0 and passed["operation_id"]
+                assert (root / "verify-result.txt").read_text() == "VERIFY_OK\n"
+                failed = run_recipe("fail", "a", "failed")
+                assert failed["exit_code"] == 7
+                (root / "verify-result.txt").unlink()
+                run_recipe("quick", "d", "denied")
+                assert not (root / "verify-result.txt").exists()
+                send(b"\x03")
+
+                start = len(session_events())
+                send("/verify slow\r")
+                wait_for(lambda: "approve once" in display_text().lower())
+                send("a")
+                wait_for(lambda: (root / "verify-waiting").exists())
+                send(b"\x03")
+                wait_for(lambda: any(report["status"] == "cancelled" for report in check_reports("slow", start)))
+                wait_for(lambda: "slow — cancelled" in display_text())
+                capture("verification-cancelled", composer_text="/verify slow")
+                send(b"\x03")
+                assert len(Fixture.requests) == verification_requests, "verification contacted the model"
+                result["findings"]["verification_pass_fail_deny_cancel_are_model_free"] = True
             send("/exit\r")
             wait_for(lambda: process.poll() is not None)
             result["exit_code"] = process.returncode

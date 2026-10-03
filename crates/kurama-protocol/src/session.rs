@@ -227,6 +227,16 @@ impl EventEnvelope {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
+    VerificationStarted {
+        recipe: crate::verification::VerificationRecipe,
+        report: crate::verification::VerificationReport,
+    },
+    VerificationUpdated {
+        report: crate::verification::VerificationReport,
+    },
+    VerificationCompleted {
+        report: crate::verification::VerificationReport,
+    },
     SessionStarted {
         metadata: SessionMetadata,
     },
