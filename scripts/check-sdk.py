@@ -340,7 +340,9 @@ def run_case(language, command, binary, output, python_path, typescript_module):
                 "provider did not observe cancellation"
             )
             assert not provider.failures, provider.failures
-            assert len(provider.requests) == 11, (
+            if language != "rust":
+                assert summary["one_shot_verified"] is True
+            assert len(provider.requests) == (11 if language == "rust" else 12), (
                 "extra/missing model calls, or verification contacted model"
             )
             journal = state / "sessions" / summary["session_id"] / "events.jsonl"

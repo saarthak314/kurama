@@ -1,77 +1,48 @@
-"""Errors raised by the client, distinct from exceptions in user callbacks."""
+"""SDK and server errors; exceptions from application callbacks stay untouched."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .types import ApprovalRequest, Reply
 
+_DEFAULT_MESSAGES = {
+    "closed": "The Kurama agent is closed.",
+    "busy": "An execution is already active; finish or close its stream first.",
+    "backpressure": (
+        "The event consumer fell behind the bounded buffer; the agent was closed. "
+        "Consume events promptly."
+    ),
+    "reply_too_large": "The reply exceeds the 16 MiB aggregation limit; use agent.stream().",
+    "approval_required": (
+        "This operation needs approval. Supply approve=True or an approval callback, "
+        "or use agent.stream() and agent.approve() for manual approval."
+    ),
+}
+
 
 class KuramaError(Exception):
-    """Base class for SDK and server errors."""
+    """SDK or server failure with a stable code and optional execution details."""
 
-    def __init__(self, message: str, *, code: str) -> None:
-        super().__init__(message)
+    def __init__(
+        self,
+        code: str,
+        message: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            message if message is not None else _DEFAULT_MESSAGES.get(code, code)
+        )
         self.code = code
-
-
-class ProtocolError(KuramaError):
-    """The binary sent invalid or incompatible protocol data."""
-
-    def __init__(self, message: str, *, code: str = "invalid_protocol") -> None:
-        super().__init__(message, code=code)
-
-
-class ProcessError(KuramaError):
-    """The owned Kurama process could not start or exited unexpectedly."""
-
-    def __init__(self, message: str, *, returncode: int | None = None) -> None:
-        super().__init__(message, code="process_error")
-        self.returncode = returncode
-
-
-class ClosedError(KuramaError):
-    def __init__(self) -> None:
-        super().__init__("The Kurama agent is closed.", code="closed")
-
-
-class BusyError(KuramaError):
-    def __init__(self) -> None:
-        super().__init__(
-            "An execution is already active; finish or close its stream first.",
-            code="busy",
-        )
-
-
-class BufferOverflowError(KuramaError):
-    def __init__(self) -> None:
-        super().__init__(
-            "The event consumer fell behind the bounded buffer; the agent was closed. "
-            "Consume events promptly or increase max_buffered_events/max_buffered_bytes.",
-            code="event_buffer_overflow",
-        )
-
-
-class ServerError(KuramaError):
-    """A structured error returned by the Rust process."""
-
-
-class TurnFailed(ServerError):
-    """An accepted execution failed; partial text remains available in reply."""
-
-    def __init__(self, message: str, *, code: str, reply: Reply) -> None:
-        super().__init__(message, code=code)
-        self.reply = reply
+        self.details = details
+        self.reply: Reply | None = details.get("reply") if details else None
+        self.returncode: int | None = details.get("returncode") if details else None
 
 
 class ApprovalRequired(KuramaError):
     """A convenience call needed approval and safely cancelled its execution."""
 
     def __init__(self, request: ApprovalRequest) -> None:
-        super().__init__(
-            "This operation needs approval. Supply on_approval, or use "
-            "agent.stream() and agent.approve() for manual approval.",
-            code="approval_required",
-        )
+        super().__init__("approval_required")
         self.request = request

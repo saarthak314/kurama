@@ -1,4 +1,4 @@
-import { IncompatibleProtocolError, ProtocolError } from "./errors.js";
+import { KuramaError } from "./errors.js";
 import type { AgentEvent, ApprovalResponse, ErrorDetail, VerificationReport } from "./types.js";
 
 export const MAX_FRAME_BYTES = 1_048_576;
@@ -85,14 +85,14 @@ export function approvalResponse(value: unknown): value is ApprovalResponse {
 export function parseFrame(bytes: Uint8Array): Frame {
   let value: unknown;
   try { value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); }
-  catch { throw new ProtocolError(); }
-  if (!object(value)) throw new ProtocolError();
+  catch { throw new KuramaError("invalid_protocol"); }
+  if (!object(value)) throw new KuramaError("invalid_protocol");
   if (value.type === "hello") {
-    if (value.protocol_version !== 1) throw new IncompatibleProtocolError();
+    if (value.protocol_version !== 1) throw new KuramaError("incompatible_protocol");
     const capabilities = value.capabilities;
     if (!string(value.server_version) || value.max_frame_bytes !== MAX_FRAME_BYTES || !strings(capabilities)
       || !["prompt", "stream", "approval", "cancel", "resume", "verify"].every(c => capabilities.includes(c))) {
-      throw new IncompatibleProtocolError();
+      throw new KuramaError("incompatible_protocol");
     }
     return value as unknown as Hello;
   }
@@ -102,7 +102,7 @@ export function parseFrame(bytes: Uint8Array): Frame {
   }
   if (value.type === "event" && (value.request_id === null || (string(value.request_id) && /^[1-9][0-9]*$/.test(value.request_id)))
     && string(value.session_id) && event(value.event)) return value as unknown as Frame;
-  throw new ProtocolError();
+  throw new KuramaError("invalid_protocol");
 }
 
 /** One fixed-size buffer avoids quadratic copying for arbitrarily fragmented frames. */
@@ -116,7 +116,7 @@ export class FrameDecoder {
       const lf = chunk.indexOf(10, offset);
       const end = lf < 0 ? chunk.length : lf;
       const count = end - offset;
-      if (this.length + count > MAX_FRAME_BYTES) throw new ProtocolError("The Kurama process exceeded the 1 MiB frame limit.");
+      if (this.length + count > MAX_FRAME_BYTES) throw new KuramaError("invalid_protocol", "The Kurama process exceeded the 1 MiB frame limit.");
       if (this.length === 0 && lf >= 0) {
         this.accept(parseFrame(chunk.subarray(offset, end)), count);
       } else {
@@ -133,6 +133,6 @@ export class FrameDecoder {
     }
   }
   end(): void {
-    if (this.length !== 0) throw new ProtocolError("The Kurama process closed stdout in the middle of a frame.");
+    if (this.length !== 0) throw new KuramaError("invalid_protocol", "The Kurama process closed stdout in the middle of a frame.");
   }
 }

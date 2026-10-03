@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, cast
 
-from .errors import ProtocolError
+from .errors import KuramaError
 from .types import (
     AgentSnapshot,
     AgentUpdatedEvent,
@@ -36,31 +36,31 @@ CAPABILITIES = {"prompt", "stream", "approval", "cancel", "resume", "verify"}
 
 def object_value(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
-        raise ProtocolError("Expected a protocol object.")
+        raise KuramaError("invalid_protocol", "Expected a protocol object.")
     return value
 
 
 def string(value: Any) -> str:
     if not isinstance(value, str):
-        raise ProtocolError("Expected a protocol string.")
+        raise KuramaError("invalid_protocol", "Expected a protocol string.")
     return value
 
 
 def integer(value: Any) -> int:
     if type(value) is not int:
-        raise ProtocolError("Expected a protocol integer.")
+        raise KuramaError("invalid_protocol", "Expected a protocol integer.")
     return value
 
 
 def boolean(value: Any) -> bool:
     if type(value) is not bool:
-        raise ProtocolError("Expected a protocol boolean.")
+        raise KuramaError("invalid_protocol", "Expected a protocol boolean.")
     return value
 
 
 def array(value: Any) -> list[Any]:
     if not isinstance(value, list):
-        raise ProtocolError("Expected a protocol array.")
+        raise KuramaError("invalid_protocol", "Expected a protocol array.")
     return value
 
 
@@ -74,7 +74,7 @@ def optional_integer(value: Any) -> int | None:
 
 def enum(value: Any, choices: set[str]) -> Any:
     if not isinstance(value, str) or value not in choices:
-        raise ProtocolError("Unrecognized protocol variant.")
+        raise KuramaError("invalid_protocol", "Unrecognized protocol variant.")
     return value
 
 
@@ -86,7 +86,9 @@ def request_id(value: Any) -> str:
         or not identifier.isdecimal()
         or identifier[0] == "0"
     ):
-        raise ProtocolError("Invalid response/request correlation ID.")
+        raise KuramaError(
+            "invalid_protocol", "Invalid response/request correlation ID."
+        )
     return identifier
 
 
@@ -96,13 +98,19 @@ def _reject_constant(value: str) -> None:
 
 def decode_frame(frame: bytes) -> dict[str, Any]:
     if not frame.endswith(b"\n"):
-        raise ProtocolError("The process ended with a truncated protocol frame.")
+        raise KuramaError(
+            "invalid_protocol", "The process ended with a truncated protocol frame."
+        )
     if len(frame) - 1 > MAX_FRAME_BYTES:
-        raise ProtocolError("Protocol frame exceeds the 1048576-byte limit.")
+        raise KuramaError(
+            "frame_too_large", "Protocol frame exceeds the 1048576-byte limit."
+        )
     try:
         value = json.loads(frame[:-1].decode("utf-8"), parse_constant=_reject_constant)
     except (UnicodeDecodeError, ValueError, RecursionError):
-        raise ProtocolError("The process sent invalid UTF-8 JSON.") from None
+        raise KuramaError(
+            "invalid_protocol", "The process sent invalid UTF-8 JSON."
+        ) from None
     return object_value(value)
 
 
@@ -245,6 +253,7 @@ def decode_event(value: Any) -> Event:
         return DoneEvent(
             status, decode_error(value["error"]) if "error" in value else None
         )
-    raise ProtocolError(
-        "Unrecognized friendly event type; install compatible SDK and Kurama versions."
+    raise KuramaError(
+        "invalid_protocol",
+        "Unrecognized friendly event type; install compatible SDK and Kurama versions.",
     )

@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, unlink, access } from "node:fs/promises";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const { Agent, ApprovalRequired } = await import(pathToFileURL(process.env.KURAMA_SDK_MODULE).href);
+const { Agent, ApprovalRequired, prompt, verify } = await import(pathToFileURL(process.env.KURAMA_SDK_MODULE).href);
 const workspace = process.env.SDK_WORKSPACE;
 const options = {
   workspace,
@@ -81,7 +81,7 @@ try {
 const resumed = await Agent.open({
   ...options,
   sessionId,
-  onApproval: async () => "approve_once",
+  approve: async () => "approve_once",
 });
 try {
   assert.equal(resumed.sessionId, sessionId);
@@ -110,4 +110,16 @@ try {
 } finally {
   await inspected.close();
 }
-console.log(JSON.stringify({ language: "typescript", session_id: sessionId, replies, manual_approvals: approvalCount, saw_child: sawChild, verification }));
+const marker = join(workspace, "verified.txt");
+await unlink(marker);
+await assert.rejects(verify("quick", options), ApprovalRequired);
+await assert.rejects(access(marker), {code:"ENOENT"});
+const oneShot = await verify("quick", {...options, approve:true});
+assert.equal(oneShot.status, "passed");
+assert.equal(await readFile(marker, "utf8"), "verified\n");
+await unlink(marker);
+const denied = await verify("quick", {...options, mode:"auto", approve:true});
+assert.equal(denied.status, "denied");
+await assert.rejects(access(marker), {code:"ENOENT"});
+assert.equal((await prompt("SDK_SIMPLE", options)).text, "SDK_SIMPLE_OK");
+console.log(JSON.stringify({ language: "typescript", session_id: sessionId, replies, manual_approvals: approvalCount, saw_child: sawChild, verification, one_shot_verified: true }));

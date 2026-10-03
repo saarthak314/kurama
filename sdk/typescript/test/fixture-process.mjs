@@ -41,6 +41,20 @@ async function finishApproval(responseValue) {
     await response(id, { ...frames.initialize_response.result, session_id: session });
     return;
   }
+  if (active.recipe !== undefined) {
+    const denied = responseValue === "deny";
+    const failed = active.recipe === "failed";
+    lastReport = {
+      ...frames.verification_event.event.report,
+      name: active.recipe,
+      status: denied ? "denied" : failed ? "failed" : "passed",
+      exit_code: denied ? null : failed ? 1 : 0,
+    };
+    if (!denied) await event({ type: "verification", report: { ...lastReport, status: "running", finished_at_ms: null, exit_code: null } });
+    await event({ type: "verification", report: lastReport });
+    await complete(denied ? frames.cancelled_event.event : frames.done_event.event);
+    return;
+  }
   if (responseValue === "deny") {
     await complete(frames.cancelled_event.event);
     return;
@@ -149,12 +163,9 @@ for await (const line of createInterface({ input: process.stdin, crlfDelay: Infi
     if (params.name !== "quick" && params.name !== "failed") {
       await send({ type: "response", id, error: { code: "unknown_recipe", message: "Unknown verification recipe" } });
     } else {
-      active = { id };
+      active = { id, recipe: params.name };
       await response(id, { accepted: true });
-      lastReport = { ...frames.verification_event.event.report, status: params.name === "failed" ? "failed" : "passed", exit_code: params.name === "failed" ? 1 : 0 };
-      await event({ type: "verification", report: { ...lastReport, status: "running", finished_at_ms: null, exit_code: null } });
-      await event({ type: "verification", report: lastReport });
-      await complete();
+      await event(frames.approval_event.event);
     }
   } else if (method === "shutdown") {
     if (scenario === "stuck") {

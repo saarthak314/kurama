@@ -4,7 +4,7 @@ import json
 import unittest
 from pathlib import Path
 
-from kurama import ProtocolError
+from kurama import KuramaError
 from kurama._protocol import (
     MAX_FRAME_BYTES,
     decode_event,
@@ -48,11 +48,13 @@ class ProtocolTests(unittest.TestCase):
     def test_shared_invalid_lines_are_rejected_without_echoing_input(self) -> None:
         for fixture in FIXTURES["invalid_lines"]:
             with self.subTest(fixture=fixture["name"]):
-                with self.assertRaises(ProtocolError):
+                with self.assertRaises(KuramaError) as raised:
                     frame = decode_frame(fixture["line"].encode())
                     request_id(frame.get("id"))
-        with self.assertRaises(ProtocolError) as raised:
+                self.assertEqual(raised.exception.code, "invalid_protocol")
+        with self.assertRaises(KuramaError) as raised:
             decode_frame(b'{"secret":"never echo this" bad}\n')
+        self.assertEqual(raised.exception.code, "invalid_protocol")
         self.assertNotIn("never echo", str(raised.exception))
 
     def test_frame_boundary_counts_utf8_bytes_and_excludes_lf(self) -> None:
@@ -61,24 +63,30 @@ class ProtocolTests(unittest.TestCase):
             prefix + b"x" * (MAX_FRAME_BYTES - len(prefix) - len(suffix) + 1) + suffix
         )
         self.assertEqual(len(decode_frame(frame)["text"]), MAX_FRAME_BYTES - 11)
-        with self.assertRaises(ProtocolError):
+        with self.assertRaises(KuramaError) as raised:
             decode_frame(frame[:-3] + b"x" + frame[-3:])
-        with self.assertRaises(ProtocolError):
+        self.assertEqual(raised.exception.code, "frame_too_large")
+        with self.assertRaises(KuramaError) as raised:
             decode_frame(frame[:-1])
-        with self.assertRaises(ProtocolError):
+        self.assertEqual(raised.exception.code, "invalid_protocol")
+        with self.assertRaises(KuramaError) as raised:
             decode_frame(b'{"text":"\xff"}\n')
+        self.assertEqual(raised.exception.code, "invalid_protocol")
 
     def test_unknown_events_fail_instead_of_disappearing(self) -> None:
-        with self.assertRaises(ProtocolError):
+        with self.assertRaises(KuramaError) as raised:
             decode_event({"type": "new_event_from_incompatible_server"})
+        self.assertEqual(raised.exception.code, "invalid_protocol")
 
     def test_nonfinite_numbers_and_invalid_correlation_ids_fail(self) -> None:
-        with self.assertRaises(ProtocolError):
+        with self.assertRaises(KuramaError) as raised:
             decode_frame(b'{"number":NaN}\n')
+        self.assertEqual(raised.exception.code, "invalid_protocol")
         for identifier in ("0", "01", "-1", "１", 1, None):
             with self.subTest(identifier=identifier):
-                with self.assertRaises(ProtocolError):
+                with self.assertRaises(KuramaError) as raised:
                     request_id(identifier)
+                self.assertEqual(raised.exception.code, "invalid_protocol")
         self.assertEqual(request_id("9007199254740993"), "9007199254740993")
 
 

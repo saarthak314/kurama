@@ -8,9 +8,9 @@ import json
 import os
 import signal
 from collections import deque
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, TypeVar, cast
+from typing import Any, TypeVar, Unpack, cast
 
 from ._protocol import (
     CAPABILITIES,
@@ -28,19 +28,10 @@ from ._protocol import (
     request_id,
     string,
 )
-from .errors import (
-    ApprovalRequired,
-    BufferOverflowError,
-    BusyError,
-    ClosedError,
-    KuramaError,
-    ProcessError,
-    ProtocolError,
-    ServerError,
-    TurnFailed,
-)
+from .errors import ApprovalRequired, KuramaError
 from .types import (
-    ApprovalCallback,
+    AgentOptions,
+    Approval,
     ApprovalEvent,
     ApprovalRequest,
     ApprovalResponse,
@@ -54,6 +45,12 @@ from .types import (
 )
 
 _T = TypeVar("_T")
+_STARTUP_TIMEOUT = 10.0
+_SHUTDOWN_TIMEOUT = 5.0
+_REQUEST_TIMEOUT = 30.0
+_MAX_BUFFERED_EVENTS = 128
+_MAX_BUFFERED_BYTES = 4 * 1024 * 1024
+_MAX_REPLY_BYTES = 16 * 1024 * 1024
 
 
 def _future() -> asyncio.Future[Any]:
@@ -81,11 +78,9 @@ async def _cleanup_wait(task: asyncio.Task[_T]) -> _T:
 
 
 class _Inbox:
-    def __init__(self, count_limit: int, byte_limit: int) -> None:
+    def __init__(self) -> None:
         self.items: deque[tuple[Event, int]] = deque()
         self.bytes = 0
-        self.count_limit = count_limit
-        self.byte_limit = byte_limit
         self.wake = asyncio.Event()
         self.ended = False
         self.error: KuramaError | None = None
@@ -95,9 +90,14 @@ class _Inbox:
         if self.discard:
             return
         if self.ended:
-            raise ProtocolError("Received an event after its terminal event.")
-        if len(self.items) >= self.count_limit or self.bytes + size > self.byte_limit:
-            raise BufferOverflowError()
+            raise KuramaError(
+                "invalid_protocol", "Received an event after its terminal event."
+            )
+        if (
+            len(self.items) >= _MAX_BUFFERED_EVENTS
+            or self.bytes + size > _MAX_BUFFERED_BYTES
+        ):
+            raise KuramaError("backpressure")
         self.items.append((event, size))
         self.bytes += size
         self.wake.set()
@@ -145,9 +145,11 @@ class Agent:
     """One owned Kurama process and resumable session.
 
     Install a Kurama binary supporting ``--stdio`` once; no binary is downloaded.
-    The default path is ``async with Agent(profile="work") as agent`` followed by
-    ``await agent.prompt(text)``. Existing Kurama configuration supplies providers
-    and credentials. ``env`` overrides only the child environment.
+    Use this stateful client for streaming and resume, or the module-level
+    ``prompt`` and ``verify`` helpers for a single call. Existing configuration
+    supplies providers and credentials; ``env`` overrides only the child environment.
+    Approval is opt-in: ``approve=True`` approves each request once, while a
+    callback chooses its response. Rust policy still applies in either case.
 
     Only one prompt/verification can execute at a time. Event buffering is bounded:
     a stalled consumer fails explicitly and closes the process rather than dropping
@@ -164,32 +166,20 @@ class Agent:
         state_dir: str | os.PathLike[str] | None = None,
         session_id: str | None = None,
         env: Mapping[str, str] | None = None,
-        on_approval: ApprovalCallback | None = None,
-        startup_timeout: float = 30.0,
-        shutdown_timeout: float = 5.0,
-        request_timeout: float = 30.0,
-        max_buffered_events: int = 64,
-        max_buffered_bytes: int = 8 * MAX_FRAME_BYTES,
+        approve: Approval = False,
     ) -> None:
         if mode not in {"supervised", "auto", "yolo"}:
             raise ValueError("mode must be supervised, auto, or yolo")
-        if min(startup_timeout, shutdown_timeout, request_timeout) <= 0:
-            raise ValueError("timeouts must be positive")
-        if max_buffered_events < 1 or max_buffered_bytes < 1:
-            raise ValueError("event buffer limits must be positive")
+        if not isinstance(approve, bool) and not callable(approve):
+            raise TypeError("approve must be a bool or approval callback")
         self.workspace = os.fspath(workspace) if workspace is not None else os.getcwd()
         self.profile = profile
         self.mode = mode
         self.session_id = session_id
-        self.on_approval = on_approval
+        self._approve = approve
         self._binary = os.fspath(binary) if binary is not None else None
         self._state_dir = os.fspath(state_dir) if state_dir is not None else None
         self._env = dict(env) if env is not None else {}
-        self._startup_timeout = startup_timeout
-        self._shutdown_timeout = shutdown_timeout
-        self._request_timeout = request_timeout
-        self._buffer_count = max_buffered_events
-        self._buffer_bytes = max_buffered_bytes
         self._process: asyncio.subprocess.Process | None = None
         self._spawn_task: asyncio.Task[asyncio.subprocess.Process] | None = None
         self._reader_task: asyncio.Task[None] | None = None
@@ -207,10 +197,7 @@ class Agent:
         self._closing_signal = asyncio.Event()
         self._error: KuramaError | None = None
         self._wire_session: str | None = None
-        self._unsolicited = self._inbox()
-
-    def _inbox(self) -> _Inbox:
-        return _Inbox(self._buffer_count, self._buffer_bytes)
+        self._unsolicited = _Inbox()
 
     async def __aenter__(self) -> Agent:
         return await self.open()
@@ -225,7 +212,7 @@ class Agent:
                 self._check_open()
                 return self
             if self._closing or self._closed:
-                raise ClosedError()
+                raise KuramaError("closed")
             try:
                 await self._open()
             except BaseException:
@@ -236,14 +223,16 @@ class Agent:
 
     async def _open(self) -> None:
         if os.name != "posix":
-            raise ProcessError("The headless SDK currently supports Linux and macOS.")
+            raise KuramaError(
+                "process_error", "The headless SDK currently supports Linux and macOS."
+            )
         environment = os.environ.copy()
         environment.update(self._env)
         binary = self._binary or environment.get("KURAMA_BIN") or "kurama"
         args = [binary, "--stdio"]
         if self.mode == "yolo":
             args.append("--yolo")
-        deadline = asyncio.timeout(self._startup_timeout)
+        deadline = asyncio.timeout(_STARTUP_TIMEOUT)
         try:
             async with deadline:
                 try:
@@ -261,12 +250,13 @@ class Agent:
                     )
                     self._process = await asyncio.shield(self._spawn_task)
                 except (OSError, ValueError):
-                    raise ProcessError(
+                    raise KuramaError(
+                        "process_error",
                         "Could not start Kurama. Install a binary supporting --stdio, or set "
-                        "binary= or KURAMA_BIN to its executable."
+                        "binary= or KURAMA_BIN to its executable.",
                     ) from None
                 if self._closing:
-                    raise ClosedError()
+                    raise KuramaError("closed")
                 self._hello = _future()
                 self._reader_task = asyncio.create_task(
                     self._read(), name="kurama-stdout"
@@ -278,11 +268,12 @@ class Agent:
         except TimeoutError:
             if not deadline.expired():
                 raise
-            raise ProcessError(
-                "Kurama protocol startup timed out. Install a binary supporting --stdio."
+            raise KuramaError(
+                "process_error",
+                "Kurama protocol startup timed out. Install a binary supporting --stdio.",
             ) from None
         # Recovery can legitimately await a user decision or model continuation.
-        state = _Execution(self._inbox(), initializing=True)
+        state = _Execution(_Inbox(), initializing=True)
         params: dict[str, Any] = {
             "protocol_version": PROTOCOL_VERSION,
             "workspace": self.workspace,
@@ -309,7 +300,10 @@ class Agent:
         result = await asyncio.shield(response)
         session = string(result.get("session_id"))
         if self._wire_session is not None and session != self._wire_session:
-            raise ProtocolError("Initialization returned a different recovery session.")
+            raise KuramaError(
+                "invalid_protocol",
+                "Initialization returned a different recovery session.",
+            )
         self.session_id = self._wire_session = session
         self.workspace = string(result.get("workspace"))
         self.profile = string(result.get("profile"))
@@ -320,7 +314,7 @@ class Agent:
         if self._error is not None:
             raise self._error
         if not self._opened or self._closing or self._closed:
-            raise ClosedError()
+            raise KuramaError("closed")
 
     async def _send(
         self,
@@ -334,13 +328,13 @@ class Agent:
             if self._error is not None:
                 raise self._error
             if self._closed or (self._closing and method != "shutdown"):
-                raise ClosedError()
+                raise KuramaError("closed")
             if self._process is None or self._process.stdin is None:
-                raise ClosedError()
+                raise KuramaError("closed")
             if execution is not None and self._active is not None:
-                raise BusyError()
+                raise KuramaError("busy")
             if execution is not None and execution.finished.is_set():
-                raise ClosedError()
+                raise KuramaError("closed")
             if target is not None and (
                 self._active is not target or target.finished.is_set()
             ):
@@ -348,9 +342,7 @@ class Agent:
                 response.set_result({"cancelled": False})
                 return response
             if len(self._pending) >= 64:
-                raise KuramaError(
-                    "Too many outstanding requests.", code="too_many_requests"
-                )
+                raise KuramaError("too_many_requests", "Too many outstanding requests.")
             identifier = str(self._next_id)
             try:
                 frame = json.dumps(
@@ -364,8 +356,9 @@ class Agent:
                     "Request parameters must be finite UTF-8 JSON values."
                 ) from None
             if len(frame) > MAX_FRAME_BYTES:
-                raise ValueError(
-                    "Request exceeds the 1048576-byte protocol frame limit."
+                raise KuramaError(
+                    "frame_too_large",
+                    "Request exceeds the 1048576-byte protocol frame limit.",
                 )
             self._next_id += 1
             response = _future()
@@ -375,10 +368,12 @@ class Agent:
                 self._active = execution
             try:
                 self._process.stdin.write(frame + b"\n")
-                async with asyncio.timeout(self._request_timeout):
+                async with asyncio.timeout(_REQUEST_TIMEOUT):
                     await self._process.stdin.drain()
             except (OSError, TimeoutError):
-                error = ProcessError("Writing to Kurama failed or timed out.")
+                error = KuramaError(
+                    "process_error", "Writing to Kurama failed or timed out."
+                )
                 self._fail(error)
                 raise error from None
             return response
@@ -388,10 +383,12 @@ class Agent:
     ) -> dict[str, Any]:
         try:
             response = await self._send(method, params, target=target)
-            async with asyncio.timeout(self._request_timeout):
+            async with asyncio.timeout(_REQUEST_TIMEOUT):
                 return await asyncio.shield(response)
         except TimeoutError:
-            error = ProcessError("Kurama did not acknowledge a request in time.")
+            error = KuramaError(
+                "process_error", "Kurama did not acknowledge a request in time."
+            )
             self._fail(error)
             raise error from None
         finally:
@@ -409,19 +406,22 @@ class Agent:
                     line = await self._process.stdout.readuntil(b"\n")
                 except asyncio.IncompleteReadError as exc:
                     if exc.partial:
-                        raise ProtocolError(
-                            "Kurama ended with a truncated protocol frame."
+                        raise KuramaError(
+                            "invalid_protocol",
+                            "Kurama ended with a truncated protocol frame.",
                         ) from None
                     if not self._closing:
-                        raise ProcessError(
+                        raise KuramaError(
+                            "process_error",
                             "Kurama closed stdout. Install a compatible binary supporting --stdio "
                             "and check your configured profile.",
-                            returncode=self._process.returncode,
+                            {"returncode": self._process.returncode},
                         ) from None
                     return
                 except asyncio.LimitOverrunError:
-                    raise ProtocolError(
-                        "Protocol frame exceeds the 1048576-byte limit."
+                    raise KuramaError(
+                        "frame_too_large",
+                        "Protocol frame exceeds the 1048576-byte limit.",
                     ) from None
                 self._receive(decode_frame(line), len(line) - 1)
         except asyncio.CancelledError:
@@ -429,49 +429,57 @@ class Agent:
         except KuramaError as error:
             self._fail(error)
         except Exception:
-            self._fail(ProtocolError("Could not read the Kurama protocol stream."))
+            self._fail(
+                KuramaError(
+                    "invalid_protocol", "Could not read the Kurama protocol stream."
+                )
+            )
 
     def _receive(self, frame: dict[str, Any], size: int) -> None:
         assert self._hello is not None
         if not self._hello.done():
             if frame.get("type") != "hello":
-                raise ProtocolError("Kurama did not send the required hello handshake.")
+                raise KuramaError(
+                    "invalid_protocol",
+                    "Kurama did not send the required hello handshake.",
+                )
             if integer(frame.get("protocol_version")) != PROTOCOL_VERSION:
-                raise ProtocolError(
+                raise KuramaError(
+                    "incompatible_protocol",
                     "Incompatible Kurama protocol. Install compatible SDK and Kurama versions.",
-                    code="incompatible_protocol",
                 )
             if integer(frame.get("max_frame_bytes")) != MAX_FRAME_BYTES:
-                raise ProtocolError("Kurama advertises an incompatible frame limit.")
+                raise KuramaError(
+                    "invalid_protocol", "Kurama advertises an incompatible frame limit."
+                )
             capabilities = {string(value) for value in array(frame.get("capabilities"))}
             if not CAPABILITIES.issubset(capabilities):
-                raise ProtocolError(
+                raise KuramaError(
+                    "incompatible_protocol",
                     "Kurama is missing required SDK capabilities.",
-                    code="incompatible_protocol",
                 )
             string(frame.get("server_version"))
             self._hello.set_result(frame)
             return
         if frame.get("type") == "response":
             if ("error" in frame) == ("result" in frame):
-                raise ProtocolError(
-                    "Response must contain exactly one result or error."
+                raise KuramaError(
+                    "invalid_protocol",
+                    "Response must contain exactly one result or error.",
                 )
             if frame.get("id") is None:
                 info = decode_error(frame.get("error"))
-                raise ProtocolError(info.message, code=info.code)
+                raise KuramaError(info.code, info.message)
             identifier = request_id(frame.get("id"))
             response = self._pending.get(identifier)
             if response is None:
-                raise ProtocolError("Response has no matching pending request.")
+                raise KuramaError(
+                    "invalid_protocol", "Response has no matching pending request."
+                )
             state = self._active
             if "error" in frame:
                 info = decode_error(frame["error"])
-                error = (
-                    ProtocolError(info.message, code=info.code)
-                    if info.code == "incompatible_protocol"
-                    else ServerError(info.message, code=info.code)
-                )
+                error = KuramaError(info.code, info.message)
                 if state is not None and state.id == identifier:
                     state.inbox.finish(error)
                     state.finished.set()
@@ -484,35 +492,47 @@ class Agent:
                         state.finished.set()
                     else:
                         if result.get("accepted") is not True:
-                            raise ProtocolError(
-                                "Execution response did not acknowledge acceptance."
+                            raise KuramaError(
+                                "invalid_protocol",
+                                "Execution response did not acknowledge acceptance.",
                             )
                         state.accepted = True
                 response.set_result(result)
             del self._pending[identifier]
             return
         if frame.get("type") != "event":
-            raise ProtocolError("Unrecognized protocol frame type.")
+            raise KuramaError("invalid_protocol", "Unrecognized protocol frame type.")
         session = string(frame.get("session_id"))
         if self._wire_session is not None and self._wire_session != session:
-            raise ProtocolError("Received an event belonging to a different session.")
+            raise KuramaError(
+                "invalid_protocol",
+                "Received an event belonging to a different session.",
+            )
         self._wire_session = session
         event = decode_event(frame.get("event"))
         correlation = frame.get("request_id")
         if correlation is None:
             if isinstance(event, DoneEvent):
-                raise ProtocolError("A terminal event must identify its execution.")
+                raise KuramaError(
+                    "invalid_protocol", "A terminal event must identify its execution."
+                )
             self._unsolicited.offer(event, size)
             return
         identifier = request_id(correlation)
         state = self._active
         if state is None or state.id != identifier or state.finished.is_set():
-            raise ProtocolError("Received an event outside its correlated execution.")
+            raise KuramaError(
+                "invalid_protocol",
+                "Received an event outside its correlated execution.",
+            )
         if not state.initializing and not state.accepted:
-            raise ProtocolError("Received an execution event before acceptance.")
+            raise KuramaError(
+                "invalid_protocol", "Received an execution event before acceptance."
+            )
         if isinstance(event, DoneEvent) and state.initializing:
-            raise ProtocolError(
-                "Initialization recovery cannot emit an execution terminal."
+            raise KuramaError(
+                "invalid_protocol",
+                "Initialization recovery cannot emit an execution terminal.",
             )
         state.inbox.offer(event, size)
         if isinstance(event, DoneEvent):
@@ -528,14 +548,15 @@ class Agent:
         if not self._closing:
             if self._reader_task is not None:
                 await asyncio.wait(
-                    {self._reader_task}, timeout=min(self._shutdown_timeout, 0.1)
+                    {self._reader_task}, timeout=min(_SHUTDOWN_TIMEOUT, 0.1)
                 )
             if self._error is None:
                 self._fail(
-                    ProcessError(
+                    KuramaError(
+                        "process_error",
                         "Kurama exited unexpectedly. Install a compatible binary supporting --stdio "
                         "and check your configured profile.",
-                        returncode=self._process.returncode,
+                        {"returncode": self._process.returncode},
                     )
                 )
 
@@ -569,13 +590,17 @@ class Agent:
         )
 
     async def prompt(self, text: str, *, explicit_delegation: bool = False) -> Reply:
-        """Collect text. Missing approval callbacks cancel safely and raise ApprovalRequired."""
+        """Collect a bounded reply; approval is opt-in and otherwise cancels safely."""
         chunks: list[str] = []
+        byte_count = 0
         async with self.stream(text, explicit_delegation=explicit_delegation) as events:
             async for event in events:
                 if isinstance(event, TextEvent):
+                    byte_count += len(event.text.encode("utf-8"))
+                    if byte_count > _MAX_REPLY_BYTES:
+                        raise KuramaError("reply_too_large")
                     chunks.append(event.text)
-                elif isinstance(event, ApprovalEvent) and self.on_approval is None:
+                elif isinstance(event, ApprovalEvent) and self._approve is False:
                     raise ApprovalRequired(event.request)
                 elif isinstance(event, DoneEvent):
                     reply = Reply(
@@ -583,7 +608,9 @@ class Agent:
                     )
                     self._raise_failed(event, reply)
                     return reply
-        raise ProtocolError("Execution ended without a terminal event.")
+        raise KuramaError(
+            "invalid_protocol", "Execution ended without a terminal event."
+        )
 
     async def verify(self, name: str) -> VerificationReport:
         """Explicitly run a named project recipe through Rust's policy and Bash tool."""
@@ -591,7 +618,7 @@ class Agent:
         report: VerificationReport | None = None
         async with EventStream(self, "verify", {"name": name}) as events:
             async for event in events:
-                if isinstance(event, ApprovalEvent) and self.on_approval is None:
+                if isinstance(event, ApprovalEvent) and self._approve is False:
                     raise ApprovalRequired(event.request)
                 elif isinstance(event, VerificationEvent):
                     report = event.report
@@ -600,7 +627,9 @@ class Agent:
                         event, Reply("", cast(str, self.session_id), event.status)
                     )
         if report is None:
-            raise ProtocolError("Verification ended without a verification report.")
+            raise KuramaError(
+                "invalid_protocol", "Verification ended without a verification report."
+            )
         return report
 
     async def verification_status(self) -> list[VerificationReport]:
@@ -641,13 +670,17 @@ class Agent:
             "approve", {"operation_id": operation_id, "response": response}
         )
         if result.get("accepted") is not True:
-            raise ProtocolError("Approval response did not acknowledge acceptance.")
+            raise KuramaError(
+                "invalid_protocol", "Approval response did not acknowledge acceptance."
+            )
 
     async def _approval(self, request: ApprovalRequest) -> None:
-        if self.on_approval is None:
+        if self._approve is False:
             raise ApprovalRequired(request)
         state = self._active
-        response = self.on_approval(request)
+        response: ApprovalResponse | Awaitable[ApprovalResponse] = (
+            "approve_once" if self._approve is True else self._approve(request)
+        )
         if inspect.isawaitable(response):
             callback = asyncio.ensure_future(response)
             stopped = asyncio.create_task(
@@ -663,7 +696,7 @@ class Agent:
                 if self._error is not None:
                     raise self._error
                 if self._closing:
-                    raise ClosedError()
+                    raise KuramaError("closed")
                 if not callback.done():
                     return
                 response = callback.result()
@@ -682,14 +715,14 @@ class Agent:
             task.add_done_callback(
                 lambda item: None if item.cancelled() else item.exception()
             )
-        _, pending = await asyncio.wait(tasks, timeout=self._shutdown_timeout)
+        _, pending = await asyncio.wait(tasks, timeout=_SHUTDOWN_TIMEOUT)
         if pending:
             # Python cannot forcibly stop cancellation-resistant application code;
             # it must not retain the Rust process or permit further executions.
             self._fail(
                 KuramaError(
+                    "approval_callback_timeout",
                     "An approval callback ignored cancellation; the agent was closed.",
-                    code="approval_callback_timeout",
                 )
             )
 
@@ -705,10 +738,10 @@ class Agent:
     @staticmethod
     def _raise_failed(event: DoneEvent, reply: Reply) -> None:
         if event.status == "failed":
-            raise TurnFailed(
+            raise KuramaError(
+                event.error.code if event.error else "runtime_error",
                 event.error.message if event.error else "Kurama execution failed.",
-                code=event.error.code if event.error else "runtime_error",
-                reply=reply,
+                {"reply": reply},
             )
 
     async def close(self) -> None:
@@ -733,7 +766,7 @@ class Agent:
             if process is not None:
                 try:
                     if self._error is None:
-                        async with asyncio.timeout(self._shutdown_timeout):
+                        async with asyncio.timeout(_SHUTDOWN_TIMEOUT):
                             if process.returncode is None:
                                 await self._request("shutdown", {})
                             if process.stdin is not None:
@@ -747,7 +780,7 @@ class Agent:
                 except ProcessLookupError:
                     pass
                 try:
-                    async with asyncio.timeout(self._shutdown_timeout):
+                    async with asyncio.timeout(_SHUTDOWN_TIMEOUT):
                         await process.wait()
                 except TimeoutError:
                     # asyncio has no public subprocess transport close. A descendant
@@ -766,7 +799,7 @@ class Agent:
                 await asyncio.gather(*tasks, return_exceptions=True)
             self._closed = True
             self._opened = False
-            error = self._error or ClosedError()
+            error = self._error or KuramaError("closed")
             for response in self._pending.values():
                 if not response.done():
                     response.set_exception(error)
@@ -790,7 +823,7 @@ class EventStream(AsyncIterator[Event]):
         self._agent = agent
         self._method = method
         self._params = params
-        self._state = _Execution(agent._inbox())
+        self._state = _Execution(_Inbox())
         self._started = False
         self._closed = False
         self._iterating = False
@@ -808,7 +841,7 @@ class EventStream(AsyncIterator[Event]):
 
     async def _start(self) -> None:
         if self._closed:
-            raise ClosedError()
+            raise KuramaError("closed")
         if self._started:
             return
         self._started = True
@@ -817,7 +850,7 @@ class EventStream(AsyncIterator[Event]):
             response = await self._agent._send(
                 self._method, self._params, execution=self._state
             )
-            async with asyncio.timeout(self._agent._request_timeout):
+            async with asyncio.timeout(_REQUEST_TIMEOUT):
                 await asyncio.shield(response)
         except BaseException:
             await self.aclose()
@@ -834,7 +867,7 @@ class EventStream(AsyncIterator[Event]):
         try:
             await self._start()
             event = await self._state.inbox.get()
-            if isinstance(event, ApprovalEvent) and self._agent.on_approval is not None:
+            if isinstance(event, ApprovalEvent) and self._agent._approve is not False:
                 await self._agent._approval(event.request)
             if isinstance(event, DoneEvent):
                 self._release()
@@ -870,7 +903,7 @@ class EventStream(AsyncIterator[Event]):
                 await self._agent.close()
             if self._agent._active is state and not state.finished.is_set():
                 try:
-                    async with asyncio.timeout(self._agent._shutdown_timeout):
+                    async with asyncio.timeout(_SHUTDOWN_TIMEOUT):
                         await self._agent._request("cancel", {}, target=state)
                         await state.finished.wait()
                 except (KuramaError, OSError, TimeoutError):
@@ -879,3 +912,21 @@ class EventStream(AsyncIterator[Event]):
             state.inbox.finish()
             state.finished.set()
             self._release()
+
+
+async def prompt(
+    text: str, *, explicit_delegation: bool = False, **options: Unpack[AgentOptions]
+) -> Reply:
+    """Run one prompt and close its process, including on failure or cancellation."""
+    async with Agent(**options) as agent:
+        return await agent.prompt(text, explicit_delegation=explicit_delegation)
+
+
+async def verify(name: str, **options: Unpack[AgentOptions]) -> VerificationReport:
+    """Run a recipe and close its process. approve=True explicitly trusts the recipe.
+
+    Opt-in approval applies once to each requested operation, including recovery;
+    Rust still enforces policy, scope, hashes, and budgets.
+    """
+    async with Agent(**options) as agent:
+        return await agent.verify(name)

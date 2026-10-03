@@ -1,10 +1,10 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import {
-  ApprovalCallbackError, ApprovalRequired, BackpressureError, BusyError, ClosedError,
-  IncompatibleProtocolError, KuramaError, ProcessError, ProtocolError, ServerError, TurnFailed,
-} from "./errors.js";
+import { ApprovalRequired, KuramaError } from "./errors.js";
 import { approvalResponse, FrameDecoder, MAX_FRAME_BYTES, verificationReport, type Frame, type Hello, type RecordValue } from "./protocol.js";
 import type { AgentEvent, AgentOptions, ApprovalRequest, ApprovalResponse, PromptOptions, Reply, VerificationReport } from "./types.js";
+
+const STARTUP_TIMEOUT_MS = 10_000;
+const CLEANUP_TIMEOUT_MS = 5_000;
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -29,13 +29,13 @@ class EventQueue implements AsyncIterableIterator<AgentEvent> {
   private ended = false;
   private error: unknown;
   push(event: AgentEvent, bytes: number): void {
-    if (this.ended) throw new ProtocolError("An event arrived after its terminal event.");
+    if (this.ended) throw new KuramaError("invalid_protocol", "An event arrived after its terminal event.");
     if (this.waiter) {
       const waiter = this.waiter;
       this.waiter = undefined;
       waiter.resolve({ value: event, done: false });
     } else {
-      if (this.items.length >= 128 || this.bytes + bytes > 4 * MAX_FRAME_BYTES) throw new BackpressureError();
+      if (this.items.length >= 128 || this.bytes + bytes > 4 * MAX_FRAME_BYTES) throw new KuramaError("backpressure");
       this.items.push({ event, bytes });
       this.bytes += bytes;
     }
@@ -101,10 +101,8 @@ export class Agent {
   private childExited = false;
   private killTimer: NodeJS.Timeout | undefined;
   private session = "";
-  private readonly cleanupMs: number;
 
   private constructor(private readonly options: AgentOptions) {
-    this.cleanupMs = options.shutdownTimeoutMs ?? 5_000;
     const env = { ...process.env, ...options.env };
     const binary = options.binary ?? env.KURAMA_BIN ?? "kurama";
     this.child = spawn(binary, options.mode === "yolo" ? ["--stdio", "--yolo"] : ["--stdio"], {
@@ -122,12 +120,12 @@ export class Agent {
     this.child.stdout.on("end", () => {
       try { decoder.end(); } catch (error) { this.fail(error); return; }
       if (!this.closing) this.fail(this.receivedHello
-        ? new ProcessError("The Kurama process closed its protocol stream unexpectedly.")
-        : new IncompatibleProtocolError());
+        ? new KuramaError("process_error", "The Kurama process closed its protocol stream unexpectedly.")
+        : new KuramaError("incompatible_protocol"));
     });
-    this.child.stdout.on("error", () => this.fail(new ProcessError("Cannot read the Kurama protocol stream.")));
+    this.child.stdout.on("error", () => this.fail(new KuramaError("process_error", "Cannot read the Kurama protocol stream.")));
     this.child.stdin.on("error", () => {
-      if (!this.closing) this.fail(new ProcessError("Cannot write to the Kurama protocol stream."));
+      if (!this.closing) this.fail(new KuramaError("process_error", "Cannot write to the Kurama protocol stream."));
     });
     // Always drain diagnostics, but never accumulate or expose potentially sensitive stderr.
     this.child.stderr.resume();
@@ -135,29 +133,27 @@ export class Agent {
     this.child.on("error", () => {
       this.childExited = true;
       this.exited.resolve();
-      this.fail(new ProcessError("Cannot start Kurama. Install a stdio-capable Kurama binary, or set binary / KURAMA_BIN to its executable."));
+      this.fail(new KuramaError("process_error", "Cannot start Kurama. Install a stdio-capable Kurama binary, or set binary / KURAMA_BIN to its executable."));
     });
     this.child.on("exit", (code, signal) => {
       this.childExited = true;
       this.exited.resolve();
       if (!this.closing && this.failure === undefined) this.fail(this.receivedHello
-        ? new ProcessError("The Kurama process exited unexpectedly.", code, signal)
-        : new IncompatibleProtocolError());
-      else this.rejectPending(new ClosedError());
+        ? new KuramaError("process_error", "The Kurama process exited unexpectedly.", { exitCode: code, signal: signal })
+        : new KuramaError("incompatible_protocol"));
+      else this.rejectPending(new KuramaError("closed"));
     });
   }
 
   static async open(options: AgentOptions = {}): Promise<Agent> {
-    for (const timeout of [options.startupTimeoutMs, options.shutdownTimeoutMs]) {
-      if (timeout !== undefined && (!Number.isFinite(timeout) || timeout <= 0 || timeout > 2_147_483_647)) {
-        throw new RangeError("SDK timeouts must be positive milliseconds within the Node timer range.");
-      }
+    if (options.approve !== undefined && typeof options.approve !== "boolean" && typeof options.approve !== "function") {
+      throw new TypeError("approve must be a boolean or an approval callback.");
     }
     const agent = new Agent(options);
     try {
-      try { await within(agent.hello.promise, options.startupTimeoutMs ?? 10_000); }
+      try { await within(agent.hello.promise, STARTUP_TIMEOUT_MS); }
       catch (error) {
-        if (error instanceof KuramaError && error.code === "timeout") throw new IncompatibleProtocolError();
+        if (error instanceof KuramaError && error.code === "timeout") throw new KuramaError("incompatible_protocol");
         throw error;
       }
       const params: RecordValue = { protocol_version: 1, workspace: options.workspace ?? process.cwd() };
@@ -177,8 +173,8 @@ export class Agent {
       agent.recovery.end();
       await recover;
       if (typeof result.session_id !== "string" || typeof result.workspace !== "string" || typeof result.profile !== "string"
-        || !["supervised", "auto", "yolo"].includes(String(result.mode))) throw new ProtocolError("Invalid initialize response.");
-      if (agent.session && agent.session !== result.session_id) throw new ProtocolError("Recovery events changed session identity.");
+        || !["supervised", "auto", "yolo"].includes(String(result.mode))) throw new KuramaError("invalid_protocol", "Invalid initialize response.");
+      if (agent.session && agent.session !== result.session_id) throw new KuramaError("invalid_protocol", "Recovery events changed session identity.");
       agent.session = result.session_id;
       return agent;
     } catch (error) {
@@ -208,7 +204,9 @@ export class Agent {
       }
       if (event.type === "done") {
         status = event.status;
-        if (status === "failed") throw new TurnFailed(event.error, { text: chunks.join(""), sessionId: this.session, status });
+        if (status === "failed") throw new KuramaError(event.error?.code ?? "runtime_error", event.error?.message, {
+          reply: { text: chunks.join(""), sessionId: this.session, status },
+        });
       }
     }
     return { text: chunks.join(""), sessionId: this.session, status };
@@ -221,10 +219,10 @@ export class Agent {
       if (event.type === "verification") report = event.report;
       if (event.type === "done") terminal = event;
     }
-    if (terminal?.status === "failed") throw new TurnFailed(terminal.error);
+    if (terminal?.status === "failed") throw new KuramaError(terminal.error?.code ?? "runtime_error", terminal.error?.message);
     if (!report || report.status === "running") {
       if (terminal?.status === "cancelled") throw new KuramaError("cancelled", "Verification was cancelled before a final report was available.");
-      throw new ProtocolError("Verification ended without a final report.");
+      throw new KuramaError("invalid_protocol", "Verification ended without a final report.");
     }
     return report;
   }
@@ -232,7 +230,7 @@ export class Agent {
   async verificationStatus(): Promise<VerificationReport[]> {
     const result = await this.request("verification_status", {});
     if (!Array.isArray(result.recipes) || !result.recipes.every(verificationReport)) {
-      const error = new ProtocolError("Invalid verification status response.");
+      const error = new KuramaError("invalid_protocol", "Invalid verification status response.");
       this.fail(error);
       throw error;
     }
@@ -250,7 +248,7 @@ export class Agent {
     if ((!this.active || this.active.done) && this.initializing === undefined) return false;
     const result = await this.request("cancel", {});
     if (typeof result.cancelled !== "boolean") {
-      const error = new ProtocolError("Invalid cancellation response.");
+      const error = new KuramaError("invalid_protocol", "Invalid cancellation response.");
       this.fail(error);
       throw error;
     }
@@ -260,10 +258,10 @@ export class Agent {
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
-    this.stopped.reject(new ClosedError());
-    this.unsolicited.end(new ClosedError());
-    this.recovery.end(new ClosedError());
-    if (this.active) { this.active.draining = true; this.active.queue.end(new ClosedError()); }
+    this.stopped.reject(new KuramaError("closed"));
+    this.unsolicited.end(new KuramaError("closed"));
+    this.recovery.end(new KuramaError("closed"));
+    if (this.active) { this.active.draining = true; this.active.queue.end(new KuramaError("closed")); }
     this.closePromise = this.finishClose();
     return this.closePromise;
   }
@@ -275,28 +273,28 @@ export class Agent {
       if (!this.childExited && this.failure === undefined && this.receivedHello) {
         await within((async () => {
           const result = await this.request("shutdown", {}, undefined, true);
-          if (result.closed !== true) throw new ProtocolError("Invalid shutdown response.");
+          if (result.closed !== true) throw new KuramaError("invalid_protocol", "Invalid shutdown response.");
           this.child.stdin.end();
           await this.exited.promise;
-        })(), this.cleanupMs);
+        })(), CLEANUP_TIMEOUT_MS);
       }
     } catch { /* Bounded forced cleanup below is mandatory even for a broken protocol. */ }
     finally {
-      this.rejectPending(new ClosedError());
-      this.active?.terminal.reject(new ClosedError());
+      this.rejectPending(new KuramaError("closed"));
+      this.active?.terminal.reject(new KuramaError("closed"));
       this.child.stdin.destroy();
       this.child.stdout.destroy();
       this.child.stderr.destroy();
       if (!this.childExited) {
         this.signalGroup("SIGTERM");
-        try { await within(this.exited.promise, this.cleanupMs); }
+        try { await within(this.exited.promise, CLEANUP_TIMEOUT_MS); }
         catch { this.signalGroup("SIGKILL"); }
       }
       // A stuck descendant may have inherited pipes after the leader exited.
       this.signalGroup("SIGKILL");
       clearTimeout(this.killTimer);
       if (!this.childExited) {
-        try { await within(this.exited.promise, this.cleanupMs); }
+        try { await within(this.exited.promise, CLEANUP_TIMEOUT_MS); }
         catch { this.child.unref(); }
       }
     }
@@ -304,7 +302,7 @@ export class Agent {
 
   private async *execute(method: "prompt" | "verify", params: RecordValue, requireApproval: boolean): AsyncGenerator<AgentEvent, void, unknown> {
     this.ensureOpen();
-    if (this.active || this.initializing !== undefined) throw new BusyError();
+    if (this.active || this.initializing !== undefined) throw new KuramaError("busy");
     const execution: Execution = { id: "", queue: new EventQueue(), terminal: deferred<Done>(), accepted: false, done: false, draining: false };
     this.active = execution;
     try {
@@ -317,7 +315,7 @@ export class Agent {
       if (execution.accepted && !execution.done && !this.closing && this.failure === undefined) {
         execution.draining = true;
         execution.queue.discard();
-        try { await within((async () => { await this.cancel(); await execution.terminal.promise; })(), this.cleanupMs); }
+        try { await within((async () => { await this.cancel(); await execution.terminal.promise; })(), CLEANUP_TIMEOUT_MS); }
         catch (error) { this.fail(error); await this.close(); }
       }
       if (this.active === execution) this.active = undefined;
@@ -325,29 +323,27 @@ export class Agent {
   }
 
   private async handleApproval(request: ApprovalRequest, required: boolean, execution?: Execution): Promise<void> {
-    if (!this.options.onApproval) {
+    const approval = this.options.approve;
+    if (!approval) {
       if (required) throw new ApprovalRequired(request);
       return;
     }
-    let response: ApprovalResponse;
-    try {
-      const callback = Promise.resolve().then(() => this.options.onApproval!(request));
-      // Cancellation/close must release a callback that never resolves.
+    let response: ApprovalResponse = "approve_once";
+    if (approval !== true) {
+      const callback = Promise.resolve().then(() => approval(request));
+      // Cancellation/close must release a callback that never resolves. Callback failures stay untouched.
       const stopped = execution?.terminal.promise.then(() => undefined);
       const outcome = await Promise.race([callback, this.stopped.promise, ...(stopped ? [stopped] : [])]);
       if (outcome === undefined && execution?.done) return;
-      if (!approvalResponse(outcome)) throw new TypeError("onApproval returned an invalid approval response.");
+      if (!approvalResponse(outcome)) throw new TypeError("approve returned an invalid approval response.");
       response = outcome;
-    } catch (error) {
-      if (this.closing || this.failure !== undefined) throw this.failure ?? new ClosedError();
-      throw new ApprovalCallbackError(error);
     }
     if (!execution?.done) await this.approve(request.operation_id, response);
   }
 
   private accepted(result: RecordValue): void {
     if (result.accepted !== true) {
-      const error = new ProtocolError("Invalid execution acknowledgement.");
+      const error = new KuramaError("invalid_protocol", "Invalid execution acknowledgement.");
       this.fail(error);
       throw error;
     }
@@ -355,7 +351,7 @@ export class Agent {
 
   private ensureOpen(): void {
     if (this.failure !== undefined) throw this.failure;
-    if (this.closing) throw new ClosedError();
+    if (this.closing) throw new KuramaError("closed");
   }
 
   private request(method: string, params: RecordValue, beforeWrite?: (id: string) => void, allowClosing = false): Promise<RecordValue> {
@@ -368,7 +364,7 @@ export class Agent {
     const bytes = Buffer.byteLength(line);
     if (bytes > MAX_FRAME_BYTES) throw new KuramaError("frame_too_large", "The request exceeds the 1 MiB protocol frame limit.");
     if (this.child.stdin.writableLength + bytes + 1 > 4 * MAX_FRAME_BYTES) {
-      const error = new BackpressureError();
+      const error = new KuramaError("backpressure");
       this.fail(error);
       throw error;
     }
@@ -376,36 +372,36 @@ export class Agent {
     this.pending.set(id, result);
     beforeWrite?.(id);
     try { this.child.stdin.write(line + "\n"); }
-    catch { this.fail(new ProcessError("Cannot write to the Kurama protocol stream.")); }
+    catch { this.fail(new KuramaError("process_error", "Cannot write to the Kurama protocol stream.")); }
     return result.promise;
   }
 
   private receive(frame: Frame, bytes: number): void {
     if (frame.type === "hello") {
-      if (this.receivedHello) throw new ProtocolError("The process sent more than one hello.");
+      if (this.receivedHello) throw new KuramaError("invalid_protocol", "The process sent more than one hello.");
       this.receivedHello = true;
       this.hello.resolve(frame);
       return;
     }
-    if (!this.receivedHello) throw new ProtocolError("The process did not begin with a hello.");
+    if (!this.receivedHello) throw new KuramaError("invalid_protocol", "The process did not begin with a hello.");
     if (frame.type === "response") {
-      if (frame.id === null) throw new ProtocolError("The process rejected a fatal protocol frame.");
+      if (frame.id === null) throw new KuramaError("invalid_protocol", "The process rejected a fatal protocol frame.");
       const pending = this.pending.get(frame.id);
-      if (!pending) throw new ProtocolError("The process replied to an unknown request.");
+      if (!pending) throw new KuramaError("invalid_protocol", "The process replied to an unknown request.");
       this.pending.delete(frame.id);
       if (frame.error) {
-        pending.reject(frame.error.code === "incompatible_protocol" ? new IncompatibleProtocolError() : new ServerError(frame.error.code, frame.error.message));
+        pending.reject(frame.error.code === "incompatible_protocol" ? new KuramaError("incompatible_protocol") : new KuramaError(frame.error.code, frame.error.message));
       } else {
         if (this.active?.id === frame.id) this.active.accepted = frame.result?.accepted === true;
         pending.resolve(frame.result!);
       }
       return;
     }
-    if (this.session && this.session !== frame.session_id) throw new ProtocolError("An event changed session identity.");
+    if (this.session && this.session !== frame.session_id) throw new KuramaError("invalid_protocol", "An event changed session identity.");
     if (!this.session) this.session = frame.session_id;
     if (frame.request_id !== null && frame.request_id === this.active?.id) {
       const execution = this.active;
-      if (!execution.accepted || execution.done) throw new ProtocolError("An execution event violated acknowledgement/terminal ordering.");
+      if (!execution.accepted || execution.done) throw new KuramaError("invalid_protocol", "An execution event violated acknowledgement/terminal ordering.");
       if (frame.event.type === "done") {
         execution.done = true;
         execution.terminal.resolve(frame.event);
@@ -413,12 +409,12 @@ export class Agent {
       if (!execution.draining) execution.queue.push(frame.event, bytes);
       if (execution.done) execution.queue.end();
     } else if (frame.request_id === null || frame.request_id === this.initializing) {
-      if (frame.event.type === "done") throw new ProtocolError("A terminal event did not belong to an execution.");
+      if (frame.event.type === "done") throw new KuramaError("invalid_protocol", "A terminal event did not belong to an execution.");
       if (!this.closing) {
         this.unsolicited.push(frame.event, bytes);
         if (this.initializing !== undefined && frame.event.type === "approval") this.recovery.push(frame.event, bytes);
       }
-    } else throw new ProtocolError("An event did not belong to a current request.");
+    } else throw new KuramaError("invalid_protocol", "An event did not belong to a current request.");
   }
 
   private rejectPending(error: unknown): void {
@@ -442,7 +438,7 @@ export class Agent {
       this.child.stdin.destroy();
       this.child.stdout.destroy();
       this.child.stderr.destroy();
-    }, this.cleanupMs);
+    }, CLEANUP_TIMEOUT_MS);
     this.killTimer.unref();
   }
 
@@ -454,4 +450,18 @@ export class Agent {
       } else process.kill(-this.child.pid, signal);
     } catch { /* Already exited; never fall back to an unrelated PID. */ }
   }
+}
+
+/** Run one prompt and release its process, including on approval or execution failure. */
+export async function prompt(text: string, options: AgentOptions & PromptOptions = {}): Promise<Reply> {
+  const agent = await Agent.open(options);
+  try { return await agent.prompt(text, options); }
+  finally { await agent.close(); }
+}
+
+/** Run a configured verification recipe and release its process. Approval is opt-in. */
+export async function verify(name: string, options: AgentOptions = {}): Promise<VerificationReport> {
+  const agent = await Agent.open(options);
+  try { return await agent.verify(name); }
+  finally { await agent.close(); }
 }

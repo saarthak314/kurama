@@ -66,6 +66,9 @@ def main() -> None:
         Path(pid_file).write_text(str(os.getpid()))
     if "--stdio" not in sys.argv:
         sys.exit(2)
+    if SCENARIO == "hang_handshake":
+        while True:
+            time.sleep(60)
     if SCENARIO == "old_binary":
         sys.stderr.write("unknown option --stdio; secret-value-must-not-leak\n")
         sys.exit(2)
@@ -89,7 +92,11 @@ def main() -> None:
             }
             if params["mode"] == "yolo" and "--yolo" not in sys.argv:
                 sys.exit(12)
-            if SCENARIO in {"recovery", "recovery_exit"}:
+            if SCENARIO in {"require_once", "recovery_once", "verify_approval"} and (
+                params["mode"] != "supervised" or "--yolo" in sys.argv
+            ):
+                sys.exit(15)
+            if SCENARIO in {"recovery", "recovery_exit", "recovery_once"}:
                 INITIALIZE = identifier
                 fixture_event("approval_event", identifier)
                 if SCENARIO == "recovery_exit":
@@ -142,6 +149,17 @@ def main() -> None:
                 for _ in range(1000):
                     event({"type": "text", "text": "x"})
                 done()
+            elif ACTIVE_TEXT == "overflow_bytes":
+                for _ in range(8):
+                    event({"type": "text", "text": "x" * 600_000})
+                done()
+            elif ACTIVE_TEXT in {"reply_limit", "reply_overflow"}:
+                for _ in range(32):
+                    event({"type": "text", "text": "é" * 262_144})
+                if ACTIVE_TEXT == "reply_overflow":
+                    event({"type": "text", "text": "é"})
+                else:
+                    done()
             elif ACTIVE_TEXT == "duplicate_terminal":
                 saved = ACTIVE
                 done()
@@ -150,6 +168,11 @@ def main() -> None:
                 fixture_event("text_event")
                 done()
         elif method == "approve":
+            if (
+                SCENARIO in {"require_once", "recovery_once", "verify_approval"}
+                and params["response"] != "approve_once"
+            ):
+                sys.exit(14)
             if params["operation_id"] != "op_fixture":
                 emit(
                     {
@@ -167,6 +190,11 @@ def main() -> None:
                 event({"type": "status", "message": "recovered"}, INITIALIZE)
                 response(INITIALIZE, globals()["INIT_RESULT"])
                 INITIALIZE = None
+            elif ACTIVE_TEXT == "verify":
+                if params["response"] == "deny":
+                    REPORT.update(status="denied", exit_code=None)
+                event({"type": "verification", "report": REPORT})
+                done()
             elif ACTIVE_TEXT == "fixtures":
                 for name in FRAMES:
                     if name.endswith("_event") and name not in {
@@ -215,8 +243,12 @@ def main() -> None:
             REPORT = copy.deepcopy(FRAMES["verification_event"]["event"]["report"])
             if params["name"] == "fails":
                 REPORT.update(name="fails", status="failed", exit_code=1)
-            event({"type": "verification", "report": REPORT})
-            done()
+            if SCENARIO in {"verify_approval", "verify_callback"}:
+                ACTIVE_TEXT = "verify"
+                fixture_event("approval_event")
+            else:
+                event({"type": "verification", "report": REPORT})
+                done()
         elif method == "shutdown":
             if SCENARIO == "hang_shutdown":
                 while True:
