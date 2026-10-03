@@ -18,6 +18,8 @@ export interface ApprovalRequest {
 }
 export type ApprovalResponse = "approve_once" | "approve_session" | "deny" | { edit: { arguments: Json } };
 export type ApprovalHandler = (request: ApprovalRequest) => ApprovalResponse | Promise<ApprovalResponse>;
+/** Explicit approval policy for this agent or one-shot call; omitted/false requires manual approval. */
+export type Approval = boolean | ApprovalHandler;
 export interface BlobRef { sha256: string; bytes: number }
 export interface ToolResult {
   call_id: string;
@@ -79,9 +81,6 @@ export interface AgentOptions {
   sessionId?: string;
   /** Child environment overrides. Values are never sent in protocol frames or logged. */
   env?: Record<string, string | undefined>;
-  onApproval?: ApprovalHandler;
-  /** Maximum time for the installed binary to send its initial hello (default 10 seconds). */
-  startupTimeoutMs?: number;
-  /** Maximum graceful shutdown/cancellation drain time (default 2 seconds). */
-  shutdownTimeoutMs?: number;
+  /** true approves each requested operation once; callbacks choose a response. Defaults to false. */
+  approve?: Approval;
 }

@@ -1,11 +1,7 @@
 /// <reference lib="esnext.disposable" preserve="true" />
-export { Agent } from "./agent.js";
-export {
-  KuramaError, ServerError, TurnFailed, ProtocolError, IncompatibleProtocolError, ProcessError,
-  ClosedError, BusyError, BackpressureError, ApprovalRequired, ApprovalCallbackError,
-} from "./errors.js";
+export { Agent, prompt, verify } from "./agent.js";
+export { KuramaError, ApprovalRequired } from "./errors.js";
 export type {
-  AgentEvent, AgentOptions, AgentSnapshot, ApprovalHandler, ApprovalRequest, ApprovalResponse,
-  BlobRef, ErrorDetail, Json, Mode, Operation, PromptOptions, Reply, ToolResult, TurnStatus,
-  Usage, VerificationReport, VerificationStatus,
+  AgentOptions, PromptOptions, Reply, AgentEvent, Approval, ApprovalRequest, ApprovalResponse,
+  VerificationReport,
 } from "./types.js";

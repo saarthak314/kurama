@@ -3,7 +3,7 @@ import json
 import os
 from pathlib import Path
 
-from kurama import Agent, ApprovalRequired
+from kurama import Agent, ApprovalRequired, prompt, verify
 
 
 async def main():
@@ -82,7 +82,7 @@ async def main():
     async def approve(_request):
         return "approve_once"
 
-    async with Agent(**options, session_id=session_id, on_approval=approve) as resumed:
+    async with Agent(**options, session_id=session_id, approve=approve) as resumed:
         assert resumed.session_id == session_id
         reply = await resumed.prompt("SDK_RESUME")
         assert reply.text == "SDK_RESUME_OK"
@@ -105,6 +105,21 @@ async def main():
             for report in await inspected.verification_status()
         ]
         assert verification == [("fail", "failed"), ("quick", "passed")]
+    marker = workspace / "verified.txt"
+    marker.unlink()
+    try:
+        await verify("quick", **options)
+    except ApprovalRequired:
+        pass
+    else:
+        raise AssertionError("one-shot verification silently approved execution")
+    assert not marker.exists()
+    one_shot = await verify("quick", **options, approve=True)
+    assert one_shot.status == "passed" and marker.read_text() == "verified\n"
+    marker.unlink()
+    denied = await verify("quick", **{**options, "mode": "auto"}, approve=True)
+    assert denied.status == "denied" and not marker.exists()
+    assert (await prompt("SDK_SIMPLE", **options)).text == "SDK_SIMPLE_OK"
     print(
         json.dumps(
             {
@@ -114,6 +129,7 @@ async def main():
                 "manual_approvals": approval_count,
                 "saw_child": saw_child,
                 "verification": verification,
+                "one_shot_verified": True,
             }
         )
     )

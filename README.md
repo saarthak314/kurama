@@ -57,7 +57,7 @@ let reply = Kurama::openai(std::env::var("OPENAI_API_KEY")?)
 
 `.yolo()` is launch-only, same as the cli. without it, `prompt` returns an error on the first write that needs approval. `reply.session_id` is what you pass to `resume`. more: [sdk](docs/sdk.md).
 
-TypeScript and Python clients use the same Rust engine through `kurama --stdio`; no daemon or native bindings. See [SDK setup, streaming, approvals, and resume](docs/sdk.md#typescript-and-python).
+TypeScript and Python clients use the same Rust engine through `kurama --stdio`. One-shot `prompt(...)` and `verify(...)` calls own startup and cleanup; use `Agent` for streaming or several turns. See [SDK setup and examples](docs/sdk.md#typescript-and-python).
 
 ## develop
 

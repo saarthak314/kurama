@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from os import PathLike
 from typing import Awaitable, Callable, Literal, TypeAlias, TypedDict
 
 JSON: TypeAlias = "None | bool | int | float | str | list[JSON] | dict[str, JSON]"
@@ -84,6 +86,18 @@ class ApprovalRequest:
 ApprovalCallback: TypeAlias = Callable[
     [ApprovalRequest], ApprovalResponse | Awaitable[ApprovalResponse]
 ]
+Approval: TypeAlias = bool | ApprovalCallback
+
+
+class AgentOptions(TypedDict, total=False):
+    workspace: str | PathLike[str] | None
+    profile: str | None
+    mode: Mode
+    binary: str | PathLike[str] | None
+    state_dir: str | PathLike[str] | None
+    session_id: str | None
+    env: Mapping[str, str] | None
+    approve: Approval
 
 
 @dataclass(frozen=True, slots=True)
