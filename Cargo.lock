@@ -788,7 +788,7 @@ dependencies = [
 
 [[package]]
 name = "kurama"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "kurama-adapters",
  "kurama-core",
@@ -799,7 +799,7 @@ dependencies = [
 
 [[package]]
 name = "kurama-adapters"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "basic-toml",
  "bytes",
@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "kurama-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "crossterm",
  "kurama-adapters",
@@ -847,7 +847,7 @@ dependencies = [
 
 [[package]]
 name = "kurama-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "futures-core",
  "futures-util",
@@ -861,7 +861,7 @@ dependencies = [
 
 [[package]]
 name = "kurama-protocol"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "futures-core",
  "serde",
@@ -871,7 +871,7 @@ dependencies = [
 
 [[package]]
 name = "kurama-sdk"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "kurama-core",
  "kurama-protocol",
